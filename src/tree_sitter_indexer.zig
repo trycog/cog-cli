@@ -175,6 +175,14 @@ fn isJsKeyword(name: []const u8) bool {
     return false;
 }
 
+/// Detect if a JavaScript file uses Flow type annotations by checking
+/// for `@flow` in the first 256 bytes (the pragma is always at the top).
+fn isFlowFile(source: []const u8) bool {
+    const check_len = @min(source.len, 256);
+    const header = source[0..check_len];
+    return std.mem.indexOf(u8, header, "@flow") != null;
+}
+
 pub const Indexer = struct {
     parser: *c.TSParser,
 
@@ -199,7 +207,14 @@ pub const Indexer = struct {
         relative_path: []const u8,
         language: Language,
     ) !IndexFileResult {
-        const ts_lang = language.tsLanguage();
+        // Detect Flow-typed JS files and use TypeScript parser instead.
+        // Flow's generic syntax (<T>) is invalid JS but valid TS, so the
+        // TypeScript parser handles these files correctly. We keep the JS
+        // query patterns since TS grammar produces the same base node types.
+        const is_flow = language == .javascript and isFlowFile(source);
+        const parser_lang: Language = if (is_flow) .typescript else language;
+
+        const ts_lang = parser_lang.tsLanguage();
 
         // Set parser language
         if (!c.ts_parser_set_language(self.parser, ts_lang)) {
@@ -217,7 +232,8 @@ pub const Indexer = struct {
 
         const root_node = c.ts_tree_root_node(tree);
 
-        // Compile the query
+        // Compile the query — use JS patterns even for Flow files since
+        // the TS grammar produces compatible node types
         const query_src = language.querySource();
         var error_offset: u32 = 0;
         var error_type: c.TSQueryError = c.TSQueryErrorNone;
@@ -227,7 +243,28 @@ pub const Indexer = struct {
             @intCast(query_src.len),
             &error_offset,
             &error_type,
-        ) orelse return error.QueryCompilationFailed;
+        ) orelse {
+            // Log query compilation error to stderr for debugging
+            var err_buf: [256]u8 = undefined;
+            const err_kind: []const u8 = switch (error_type) {
+                c.TSQueryErrorSyntax => "syntax",
+                c.TSQueryErrorNodeType => "node_type",
+                c.TSQueryErrorField => "field",
+                c.TSQueryErrorCapture => "capture",
+                c.TSQueryErrorStructure => "structure",
+                else => "unknown",
+            };
+            const err_msg = std.fmt.bufPrint(&err_buf, "query compile error ({s}) at offset {d} in {s} query\n", .{
+                err_kind,
+                error_offset,
+                language.scipName(),
+            }) catch "query compile error\n";
+            var buf: [4096]u8 = undefined;
+            var w = std.fs.File.stderr().writer(&buf);
+            w.interface.writeAll(err_msg) catch {};
+            w.interface.flush() catch {};
+            return error.QueryCompilationFailed;
+        };
         defer c.ts_query_delete(query);
 
         // Execute query
@@ -271,14 +308,14 @@ pub const Indexer = struct {
             const name_n = name_node orelse continue;
             const kind = def_kind orelse continue;
 
-            // Skip nodes in error subtrees. Check both the name node
-            // and the definition node — when a parser can't handle the
-            // syntax (e.g. Flow-typed JS parsed as plain JS), error
-            // recovery creates misleading AST nodes.
-            if (nodeInErrorContext(name_n)) continue;
-            if (def_node) |dn| {
-                if (nodeInErrorContext(dn)) continue;
-            }
+            // Skip names that are themselves error nodes or whose
+            // immediate parent is an error node.  We intentionally do
+            // NOT walk the full ancestor chain: Flow-typed JS produces
+            // error nodes around type annotations, but the function
+            // name identifier is still valid and worth capturing.
+            if (c.ts_node_is_error(name_n)) continue;
+            const name_parent = c.ts_node_parent(name_n);
+            if (!c.ts_node_is_null(name_parent) and c.ts_node_is_error(name_parent)) continue;
 
             const start_byte = c.ts_node_start_byte(name_n);
             const end_byte = c.ts_node_end_byte(name_n);
@@ -290,6 +327,21 @@ pub const Indexer = struct {
             // error recovery (e.g. Flow-typed JS misidentifying `if` as
             // a method name).
             if (isJsKeyword(name_text)) continue;
+
+            // Deduplicate: skip if we already have a def with the same
+            // name on the same line (e.g. export_statement + function_declaration
+            // both capturing the same identifier).
+            const this_row = c.ts_node_start_point(name_n).row;
+            var is_dup = false;
+            for (raw_defs.items) |existing| {
+                if (existing.start_point.row == this_row and
+                    std.mem.eql(u8, existing.name_text, name_text))
+                {
+                    is_dup = true;
+                    break;
+                }
+            }
+            if (is_dup) continue;
 
             try raw_defs.append(allocator, .{
                 .name_text = name_text,

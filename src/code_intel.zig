@@ -386,9 +386,21 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return error.Explained;
     }
 
+    // Count indexable files (those with a recognized extension) for accurate progress
+    var indexable_count: usize = 0;
+    for (files.items) |file_path| {
+        const ext = std.fs.path.extension(file_path);
+        if (ext.len == 0) continue;
+        if (tree_sitter_indexer.detectLanguage(ext) != null) {
+            indexable_count += 1;
+        } else if (extensions.resolveByExtension(allocator, ext) != null) {
+            indexable_count += 1;
+        }
+    }
+
     // TTY progress display
     const show_progress = tui.isStderrTty();
-    const total_files = files.items.len;
+    const total_files = indexable_count;
     if (show_progress) {
         tui.header();
         tui.progressStart(total_files);
@@ -421,11 +433,23 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             defer allocator.free(source);
 
             // Index with tree-sitter
-            const result = indexer.indexFile(allocator, source, file_path, lang) catch continue;
-            backing_buffers.append(allocator, result.string_data) catch {};
-            mergeDocument(allocator, &master_index, result.doc);
-            indexed_count += 1;
-            total_symbols += result.doc.symbols.len;
+            if (indexer.indexFile(allocator, source, file_path, lang)) |result| {
+                backing_buffers.append(allocator, result.string_data) catch {};
+                mergeDocument(allocator, &master_index, result.doc);
+                indexed_count += 1;
+                total_symbols += result.doc.symbols.len;
+            } else |_| {
+                // Indexing failed (e.g. Flow-typed JS parsed as plain JS).
+                // Still add a stub document so the file appears in the index
+                // and queries report "no symbols" instead of "file not found".
+                mergeDocument(allocator, &master_index, .{
+                    .language = lang.scipName(),
+                    .relative_path = file_path,
+                    .occurrences = &.{},
+                    .symbols = &.{},
+                });
+                indexed_count += 1;
+            }
 
             if (show_progress) {
                 tui.progressUpdate(indexed_count, total_files, total_symbols, file_path);
@@ -504,7 +528,8 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     total_symbols += master_index.external_symbols.len;
 
     if (show_progress) {
-        tui.progressFinish(indexed_count, total_symbols, 0, index_path);
+        const skipped = files.items.len - indexed_count;
+        tui.progressFinish(indexed_count, total_symbols, skipped, index_path);
     }
 
     // Output JSON stats
