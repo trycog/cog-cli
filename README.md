@@ -8,7 +8,7 @@
 
 **Tools for AI coding.**
 
-A zero-dependency native CLI for [Cog](https://trycog.ai) — persistent memory (hosted on [trycog.ai](https://trycog.ai)), code intelligence, and debugging for developers and AI agents. Built in Zig.
+Persistent memory, code intelligence, and debugging for developers and AI agents. A zero-dependency native CLI built in Zig.
 
 [Getting Started](#getting-started) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Extensions](#extensions)
 
@@ -21,7 +21,6 @@ A zero-dependency native CLI for [Cog](https://trycog.ai) — persistent memory 
 ### Prerequisites
 
 - [Zig 0.15.2+](https://ziglang.org/download/)
-- A [Cog](https://trycog.ai) account and API key (required for memory, optional for other tools)
 
 ### Build
 
@@ -39,7 +38,7 @@ Run the interactive setup:
 cog init
 ```
 
-You'll be prompted to choose between **Memory + Tools** (full setup with brain selection, agent prompts, and skill installation) or **Tools only** (code intelligence and debug server without a trycog.ai account).
+You'll be prompted to choose between **Memory + Tools** (full setup with brain selection, agent prompts, and skill installation) or **Tools only** (code intelligence and debug server).
 
 On macOS, `cog init` also code-signs the binary with debug entitlements for the native debugger.
 
@@ -678,5 +677,5 @@ zig build run -- mem/stats           # Run with arguments
 ---
 
 <div align="center">
-<sub>Built with <a href="https://ziglang.org">Zig</a> · Zero dependencies · <a href="https://trycog.ai">trycog.ai</a></sub>
+<sub>Built with <a href="https://ziglang.org">Zig</a> · Zero dependencies</sub>
 </div>
