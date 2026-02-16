@@ -38,15 +38,19 @@ pub fn decodeMessage(allocator: std.mem.Allocator, data: []const u8) DecodeError
     // Find Content-Length header
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return error.MissingHeader;
 
-    const header = data[0..header_end];
-    const prefix = "Content-Length: ";
-    if (!std.mem.startsWith(u8, header, prefix)) return error.InvalidHeader;
-
-    const len_str = header[prefix.len..];
-    const content_length = std.fmt.parseInt(usize, len_str, 10) catch return error.InvalidHeader;
+    // Scan all header lines for Content-Length
+    var content_length: ?usize = null;
+    var line_iter = std.mem.splitSequence(u8, data[0..header_end], "\r\n");
+    while (line_iter.next()) |line| {
+        if (std.mem.startsWith(u8, line, "Content-Length: ")) {
+            const len_str = line["Content-Length: ".len..];
+            content_length = std.fmt.parseInt(usize, len_str, 10) catch return error.InvalidHeader;
+        }
+    }
+    if (content_length == null) return error.InvalidHeader;
 
     const body_start = header_end + 4; // skip \r\n\r\n
-    const body_end = body_start + content_length;
+    const body_end = body_start + content_length.?;
 
     if (body_end > data.len) return error.TruncatedBody;
 
@@ -192,6 +196,25 @@ pub fn wsDecodeFrame(allocator: std.mem.Allocator, data: []const u8) WsDecodeErr
         },
         .bytes_consumed = payload_end,
     };
+}
+
+/// Build a WebSocket close frame with a 2-byte status code and optional reason.
+pub fn wsCloseFrame(allocator: std.mem.Allocator, status_code: u16, reason: []const u8) ![]const u8 {
+    // Close frame payload: 2-byte big-endian status code + reason string
+    const payload = try allocator.alloc(u8, 2 + reason.len);
+    defer allocator.free(payload);
+
+    const code_bytes = std.mem.toBytes(std.mem.nativeToBig(u16, status_code));
+    payload[0] = code_bytes[0];
+    payload[1] = code_bytes[1];
+    @memcpy(payload[2..], reason);
+
+    return wsEncodeFrame(allocator, payload, .close);
+}
+
+/// Build a WebSocket pong frame echoing back the ping payload (RFC 6455).
+pub fn wsPongFrame(allocator: std.mem.Allocator, ping_payload: []const u8) ![]const u8 {
+    return wsEncodeFrame(allocator, ping_payload, .pong);
 }
 
 // ── WebSocket Handshake ────────────────────────────────────────────────
@@ -626,4 +649,89 @@ test "CDP transport gets JS stack trace" {
         const scope_chain = frame.object.get("scopeChain").?.array;
         try std.testing.expect(scope_chain.items.len > 0);
     }
+}
+
+// ── DAP Multi-Header Tests ─────────────────────────────────────────────
+
+test "decodeMessage with Content-Type before Content-Length" {
+    const allocator = std.testing.allocator;
+    const data = "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: 9\r\n\r\n{\"seq\":1}";
+    const decoded = try decodeMessage(allocator, data);
+    defer allocator.free(decoded.body);
+
+    try std.testing.expectEqualStrings("{\"seq\":1}", decoded.body);
+}
+
+test "decodeMessage with Content-Length not as first header" {
+    const allocator = std.testing.allocator;
+    const data = "X-Custom: foo\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"hello\":1}";
+    const decoded = try decodeMessage(allocator, data);
+    defer allocator.free(decoded.body);
+
+    try std.testing.expectEqualStrings("{\"hello\":1}", decoded.body);
+}
+
+// ── WebSocket Close/Pong Frame Tests ───────────────────────────────────
+
+test "wsCloseFrame encodes status code and reason" {
+    const allocator = std.testing.allocator;
+    const frame = try wsCloseFrame(allocator, 1000, "normal closure");
+    defer allocator.free(frame);
+
+    // Decode the frame
+    const result = try wsDecodeFrame(allocator, frame);
+    defer allocator.free(result.frame.payload);
+
+    try std.testing.expectEqual(WsOpcode.close, result.frame.opcode);
+    try std.testing.expect(result.frame.fin);
+
+    // Payload should be 2-byte status code + reason
+    try std.testing.expectEqual(@as(usize, 2 + "normal closure".len), result.frame.payload.len);
+
+    // Check status code (big-endian)
+    const status = std.mem.bigToNative(u16, std.mem.bytesToValue(u16, result.frame.payload[0..2]));
+    try std.testing.expectEqual(@as(u16, 1000), status);
+
+    // Check reason
+    try std.testing.expectEqualStrings("normal closure", result.frame.payload[2..]);
+}
+
+test "wsPongFrame echoes payload correctly" {
+    const allocator = std.testing.allocator;
+    const ping_data = "ping-payload-123";
+    const frame = try wsPongFrame(allocator, ping_data);
+    defer allocator.free(frame);
+
+    // Decode the frame
+    const result = try wsDecodeFrame(allocator, frame);
+    defer allocator.free(result.frame.payload);
+
+    try std.testing.expectEqual(WsOpcode.pong, result.frame.opcode);
+    try std.testing.expect(result.frame.fin);
+    try std.testing.expectEqualStrings("ping-payload-123", result.frame.payload);
+}
+
+test "wsCloseFrame roundtrip encode-decode verifies opcode and payload" {
+    const allocator = std.testing.allocator;
+
+    // Build a close frame with status 1001 (going away) and a reason
+    const frame = try wsCloseFrame(allocator, 1001, "going away");
+    defer allocator.free(frame);
+
+    // Decode the raw frame
+    const result = try wsDecodeFrame(allocator, frame);
+    defer allocator.free(result.frame.payload);
+
+    // Verify opcode
+    try std.testing.expectEqual(WsOpcode.close, result.frame.opcode);
+
+    // Verify status code from payload
+    const status = std.mem.bigToNative(u16, std.mem.bytesToValue(u16, result.frame.payload[0..2]));
+    try std.testing.expectEqual(@as(u16, 1001), status);
+
+    // Verify reason text
+    try std.testing.expectEqualStrings("going away", result.frame.payload[2..]);
+
+    // Verify FIN bit is set (close frames must not be fragmented)
+    try std.testing.expect(result.frame.fin);
 }

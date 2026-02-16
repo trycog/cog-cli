@@ -249,6 +249,14 @@ pub const Dashboard = struct {
             copyInto(&entry.summary, &entry.summary_len, summary);
         }
         self.log.push(entry);
+
+        // Log any log point messages
+        for (state.log_messages) |msg| {
+            var log_entry: LogEntry = .{};
+            copyInto(&log_entry.tool_name, &log_entry.tool_name_len, "log_point");
+            copyInto(&log_entry.summary, &log_entry.summary_len, truncate(msg, 76));
+            self.log.push(log_entry);
+        }
     }
 
     pub fn onInspect(self: *Dashboard, session_id: []const u8, expression: []const u8, result: []const u8) void {
@@ -285,6 +293,230 @@ pub const Dashboard = struct {
         const summary = std.fmt.bufPrint(&buf, "{s} destroyed", .{
             truncate(session_id, 20),
         }) catch "session destroyed";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onStackTrace(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_stacktrace");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} frame(s)", .{count}) catch "stack trace";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onSetVariable(self: *Dashboard, session_id: []const u8, variable: []const u8, value: []const u8) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_set_variable");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{s} = {s}", .{
+            truncate(variable, 20), truncate(value, 30),
+        }) catch "variable set";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onThreads(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_threads");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} thread(s)", .{count}) catch "threads listed";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onMemory(self: *Dashboard, session_id: []const u8, action: []const u8, address: []const u8) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_memory");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{s} @ {s}", .{
+            truncate(action, 8), truncate(address, 20),
+        }) catch "memory operation";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onDisassemble(self: *Dashboard, session_id: []const u8, address: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_disassemble");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} insn @ {s}", .{
+            count, truncate(address, 20),
+        }) catch "disassembly";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onAttach(self: *Dashboard, session_id: []const u8, pid: i64) void {
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_attach");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{s} attached to pid {d}", .{
+            truncate(session_id, 16), pid,
+        }) catch "attached";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onScopes(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_scopes");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} scope(s)", .{count}) catch "scopes listed";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onWatchpoint(self: *Dashboard, session_id: []const u8, variable: []const u8, access_type: []const u8) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_watchpoint");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{s} ({s})", .{
+            truncate(variable, 30), truncate(access_type, 10),
+        }) catch "watchpoint set";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onCompletions(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_completions");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} completion(s)", .{count}) catch "completions";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onModules(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_modules");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} module(s)", .{count}) catch "modules";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onRestartFrame(self: *Dashboard, session_id: []const u8, frame_id: u32) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_restart_fr");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "restarted frame {d}", .{frame_id}) catch "frame restarted";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onCapabilities(self: *Dashboard, session_id: []const u8) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_capabilities");
+        copyInto(&entry.summary, &entry.summary_len, "queried capabilities");
+        self.log.push(entry);
+    }
+
+    pub fn onExceptionInfo(self: *Dashboard, session_id: []const u8) void {
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_exception_info");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "exception info for {s}", .{
+            truncate(session_id, 20),
+        }) catch "exception info";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onRegisters(self: *Dashboard, session_id: []const u8, count: usize) void {
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_registers");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} registers for {s}", .{
+            count, truncate(session_id, 20),
+        }) catch "registers read";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onInstructionBreakpoint(self: *Dashboard, session_id: []const u8, address: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_insn_bp");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} insn bp @ {s}", .{
+            count, truncate(address, 30),
+        }) catch "instruction breakpoint";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onStepInTargets(self: *Dashboard, session_id: []const u8, frame_id: u32, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_step_targets");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} target(s) for frame {d}", .{
+            count, frame_id,
+        }) catch "step-in targets";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onBreakpointLocations(self: *Dashboard, session_id: []const u8, source: []const u8, line: u32, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_bp_locations");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} location(s) @ {s}:{d}", .{
+            count, truncate(source, 30), line,
+        }) catch "breakpoint locations";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onCancel(self: *Dashboard, session_id: []const u8) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_cancel");
+        copyInto(&entry.summary, &entry.summary_len, "request cancelled");
+        self.log.push(entry);
+    }
+
+    pub fn onTerminateThreads(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_term_threads");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} thread(s) terminated", .{count}) catch "threads terminated";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onRestart(self: *Dashboard, session_id: []const u8) void {
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_restart");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{s} restarted", .{
+            truncate(session_id, 20),
+        }) catch "session restarted";
+        copyInto(&entry.summary, &entry.summary_len, summary);
+        self.log.push(entry);
+    }
+
+    pub fn onLoadedSources(self: *Dashboard, session_id: []const u8, count: usize) void {
+        _ = session_id;
+        var entry: LogEntry = .{};
+        copyInto(&entry.tool_name, &entry.tool_name_len, "debug_loaded_src");
+        var buf: [80]u8 = undefined;
+        const summary = std.fmt.bufPrint(&buf, "{d} source(s) loaded", .{count}) catch "loaded sources";
         copyInto(&entry.summary, &entry.summary_len, summary);
         self.log.push(entry);
     }
@@ -634,4 +866,68 @@ test "Dashboard full lifecycle" {
     try std.testing.expectEqual(@as(usize, 0), dash.session_count);
     try std.testing.expectEqual(@as(usize, 5), dash.log.count);
     try std.testing.expect(dash.last_stop != null);
+}
+
+test "Dashboard onInstructionBreakpoint logs activity" {
+    var dash = Dashboard.init();
+    dash.onInstructionBreakpoint("session-1", "0x400080", 2);
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_insn_bp", entry.toolNameSlice());
+}
+
+test "Dashboard onStepInTargets logs activity" {
+    var dash = Dashboard.init();
+    dash.onStepInTargets("session-1", 3, 5);
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_step_targets", entry.toolNameSlice());
+}
+
+test "Dashboard onBreakpointLocations logs activity" {
+    var dash = Dashboard.init();
+    dash.onBreakpointLocations("session-1", "main.c", 42, 3);
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_bp_locations", entry.toolNameSlice());
+}
+
+test "Dashboard onCancel logs activity" {
+    var dash = Dashboard.init();
+    dash.onCancel("session-1");
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_cancel", entry.toolNameSlice());
+    try std.testing.expectEqualStrings("request cancelled", entry.summarySlice());
+}
+
+test "Dashboard onTerminateThreads logs activity" {
+    var dash = Dashboard.init();
+    dash.onTerminateThreads("session-1", 3);
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_term_threads", entry.toolNameSlice());
+}
+
+test "Dashboard onRestart logs activity" {
+    var dash = Dashboard.init();
+    dash.onRestart("session-1");
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_restart", entry.toolNameSlice());
+}
+
+test "Dashboard onLoadedSources logs activity" {
+    var dash = Dashboard.init();
+    dash.onLoadedSources("session-1", 12);
+
+    try std.testing.expectEqual(@as(usize, 1), dash.log.count);
+    const entry = &dash.log.entries[0];
+    try std.testing.expectEqualStrings("debug_loaded_src", entry.toolNameSlice());
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const process_mod = @import("process.zig");
+const types = @import("../types.zig");
 
 // ── Software Breakpoint Management ─────────────────────────────────────
 
@@ -18,10 +19,14 @@ pub const Breakpoint = struct {
     address: u64,
     file: []const u8,
     line: u32,
+    column: ?u32 = null,
     original_bytes: [bp_size]u8,
     enabled: bool,
     hit_count: u32,
     condition: ?[]const u8,
+    hit_condition: ?[]const u8 = null,
+    log_message: ?[]const u8 = null,
+    is_temporary: bool = false,
 };
 
 pub const BreakpointManager = struct {
@@ -52,19 +57,79 @@ pub const BreakpointManager = struct {
         line_entries: []const parser.LineEntry,
         condition: ?[]const u8,
     ) !Breakpoint {
+        return self.resolveAndSetEx(file, line, line_entries, condition, null, null);
+    }
+
+    /// Resolve a file:line:column to an address using DWARF line entries and set a breakpoint.
+    pub fn resolveAndSetColumn(
+        self: *BreakpointManager,
+        file: []const u8,
+        line: u32,
+        column: ?u32,
+        line_entries: []const parser.LineEntry,
+        condition: ?[]const u8,
+        hit_condition: ?[]const u8,
+        log_message: ?[]const u8,
+    ) !Breakpoint {
+        return self.resolveAndSetExInternal(file, line, column, line_entries, condition, hit_condition, log_message);
+    }
+
+    /// Resolve a file:line to an address with extended options.
+    pub fn resolveAndSetEx(
+        self: *BreakpointManager,
+        file: []const u8,
+        line: u32,
+        line_entries: []const parser.LineEntry,
+        condition: ?[]const u8,
+        hit_condition: ?[]const u8,
+        log_message: ?[]const u8,
+    ) !Breakpoint {
+        return self.resolveAndSetExInternal(file, line, null, line_entries, condition, hit_condition, log_message);
+    }
+
+    /// Internal resolver that handles both line-only and line+column matching.
+    fn resolveAndSetExInternal(
+        self: *BreakpointManager,
+        file: []const u8,
+        line: u32,
+        column: ?u32,
+        line_entries: []const parser.LineEntry,
+        condition: ?[]const u8,
+        hit_condition: ?[]const u8,
+        log_message: ?[]const u8,
+    ) !Breakpoint {
         // Find the best matching line entry
         var best_addr: ?u64 = null;
         var best_line: u32 = 0;
+        var best_col_distance: u32 = std.math.maxInt(u32);
+
         for (line_entries) |entry| {
             if (entry.end_sequence) continue;
-            if (entry.line == line and entry.is_stmt) {
-                best_addr = entry.address;
-                best_line = entry.line;
-                break;
-            }
-            // Also accept the nearest line at or after the requested line
-            if (entry.line >= line and entry.is_stmt) {
-                if (best_addr == null or entry.line < best_line) {
+            if (!entry.is_stmt) continue;
+
+            if (entry.line == line) {
+                if (column) |requested_col| {
+                    // Column matching: prefer exact column match, otherwise closest column
+                    const col_distance = if (entry.column >= requested_col)
+                        entry.column - requested_col
+                    else
+                        requested_col - entry.column;
+
+                    if (best_addr == null or best_line != line or col_distance < best_col_distance) {
+                        best_addr = entry.address;
+                        best_line = entry.line;
+                        best_col_distance = col_distance;
+                    }
+                } else {
+                    // No column requested: take first exact line match
+                    best_addr = entry.address;
+                    best_line = entry.line;
+                    break;
+                }
+            } else if (entry.line >= line) {
+                // Also accept the nearest line at or after the requested line
+                // but only if we haven't found an exact line match
+                if (best_line != line and (best_addr == null or entry.line < best_line)) {
                     best_addr = entry.address;
                     best_line = entry.line;
                 }
@@ -81,14 +146,54 @@ pub const BreakpointManager = struct {
             .address = address,
             .file = owned_file,
             .line = best_line,
+            .column = column,
             .original_bytes = std.mem.zeroes([bp_size]u8),
             .enabled = true,
             .hit_count = 0,
             .condition = condition,
+            .hit_condition = hit_condition,
+            .log_message = log_message,
         };
         self.next_id += 1;
         try self.breakpoints.append(self.allocator, bp);
         return bp;
+    }
+
+    /// Set a temporary breakpoint at a raw address that auto-removes after first hit.
+    pub fn setTemporary(self: *BreakpointManager, address: u64) !u32 {
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.breakpoints.append(self.allocator, .{
+            .id = id,
+            .address = address,
+            .file = "",
+            .line = 0,
+            .original_bytes = std.mem.zeroes([bp_size]u8),
+            .enabled = true,
+            .hit_count = 0,
+            .condition = null,
+            .is_temporary = true,
+        });
+
+        return id;
+    }
+
+    /// Clean up any temporary breakpoints that have been hit (hit_count > 0).
+    pub fn cleanupTemporary(self: *BreakpointManager, process: *process_mod.ProcessControl) void {
+        var i: usize = 0;
+        while (i < self.breakpoints.items.len) {
+            const bp = &self.breakpoints.items[i];
+            if (bp.is_temporary and bp.hit_count > 0) {
+                // Restore original bytes
+                if (bp.enabled) {
+                    process.writeMemory(bp.address, &bp.original_bytes) catch {};
+                }
+                _ = self.breakpoints.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
     }
 
     /// Set a breakpoint at a raw address (for testing without DWARF data).
@@ -113,6 +218,45 @@ pub const BreakpointManager = struct {
             .enabled = true,
             .hit_count = 0,
             .condition = null,
+        });
+
+        return id;
+    }
+
+    /// Set a breakpoint at an instruction address from an InstructionBreakpoint.
+    /// Parses the instruction_reference as a hex address and applies the optional offset.
+    pub fn setInstructionBreakpoint(self: *BreakpointManager, bp: types.InstructionBreakpoint) !u32 {
+        // Parse the instruction reference as a hex address (with or without "0x" prefix)
+        const ref = bp.instruction_reference;
+        const hex_str = if (ref.len > 2 and ref[0] == '0' and (ref[1] == 'x' or ref[1] == 'X'))
+            ref[2..]
+        else
+            ref;
+
+        const base_addr = std.fmt.parseInt(u64, hex_str, 16) catch return error.InvalidInstructionReference;
+
+        // Apply offset if provided
+        const address: u64 = if (bp.offset) |offset| blk: {
+            if (offset >= 0) {
+                break :blk base_addr +% @as(u64, @intCast(offset));
+            } else {
+                break :blk base_addr -% @as(u64, @intCast(-offset));
+            }
+        } else base_addr;
+
+        const id = self.next_id;
+        self.next_id += 1;
+
+        try self.breakpoints.append(self.allocator, .{
+            .id = id,
+            .address = address,
+            .file = "",
+            .line = 0,
+            .original_bytes = std.mem.zeroes([bp_size]u8),
+            .enabled = true,
+            .hit_count = 0,
+            .condition = bp.condition,
+            .hit_condition = bp.hit_condition,
         });
 
         return id;
@@ -195,21 +339,65 @@ pub const BreakpointManager = struct {
     /// Callback type for evaluating breakpoint condition expressions.
     /// The engine provides an evaluator that resolves the condition string
     /// against the debuggee's current state.
-    pub const ConditionEvaluator = *const fn (condition: []const u8) bool;
+    pub const ConditionEvaluator = struct {
+        ctx: *anyopaque,
+        evalFn: *const fn (ctx: *anyopaque, condition: []const u8) bool,
+
+        pub fn eval(self: ConditionEvaluator, condition: []const u8) bool {
+            return self.evalFn(self.ctx, condition);
+        }
+    };
 
     /// Check whether execution should stop at this breakpoint.
-    /// Increments hit_count and evaluates the condition if present.
+    /// Increments hit_count and evaluates the condition and hit_condition if present.
     /// Returns true if we should stop, false to silently continue.
     pub fn shouldStop(_: *BreakpointManager, bp: *Breakpoint, evaluator: ?ConditionEvaluator) bool {
         bp.hit_count += 1;
+
+        // Check expression condition first
         if (bp.condition) |cond| {
             if (evaluator) |eval| {
-                return eval(cond);
+                if (!eval.eval(cond)) return false;
             }
-            // No evaluator available — stop unconditionally
-            return true;
         }
+
+        // Check hit condition
+        if (bp.hit_condition) |hc| {
+            return evaluateHitCondition(hc, bp.hit_count);
+        }
+
+        // Log points never stop (they log and continue)
+        if (bp.log_message != null) return false;
+
         return true;
+    }
+
+    /// Parse and evaluate a hit condition string against the current hit count.
+    /// Supported formats: ">= N", "> N", "== N", "= N", "% N", "<= N", "< N"
+    pub fn evaluateHitCondition(hc: []const u8, hit_count: u32) bool {
+        const trimmed = std.mem.trim(u8, hc, " ");
+        if (trimmed.len == 0) return true;
+
+        // Try to parse as plain number first (equivalent to "== N")
+        if (std.fmt.parseInt(u32, trimmed, 10)) |n| {
+            return hit_count == n;
+        } else |_| {}
+
+        // Parse operator and number
+        var op_end: usize = 0;
+        while (op_end < trimmed.len and !std.ascii.isDigit(trimmed[op_end])) : (op_end += 1) {}
+        const op = std.mem.trim(u8, trimmed[0..op_end], " ");
+        const num_str = std.mem.trim(u8, trimmed[op_end..], " ");
+        const n = std.fmt.parseInt(u32, num_str, 10) catch return true;
+
+        if (std.mem.eql(u8, op, ">=")) return hit_count >= n;
+        if (std.mem.eql(u8, op, ">")) return hit_count > n;
+        if (std.mem.eql(u8, op, "==") or std.mem.eql(u8, op, "=")) return hit_count == n;
+        if (std.mem.eql(u8, op, "<=")) return hit_count <= n;
+        if (std.mem.eql(u8, op, "<")) return hit_count < n;
+        if (std.mem.eql(u8, op, "%")) return if (n > 0) (hit_count % n == 0) else true;
+
+        return true; // Unknown operator — stop
     }
 };
 
@@ -371,19 +559,25 @@ test "conditional breakpoint evaluates expression" {
     const bp = mgr.findByAddress(0x1000).?;
 
     // Evaluator that returns false (condition not met) — should not stop
-    const result1 = mgr.shouldStop(bp, struct {
-        fn eval(_: []const u8) bool {
-            return false;
-        }
-    }.eval);
+    const result1 = mgr.shouldStop(bp, .{
+        .ctx = undefined,
+        .evalFn = &struct {
+            fn f(_: *anyopaque, _: []const u8) bool {
+                return false;
+            }
+        }.f,
+    });
     try std.testing.expect(!result1);
 
     // Evaluator that returns true (condition met) — should stop
-    const result2 = mgr.shouldStop(bp, struct {
-        fn eval(_: []const u8) bool {
-            return true;
-        }
-    }.eval);
+    const result2 = mgr.shouldStop(bp, .{
+        .ctx = undefined,
+        .evalFn = &struct {
+            fn f(_: *anyopaque, _: []const u8) bool {
+                return true;
+            }
+        }.f,
+    });
     try std.testing.expect(result2);
 
     // Hit count should be 2 after both evaluations
@@ -454,4 +648,189 @@ test "removeBreakpoint without process removes from list" {
     // remove() doesn't need a process — just removes from the list
     try mgr.remove(id);
     try std.testing.expectEqual(@as(usize, 0), mgr.list().len);
+}
+
+test "evaluateHitCondition with >= operator" {
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition(">= 3", 1));
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition(">= 3", 2));
+    try std.testing.expect(BreakpointManager.evaluateHitCondition(">= 3", 3));
+    try std.testing.expect(BreakpointManager.evaluateHitCondition(">= 3", 4));
+}
+
+test "evaluateHitCondition with == operator" {
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("== 5", 4));
+    try std.testing.expect(BreakpointManager.evaluateHitCondition("== 5", 5));
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("== 5", 6));
+}
+
+test "evaluateHitCondition with modulo operator" {
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("% 3", 1));
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("% 3", 2));
+    try std.testing.expect(BreakpointManager.evaluateHitCondition("% 3", 3));
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("% 3", 4));
+    try std.testing.expect(BreakpointManager.evaluateHitCondition("% 3", 6));
+}
+
+test "evaluateHitCondition with plain number" {
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("3", 2));
+    try std.testing.expect(BreakpointManager.evaluateHitCondition("3", 3));
+    try std.testing.expect(!BreakpointManager.evaluateHitCondition("3", 4));
+}
+
+test "hit_condition breakpoint stops on correct hit" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const entries = [_]parser.LineEntry{
+        .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
+    };
+
+    _ = try mgr.resolveAndSetEx("test.c", 10, &entries, null, ">= 3", null);
+    const bp = mgr.findByAddress(0x1000).?;
+
+    // Hits 1 and 2 should not stop
+    try std.testing.expect(!mgr.shouldStop(bp, null));
+    try std.testing.expect(!mgr.shouldStop(bp, null));
+    // Hit 3 should stop
+    try std.testing.expect(mgr.shouldStop(bp, null));
+    // Hit 4 should also stop (>= 3)
+    try std.testing.expect(mgr.shouldStop(bp, null));
+}
+
+test "log point breakpoint never stops" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const entries = [_]parser.LineEntry{
+        .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
+    };
+
+    _ = try mgr.resolveAndSetEx("test.c", 10, &entries, null, null, "x = {x}");
+    const bp = mgr.findByAddress(0x1000).?;
+
+    // Log points should never stop
+    try std.testing.expect(!mgr.shouldStop(bp, null));
+    try std.testing.expect(!mgr.shouldStop(bp, null));
+    try std.testing.expect(!mgr.shouldStop(bp, null));
+}
+
+test "column field is stored correctly on breakpoints" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const entries = [_]parser.LineEntry{
+        .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 5, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1008, .file_index = 1, .line = 10, .column = 20, .is_stmt = true, .end_sequence = false },
+    };
+
+    // Set a breakpoint with column specified
+    const bp = try mgr.resolveAndSetColumn("test.c", 10, 5, &entries, null, null, null);
+    try std.testing.expectEqual(@as(?u32, 5), bp.column);
+    try std.testing.expectEqual(@as(u64, 0x1000), bp.address);
+    try std.testing.expectEqual(@as(u32, 10), bp.line);
+
+    // Set a breakpoint without column — column should be null
+    const bp2 = try mgr.resolveAndSetEx("test.c", 10, &entries, null, null, null);
+    try std.testing.expect(bp2.column == null);
+}
+
+test "column matching prefers more specific matches" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const entries = [_]parser.LineEntry{
+        .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 5, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1008, .file_index = 1, .line = 10, .column = 20, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1010, .file_index = 1, .line = 10, .column = 35, .is_stmt = true, .end_sequence = false },
+    };
+
+    // Request column 20 — should match exactly at 0x1008
+    const bp1 = try mgr.resolveAndSetColumn("test.c", 10, 20, &entries, null, null, null);
+    try std.testing.expectEqual(@as(u64, 0x1008), bp1.address);
+
+    // Request column 22 — should match closest at column 20 (distance 2) vs 35 (distance 13) vs 5 (distance 17)
+    const bp2 = try mgr.resolveAndSetColumn("test.c", 10, 22, &entries, null, null, null);
+    try std.testing.expectEqual(@as(u64, 0x1008), bp2.address);
+
+    // Request column 30 — should match closest at column 35 (distance 5) vs 20 (distance 10) vs 5 (distance 25)
+    const bp3 = try mgr.resolveAndSetColumn("test.c", 10, 30, &entries, null, null, null);
+    try std.testing.expectEqual(@as(u64, 0x1010), bp3.address);
+
+    // Request column 1 — should match closest at column 5 (distance 4)
+    const bp4 = try mgr.resolveAndSetColumn("test.c", 10, 1, &entries, null, null, null);
+    try std.testing.expectEqual(@as(u64, 0x1000), bp4.address);
+}
+
+test "instruction breakpoint sets at correct address" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const ibp = types.InstructionBreakpoint{
+        .instruction_reference = "0x4000",
+    };
+    const id = try mgr.setInstructionBreakpoint(ibp);
+    const bp = mgr.findById(id).?;
+    try std.testing.expectEqual(@as(u64, 0x4000), bp.address);
+    try std.testing.expect(bp.enabled);
+}
+
+test "instruction breakpoint with offset applied" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Positive offset
+    const ibp1 = types.InstructionBreakpoint{
+        .instruction_reference = "0x4000",
+        .offset = 16,
+    };
+    const id1 = try mgr.setInstructionBreakpoint(ibp1);
+    const bp1 = mgr.findById(id1).?;
+    try std.testing.expectEqual(@as(u64, 0x4010), bp1.address);
+
+    // Negative offset
+    const ibp2 = types.InstructionBreakpoint{
+        .instruction_reference = "0x4000",
+        .offset = -8,
+    };
+    const id2 = try mgr.setInstructionBreakpoint(ibp2);
+    const bp2 = mgr.findById(id2).?;
+    try std.testing.expectEqual(@as(u64, 0x3FF8), bp2.address);
+}
+
+test "instruction breakpoint without 0x prefix" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const ibp = types.InstructionBreakpoint{
+        .instruction_reference = "ABCD",
+    };
+    const id = try mgr.setInstructionBreakpoint(ibp);
+    const bp = mgr.findById(id).?;
+    try std.testing.expectEqual(@as(u64, 0xABCD), bp.address);
+}
+
+test "instruction breakpoint with condition" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const ibp = types.InstructionBreakpoint{
+        .instruction_reference = "0x5000",
+        .condition = "rax == 0",
+        .hit_condition = ">= 3",
+    };
+    const id = try mgr.setInstructionBreakpoint(ibp);
+    const bp = mgr.findById(id).?;
+    try std.testing.expectEqual(@as(u64, 0x5000), bp.address);
+    try std.testing.expectEqualStrings("rax == 0", bp.condition.?);
+    try std.testing.expectEqualStrings(">= 3", bp.hit_condition.?);
+}
+
+test "instruction breakpoint with invalid reference returns error" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const ibp = types.InstructionBreakpoint{
+        .instruction_reference = "not_hex",
+    };
+    try std.testing.expectError(error.InvalidInstructionReference, mgr.setInstructionBreakpoint(ibp));
 }

@@ -14,6 +14,14 @@ const ARM_THREAD_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(ArmThread
 const x86_THREAD_STATE64: std.c.thread_flavor_t = 4;
 const x86_THREAD_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(X86ThreadState64) / @sizeOf(std.c.natural_t);
 
+// ARM64 NEON (FP/SIMD) thread state
+const ARM_NEON_STATE64: std.c.thread_flavor_t = 17;
+const ARM_NEON_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(ArmNeonState64) / @sizeOf(std.c.natural_t);
+
+// x86_64 float state (SSE/XMM registers)
+const x86_FLOAT_STATE64: std.c.thread_flavor_t = 5;
+const x86_FLOAT_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(X86FloatState64) / @sizeOf(std.c.natural_t);
+
 const ArmThreadState64 = extern struct {
     x: [29]u64, // general purpose x0-x28
     fp: u64, // x29
@@ -48,9 +56,85 @@ const X86ThreadState64 = extern struct {
     gs: u64,
 };
 
+/// ARM64 NEON state: 32 x 128-bit vector registers (V0-V31) plus FPSR and FPCR.
+/// Each V register is stored as two 64-bit halves (low, high).
+const ArmNeonState64 = extern struct {
+    v: [32][2]u64, // v[i][0] = low 64 bits, v[i][1] = high 64 bits
+    fpsr: u32,
+    fpcr: u32,
+};
+
+/// x86_64 float state (FXSAVE layout). We only care about the XMM registers
+/// which start at offset 160 in the FXSAVE area. The full struct is 512 bytes.
+const X86FloatState64 = extern struct {
+    // FPU control/status (bytes 0-31)
+    fcw: u16,
+    fsw: u16,
+    ftw: u8,
+    _reserved1: u8,
+    fop: u16,
+    fip: u32,
+    fcs: u16,
+    _reserved2: u16,
+    fdp: u32,
+    fds: u16,
+    _reserved3: u16,
+    mxcsr: u32,
+    mxcsr_mask: u32,
+    // ST/MM registers (bytes 32-159) - 8 x 16 bytes
+    st_mm: [8][2]u64,
+    // XMM registers (bytes 160-415) - 16 x 16 bytes
+    xmm: [16][2]u64,
+    // Reserved (bytes 416-511)
+    _reserved4: [6][2]u64,
+};
+
+/// FP/SIMD register state returned by readFloatRegisters.
+/// Each register is stored as two 64-bit values (low and high halves of 128-bit register).
+pub const FloatRegisterState = struct {
+    /// Register values: [i][0] = low 64 bits, [i][1] = high 64 bits
+    regs: [max_fp_regs][2]u64 = [_][2]u64{.{ 0, 0 }} ** max_fp_regs,
+    /// Number of valid registers in the array
+    count: u32 = 0,
+    /// Whether these are ARM NEON (v0-v31) or x86 XMM (xmm0-xmm15)
+    is_arm: bool = false,
+
+    pub const max_fp_regs = 32;
+};
+
 pub const MachProcessControl = struct {
     pid: ?posix.pid_t = null,
     is_running: bool = false,
+    stdout_pipe_read: ?posix.fd_t = null,
+    stderr_pipe_read: ?posix.fd_t = null,
+
+    /// Read available data from the captured stdout pipe.
+    /// Returns null if no stdout pipe is configured.
+    /// Caller owns the returned memory.
+    pub fn readCapturedOutput(self: *MachProcessControl, allocator: std.mem.Allocator) !?[]const u8 {
+        const fd = self.stdout_pipe_read orelse return null;
+        var buf = try allocator.alloc(u8, 4096);
+        errdefer allocator.free(buf);
+        const n = posix.read(fd, buf) catch |err| {
+            if (err == error.WouldBlock) {
+                allocator.free(buf);
+                return null;
+            }
+            return err;
+        };
+        if (n == 0) {
+            allocator.free(buf);
+            return null;
+        }
+        // Shrink to actual size
+        if (allocator.resize(buf, n)) {
+            return buf[0..n];
+        }
+        const exact = try allocator.alloc(u8, n);
+        @memcpy(exact, buf[0..n]);
+        allocator.free(buf);
+        return exact;
+    }
 
     pub fn spawn(self: *MachProcessControl, allocator: std.mem.Allocator, program: []const u8, args: []const []const u8) !void {
         var argv: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
@@ -160,21 +244,98 @@ pub const MachProcessControl = struct {
             var count: std.c.mach_msg_type_number_t = ARM_THREAD_STATE64_COUNT;
             kr = std.c.thread_get_state(thread, ARM_THREAD_STATE64, @ptrCast(&state), &count);
             if (kr != 0) return error.ThreadGetStateFailed;
-            return .{
-                .rip = state.pc,
-                .rsp = state.sp,
-                .rbp = state.fp,
+            var regs = RegisterState{
+                .pc = state.pc,
+                .sp = state.sp,
+                .fp = state.fp,
+                .flags = state.cpsr,
             };
+            // x0-x28
+            for (0..29) |i| {
+                regs.gprs[i] = state.x[i];
+            }
+            regs.gprs[29] = state.fp; // x29 = FP
+            regs.gprs[30] = state.lr; // x30 = LR
+            regs.gprs[31] = state.sp; // x31 = SP (conceptual)
+            return regs;
         } else {
             var state: X86ThreadState64 = undefined;
             var count: std.c.mach_msg_type_number_t = x86_THREAD_STATE64_COUNT;
             kr = std.c.thread_get_state(thread, x86_THREAD_STATE64, @ptrCast(&state), &count);
             if (kr != 0) return error.ThreadGetStateFailed;
-            return .{
-                .rip = state.rip,
-                .rsp = state.rsp,
-                .rbp = state.rbp,
+            var regs = RegisterState{
+                .pc = state.rip,
+                .sp = state.rsp,
+                .fp = state.rbp,
+                .flags = state.rflags,
             };
+            // Map x86-64 registers to DWARF register numbers
+            regs.gprs[0] = state.rax;
+            regs.gprs[1] = state.rdx;
+            regs.gprs[2] = state.rcx;
+            regs.gprs[3] = state.rbx;
+            regs.gprs[4] = state.rsi;
+            regs.gprs[5] = state.rdi;
+            regs.gprs[6] = state.rbp;
+            regs.gprs[7] = state.rsp;
+            regs.gprs[8] = state.r8;
+            regs.gprs[9] = state.r9;
+            regs.gprs[10] = state.r10;
+            regs.gprs[11] = state.r11;
+            regs.gprs[12] = state.r12;
+            regs.gprs[13] = state.r13;
+            regs.gprs[14] = state.r14;
+            regs.gprs[15] = state.r15;
+            regs.gprs[16] = state.rip;
+            return regs;
+        }
+    }
+
+    /// Read floating point / SIMD registers from the traced process.
+    /// On ARM64 this reads V0-V31 (NEON), on x86_64 this reads XMM0-XMM15.
+    pub fn readFloatRegisters(self: *MachProcessControl) !FloatRegisterState {
+        if (self.pid == null) return error.NoProcess;
+        if (builtin.os.tag != .macos) return .{};
+
+        const task = try self.getTask();
+
+        var threads: std.c.mach_port_array_t = undefined;
+        var thread_count: std.c.mach_msg_type_number_t = undefined;
+        var kr = std.c.task_threads(task, &threads, &thread_count);
+        if (kr != 0) return error.TaskThreadsFailed;
+
+        if (thread_count == 0) return error.NoThreads;
+        const thread = threads[0];
+
+        const is_arm = builtin.cpu.arch == .aarch64;
+        if (is_arm) {
+            var state: ArmNeonState64 = undefined;
+            var count: std.c.mach_msg_type_number_t = ARM_NEON_STATE64_COUNT;
+            kr = std.c.thread_get_state(thread, ARM_NEON_STATE64, @ptrCast(&state), &count);
+            if (kr != 0) return error.FloatRegisterReadFailed;
+
+            var result = FloatRegisterState{
+                .count = 32,
+                .is_arm = true,
+            };
+            for (0..32) |i| {
+                result.regs[i] = state.v[i];
+            }
+            return result;
+        } else {
+            var state: X86FloatState64 = undefined;
+            var count: std.c.mach_msg_type_number_t = x86_FLOAT_STATE64_COUNT;
+            kr = std.c.thread_get_state(thread, x86_FLOAT_STATE64, @ptrCast(&state), &count);
+            if (kr != 0) return error.FloatRegisterReadFailed;
+
+            var result = FloatRegisterState{
+                .count = 16,
+                .is_arm = false,
+            };
+            for (0..16) |i| {
+                result.regs[i] = state.xmm[i];
+            }
+            return result;
         }
     }
 
@@ -198,9 +359,13 @@ pub const MachProcessControl = struct {
             var count: std.c.mach_msg_type_number_t = ARM_THREAD_STATE64_COUNT;
             kr = std.c.thread_get_state(thread, ARM_THREAD_STATE64, @ptrCast(&state), &count);
             if (kr != 0) return error.ThreadGetStateFailed;
-            state.pc = regs.rip;
-            state.sp = regs.rsp;
-            state.fp = regs.rbp;
+            state.pc = regs.pc;
+            state.sp = regs.sp;
+            state.fp = regs.fp;
+            for (0..29) |i| {
+                state.x[i] = regs.gprs[i];
+            }
+            state.lr = regs.gprs[30];
             kr = std.c.thread_set_state(thread, ARM_THREAD_STATE64, @ptrCast(&state), ARM_THREAD_STATE64_COUNT);
             if (kr != 0) return error.ThreadSetStateFailed;
         } else {
@@ -208,9 +373,23 @@ pub const MachProcessControl = struct {
             var count: std.c.mach_msg_type_number_t = x86_THREAD_STATE64_COUNT;
             kr = std.c.thread_get_state(thread, x86_THREAD_STATE64, @ptrCast(&state), &count);
             if (kr != 0) return error.ThreadGetStateFailed;
-            state.rip = regs.rip;
-            state.rsp = regs.rsp;
-            state.rbp = regs.rbp;
+            state.rip = regs.pc;
+            state.rsp = regs.sp;
+            state.rbp = regs.fp;
+            state.rax = regs.gprs[0];
+            state.rdx = regs.gprs[1];
+            state.rcx = regs.gprs[2];
+            state.rbx = regs.gprs[3];
+            state.rsi = regs.gprs[4];
+            state.rdi = regs.gprs[5];
+            state.r8 = regs.gprs[8];
+            state.r9 = regs.gprs[9];
+            state.r10 = regs.gprs[10];
+            state.r11 = regs.gprs[11];
+            state.r12 = regs.gprs[12];
+            state.r13 = regs.gprs[13];
+            state.r14 = regs.gprs[14];
+            state.r15 = regs.gprs[15];
             kr = std.c.thread_set_state(thread, x86_THREAD_STATE64, @ptrCast(&state), x86_THREAD_STATE64_COUNT);
             if (kr != 0) return error.ThreadSetStateFailed;
         }
@@ -264,7 +443,7 @@ pub const MachProcessControl = struct {
     }
 
     /// Get the Mach task port for the traced process.
-    fn getTask(self: *MachProcessControl) !std.c.mach_port_name_t {
+    pub fn getTask(self: *MachProcessControl) !std.c.mach_port_name_t {
         const pid = self.pid orelse return error.NoProcess;
         var task: std.c.mach_port_name_t = undefined;
         const kr = std.c.task_for_pid(std.c.mach_task_self(), pid, &task);
@@ -365,9 +544,22 @@ pub const WaitResult = struct {
 };
 
 pub const RegisterState = struct {
-    rip: u64 = 0,
-    rsp: u64 = 0,
-    rbp: u64 = 0,
+    gprs: [32]u64 = [_]u64{0} ** 32,
+    pc: u64 = 0,
+    sp: u64 = 0,
+    fp: u64 = 0,
+    flags: u64 = 0,
+
+    // Convenience aliases for backward compatibility
+    pub inline fn rip(self: RegisterState) u64 {
+        return self.pc;
+    }
+    pub inline fn rsp(self: RegisterState) u64 {
+        return self.sp;
+    }
+    pub inline fn rbp(self: RegisterState) u64 {
+        return self.fp;
+    }
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -422,6 +614,35 @@ test "readRegisters returns register state" {
     _ = regs;
 }
 
+test "readFloatRegisters returns without error" {
+    if (builtin.os.tag != .macos or !builtin.single_threaded) return error.SkipZigTest;
+    var pc = MachProcessControl{};
+    pc.spawn(std.testing.allocator, "/bin/echo", &.{"hello"}) catch return error.SkipZigTest;
+    defer pc.kill() catch {};
+    const fp_regs = try pc.readFloatRegisters();
+    const is_arm = builtin.cpu.arch == .aarch64;
+    if (is_arm) {
+        try std.testing.expectEqual(@as(u32, 32), fp_regs.count);
+        try std.testing.expect(fp_regs.is_arm);
+    } else {
+        try std.testing.expectEqual(@as(u32, 16), fp_regs.count);
+        try std.testing.expect(!fp_regs.is_arm);
+    }
+}
+
+test "readFloatRegisters returns NoProcess when no pid" {
+    var pc = MachProcessControl{};
+    try std.testing.expectError(error.NoProcess, pc.readFloatRegisters());
+}
+
+test "FloatRegisterState default is zeroed" {
+    const fp = FloatRegisterState{};
+    try std.testing.expectEqual(@as(u32, 0), fp.count);
+    try std.testing.expect(!fp.is_arm);
+    try std.testing.expectEqual(@as(u64, 0), fp.regs[0][0]);
+    try std.testing.expectEqual(@as(u64, 0), fp.regs[0][1]);
+}
+
 test "readMemory reads bytes from process" {
     if (builtin.os.tag != .macos or !builtin.single_threaded) return error.SkipZigTest;
     var pc = MachProcessControl{};
@@ -467,4 +688,18 @@ test "spawn with invalid path returns error" {
     const result = try pc.waitForStop();
     try std.testing.expectEqual(WaitResult.Status.exited, result.status);
     pc.pid = null;
+}
+
+test "readCapturedOutput returns null when no pipe is set" {
+    var pc = MachProcessControl{};
+    try std.testing.expect(pc.stdout_pipe_read == null);
+    try std.testing.expect(pc.stderr_pipe_read == null);
+    const output = try pc.readCapturedOutput(std.testing.allocator);
+    try std.testing.expect(output == null);
+}
+
+test "MachProcessControl pipe fields default to null" {
+    const pc = MachProcessControl{};
+    try std.testing.expect(pc.stdout_pipe_read == null);
+    try std.testing.expect(pc.stderr_pipe_read == null);
 }

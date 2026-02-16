@@ -22,8 +22,12 @@ const help = @import("help_text.zig");
 const tui = @import("tui.zig");
 
 // ANSI styles
+const cyan = "\x1B[36m";
 const dim = "\x1B[2m";
 const reset = "\x1B[0m";
+
+// Unicode glyphs
+const check_glyph = "\xE2\x9C\x93"; // ✓
 
 fn printErr(msg: []const u8) void {
     if (@import("builtin").is_test) return;
@@ -41,6 +45,7 @@ fn printCommandHelp(comptime help_text: []const u8) void {
 /// Dispatch debug subcommands.
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
     if (std.mem.eql(u8, subcmd, "debug/serve")) return debugServe(allocator, args);
+    if (std.mem.eql(u8, subcmd, "debug/sign")) return debugSign(allocator, args);
 
     printErr("error: unknown command '");
     printErr(subcmd);
@@ -55,10 +60,115 @@ fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
     return false;
 }
 
+fn debugSign(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
+        printCommandHelp(help.debug_sign);
+        return;
+    }
+
+    try ensureDebugEntitlements(allocator);
+
+    tui.header();
+    printErr("  " ++ cyan ++ check_glyph ++ reset ++ " Signed with debug entitlements.\n");
+    printErr("  " ++ dim ++ "The debug server can now attach to processes on macOS." ++ reset ++ "\n\n");
+}
+
+/// Sign the current executable with debug entitlements (macOS only).
+/// Idempotent — safe to call on every debug serve start.
+fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag != .macos) return;
+
+    // Get path to this executable
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_buf) catch {
+        printErr("error: could not determine executable path\n");
+        return error.Explained;
+    };
+
+    // Write entitlements to a temp file
+    const entitlements_xml =
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>com.apple.security.cs.debugger</key>
+        \\    <true/>
+        \\</dict>
+        \\</plist>
+    ;
+
+    var tmp_dir = std.fs.openDirAbsolute("/tmp", .{}) catch {
+        printErr("error: could not open /tmp\n");
+        return error.Explained;
+    };
+    defer tmp_dir.close();
+
+    const tmp_name = "cog-debug-entitlements.plist";
+    tmp_dir.writeFile(.{ .sub_path = tmp_name, .data = entitlements_xml }) catch {
+        printErr("error: could not write entitlements to /tmp\n");
+        return error.Explained;
+    };
+    defer tmp_dir.deleteFile(tmp_name) catch {};
+
+    // Run codesign
+    var child = std.process.Child.init(
+        &.{ "codesign", "--entitlements", "/tmp/" ++ tmp_name, "--force", "-s", "-", exe_path },
+        allocator,
+    );
+    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+
+    _ = child.spawnAndWait() catch {
+        printErr("error: failed to run codesign\n");
+        return error.Explained;
+    };
+}
+
+/// Re-exec the current process so macOS loads the newly signed entitlements.
+/// On macOS, entitlements are checked at process launch — signing the running
+/// binary doesn't grant entitlements to the current process. This re-exec
+/// replaces the process with a fresh instance that has the entitlements active.
+/// Uses COG_DEBUG_SIGNED env var to prevent infinite re-exec.
+fn reexecWithEntitlements() void {
+    const c_fns = struct {
+        extern fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+    };
+    if (c_fns.setenv("COG_DEBUG_SIGNED", "1", 1) != 0) return;
+
+    var argv_buf: [256:null]?[*:0]const u8 = @splat(null);
+    var argc: usize = 0;
+    var args_iter = std.process.args();
+    while (args_iter.next()) |arg| {
+        if (argc >= 255) break;
+        argv_buf[argc] = arg.ptr;
+        argc += 1;
+    }
+    if (argc == 0) return;
+
+    std.posix.execvpeZ(
+        argv_buf[0].?,
+        @ptrCast(&argv_buf),
+        @ptrCast(std.c.environ),
+    ) catch {};
+    // If execvpe fails, fall through — server runs without entitlements
+}
+
 fn debugServe(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
         printCommandHelp(help.debug_serve);
         return;
+    }
+
+    // On macOS, ensure debug entitlements are active.
+    // Entitlements are checked at process launch, so if the binary wasn't
+    // already signed, we sign it and re-exec to activate them.
+    if (@import("builtin").os.tag == .macos) {
+        if (std.posix.getenv("COG_DEBUG_SIGNED") == null) {
+            ensureDebugEntitlements(allocator) catch {};
+            reexecWithEntitlements();
+            // If re-exec failed, continue without entitlements
+        }
     }
 
     var mcp_server = server.McpServer.init(allocator);

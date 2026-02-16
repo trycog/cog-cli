@@ -16,4 +16,8 @@ cask "cog-cli" do
   homepage "https://trycog.ai"
 
   binary "cog"
+
+  postflight do
+    system_command "#{staged_path}/cog", args: ["debug/sign"]
+  end
 end

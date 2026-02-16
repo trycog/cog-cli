@@ -63,7 +63,16 @@ pub const DebugSections = struct {
     debug_ranges: ?SectionInfo = null,
     debug_aranges: ?SectionInfo = null,
     debug_line_str: ?SectionInfo = null,
+    debug_frame: ?SectionInfo = null,
+    debug_loc: ?SectionInfo = null,
+    debug_loclists: ?SectionInfo = null,
+    debug_rnglists: ?SectionInfo = null,
     eh_frame: ?SectionInfo = null,
+    debug_macro: ?SectionInfo = null,
+    debug_names: ?SectionInfo = null,
+    debug_types: ?SectionInfo = null,
+    debug_pubnames: ?SectionInfo = null,
+    debug_pubtypes: ?SectionInfo = null,
 
     pub fn hasDebugInfo(self: DebugSections) bool {
         return self.debug_info != null or self.debug_line != null;
@@ -170,8 +179,26 @@ fn parseMachO(data: []const u8) !MachoBinary {
                     sections.debug_aranges = info;
                 } else if (std.mem.eql(u8, name, "__debug_line_st")) {
                     sections.debug_line_str = info;
+                } else if (std.mem.eql(u8, name, "__debug_frame")) {
+                    sections.debug_frame = info;
+                } else if (std.mem.eql(u8, name, "__debug_loc")) {
+                    sections.debug_loc = info;
+                } else if (std.mem.eql(u8, name, "__debug_loclist")) {
+                    sections.debug_loclists = info;
+                } else if (std.mem.eql(u8, name, "__debug_rnglist")) {
+                    sections.debug_rnglists = info;
                 } else if (std.mem.eql(u8, name, "__eh_frame")) {
                     sections.eh_frame = info;
+                } else if (std.mem.eql(u8, name, "__debug_macro")) {
+                    sections.debug_macro = info;
+                } else if (std.mem.eql(u8, name, "__debug_names")) {
+                    sections.debug_names = info;
+                } else if (std.mem.eql(u8, name, "__debug_types")) {
+                    sections.debug_types = info;
+                } else if (std.mem.eql(u8, name, "__debug_pubname")) {
+                    sections.debug_pubnames = info;
+                } else if (std.mem.eql(u8, name, "__debug_pubtype")) {
+                    sections.debug_pubtypes = info;
                 }
 
                 sect_offset += @sizeOf(Section64);
@@ -349,4 +376,58 @@ test "loadBinary returns error for non-Mach-O file" {
     // Try to load a text file as Mach-O
     const result = MachoBinary.loadFile(std.testing.allocator, "build.zig");
     try std.testing.expectError(error.InvalidMagic, result);
+}
+
+test "DebugSections new fields default to null" {
+    const sections = DebugSections{};
+    try std.testing.expect(sections.debug_macro == null);
+    try std.testing.expect(sections.debug_names == null);
+    try std.testing.expect(sections.debug_types == null);
+    try std.testing.expect(sections.debug_pubnames == null);
+    try std.testing.expect(sections.debug_pubtypes == null);
+}
+
+test "parseMachO matches new debug section names" {
+    // Build a minimal Mach-O with a __DWARF segment containing a __debug_macro section
+    const header_size = @sizeOf(MachHeader64);
+    const seg_size = @sizeOf(SegmentCommand64);
+    const sect_size = @sizeOf(Section64);
+    const num_sections = 5;
+    const seg_cmdsize = seg_size + num_sections * sect_size;
+    const dummy_data_offset = header_size + seg_cmdsize;
+    const dummy_data_size = 16;
+    const total_size = dummy_data_offset + dummy_data_size;
+
+    var data = [_]u8{0} ** total_size;
+
+    // Mach-O header
+    std.mem.writeInt(u32, data[0..4], MH_MAGIC_64, .little);
+    std.mem.writeInt(u32, data[16..20], 1, .little); // ncmds = 1
+
+    // Segment command (SegmentCommand64 layout: cmd[4] cmdsize[4] segname[16] vmaddr[8] vmsize[8] fileoff[8] filesize[8] maxprot[4] initprot[4] nsects[4] flags[4])
+    const seg_off = header_size;
+    std.mem.writeInt(u32, data[seg_off..][0..4], LC_SEGMENT_64, .little); // cmd at +0
+    std.mem.writeInt(u32, data[seg_off + 4 ..][0..4], @intCast(seg_cmdsize), .little); // cmdsize at +4
+    // segname = "__DWARF" at +8
+    @memcpy(data[seg_off + 8 ..][0..7], "__DWARF");
+    std.mem.writeInt(u32, data[seg_off + 64 ..][0..4], num_sections, .little); // nsects at +64
+
+    // Helper to write a section entry
+    const sect_base = seg_off + seg_size;
+    const section_names = [_][]const u8{ "__debug_macro", "__debug_names", "__debug_types", "__debug_pubname", "__debug_pubtype" };
+
+    for (0..num_sections) |i| {
+        const s_off = sect_base + i * sect_size;
+        @memcpy(data[s_off..][0..section_names[i].len], section_names[i]);
+        // Section64 layout: sectname[16], segname[16], addr(u64), size(u64), offset(u32)
+        std.mem.writeInt(u64, data[s_off + 40 ..][0..8], dummy_data_size, .little); // size at offset 40
+        std.mem.writeInt(u32, data[s_off + 48 ..][0..4], @intCast(dummy_data_offset), .little); // offset at offset 48
+    }
+
+    const binary = try MachoBinary.loadFromMemory(&data);
+    try std.testing.expect(binary.sections.debug_macro != null);
+    try std.testing.expect(binary.sections.debug_names != null);
+    try std.testing.expect(binary.sections.debug_types != null);
+    try std.testing.expect(binary.sections.debug_pubnames != null);
+    try std.testing.expect(binary.sections.debug_pubtypes != null);
 }

@@ -199,6 +199,7 @@ fn printDebugHelp() void {
         ++ "\n"
         ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n"
         ++ "    " ++ bold ++ "debug/serve" ++ reset ++ "           " ++ dim ++ "Start MCP debug server (stdio transport)" ++ reset ++ "\n"
+        ++ "    " ++ bold ++ "debug/sign" ++ reset ++ "            " ++ dim ++ "Code-sign binary with debug entitlements (macOS)" ++ reset ++ "\n"
         ++ "\n"
         ++ dim ++ "  Run 'cog debug/<command> --help' for details on a specific command." ++ reset ++ "\n"
         ++ "\n"

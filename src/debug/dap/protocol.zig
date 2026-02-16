@@ -2,6 +2,7 @@ const std = @import("std");
 const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
+const types = @import("../types.zig");
 
 // ── DAP Base Types ──────────────────────────────────────────────────────
 
@@ -102,6 +103,7 @@ pub const DapEvent = struct {
     stop_reason: ?[]const u8 = null,
     thread_id: ?i64 = null,
     exit_code: ?i64 = null,
+    hit_breakpoint_ids: []const u32 = &.{},
 
     pub fn parse(allocator: std.mem.Allocator, data: []const u8) !DapEvent {
         const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
@@ -143,6 +145,19 @@ pub const DapEvent = struct {
                 if (body_obj.get("exitCode")) |e| {
                     if (e == .integer) result.exit_code = e.integer;
                 }
+                // Parse hitBreakpointIds from stopped events
+                if (body_obj.get("hitBreakpointIds")) |ids| {
+                    if (ids == .array) {
+                        var bp_ids = std.ArrayListUnmanaged(u32).empty;
+                        errdefer bp_ids.deinit(allocator);
+                        for (ids.array.items) |item| {
+                            if (item == .integer) {
+                                try bp_ids.append(allocator, @intCast(item.integer));
+                            }
+                        }
+                        result.hit_breakpoint_ids = try bp_ids.toOwnedSlice(allocator);
+                    }
+                }
             }
         }
 
@@ -152,6 +167,7 @@ pub const DapEvent = struct {
     pub fn deinit(self: *const DapEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.event);
         if (self.stop_reason) |r| allocator.free(r);
+        if (self.hit_breakpoint_ids.len > 0) allocator.free(self.hit_breakpoint_ids);
     }
 };
 
@@ -180,7 +196,24 @@ pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
     try s.objectField("columnsStartAt1");
     try s.write(true);
     try s.objectField("supportsRunInTerminalRequest");
-    try s.write(false);
+    try s.write(true);
+    // Advertise client capabilities
+    try s.objectField("supportsVariableType");
+    try s.write(true);
+    try s.objectField("supportsVariablePaging");
+    try s.write(true);
+    try s.objectField("supportsMemoryReferences");
+    try s.write(true);
+    try s.objectField("supportsProgressReporting");
+    try s.write(true);
+    try s.objectField("supportsInvalidatedEvent");
+    try s.write(true);
+    try s.objectField("supportsMemoryEvent");
+    try s.write(true);
+    try s.objectField("supportsStartDebuggingRequest");
+    try s.write(true);
+    try s.objectField("supportsANSIStyling");
+    try s.write(true);
     try s.endObject();
     try s.endObject();
 
@@ -217,7 +250,18 @@ pub fn launchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8
     return try aw.toOwnedSlice();
 }
 
+pub const BreakpointOption = struct {
+    line: u32,
+    condition: ?[]const u8 = null,
+    hit_condition: ?[]const u8 = null,
+    log_message: ?[]const u8 = null,
+};
+
 pub fn setBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, source_path: []const u8, lines: []const u32) ![]const u8 {
+    return setBreakpointsRequestEx(allocator, seq, source_path, lines, null);
+}
+
+pub fn setBreakpointsRequestEx(allocator: std.mem.Allocator, seq: i64, source_path: []const u8, lines: []const u32, options: ?[]const BreakpointOption) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -238,11 +282,32 @@ pub fn setBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, source_path
     try s.endObject();
     try s.objectField("breakpoints");
     try s.beginArray();
-    for (lines) |line| {
-        try s.beginObject();
-        try s.objectField("line");
-        try s.write(line);
-        try s.endObject();
+    if (options) |opts| {
+        for (opts) |opt| {
+            try s.beginObject();
+            try s.objectField("line");
+            try s.write(opt.line);
+            if (opt.condition) |c| {
+                try s.objectField("condition");
+                try s.write(c);
+            }
+            if (opt.hit_condition) |hc| {
+                try s.objectField("hitCondition");
+                try s.write(hc);
+            }
+            if (opt.log_message) |lm| {
+                try s.objectField("logMessage");
+                try s.write(lm);
+            }
+            try s.endObject();
+        }
+    } else {
+        for (lines) |line| {
+            try s.beginObject();
+            try s.objectField("line");
+            try s.write(line);
+            try s.endObject();
+        }
     }
     try s.endArray();
     try s.endObject();
@@ -251,23 +316,102 @@ pub fn setBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, source_path
     return try aw.toOwnedSlice();
 }
 
+pub const SteppingOptions = struct {
+    granularity: ?types.SteppingGranularity = null,
+    single_thread: ?bool = null,
+};
+
 pub fn continueRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
-    return threadCommand(allocator, seq, "continue", thread_id);
+    return continueRequestEx(allocator, seq, thread_id, null);
+}
+
+pub fn continueRequestEx(allocator: std.mem.Allocator, seq: i64, thread_id: i64, single_thread: ?bool) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("continue");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("threadId");
+    try s.write(thread_id);
+    if (single_thread) |st| {
+        try s.objectField("singleThread");
+        try s.write(st);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
 }
 
 pub fn stepInRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
-    return threadCommand(allocator, seq, "stepIn", thread_id);
+    return stepInRequestEx(allocator, seq, thread_id, .{});
+}
+
+pub fn stepInRequestEx(allocator: std.mem.Allocator, seq: i64, thread_id: i64, opts: SteppingOptions) ![]const u8 {
+    return steppingCommand(allocator, seq, "stepIn", thread_id, opts);
+}
+
+pub fn stepInRequestWithTarget(allocator: std.mem.Allocator, seq: i64, thread_id: i64, opts: SteppingOptions, target_id: u32) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("stepIn");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("threadId");
+    try s.write(thread_id);
+    try s.objectField("targetId");
+    try s.write(target_id);
+    if (opts.granularity) |g| {
+        try s.objectField("granularity");
+        try s.write(@tagName(g));
+    }
+    if (opts.single_thread) |st| {
+        try s.objectField("singleThread");
+        try s.write(st);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
 }
 
 pub fn nextRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
-    return threadCommand(allocator, seq, "next", thread_id);
+    return nextRequestEx(allocator, seq, thread_id, .{});
+}
+
+pub fn nextRequestEx(allocator: std.mem.Allocator, seq: i64, thread_id: i64, opts: SteppingOptions) ![]const u8 {
+    return steppingCommand(allocator, seq, "next", thread_id, opts);
 }
 
 pub fn stepOutRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
-    return threadCommand(allocator, seq, "stepOut", thread_id);
+    return stepOutRequestEx(allocator, seq, thread_id, .{});
+}
+
+pub fn stepOutRequestEx(allocator: std.mem.Allocator, seq: i64, thread_id: i64, opts: SteppingOptions) ![]const u8 {
+    return steppingCommand(allocator, seq, "stepOut", thread_id, opts);
 }
 
 pub fn stackTraceRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64, start_frame: i64, levels: i64) ![]const u8 {
+    return stackTraceRequestEx(allocator, seq, thread_id, start_frame, levels, null);
+}
+
+pub fn stackTraceRequestEx(allocator: std.mem.Allocator, seq: i64, thread_id: i64, start_frame: i64, levels: i64, format: ?types.StackFrameFormat) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -287,13 +431,28 @@ pub fn stackTraceRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64,
     try s.write(start_frame);
     try s.objectField("levels");
     try s.write(levels);
+    if (format) |fmt| {
+        try s.objectField("format");
+        try writeStackFrameFormat(&s, fmt);
+    }
     try s.endObject();
     try s.endObject();
 
     return try aw.toOwnedSlice();
 }
 
+pub const VariablesRequestOptions = struct {
+    filter: ?types.VariableFilter = null,
+    start: ?i64 = null,
+    count: ?i64 = null,
+    format: ?types.ValueFormat = null,
+};
+
 pub fn variablesRequest(allocator: std.mem.Allocator, seq: i64, variables_ref: i64) ![]const u8 {
+    return variablesRequestEx(allocator, seq, variables_ref, .{});
+}
+
+pub fn variablesRequestEx(allocator: std.mem.Allocator, seq: i64, variables_ref: i64, opts: VariablesRequestOptions) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -309,6 +468,22 @@ pub fn variablesRequest(allocator: std.mem.Allocator, seq: i64, variables_ref: i
     try s.beginObject();
     try s.objectField("variablesReference");
     try s.write(variables_ref);
+    if (opts.filter) |f| {
+        try s.objectField("filter");
+        try s.write(@tagName(f));
+    }
+    if (opts.start) |st| {
+        try s.objectField("start");
+        try s.write(st);
+    }
+    if (opts.count) |c| {
+        try s.objectField("count");
+        try s.write(c);
+    }
+    if (opts.format) |fmt| {
+        try s.objectField("format");
+        try writeValueFormat(&s, fmt);
+    }
     try s.endObject();
     try s.endObject();
 
@@ -316,6 +491,10 @@ pub fn variablesRequest(allocator: std.mem.Allocator, seq: i64, variables_ref: i
 }
 
 pub fn evaluateRequest(allocator: std.mem.Allocator, seq: i64, expression: []const u8, frame_id: ?i64) ![]const u8 {
+    return evaluateRequestEx(allocator, seq, expression, frame_id, null);
+}
+
+pub fn evaluateRequestEx(allocator: std.mem.Allocator, seq: i64, expression: []const u8, frame_id: ?i64, context: ?types.EvaluateContext) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -332,7 +511,11 @@ pub fn evaluateRequest(allocator: std.mem.Allocator, seq: i64, expression: []con
     try s.objectField("expression");
     try s.write(expression);
     try s.objectField("context");
-    try s.write("repl");
+    if (context) |ctx| {
+        try s.write(@tagName(ctx));
+    } else {
+        try s.write("repl");
+    }
     if (frame_id) |fid| {
         try s.objectField("frameId");
         try s.write(fid);
@@ -343,7 +526,350 @@ pub fn evaluateRequest(allocator: std.mem.Allocator, seq: i64, expression: []con
     return try aw.toOwnedSlice();
 }
 
+pub fn pauseRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
+    return threadCommand(allocator, seq, "pause", thread_id);
+}
+
+pub fn threadsRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("threads");
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn readMemoryRequest(allocator: std.mem.Allocator, seq: i64, memory_ref: []const u8, offset: i64, count: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("readMemory");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("memoryReference");
+    try s.write(memory_ref);
+    try s.objectField("offset");
+    try s.write(offset);
+    try s.objectField("count");
+    try s.write(count);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn writeMemoryRequest(allocator: std.mem.Allocator, seq: i64, memory_ref: []const u8, offset: i64, data_b64: []const u8) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("writeMemory");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("memoryReference");
+    try s.write(memory_ref);
+    try s.objectField("offset");
+    try s.write(offset);
+    try s.objectField("data");
+    try s.write(data_b64);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub const DisassembleOptions = struct {
+    instruction_offset: ?i64 = null,
+    resolve_symbols: ?bool = null,
+};
+
+pub fn disassembleRequest(allocator: std.mem.Allocator, seq: i64, memory_ref: []const u8, instruction_count: i64) ![]const u8 {
+    return disassembleRequestEx(allocator, seq, memory_ref, instruction_count, .{});
+}
+
+pub fn disassembleRequestEx(allocator: std.mem.Allocator, seq: i64, memory_ref: []const u8, instruction_count: i64, opts: DisassembleOptions) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("disassemble");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("memoryReference");
+    try s.write(memory_ref);
+    if (opts.instruction_offset) |offset| {
+        try s.objectField("instructionOffset");
+        try s.write(offset);
+    }
+    try s.objectField("instructionCount");
+    try s.write(instruction_count);
+    if (opts.resolve_symbols) |rs| {
+        try s.objectField("resolveSymbols");
+        try s.write(rs);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn attachRequest(allocator: std.mem.Allocator, seq: i64, pid: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("attach");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("processId");
+    try s.write(pid);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn setFunctionBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, names: []const []const u8, conditions: []const ?[]const u8) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setFunctionBreakpoints");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("breakpoints");
+    try s.beginArray();
+    for (names, 0..) |name, i| {
+        try s.beginObject();
+        try s.objectField("name");
+        try s.write(name);
+        if (i < conditions.len) {
+            if (conditions[i]) |cond| {
+                try s.objectField("condition");
+                try s.write(cond);
+            }
+        }
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub const ExceptionFilterOption = struct {
+    filter_id: []const u8,
+    condition: ?[]const u8 = null,
+};
+
+pub fn setExceptionBreakpointsRequestEx(allocator: std.mem.Allocator, seq: i64, filters: []const []const u8, filter_options: ?[]const ExceptionFilterOption) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setExceptionBreakpoints");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("filters");
+    try s.beginArray();
+    for (filters) |f| {
+        try s.write(f);
+    }
+    try s.endArray();
+    if (filter_options) |opts| {
+        if (opts.len > 0) {
+            try s.objectField("filterOptions");
+            try s.beginArray();
+            for (opts) |opt| {
+                try s.beginObject();
+                try s.objectField("filterId");
+                try s.write(opt.filter_id);
+                if (opt.condition) |c| {
+                    try s.objectField("condition");
+                    try s.write(c);
+                }
+                try s.endObject();
+            }
+            try s.endArray();
+        }
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn setExceptionBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, filters: []const []const u8) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setExceptionBreakpoints");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("filters");
+    try s.beginArray();
+    for (filters) |f| {
+        try s.write(f);
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn setVariableRequest(allocator: std.mem.Allocator, seq: i64, variables_ref: i64, name: []const u8, value: []const u8) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setVariable");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("variablesReference");
+    try s.write(variables_ref);
+    try s.objectField("name");
+    try s.write(name);
+    try s.objectField("value");
+    try s.write(value);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn gotoTargetsRequest(allocator: std.mem.Allocator, seq: i64, source_path: []const u8, line: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("gotoTargets");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("source");
+    try s.beginObject();
+    try s.objectField("path");
+    try s.write(source_path);
+    try s.endObject();
+    try s.objectField("line");
+    try s.write(line);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn gotoRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64, target_id: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("goto");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("threadId");
+    try s.write(thread_id);
+    try s.objectField("targetId");
+    try s.write(target_id);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn configurationDoneRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("configurationDone");
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
 pub fn disconnectRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    return disconnectRequestEx(allocator, seq, true, false);
+}
+
+pub fn disconnectRequestEx(allocator: std.mem.Allocator, seq: i64, terminate_debuggee: bool, suspend_debuggee: bool) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -358,7 +884,11 @@ pub fn disconnectRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
     try s.objectField("arguments");
     try s.beginObject();
     try s.objectField("terminateDebuggee");
-    try s.write(true);
+    try s.write(terminate_debuggee);
+    if (suspend_debuggee) {
+        try s.objectField("suspendDebuggee");
+        try s.write(true);
+    }
     try s.endObject();
     try s.endObject();
 
@@ -404,6 +934,501 @@ fn threadCommand(allocator: std.mem.Allocator, seq: i64, command: []const u8, th
     try s.objectField("threadId");
     try s.write(thread_id);
     try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+fn steppingCommand(allocator: std.mem.Allocator, seq: i64, command: []const u8, thread_id: i64, opts: SteppingOptions) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write(command);
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("threadId");
+    try s.write(thread_id);
+    if (opts.granularity) |g| {
+        try s.objectField("granularity");
+        try s.write(@tagName(g));
+    }
+    if (opts.single_thread) |st| {
+        try s.objectField("singleThread");
+        try s.write(st);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+fn writeStackFrameFormat(s: *Stringify, fmt: types.StackFrameFormat) !void {
+    try s.beginObject();
+    if (fmt.parameters) |v| {
+        try s.objectField("parameters");
+        try s.write(v);
+    }
+    if (fmt.parameter_types) |v| {
+        try s.objectField("parameterTypes");
+        try s.write(v);
+    }
+    if (fmt.parameter_names) |v| {
+        try s.objectField("parameterNames");
+        try s.write(v);
+    }
+    if (fmt.parameter_values) |v| {
+        try s.objectField("parameterValues");
+        try s.write(v);
+    }
+    if (fmt.line) |v| {
+        try s.objectField("line");
+        try s.write(v);
+    }
+    if (fmt.module) |v| {
+        try s.objectField("module");
+        try s.write(v);
+    }
+    if (fmt.include_all) |v| {
+        try s.objectField("includeAll");
+        try s.write(v);
+    }
+    try s.endObject();
+}
+
+fn writeValueFormat(s: *Stringify, fmt: types.ValueFormat) !void {
+    try s.beginObject();
+    if (fmt.hex) |v| {
+        try s.objectField("hex");
+        try s.write(v);
+    }
+    try s.endObject();
+}
+
+pub fn dataBreakpointInfoRequest(allocator: std.mem.Allocator, seq: i64, name: []const u8, variables_ref: ?i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("dataBreakpointInfo");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("name");
+    try s.write(name);
+    if (variables_ref) |vr| {
+        try s.objectField("variablesReference");
+        try s.write(vr);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn setDataBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, data_id: []const u8, access_type: []const u8) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setDataBreakpoints");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("breakpoints");
+    try s.beginArray();
+    try s.beginObject();
+    try s.objectField("dataId");
+    try s.write(data_id);
+    try s.objectField("accessType");
+    try s.write(access_type);
+    try s.endObject();
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn exceptionInfoRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
+    return threadCommand(allocator, seq, "exceptionInfo", thread_id);
+}
+
+pub fn terminateRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("terminate");
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+// ── Phase 5 Protocol Builders ───────────────────────────────────────────
+
+pub fn completionsRequest(allocator: std.mem.Allocator, seq: i64, text: []const u8, column: i64, frame_id: ?i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("completions");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("text");
+    try s.write(text);
+    try s.objectField("column");
+    try s.write(column);
+    if (frame_id) |fid| {
+        try s.objectField("frameId");
+        try s.write(fid);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn modulesRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    return modulesRequestEx(allocator, seq, 0, 100);
+}
+
+pub fn modulesRequestEx(allocator: std.mem.Allocator, seq: i64, start_module: i64, module_count: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("modules");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("startModule");
+    try s.write(start_module);
+    try s.objectField("moduleCount");
+    try s.write(module_count);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn loadedSourcesRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("loadedSources");
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn sourceRequest(allocator: std.mem.Allocator, seq: i64, source_reference: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("source");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("source");
+    try s.beginObject();
+    try s.objectField("sourceReference");
+    try s.write(source_reference);
+    try s.endObject();
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn setExpressionRequest(allocator: std.mem.Allocator, seq: i64, expression: []const u8, value: []const u8, frame_id: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setExpression");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("expression");
+    try s.write(expression);
+    try s.objectField("value");
+    try s.write(value);
+    try s.objectField("frameId");
+    try s.write(frame_id);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+// ── Phase 6 Protocol Builders ───────────────────────────────────────────
+
+pub fn reverseContinueRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
+    return threadCommand(allocator, seq, "reverseContinue", thread_id);
+}
+
+pub fn stepBackRequest(allocator: std.mem.Allocator, seq: i64, thread_id: i64) ![]const u8 {
+    return threadCommand(allocator, seq, "stepBack", thread_id);
+}
+
+pub fn restartFrameRequest(allocator: std.mem.Allocator, seq: i64, frame_id: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("restartFrame");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("frameId");
+    try s.write(frame_id);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+// ── WP9 Protocol Builders ───────────────────────────────────────────────
+
+pub fn setInstructionBreakpointsRequest(allocator: std.mem.Allocator, seq: i64, breakpoints: []const types.InstructionBreakpoint) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("setInstructionBreakpoints");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("breakpoints");
+    try s.beginArray();
+    for (breakpoints) |bp| {
+        try s.beginObject();
+        try s.objectField("instructionReference");
+        try s.write(bp.instruction_reference);
+        if (bp.offset) |o| {
+            try s.objectField("offset");
+            try s.write(o);
+        }
+        if (bp.condition) |c| {
+            try s.objectField("condition");
+            try s.write(c);
+        }
+        if (bp.hit_condition) |hc| {
+            try s.objectField("hitCondition");
+            try s.write(hc);
+        }
+        try s.endObject();
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn stepInTargetsRequest(allocator: std.mem.Allocator, seq: i64, frame_id: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("stepInTargets");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("frameId");
+    try s.write(frame_id);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn breakpointLocationsRequest(allocator: std.mem.Allocator, seq: i64, source_path: []const u8, line: i64, end_line: ?i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("breakpointLocations");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("source");
+    try s.beginObject();
+    try s.objectField("path");
+    try s.write(source_path);
+    try s.endObject();
+    try s.objectField("line");
+    try s.write(line);
+    if (end_line) |el| {
+        try s.objectField("endLine");
+        try s.write(el);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn cancelRequest(allocator: std.mem.Allocator, seq: i64, request_id: ?i64, progress_id: ?[]const u8) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("cancel");
+    try s.objectField("arguments");
+    try s.beginObject();
+    if (request_id) |rid| {
+        try s.objectField("requestId");
+        try s.write(rid);
+    }
+    if (progress_id) |pid| {
+        try s.objectField("progressId");
+        try s.write(pid);
+    }
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn terminateThreadsRequest(allocator: std.mem.Allocator, seq: i64, thread_ids: []const i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("terminateThreads");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("threadIds");
+    try s.beginArray();
+    for (thread_ids) |tid| {
+        try s.write(tid);
+    }
+    try s.endArray();
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn locationsRequest(allocator: std.mem.Allocator, seq: i64, location_reference: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("locations");
+    try s.objectField("arguments");
+    try s.beginObject();
+    try s.objectField("locationReference");
+    try s.write(location_reference);
+    try s.endObject();
+    try s.endObject();
+
+    return try aw.toOwnedSlice();
+}
+
+pub fn restartRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("seq");
+    try s.write(seq);
+    try s.objectField("type");
+    try s.write("request");
+    try s.objectField("command");
+    try s.write("restart");
     try s.endObject();
 
     return try aw.toOwnedSlice();
@@ -570,4 +1595,420 @@ test "EvaluateRequest serializes with expression and frameId" {
 
     try std.testing.expectEqualStrings("len(items)", args.get("expression").?.string);
     try std.testing.expectEqual(@as(i64, 3), args.get("frameId").?.integer);
+}
+
+test "ThreadsRequest serializes without arguments" {
+    const allocator = std.testing.allocator;
+    const data = try threadsRequest(allocator, 10);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("threads", parsed.value.object.get("command").?.string);
+}
+
+test "AttachRequest serializes with processId" {
+    const allocator = std.testing.allocator;
+    const data = try attachRequest(allocator, 11, 12345);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("attach", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqual(@as(i64, 12345), parsed.value.object.get("arguments").?.object.get("processId").?.integer);
+}
+
+test "SetFunctionBreakpointsRequest serializes with breakpoint names" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "main", "compute" };
+    const conditions = [_]?[]const u8{ null, "x > 0" };
+    const data = try setFunctionBreakpointsRequest(allocator, 12, &names, &conditions);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("setFunctionBreakpoints", parsed.value.object.get("command").?.string);
+    const bps = parsed.value.object.get("arguments").?.object.get("breakpoints").?.array;
+    try std.testing.expectEqual(@as(usize, 2), bps.items.len);
+    try std.testing.expectEqualStrings("main", bps.items[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("x > 0", bps.items[1].object.get("condition").?.string);
+}
+
+test "SetExceptionBreakpointsRequest serializes with filters" {
+    const allocator = std.testing.allocator;
+    const filters = [_][]const u8{ "uncaught", "raised" };
+    const data = try setExceptionBreakpointsRequest(allocator, 13, &filters);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("setExceptionBreakpoints", parsed.value.object.get("command").?.string);
+    const f = parsed.value.object.get("arguments").?.object.get("filters").?.array;
+    try std.testing.expectEqual(@as(usize, 2), f.items.len);
+    try std.testing.expectEqualStrings("uncaught", f.items[0].string);
+}
+
+test "ConfigurationDoneRequest serializes correctly" {
+    const allocator = std.testing.allocator;
+    const data = try configurationDoneRequest(allocator, 14);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("configurationDone", parsed.value.object.get("command").?.string);
+}
+
+test "GotoTargetsRequest serializes with source and line" {
+    const allocator = std.testing.allocator;
+    const data = try gotoTargetsRequest(allocator, 15, "/test/main.py", 25);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("gotoTargets", parsed.value.object.get("command").?.string);
+    const args = parsed.value.object.get("arguments").?.object;
+    try std.testing.expectEqualStrings("/test/main.py", args.get("source").?.object.get("path").?.string);
+    try std.testing.expectEqual(@as(i64, 25), args.get("line").?.integer);
+}
+
+test "SetVariableRequest serializes with variablesReference, name, and value" {
+    const allocator = std.testing.allocator;
+    const data = try setVariableRequest(allocator, 16, 42, "x", "100");
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("setVariable", parsed.value.object.get("command").?.string);
+    const args = parsed.value.object.get("arguments").?.object;
+    try std.testing.expectEqual(@as(i64, 42), args.get("variablesReference").?.integer);
+    try std.testing.expectEqualStrings("x", args.get("name").?.string);
+    try std.testing.expectEqualStrings("100", args.get("value").?.string);
+}
+
+// ── WP9 Tests ───────────────────────────────────────────────────────────
+
+test "InitializeRequest advertises client capabilities" {
+    const allocator = std.testing.allocator;
+    const data = try initializeRequest(allocator, 1);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expect(args.get("supportsVariableType").?.bool);
+    try std.testing.expect(args.get("supportsVariablePaging").?.bool);
+    try std.testing.expect(args.get("supportsMemoryReferences").?.bool);
+    try std.testing.expect(args.get("supportsProgressReporting").?.bool);
+    try std.testing.expect(args.get("supportsInvalidatedEvent").?.bool);
+    try std.testing.expect(args.get("supportsMemoryEvent").?.bool);
+    try std.testing.expect(args.get("supportsStartDebuggingRequest").?.bool);
+    try std.testing.expect(args.get("supportsANSIStyling").?.bool);
+}
+
+test "ContinueRequestEx serializes with singleThread" {
+    const allocator = std.testing.allocator;
+    const data = try continueRequestEx(allocator, 5, 1, true);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("continue", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqual(@as(i64, 1), args.get("threadId").?.integer);
+    try std.testing.expect(args.get("singleThread").?.bool);
+}
+
+test "ContinueRequestEx omits singleThread when null" {
+    const allocator = std.testing.allocator;
+    const data = try continueRequestEx(allocator, 5, 1, null);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expect(args.get("singleThread") == null);
+}
+
+test "StepInRequestEx serializes with granularity and singleThread" {
+    const allocator = std.testing.allocator;
+    const data = try stepInRequestEx(allocator, 6, 1, .{
+        .granularity = .instruction,
+        .single_thread = true,
+    });
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("stepIn", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqualStrings("instruction", args.get("granularity").?.string);
+    try std.testing.expect(args.get("singleThread").?.bool);
+}
+
+test "NextRequestEx serializes with granularity" {
+    const allocator = std.testing.allocator;
+    const data = try nextRequestEx(allocator, 7, 1, .{ .granularity = .line });
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("next", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqualStrings("line", args.get("granularity").?.string);
+}
+
+test "StepOutRequestEx serializes with singleThread" {
+    const allocator = std.testing.allocator;
+    const data = try stepOutRequestEx(allocator, 8, 1, .{ .single_thread = false });
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("stepOut", parsed.value.object.get("command").?.string);
+    try std.testing.expect(!args.get("singleThread").?.bool);
+}
+
+test "EvaluateRequestEx serializes with explicit context" {
+    const allocator = std.testing.allocator;
+    const data = try evaluateRequestEx(allocator, 9, "x.value", 3, .hover);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("hover", args.get("context").?.string);
+    try std.testing.expectEqualStrings("x.value", args.get("expression").?.string);
+}
+
+test "EvaluateRequestEx defaults to repl when context is null" {
+    const allocator = std.testing.allocator;
+    const data = try evaluateRequestEx(allocator, 9, "x + y", null, null);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("repl", args.get("context").?.string);
+    try std.testing.expect(args.get("frameId") == null);
+}
+
+test "VariablesRequestEx serializes with filter, start, count, format" {
+    const allocator = std.testing.allocator;
+    const data = try variablesRequestEx(allocator, 10, 42, .{
+        .filter = .indexed,
+        .start = 0,
+        .count = 10,
+        .format = .{ .hex = true },
+    });
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqual(@as(i64, 42), args.get("variablesReference").?.integer);
+    try std.testing.expectEqualStrings("indexed", args.get("filter").?.string);
+    try std.testing.expectEqual(@as(i64, 0), args.get("start").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), args.get("count").?.integer);
+    const fmt = args.get("format").?.object;
+    try std.testing.expect(fmt.get("hex").?.bool);
+}
+
+test "StackTraceRequestEx serializes with format" {
+    const allocator = std.testing.allocator;
+    const data = try stackTraceRequestEx(allocator, 11, 1, 0, 20, .{
+        .parameters = true,
+        .parameter_types = true,
+        .module = true,
+    });
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqual(@as(i64, 1), args.get("threadId").?.integer);
+    const fmt = args.get("format").?.object;
+    try std.testing.expect(fmt.get("parameters").?.bool);
+    try std.testing.expect(fmt.get("parameterTypes").?.bool);
+    try std.testing.expect(fmt.get("module").?.bool);
+    try std.testing.expect(fmt.get("parameterNames") == null);
+}
+
+test "DisassembleRequestEx serializes with instructionOffset and resolveSymbols" {
+    const allocator = std.testing.allocator;
+    const data = try disassembleRequestEx(allocator, 12, "0x1000", 50, .{
+        .instruction_offset = -10,
+        .resolve_symbols = true,
+    });
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("0x1000", args.get("memoryReference").?.string);
+    try std.testing.expectEqual(@as(i64, -10), args.get("instructionOffset").?.integer);
+    try std.testing.expectEqual(@as(i64, 50), args.get("instructionCount").?.integer);
+    try std.testing.expect(args.get("resolveSymbols").?.bool);
+}
+
+test "ModulesRequestEx serializes with custom start and count" {
+    const allocator = std.testing.allocator;
+    const data = try modulesRequestEx(allocator, 13, 10, 50);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expectEqualStrings("modules", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqual(@as(i64, 10), args.get("startModule").?.integer);
+    try std.testing.expectEqual(@as(i64, 50), args.get("moduleCount").?.integer);
+}
+
+test "SetInstructionBreakpointsRequest serializes breakpoints" {
+    const allocator = std.testing.allocator;
+    const bps = [_]types.InstructionBreakpoint{
+        .{ .instruction_reference = "0x1000", .offset = 4, .condition = "x > 0" },
+        .{ .instruction_reference = "0x2000" },
+    };
+    const data = try setInstructionBreakpointsRequest(allocator, 14, &bps);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("setInstructionBreakpoints", obj.get("command").?.string);
+    const args = obj.get("arguments").?.object;
+    const bp_arr = args.get("breakpoints").?.array;
+    try std.testing.expectEqual(@as(usize, 2), bp_arr.items.len);
+    try std.testing.expectEqualStrings("0x1000", bp_arr.items[0].object.get("instructionReference").?.string);
+    try std.testing.expectEqual(@as(i64, 4), bp_arr.items[0].object.get("offset").?.integer);
+    try std.testing.expectEqualStrings("x > 0", bp_arr.items[0].object.get("condition").?.string);
+    try std.testing.expectEqualStrings("0x2000", bp_arr.items[1].object.get("instructionReference").?.string);
+    try std.testing.expect(bp_arr.items[1].object.get("offset") == null);
+}
+
+test "StepInTargetsRequest serializes with frameId" {
+    const allocator = std.testing.allocator;
+    const data = try stepInTargetsRequest(allocator, 15, 5);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("stepInTargets", obj.get("command").?.string);
+    try std.testing.expectEqual(@as(i64, 5), obj.get("arguments").?.object.get("frameId").?.integer);
+}
+
+test "BreakpointLocationsRequest serializes with source, line, and endLine" {
+    const allocator = std.testing.allocator;
+    const data = try breakpointLocationsRequest(allocator, 16, "/src/main.zig", 10, 20);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("breakpointLocations", obj.get("command").?.string);
+    const args = obj.get("arguments").?.object;
+    try std.testing.expectEqualStrings("/src/main.zig", args.get("source").?.object.get("path").?.string);
+    try std.testing.expectEqual(@as(i64, 10), args.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), args.get("endLine").?.integer);
+}
+
+test "BreakpointLocationsRequest omits endLine when null" {
+    const allocator = std.testing.allocator;
+    const data = try breakpointLocationsRequest(allocator, 16, "/src/main.zig", 10, null);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expect(args.get("endLine") == null);
+}
+
+test "CancelRequest serializes with requestId" {
+    const allocator = std.testing.allocator;
+    const data = try cancelRequest(allocator, 17, 42, null);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("cancel", obj.get("command").?.string);
+    const args = obj.get("arguments").?.object;
+    try std.testing.expectEqual(@as(i64, 42), args.get("requestId").?.integer);
+    try std.testing.expect(args.get("progressId") == null);
+}
+
+test "CancelRequest serializes with progressId" {
+    const allocator = std.testing.allocator;
+    const data = try cancelRequest(allocator, 17, null, "progress-123");
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const args = parsed.value.object.get("arguments").?.object;
+
+    try std.testing.expect(args.get("requestId") == null);
+    try std.testing.expectEqualStrings("progress-123", args.get("progressId").?.string);
+}
+
+test "TerminateThreadsRequest serializes with threadIds" {
+    const allocator = std.testing.allocator;
+    const ids = [_]i64{ 1, 2, 3 };
+    const data = try terminateThreadsRequest(allocator, 18, &ids);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("terminateThreads", obj.get("command").?.string);
+    const tids = obj.get("arguments").?.object.get("threadIds").?.array;
+    try std.testing.expectEqual(@as(usize, 3), tids.items.len);
+    try std.testing.expectEqual(@as(i64, 1), tids.items[0].integer);
+    try std.testing.expectEqual(@as(i64, 2), tids.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 3), tids.items[2].integer);
+}
+
+test "LocationsRequest serializes with locationReference" {
+    const allocator = std.testing.allocator;
+    const data = try locationsRequest(allocator, 19, 42);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("locations", obj.get("command").?.string);
+    try std.testing.expectEqual(@as(i64, 42), obj.get("arguments").?.object.get("locationReference").?.integer);
+}
+
+test "RestartRequest serializes without arguments" {
+    const allocator = std.testing.allocator;
+    const data = try restartRequest(allocator, 20);
+    defer allocator.free(data);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqualStrings("restart", obj.get("command").?.string);
+    try std.testing.expect(obj.get("arguments") == null);
 }

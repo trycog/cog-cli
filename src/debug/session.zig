@@ -69,6 +69,27 @@ pub const SessionManager = struct {
     pub fn sessionCount(self: *const SessionManager) usize {
         return self.sessions.count();
     }
+
+    pub const SessionInfo = struct {
+        id: []const u8,
+        status: Session.Status,
+        driver_type: ActiveDriver.DriverType,
+    };
+
+    pub fn listSessions(self: *const SessionManager, allocator: std.mem.Allocator) ![]const SessionInfo {
+        var result = std.ArrayListUnmanaged(SessionInfo).empty;
+        errdefer result.deinit(allocator);
+
+        var iter = self.sessions.iterator();
+        while (iter.next()) |entry| {
+            try result.append(allocator, .{
+                .id = entry.key_ptr.*,
+                .status = entry.value_ptr.status,
+                .driver_type = entry.value_ptr.driver.driver_type,
+            });
+        }
+        return try result.toOwnedSlice(allocator);
+    }
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────

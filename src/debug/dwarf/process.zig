@@ -15,6 +15,7 @@ else
 
 pub const WaitResult = process_mach.WaitResult;
 pub const RegisterState = process_mach.RegisterState;
+pub const FloatRegisterState = process_mach.FloatRegisterState;
 
 const UnsupportedProcessControl = struct {
     pub fn spawn(_: *@This(), _: std.mem.Allocator, _: []const u8, _: []const []const u8) !void {
