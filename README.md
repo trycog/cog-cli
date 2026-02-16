@@ -4,7 +4,7 @@
 
 **Tools for AI coding.**
 
-A zero-dependency native CLI for [Cog](https://trycog.ai) — persistent memory, code intelligence, and debugging for developers and AI agents. Built in Zig.
+A zero-dependency native CLI for [Cog](https://trycog.ai) — persistent memory (hosted on [trycog.ai](https://trycog.ai)), code intelligence, and debugging for developers and AI agents. Built in Zig.
 
 [Getting Started](#getting-started) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Extensions](#extensions)
 
@@ -91,7 +91,7 @@ Run `cog --help` for an overview, or `cog <group> --help` to list commands in a 
 
 ## Memory
 
-Persistent associative memory powered by a knowledge graph. Requires a trycog.ai account.
+Persistent associative memory powered by a knowledge graph. Memory is hosted as a service on [trycog.ai](https://trycog.ai) — requires an account and API key.
 
 ### Read Commands
 
