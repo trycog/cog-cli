@@ -4,7 +4,6 @@ const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const posix = std.posix;
 const daemon_mod = @import("daemon.zig");
-const server = @import("server.zig");
 
 // ── CLI Tool Definition Table ───────────────────────────────────────────
 

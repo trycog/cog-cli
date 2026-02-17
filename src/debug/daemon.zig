@@ -4,14 +4,14 @@ const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const posix = std.posix;
 const server_mod = @import("server.zig");
-const McpServer = server_mod.McpServer;
+const DebugServer = server_mod.DebugServer;
 const ToolResult = server_mod.ToolResult;
 
 // ── Daemon Server ───────────────────────────────────────────────────────
 
 pub const DaemonServer = struct {
     allocator: std.mem.Allocator,
-    mcp: McpServer,
+    server: DebugServer,
     socket_fd: ?posix.socket_t = null,
     last_activity: i64 = 0,
 
@@ -20,7 +20,7 @@ pub const DaemonServer = struct {
     pub fn init(allocator: std.mem.Allocator) DaemonServer {
         return .{
             .allocator = allocator,
-            .mcp = McpServer.init(allocator),
+            .server = DebugServer.init(allocator),
             .last_activity = std.time.milliTimestamp(),
         };
     }
@@ -39,7 +39,7 @@ pub const DaemonServer = struct {
         if (getPidPath(&pid_buf)) |path| {
             std.fs.deleteFileAbsolute(path) catch {};
         }
-        self.mcp.deinit();
+        self.server.deinit();
     }
 
     pub fn run(self: *DaemonServer) !void {
@@ -47,7 +47,7 @@ pub const DaemonServer = struct {
         setupSignalHandler();
 
         // Connect to dashboard TUI if one is running
-        self.mcp.connectDashboardSocket();
+        self.server.connectDashboardSocket();
 
         // Create and bind the Unix domain socket
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
@@ -81,7 +81,7 @@ pub const DaemonServer = struct {
             const now = std.time.milliTimestamp();
             if (now - self.last_activity > IDLE_TIMEOUT_MS) {
                 // Check if there are active sessions
-                const sessions = self.mcp.session_manager.listSessions(self.allocator) catch break;
+                const sessions = self.server.session_manager.listSessions(self.allocator) catch break;
                 defer self.allocator.free(sessions);
                 if (sessions.len == 0) break; // No active sessions, shut down
             }
@@ -154,7 +154,7 @@ pub const DaemonServer = struct {
         const tool_args = parsed.value.object.get("args");
 
         // Dispatch via McpServer.callTool
-        const result = self.mcp.callTool(self.allocator, tool_name, tool_args) catch {
+        const result = self.server.callTool(self.allocator, tool_name, tool_args) catch {
             self.writeResponse(client_fd, "{\"ok\":false,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}");
             return;
         };

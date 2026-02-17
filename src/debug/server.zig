@@ -11,31 +11,7 @@ const dashboard_tui = @import("dashboard_tui.zig");
 
 const SessionManager = session_mod.SessionManager;
 
-// ── JSON-RPC Types ──────────────────────────────────────────────────────
-
-pub const JsonRpcRequest = struct {
-    jsonrpc: []const u8,
-    id: ?json.Value = null,
-    method: []const u8,
-    params: ?json.Value = null,
-    /// Owns the parsed JSON tree — must be kept alive while id/params are in use.
-    _parsed: json.Parsed(json.Value),
-
-    pub fn deinit(self: *const JsonRpcRequest, allocator: std.mem.Allocator) void {
-        allocator.free(self.method);
-        // deinit is not const-qualified on Parsed, so we need a mutable copy
-        var p = self._parsed;
-        p.deinit();
-    }
-};
-
-pub const JsonRpcError = struct {
-    code: i32,
-    message: []const u8,
-    data: ?json.Value = null,
-};
-
-// Standard JSON-RPC error codes
+// Standard error codes
 pub const PARSE_ERROR = -32700;
 pub const INVALID_REQUEST = -32600;
 pub const METHOD_NOT_FOUND = -32601;
@@ -43,102 +19,13 @@ pub const INVALID_PARAMS = -32602;
 pub const INTERNAL_ERROR = -32603;
 pub const NOT_SUPPORTED = -32001;
 
-// ── Parsing ─────────────────────────────────────────────────────────────
-
-pub fn parseJsonRpc(allocator: std.mem.Allocator, data: []const u8) !JsonRpcRequest {
-    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
-    errdefer parsed.deinit();
-
-    if (parsed.value != .object) return error.InvalidRequest;
-    const obj = parsed.value.object;
-
-    const method_val = obj.get("method") orelse return error.MissingMethod;
-    if (method_val != .string) return error.MissingMethod;
-
-    const id_val = obj.get("id");
-
-    return .{
-        .jsonrpc = "2.0",
-        .id = if (id_val) |v| switch (v) {
-            .integer => v,
-            .string => v,
-            .null => v,
-            else => null,
-        } else null,
-        .method = try allocator.dupe(u8, method_val.string),
-        .params = if (obj.get("params")) |p| switch (p) {
-            .object, .array => p,
-            else => null,
-        } else null,
-        ._parsed = parsed,
-    };
-}
-
-// ── Response Formatting ─────────────────────────────────────────────────
-
-pub fn formatJsonRpcResponse(allocator: std.mem.Allocator, id: ?json.Value, result: []const u8) ![]const u8 {
-    var aw: Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-
-    // Build manually to embed raw JSON for the result field
-    try aw.writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-    if (id) |v| {
-        switch (v) {
-            .integer => |i| {
-                var buf: [32]u8 = undefined;
-                const s = std.fmt.bufPrint(&buf, "{d}", .{i}) catch "null";
-                try aw.writer.writeAll(s);
-            },
-            .string => |s| {
-                try aw.writer.writeByte('"');
-                try aw.writer.writeAll(s);
-                try aw.writer.writeByte('"');
-            },
-            else => try aw.writer.writeAll("null"),
-        }
-    } else {
-        try aw.writer.writeAll("null");
-    }
-    try aw.writer.writeAll(",\"result\":");
-    try aw.writer.writeAll(result);
-    try aw.writer.writeByte('}');
-
-    return try aw.toOwnedSlice();
-}
-
-pub fn formatJsonRpcError(allocator: std.mem.Allocator, id: ?json.Value, code: i32, message: []const u8) ![]const u8 {
-    var aw: Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-
-    try s.beginObject();
-    try s.objectField("jsonrpc");
-    try s.write("2.0");
-    try s.objectField("id");
-    if (id) |v| {
-        try s.write(v);
-    } else {
-        try s.write(null);
-    }
-    try s.objectField("error");
-    try s.beginObject();
-    try s.objectField("code");
-    try s.write(code);
-    try s.objectField("message");
-    try s.write(message);
-    try s.endObject();
-    try s.endObject();
-
-    return try aw.toOwnedSlice();
-}
-
-/// Map an error to the appropriate JSON-RPC error code.
+/// Map an error to the appropriate error code.
 /// NotSupported gets a dedicated code (-32001) instead of INTERNAL_ERROR.
 pub fn errorToCode(err: anyerror) i32 {
     return if (err == error.NotSupported) NOT_SUPPORTED else INTERNAL_ERROR;
 }
 
-// ── MCP Tool Definitions ────────────────────────────────────────────────
+// ── Tool Definitions ────────────────────────────────────────────────────
 
 pub const tool_definitions = [_]ToolDef{
     .{
@@ -469,28 +356,16 @@ pub const ToolResult = union(enum) {
     };
 };
 
-// ── MCP Server ──────────────────────────────────────────────────────────
+// ── Debug Server ────────────────────────────────────────────────────────
 
-pub const McpServer = struct {
+pub const DebugServer = struct {
     session_manager: SessionManager,
     allocator: std.mem.Allocator,
     dashboard: dashboard_mod.Dashboard,
-    /// Resource URIs that clients have subscribed to
-    resource_subscriptions: std.StringHashMapUnmanaged(void) = .empty,
-    /// Pending notification lines to emit after tool call
-    pending_notification_lines: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Socket connection to standalone dashboard TUI (null if not connected)
     dashboard_socket: ?posix.socket_t = null,
 
-    // Rate limiting
-    rate_limit_window_start: i64 = 0,
-    rate_limit_count: u32 = 0,
-
-    const RATE_LIMIT_MAX: u32 = 100;
-    const RATE_LIMIT_WINDOW_MS: i64 = 10_000;
-    const RATE_LIMIT_ERROR: i32 = -32000;
-
-    pub fn init(allocator: std.mem.Allocator) McpServer {
+    pub fn init(allocator: std.mem.Allocator) DebugServer {
         return .{
             .session_manager = SessionManager.init(allocator),
             .allocator = allocator,
@@ -498,20 +373,7 @@ pub const McpServer = struct {
         };
     }
 
-    pub fn deinit(self: *McpServer) void {
-        // Free resource subscriptions
-        {
-            var it = self.resource_subscriptions.keyIterator();
-            while (it.next()) |key| {
-                self.allocator.free(key.*);
-            }
-            self.resource_subscriptions.deinit(self.allocator);
-        }
-        // Free pending notification lines
-        for (self.pending_notification_lines.items) |line| {
-            self.allocator.free(line);
-        }
-        self.pending_notification_lines.deinit(self.allocator);
+    pub fn deinit(self: *DebugServer) void {
         // Close dashboard socket
         if (self.dashboard_socket) |sock| {
             posix.close(sock);
@@ -520,66 +382,9 @@ pub const McpServer = struct {
         self.session_manager.deinit();
     }
 
-    /// Handle an MCP JSON-RPC request and return a response.
-    pub fn handleRequest(self: *McpServer, allocator: std.mem.Allocator, method: []const u8, params: ?json.Value, id: ?json.Value) ![]const u8 {
-        if (std.mem.eql(u8, method, "initialize")) {
-            return self.handleInitialize(allocator, id);
-        } else if (std.mem.eql(u8, method, "tools/list")) {
-            return self.handleToolsList(allocator, id);
-        } else if (std.mem.eql(u8, method, "tools/call")) {
-            return self.handleToolsCall(allocator, params, id);
-        } else if (std.mem.eql(u8, method, "resources/list")) {
-            return self.handleResourcesList(allocator, id);
-        } else if (std.mem.eql(u8, method, "resources/read")) {
-            return self.handleResourcesRead(allocator, params, id);
-        } else if (std.mem.eql(u8, method, "resources/subscribe")) {
-            return self.handleResourcesSubscribe(allocator, params, id);
-        } else if (std.mem.eql(u8, method, "resources/unsubscribe")) {
-            return self.handleResourcesUnsubscribe(allocator, params, id);
-        } else if (std.mem.eql(u8, method, "prompts/list")) {
-            return self.handlePromptsList(allocator, id);
-        } else if (std.mem.eql(u8, method, "prompts/get")) {
-            return self.handlePromptsGet(allocator, params, id);
-        } else {
-            return formatJsonRpcError(allocator, id, METHOD_NOT_FOUND, "Method not found");
-        }
-    }
-
-    fn handleInitialize(self: *McpServer, allocator: std.mem.Allocator, id: ?json.Value) ![]const u8 {
-        _ = self;
-        const result =
-            \\{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false},"resources":{"subscribe":true,"listChanged":false},"notifications":true,"prompts":{"listChanged":false}},"serverInfo":{"name":"cog-debug","version":"0.1.0"}}
-        ;
-        return formatJsonRpcResponse(allocator, id, result);
-    }
-
-    fn handleToolsList(self: *McpServer, allocator: std.mem.Allocator, id: ?json.Value) ![]const u8 {
-        _ = self;
-        var aw: Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-
-        // Build tools list with raw schema embedding
-        try aw.writer.writeAll("{\"tools\":[");
-        for (&tool_definitions, 0..) |*tool, i| {
-            if (i > 0) try aw.writer.writeByte(',');
-            try aw.writer.writeAll("{\"name\":\"");
-            try aw.writer.writeAll(tool.name);
-            try aw.writer.writeAll("\",\"description\":\"");
-            try aw.writer.writeAll(tool.description);
-            try aw.writer.writeAll("\",\"inputSchema\":");
-            try aw.writer.writeAll(tool.input_schema);
-            try aw.writer.writeByte('}');
-        }
-        try aw.writer.writeAll("]}");
-
-        const result = try aw.toOwnedSlice();
-        defer allocator.free(result);
-        return formatJsonRpcResponse(allocator, id, result);
-    }
-
-    /// Dispatch a tool call and return the raw result (no JSON-RPC envelope).
-    /// Used by both the MCP stdio transport and the daemon socket transport.
-    pub fn callTool(self: *McpServer, allocator: std.mem.Allocator, tool_name: []const u8, tool_args: ?json.Value) !ToolResult {
+    /// Dispatch a tool call and return the raw result.
+    /// Used by the daemon socket transport.
+    pub fn callTool(self: *DebugServer, allocator: std.mem.Allocator, tool_name: []const u8, tool_args: ?json.Value) !ToolResult {
         if (std.mem.eql(u8, tool_name, "debug_launch")) {
             return self.toolLaunch(allocator, tool_args);
         } else if (std.mem.eql(u8, tool_name, "debug_breakpoint")) {
@@ -653,312 +458,9 @@ pub const McpServer = struct {
         }
     }
 
-    fn handleToolsCall(self: *McpServer, allocator: std.mem.Allocator, params: ?json.Value, id: ?json.Value) ![]const u8 {
-        // Rate limiting check
-        const now_ms = std.time.milliTimestamp();
-        if (now_ms - self.rate_limit_window_start > RATE_LIMIT_WINDOW_MS) {
-            self.rate_limit_window_start = now_ms;
-            self.rate_limit_count = 0;
-        }
-        self.rate_limit_count += 1;
-        if (self.rate_limit_count > RATE_LIMIT_MAX) {
-            return formatJsonRpcError(allocator, id, RATE_LIMIT_ERROR, "Rate limit exceeded");
-        }
-
-        const p = params orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing params");
-        if (p != .object) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Params must be object");
-
-        const name_val = p.object.get("name") orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing tool name");
-        if (name_val != .string) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Tool name must be string");
-        const tool_name = name_val.string;
-
-        const tool_args = p.object.get("arguments");
-
-        const result = try self.callTool(allocator, tool_name, tool_args);
-        switch (result) {
-            .ok => |raw| {
-                defer allocator.free(raw);
-                return formatJsonRpcResponse(allocator, id, raw);
-            },
-            .err => |e| {
-                return formatJsonRpcError(allocator, id, e.code, e.message);
-            },
-        }
-    }
-
-    // ── Resource Handlers ─────────────────────────────────────────────
-
-    fn handleResourcesList(self: *McpServer, allocator: std.mem.Allocator, id: ?json.Value) ![]const u8 {
-        _ = self;
-        const result =
-            \\{"resources":[{"uri":"debug://sessions","name":"Debug Sessions","description":"List of all active debug sessions","mimeType":"application/json"},{"uri":"debug://session/{id}/state","name":"Session State","description":"Current stop state for a debug session","mimeType":"application/json"},{"uri":"debug://session/{id}/threads","name":"Session Threads","description":"Thread list for a debug session","mimeType":"application/json"},{"uri":"debug://session/{id}/breakpoints","name":"Session Breakpoints","description":"Active breakpoints for a debug session","mimeType":"application/json"},{"uri":"debug://session/{id}/modules","name":"Session Modules","description":"Loaded modules and shared libraries for a debug session","mimeType":"application/json"},{"uri":"debug://session/{id}/sources","name":"Session Sources","description":"Available source files for a debug session","mimeType":"application/json"},{"uri":"debug://session/{id}/capabilities","name":"Session Capabilities","description":"Debug driver capability flags for a session","mimeType":"application/json"},{"uri":"debug://session/{id}/stack/{thread_id}","name":"Session Stack Trace","description":"Stack trace for a specific thread in a debug session","mimeType":"application/json"}]}
-        ;
-        return formatJsonRpcResponse(allocator, id, result);
-    }
-
-    fn handleResourcesRead(self: *McpServer, allocator: std.mem.Allocator, params: ?json.Value, id: ?json.Value) ![]const u8 {
-        const p = params orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing params");
-        if (p != .object) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Params must be object");
-
-        const uri_val = p.object.get("uri") orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing uri");
-        if (uri_val != .string) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "uri must be string");
-        const uri = uri_val.string;
-
-        if (std.mem.eql(u8, uri, "debug://sessions")) {
-            // Return session list
-            const sessions = self.session_manager.listSessions(allocator) catch |err| {
-                return formatJsonRpcError(allocator, id, errorToCode(err), @errorName(err));
-            };
-            defer allocator.free(sessions);
-
-            var aw: Writer.Allocating = .init(allocator);
-            defer aw.deinit();
-            var jw: Stringify = .{ .writer = &aw.writer };
-            try jw.beginObject();
-            try jw.objectField("contents");
-            try jw.beginArray();
-            try jw.beginObject();
-            try jw.objectField("uri");
-            try jw.write("debug://sessions");
-            try jw.objectField("mimeType");
-            try jw.write("application/json");
-            try jw.objectField("text");
-            // Serialize session array as a string value
-            {
-                var inner_aw: Writer.Allocating = .init(allocator);
-                defer inner_aw.deinit();
-                var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                try inner_jw.beginArray();
-                for (sessions) |*s| {
-                    try inner_jw.beginObject();
-                    try inner_jw.objectField("id");
-                    try inner_jw.write(s.id);
-                    try inner_jw.objectField("status");
-                    try inner_jw.write(@tagName(s.status));
-                    try inner_jw.objectField("driver_type");
-                    try inner_jw.write(@tagName(s.driver_type));
-                    try inner_jw.endObject();
-                }
-                try inner_jw.endArray();
-                const inner_text = try inner_aw.toOwnedSlice();
-                defer allocator.free(inner_text);
-                try jw.write(inner_text);
-            }
-            try jw.endObject();
-            try jw.endArray();
-            try jw.endObject();
-            const result = try aw.toOwnedSlice();
-            defer allocator.free(result);
-            return formatJsonRpcResponse(allocator, id, result);
-        }
-
-        // Parse session-specific URIs: debug://session/{id}/...
-        const session_prefix = "debug://session/";
-        if (std.mem.startsWith(u8, uri, session_prefix)) {
-            const rest = uri[session_prefix.len..];
-            // Find the session ID and sub-resource
-            if (std.mem.indexOf(u8, rest, "/")) |slash_pos| {
-                const session_id = rest[0..slash_pos];
-                const sub_resource = rest[slash_pos + 1 ..];
-
-                const session = self.session_manager.getSession(session_id) orelse
-                    return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Unknown session");
-
-                var aw: Writer.Allocating = .init(allocator);
-                defer aw.deinit();
-                var jw: Stringify = .{ .writer = &aw.writer };
-                try jw.beginObject();
-                try jw.objectField("contents");
-                try jw.beginArray();
-                try jw.beginObject();
-                try jw.objectField("uri");
-                try jw.write(uri);
-                try jw.objectField("mimeType");
-                try jw.write("application/json");
-                try jw.objectField("text");
-
-                if (std.mem.eql(u8, sub_resource, "state")) {
-                    try jw.write(@tagName(session.status));
-                } else if (std.mem.eql(u8, sub_resource, "threads")) {
-                    if (session.driver.threads(allocator)) |thread_list| {
-                        var inner_aw: Writer.Allocating = .init(allocator);
-                        defer inner_aw.deinit();
-                        var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                        try inner_jw.beginArray();
-                        for (thread_list) |*t| {
-                            try t.jsonStringify(&inner_jw);
-                        }
-                        try inner_jw.endArray();
-                        const inner_text = try inner_aw.toOwnedSlice();
-                        defer allocator.free(inner_text);
-                        try jw.write(inner_text);
-                    } else |_| {
-                        try jw.write("[]");
-                    }
-                } else if (std.mem.eql(u8, sub_resource, "breakpoints")) {
-                    if (session.driver.listBreakpoints(allocator)) |bp_list| {
-                        var inner_aw: Writer.Allocating = .init(allocator);
-                        defer inner_aw.deinit();
-                        var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                        try inner_jw.beginArray();
-                        for (bp_list) |*bp| {
-                            try bp.jsonStringify(&inner_jw);
-                        }
-                        try inner_jw.endArray();
-                        const inner_text = try inner_aw.toOwnedSlice();
-                        defer allocator.free(inner_text);
-                        try jw.write(inner_text);
-                    } else |_| {
-                        try jw.write("[]");
-                    }
-                } else if (std.mem.eql(u8, sub_resource, "modules")) {
-                    if (session.driver.modules(allocator)) |module_list| {
-                        var inner_aw: Writer.Allocating = .init(allocator);
-                        defer inner_aw.deinit();
-                        var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                        try inner_jw.beginArray();
-                        for (module_list) |*m| {
-                            try m.jsonStringify(&inner_jw);
-                        }
-                        try inner_jw.endArray();
-                        const inner_text = try inner_aw.toOwnedSlice();
-                        defer allocator.free(inner_text);
-                        try jw.write(inner_text);
-                    } else |_| {
-                        try jw.write("[]");
-                    }
-                } else if (std.mem.eql(u8, sub_resource, "sources")) {
-                    if (session.driver.loadedSources(allocator)) |source_list| {
-                        var inner_aw: Writer.Allocating = .init(allocator);
-                        defer inner_aw.deinit();
-                        var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                        try inner_jw.beginArray();
-                        for (source_list) |*s| {
-                            try s.jsonStringify(&inner_jw);
-                        }
-                        try inner_jw.endArray();
-                        const inner_text = try inner_aw.toOwnedSlice();
-                        defer allocator.free(inner_text);
-                        try jw.write(inner_text);
-                    } else |_| {
-                        try jw.write("[]");
-                    }
-                } else if (std.mem.eql(u8, sub_resource, "capabilities")) {
-                    const caps = session.driver.capabilities();
-                    var inner_aw: Writer.Allocating = .init(allocator);
-                    defer inner_aw.deinit();
-                    var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                    try caps.jsonStringify(&inner_jw);
-                    const inner_text = try inner_aw.toOwnedSlice();
-                    defer allocator.free(inner_text);
-                    try jw.write(inner_text);
-                } else if (std.mem.startsWith(u8, sub_resource, "stack/")) {
-                    const thread_id_str = sub_resource["stack/".len..];
-                    const thread_id = std.fmt.parseInt(u32, thread_id_str, 10) catch {
-                        try jw.endObject();
-                        try jw.endArray();
-                        try jw.endObject();
-                        const discard = try aw.toOwnedSlice();
-                        defer allocator.free(discard);
-                        return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Invalid thread_id");
-                    };
-                    if (session.driver.stackTrace(allocator, thread_id, 0, 100)) |frames| {
-                        var inner_aw: Writer.Allocating = .init(allocator);
-                        defer inner_aw.deinit();
-                        var inner_jw: Stringify = .{ .writer = &inner_aw.writer };
-                        try inner_jw.beginArray();
-                        for (frames) |*f| {
-                            try f.jsonStringify(&inner_jw);
-                        }
-                        try inner_jw.endArray();
-                        const inner_text = try inner_aw.toOwnedSlice();
-                        defer allocator.free(inner_text);
-                        try jw.write(inner_text);
-                    } else |_| {
-                        try jw.write("[]");
-                    }
-                } else {
-                    try jw.endObject();
-                    try jw.endArray();
-                    try jw.endObject();
-                    const discard = try aw.toOwnedSlice();
-                    defer allocator.free(discard);
-                    return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Unknown sub-resource");
-                }
-
-                try jw.endObject();
-                try jw.endArray();
-                try jw.endObject();
-                const result = try aw.toOwnedSlice();
-                defer allocator.free(result);
-                return formatJsonRpcResponse(allocator, id, result);
-            }
-        }
-
-        return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Unknown resource URI");
-    }
-
-    fn handleResourcesSubscribe(self: *McpServer, allocator: std.mem.Allocator, params: ?json.Value, id: ?json.Value) ![]const u8 {
-        const p = params orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing params");
-        if (p != .object) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Params must be object");
-
-        const uri_val = p.object.get("uri") orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing uri");
-        if (uri_val != .string) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "uri must be string");
-
-        const key = try allocator.dupe(u8, uri_val.string);
-        self.resource_subscriptions.put(self.allocator, key, {}) catch {
-            allocator.free(key);
-            return formatJsonRpcError(allocator, id, INTERNAL_ERROR, "Subscription failed");
-        };
-
-        return formatJsonRpcResponse(allocator, id, "{}");
-    }
-
-    fn handleResourcesUnsubscribe(self: *McpServer, allocator: std.mem.Allocator, params: ?json.Value, id: ?json.Value) ![]const u8 {
-        const p = params orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing params");
-        if (p != .object) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Params must be object");
-
-        const uri_val = p.object.get("uri") orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing uri");
-        if (uri_val != .string) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "uri must be string");
-
-        if (self.resource_subscriptions.fetchRemove(uri_val.string)) |kv| {
-            self.allocator.free(kv.key);
-        }
-
-        return formatJsonRpcResponse(allocator, id, "{}");
-    }
-
-    // ── Notification Emission ────────────────────────────────────────────
-
-    /// Collect notifications from all active sessions' drivers and format as JSON-RPC notification lines.
-    pub fn collectNotifications(self: *McpServer) void {
-        var iter = self.session_manager.sessions.iterator();
-        while (iter.next()) |entry| {
-            const notifications = entry.value_ptr.driver.drainNotifications(self.allocator);
-            defer self.allocator.free(notifications);
-            for (notifications) |*notif| {
-                // Format as JSON-RPC notification line
-                var aw: Writer.Allocating = .init(self.allocator);
-                var jw: Stringify = .{ .writer = &aw.writer };
-                notif.jsonStringify(&jw) catch {
-                    aw.deinit();
-                    continue;
-                };
-                if (aw.toOwnedSlice()) |line| {
-                    self.pending_notification_lines.append(self.allocator, line) catch {
-                        self.allocator.free(line);
-                    };
-                } else |_| {}
-                // Free the notification data
-                self.allocator.free(notif.method);
-                self.allocator.free(notif.params_json);
-            }
-        }
-    }
-
     // ── Tool Implementations ────────────────────────────────────────────
 
-    fn toolLaunch(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolLaunch(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1053,7 +555,7 @@ pub const McpServer = struct {
         }
     }
 
-    fn toolBreakpoint(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolBreakpoint(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1189,7 +691,7 @@ pub const McpServer = struct {
         }
     }
 
-    fn toolRun(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolRun(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1253,7 +755,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolInspect(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolInspect(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1296,7 +798,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolStop(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolStop(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1341,7 +843,7 @@ pub const McpServer = struct {
 
     // ── New Tool Implementations (Phase 3) ────────────────────────────
 
-    fn toolThreads(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolThreads(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1377,7 +879,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolStackTrace(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolStackTrace(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1417,7 +919,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolMemory(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolMemory(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1499,7 +1001,7 @@ pub const McpServer = struct {
         }
     }
 
-    fn toolDisassemble(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolDisassemble(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1560,7 +1062,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolAttach(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolAttach(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1635,7 +1137,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolSetVariable(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolSetVariable(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1670,7 +1172,7 @@ pub const McpServer = struct {
 
     // ── Phase 4 Tool Implementations ────────────────────────────────
 
-    fn toolScopes(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolScopes(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1703,7 +1205,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolWatchpoint(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolWatchpoint(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1751,7 +1253,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolCapabilities(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolCapabilities(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1774,7 +1276,7 @@ pub const McpServer = struct {
 
     // ── Phase 5 Tool Implementations ────────────────────────────────
 
-    fn toolCompletions(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolCompletions(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1811,7 +1313,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolModules(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolModules(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1842,7 +1344,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolLoadedSources(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolLoadedSources(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1873,7 +1375,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolSource(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolSource(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1902,7 +1404,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolSetExpression(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolSetExpression(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1936,7 +1438,7 @@ pub const McpServer = struct {
 
     // ── Phase 6 Tool Implementations ────────────────────────────────
 
-    fn toolRestartFrame(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolRestartFrame(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1960,7 +1462,7 @@ pub const McpServer = struct {
 
     // ── Phase 7 Tool Implementations ────────────────────────────────
 
-    fn toolExceptionInfo(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolExceptionInfo(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -1986,7 +1488,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolRegisters(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolRegisters(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2021,7 +1523,7 @@ pub const McpServer = struct {
 
     // ── Phase 12 Tool Implementations ────────────────────────────────
 
-    fn toolInstructionBreakpoint(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolInstructionBreakpoint(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2087,7 +1589,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolStepInTargets(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolStepInTargets(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2121,7 +1623,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolBreakpointLocations(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolBreakpointLocations(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2160,7 +1662,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolCancel(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolCancel(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2182,7 +1684,7 @@ pub const McpServer = struct {
         return .{ .ok = try allocator.dupe(u8, "{\"cancelled\":true}") };
     }
 
-    fn toolTerminateThreads(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolTerminateThreads(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2212,7 +1714,7 @@ pub const McpServer = struct {
         return .{ .ok = try allocator.dupe(u8, "{\"terminated\":true}") };
     }
 
-    fn toolRestart(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolRestart(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2233,7 +1735,7 @@ pub const McpServer = struct {
 
     // ── Phase 4: New Tool Implementations ────────────────────────────────
 
-    fn toolSessions(self: *McpServer, allocator: std.mem.Allocator) !ToolResult {
+    fn toolSessions(self: *DebugServer, allocator: std.mem.Allocator) !ToolResult {
         const sessions = self.session_manager.listSessions(allocator) catch |err| {
             return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
         };
@@ -2258,7 +1760,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolGotoTargets(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolGotoTargets(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2291,7 +1793,7 @@ pub const McpServer = struct {
         return .{ .ok = result };
     }
 
-    fn toolFindSymbol(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolFindSymbol(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2323,7 +1825,7 @@ pub const McpServer = struct {
 
     // ── Phase 6: DWARF Engine Tools ─────────────────────────────────────
 
-    fn toolWriteRegister(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolWriteRegister(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2349,7 +1851,7 @@ pub const McpServer = struct {
         return .{ .ok = try allocator.dupe(u8, "{\"written\":true}") };
     }
 
-    fn toolVariableLocation(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolVariableLocation(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
@@ -2379,7 +1881,7 @@ pub const McpServer = struct {
 
     // ── Event Polling ──────────────────────────────────────────────────
 
-    fn toolPollEvents(self: *McpServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+    fn toolPollEvents(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const session_id_filter: ?[]const u8 = if (args) |a| blk: {
             if (a == .object) {
                 if (a.object.get("session_id")) |v| {
@@ -2433,43 +1935,11 @@ pub const McpServer = struct {
 
     // ── Prompts ──────────────────────────────────────────────────────────
 
-    fn handlePromptsList(self: *McpServer, allocator: std.mem.Allocator, id: ?json.Value) ![]const u8 {
-        _ = self;
-        const result =
-            \\{"prompts":[
-            \\{"name":"diagnose-crash","description":"Diagnose a crash by examining exception info, stack trace, and locals"},
-            \\{"name":"find-root-cause","description":"Systematically find the root cause of a bug using breakpoints and inspection"},
-            \\{"name":"detect-memory-corruption","description":"Investigate memory corruption using watchpoints, memory reads, and disassembly"}
-            \\]}
-        ;
-        return formatJsonRpcResponse(allocator, id, result);
-    }
-
-    fn handlePromptsGet(self: *McpServer, allocator: std.mem.Allocator, params: ?json.Value, id: ?json.Value) ![]const u8 {
-        _ = self;
-        const p = params orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing params");
-        if (p != .object) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Params must be object");
-
-        const name_val = p.object.get("name") orelse return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Missing name");
-        if (name_val != .string) return formatJsonRpcError(allocator, id, INVALID_PARAMS, "name must be string");
-
-        const prompt_text = if (std.mem.eql(u8, name_val.string, "diagnose-crash"))
-            \\{"description":"Diagnose a crash","messages":[{"role":"user","content":{"type":"text","text":"A crash occurred. Follow these steps:\n1. Use debug_exception_info to get the exception details\n2. Use debug_stacktrace to get the full call stack\n3. Use debug_scopes and debug_inspect to examine locals at each frame\n4. Use debug_registers to check CPU state if it's a low-level crash (segfault, illegal instruction)\n5. Report the likely cause, the chain of events that led to it, and suggest a fix."}}]}
-        else if (std.mem.eql(u8, name_val.string, "find-root-cause"))
-            \\{"description":"Find root cause","messages":[{"role":"user","content":{"type":"text","text":"Systematically find the root cause of a bug:\n1. Use debug_stacktrace to get the full call stack\n2. Use debug_scopes and debug_inspect to examine locals at each frame\n3. Use debug_find_symbol to locate related code\n4. Set conditional breakpoints with debug_breakpoint to test hypotheses\n5. Use debug_run to continue and observe behavior\n6. Report the root cause with evidence from each step."}}]}
-        else if (std.mem.eql(u8, name_val.string, "detect-memory-corruption"))
-            \\{"description":"Detect memory corruption","messages":[{"role":"user","content":{"type":"text","text":"Investigate potential memory corruption:\n1. Use debug_memory to read the suspected corrupted memory region\n2. Use debug_watchpoint to set a data breakpoint on the corrupted address\n3. Use debug_run to continue execution until the watchpoint triggers\n4. Use debug_stacktrace to analyze the stack at the point of corruption\n5. Use debug_disassemble at the writing instruction to verify the operation\n6. Report what wrote to the memory, from where, and whether it was an out-of-bounds write, use-after-free, or other corruption pattern."}}]}
-        else
-            return formatJsonRpcError(allocator, id, INVALID_PARAMS, "Unknown prompt name");
-
-        return formatJsonRpcResponse(allocator, id, prompt_text);
-    }
-
     // ── Dashboard Socket ────────────────────────────────────────────────
 
     /// Attempt to connect to the standalone dashboard TUI.
     /// Silently continues if no TUI is running.
-    pub fn connectDashboardSocket(self: *McpServer) void {
+    pub fn connectDashboardSocket(self: *DebugServer) void {
         var path_buf: [128]u8 = undefined;
         const path = dashboard_tui.getSocketPath(&path_buf) orelse return;
 
@@ -2492,7 +1962,7 @@ pub const McpServer = struct {
     /// Write a JSON event line to the dashboard socket. Fire-and-forget.
     /// Proactively detects dead connections via poll(), reconnects, and
     /// retries once so events are not silently lost after dashboard restart.
-    fn pushDashboardEvent(self: *McpServer, event_json: []const u8) void {
+    fn pushDashboardEvent(self: *DebugServer, event_json: []const u8) void {
         // Proactively detect dead connections before sending.
         // On macOS, send() to a broken Unix socket may deliver SIGPIPE
         // or silently succeed; poll() for HUP catches both cases.
@@ -2525,7 +1995,7 @@ pub const McpServer = struct {
     }
 
     /// Send event data + newline on the dashboard socket. Returns true on success.
-    fn sendDashboardData(self: *McpServer, event_json: []const u8) bool {
+    fn sendDashboardData(self: *DebugServer, event_json: []const u8) bool {
         const sock = self.dashboard_socket orelse return false;
         _ = posix.send(sock, event_json, 0) catch {
             posix.close(sock);
@@ -2541,7 +2011,7 @@ pub const McpServer = struct {
     }
 
     /// Emit a launch event to the dashboard TUI.
-    fn emitLaunchEvent(self: *McpServer, session_id: []const u8, program: []const u8, driver_type: []const u8) void {
+    fn emitLaunchEvent(self: *DebugServer, session_id: []const u8, program: []const u8, driver_type: []const u8) void {
         var buf: [512]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"launch","session_id":"{s}","program":"{s}","driver":"{s}"}}
@@ -2550,7 +2020,7 @@ pub const McpServer = struct {
     }
 
     /// Emit a breakpoint event to the dashboard TUI.
-    fn emitBreakpointEvent(self: *McpServer, session_id: []const u8, action: []const u8, bp: types.BreakpointInfo) void {
+    fn emitBreakpointEvent(self: *DebugServer, session_id: []const u8, action: []const u8, bp: types.BreakpointInfo) void {
         var buf: [512]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"breakpoint","session_id":"{s}","action":"{s}","bp":{{"id":{d},"file":"{s}","line":{d},"verified":{s}}}}}
@@ -2566,7 +2036,7 @@ pub const McpServer = struct {
     }
 
     /// Emit a stop event (richest event — carries stack trace + locals).
-    fn emitStopEvent(self: *McpServer, session_id: []const u8, action: []const u8, state: types.StopState) void {
+    fn emitStopEvent(self: *DebugServer, session_id: []const u8, action: []const u8, state: types.StopState) void {
         // Build JSON using allocator since stop events can be large
         var aw: Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -2634,7 +2104,7 @@ pub const McpServer = struct {
     }
 
     /// Emit an inspect event to the dashboard TUI.
-    fn emitInspectEvent(self: *McpServer, session_id: []const u8, expression: []const u8, result_str: []const u8, var_type: []const u8) void {
+    fn emitInspectEvent(self: *DebugServer, session_id: []const u8, expression: []const u8, result_str: []const u8, var_type: []const u8) void {
         var buf: [512]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"inspect","session_id":"{s}","expression":"{s}","result":"{s}","var_type":"{s}"}}
@@ -2648,7 +2118,7 @@ pub const McpServer = struct {
     }
 
     /// Emit a session end event to the dashboard TUI.
-    fn emitSessionEndEvent(self: *McpServer, session_id: []const u8) void {
+    fn emitSessionEndEvent(self: *DebugServer, session_id: []const u8) void {
         var buf: [128]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"session_end","session_id":"{s}"}}
@@ -2657,7 +2127,7 @@ pub const McpServer = struct {
     }
 
     /// Emit an error event to the dashboard TUI.
-    fn emitErrorEvent(self: *McpServer, session_id: []const u8, method: []const u8, message: []const u8) void {
+    fn emitErrorEvent(self: *DebugServer, session_id: []const u8, method: []const u8, message: []const u8) void {
         var buf: [512]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"error","session_id":"{s}","method":"{s}","message":"{s}"}}
@@ -2666,7 +2136,7 @@ pub const McpServer = struct {
     }
 
     /// Emit a generic activity event to the dashboard TUI.
-    fn emitActivityEvent(self: *McpServer, session_id: []const u8, tool: []const u8, summary: []const u8) void {
+    fn emitActivityEvent(self: *DebugServer, session_id: []const u8, tool: []const u8, summary: []const u8) void {
         var buf: [512]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"activity","session_id":"{s}","tool":"{s}","summary":"{s}"}}
@@ -2675,7 +2145,7 @@ pub const McpServer = struct {
     }
 
     /// Emit a run event (execution resumed, before stop).
-    fn emitRunEvent(self: *McpServer, session_id: []const u8, action: []const u8) void {
+    fn emitRunEvent(self: *DebugServer, session_id: []const u8, action: []const u8) void {
         var buf: [256]u8 = undefined;
         const event = std.fmt.bufPrint(&buf,
             \\{{"type":"run","session_id":"{s}","action":"{s}"}}
@@ -2683,74 +2153,6 @@ pub const McpServer = struct {
         self.pushDashboardEvent(event);
     }
 
-    // ── Stdio Transport ─────────────────────────────────────────────────
-
-    pub fn runStdio(self: *McpServer) !void {
-        // Ignore SIGPIPE so send() to a broken dashboard socket returns EPIPE
-        // instead of killing the process.
-        const ignore_act: posix.Sigaction = .{
-            .handler = .{ .handler = posix.SIG.IGN },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
-        posix.sigaction(posix.SIG.PIPE, &ignore_act, null);
-
-        // Try to connect to standalone dashboard TUI
-        self.connectDashboardSocket();
-
-        const stdin = std.fs.File.stdin();
-        const stdout = std.fs.File.stdout();
-        var reader_buf: [65536]u8 = undefined;
-        var reader = stdin.reader(&reader_buf);
-
-        // Initial render
-        self.dashboard.render();
-
-        while (true) {
-            const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-                error.ReadFailed => return,
-                error.StreamTooLong => continue,
-            } orelse return; // null = EOF
-
-            if (line.len == 0) continue;
-
-            // Parse JSON-RPC
-            const parsed = parseJsonRpc(self.allocator, line) catch {
-                const err_resp = try formatJsonRpcError(self.allocator, null, PARSE_ERROR, "Parse error");
-                defer self.allocator.free(err_resp);
-                var write_buf: [65536]u8 = undefined;
-                var w = stdout.writer(&write_buf);
-                w.interface.writeAll(err_resp) catch {};
-                w.interface.writeByte('\n') catch {};
-                w.interface.flush() catch {};
-                self.dashboard.onError("parse", "Parse error");
-                self.dashboard.render();
-                continue;
-            };
-            defer parsed.deinit(self.allocator);
-
-            const response = try self.handleRequest(self.allocator, parsed.method, parsed.params, parsed.id);
-            defer self.allocator.free(response);
-
-            var write_buf: [65536]u8 = undefined;
-            var w = stdout.writer(&write_buf);
-            w.interface.writeAll(response) catch {};
-            w.interface.writeByte('\n') catch {};
-
-            // Emit any pending notifications after tool call
-            self.collectNotifications();
-            for (self.pending_notification_lines.items) |notif_line| {
-                w.interface.writeAll(notif_line) catch {};
-                w.interface.writeByte('\n') catch {};
-                self.allocator.free(notif_line);
-            }
-            self.pending_notification_lines.items.len = 0;
-
-            w.interface.flush() catch {};
-
-            self.dashboard.render();
-        }
-    }
 };
 
 fn truncateStr(s: []const u8, max: usize) []const u8 {
@@ -2759,147 +2161,42 @@ fn truncateStr(s: []const u8, max: usize) []const u8 {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-test "parseJsonRpc extracts method and params from valid request" {
-    const allocator = std.testing.allocator;
-    const input =
-        \\{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
-    ;
-    const req = try parseJsonRpc(allocator, input);
-    defer req.deinit(allocator);
-
-    try std.testing.expectEqualStrings("tools/list", req.method);
+test "tool_definitions has 34 entries" {
+    try std.testing.expectEqual(@as(usize, 34), tool_definitions.len);
 }
 
-test "parseJsonRpc returns error for missing method" {
+test "callTool returns error for unknown tool" {
     const allocator = std.testing.allocator;
-    const input =
-        \\{"jsonrpc":"2.0","id":1}
-    ;
-    const result = parseJsonRpc(allocator, input);
-    try std.testing.expectError(error.MissingMethod, result);
-}
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
 
-test "parseJsonRpc handles request without params" {
-    const allocator = std.testing.allocator;
-    const input =
-        \\{"jsonrpc":"2.0","id":1,"method":"initialize"}
-    ;
-    const req = try parseJsonRpc(allocator, input);
-    defer req.deinit(allocator);
-
-    try std.testing.expectEqualStrings("initialize", req.method);
-    try std.testing.expect(req.params == null);
-}
-
-test "formatJsonRpcError produces error response with code" {
-    const allocator = std.testing.allocator;
-    const result = try formatJsonRpcError(allocator, null, METHOD_NOT_FOUND, "Method not found");
-    defer allocator.free(result);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, result, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-
-    try std.testing.expectEqualStrings("2.0", obj.get("jsonrpc").?.string);
-    const err_obj = obj.get("error").?.object;
-    try std.testing.expectEqual(@as(i64, METHOD_NOT_FOUND), err_obj.get("code").?.integer);
-    try std.testing.expectEqualStrings("Method not found", err_obj.get("message").?.string);
-}
-
-test "handleInitialize returns server capabilities" {
-    const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
-
-    const response = try mcp.handleRequest(allocator, "initialize", null, null);
-    defer allocator.free(response);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-
-    const result = obj.get("result").?.object;
-    try std.testing.expectEqualStrings("cog-debug", result.get("serverInfo").?.object.get("name").?.string);
-}
-
-test "handleToolsList returns 10 debug tools with schemas" {
-    const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
-
-    const response = try mcp.handleRequest(allocator, "tools/list", null, null);
-    defer allocator.free(response);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    const result = obj.get("result").?.object;
-    const tools = result.get("tools").?.array;
-
-    try std.testing.expectEqual(@as(usize, 34), tools.items.len);
-
-    const expected_names = [_][]const u8{ "debug_launch", "debug_breakpoint", "debug_run", "debug_inspect", "debug_stop", "debug_threads", "debug_stacktrace", "debug_memory", "debug_disassemble", "debug_attach", "debug_set_variable", "debug_scopes", "debug_watchpoint", "debug_capabilities", "debug_completions", "debug_modules", "debug_loaded_sources", "debug_source", "debug_set_expression", "debug_restart_frame", "debug_exception_info", "debug_registers", "debug_instruction_breakpoint", "debug_step_in_targets", "debug_breakpoint_locations", "debug_cancel", "debug_terminate_threads", "debug_restart", "debug_sessions", "debug_goto_targets", "debug_find_symbol", "debug_write_register", "debug_variable_location", "debug_poll_events" };
-    for (tools.items, 0..) |tool, i| {
-        try std.testing.expectEqualStrings(expected_names[i], tool.object.get("name").?.string);
+    const result = try srv.callTool(allocator, "nonexistent_tool", null);
+    switch (result) {
+        .err => |e| try std.testing.expectEqual(METHOD_NOT_FOUND, e.code),
+        .ok => unreachable,
     }
 }
 
-test "handleToolsCall dispatches to correct tool handler" {
+test "callTool dispatches debug_stop" {
     const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
 
-    // debug_stop with unknown session should return a result (stopped:true)
-    const params_str =
-        \\{"name":"debug_stop","arguments":{"session_id":"nonexistent"}}
+    const args_str =
+        \\{"session_id":"nonexistent"}
     ;
-    const params_parsed = try json.parseFromSlice(json.Value, allocator, params_str, .{});
-    defer params_parsed.deinit();
+    const args_parsed = try json.parseFromSlice(json.Value, allocator, args_str, .{});
+    defer args_parsed.deinit();
 
-    const response = try mcp.handleRequest(allocator, "tools/call", params_parsed.value, null);
-    defer allocator.free(response);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    // Should have a result with stopped:true
-    const result = obj.get("result").?.object;
-    try std.testing.expect(result.get("stopped").?.bool);
-}
-
-test "formatJsonRpcResponse produces valid JSON-RPC 2.0 response" {
-    const allocator = std.testing.allocator;
-    const result = try formatJsonRpcResponse(allocator, .{ .integer = 42 }, "{\"status\":\"ok\"}");
-    defer allocator.free(result);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, result, .{});
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-
-    try std.testing.expectEqualStrings("2.0", obj.get("jsonrpc").?.string);
-    try std.testing.expectEqual(@as(i64, 42), obj.get("id").?.integer);
-    const res_obj = obj.get("result").?.object;
-    try std.testing.expectEqualStrings("ok", res_obj.get("status").?.string);
-}
-
-test "handleToolsCall returns MethodNotFound for unknown tool" {
-    const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
-
-    const params_str =
-        \\{"name":"nonexistent_tool","arguments":{}}
-    ;
-    const params_parsed = try json.parseFromSlice(json.Value, allocator, params_str, .{});
-    defer params_parsed.deinit();
-
-    const response = try mcp.handleRequest(allocator, "tools/call", params_parsed.value, null);
-    defer allocator.free(response);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    const err = parsed.value.object.get("error").?.object;
-    try std.testing.expectEqual(@as(i64, METHOD_NOT_FOUND), err.get("code").?.integer);
+    const result = try srv.callTool(allocator, "debug_stop", args_parsed.value);
+    switch (result) {
+        .ok => |raw| {
+            defer allocator.free(raw);
+            // Should contain stopped:true
+            try std.testing.expect(std.mem.indexOf(u8, raw, "\"stopped\":true") != null);
+        },
+        .err => unreachable,
+    }
 }
 
 test "tool schema for debug_launch has required program field" {
@@ -2921,107 +2218,6 @@ test "tool schema for debug_run has required session_id and action" {
     try std.testing.expectEqual(@as(usize, 2), required.items.len);
     try std.testing.expectEqualStrings("session_id", required.items[0].string);
     try std.testing.expectEqualStrings("action", required.items[1].string);
-}
-
-// ── Phase 12 Tests ──────────────────────────────────────────────────────
-
-test "new Phase 12 tools appear in tool list" {
-    const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
-
-    const response = try mcp.handleRequest(allocator, "tools/list", null, null);
-    defer allocator.free(response);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-    defer parsed.deinit();
-    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
-
-    // Collect tool names
-    var found_instruction_bp = false;
-    var found_step_in_targets = false;
-    var found_bp_locations = false;
-    var found_cancel = false;
-    var found_terminate_threads = false;
-    var found_restart = false;
-
-    for (tools.items) |tool| {
-        const name = tool.object.get("name").?.string;
-        if (std.mem.eql(u8, name, "debug_instruction_breakpoint")) found_instruction_bp = true;
-        if (std.mem.eql(u8, name, "debug_step_in_targets")) found_step_in_targets = true;
-        if (std.mem.eql(u8, name, "debug_breakpoint_locations")) found_bp_locations = true;
-        if (std.mem.eql(u8, name, "debug_cancel")) found_cancel = true;
-        if (std.mem.eql(u8, name, "debug_terminate_threads")) found_terminate_threads = true;
-        if (std.mem.eql(u8, name, "debug_restart")) found_restart = true;
-    }
-
-    try std.testing.expect(found_instruction_bp);
-    try std.testing.expect(found_step_in_targets);
-    try std.testing.expect(found_bp_locations);
-    try std.testing.expect(found_cancel);
-    try std.testing.expect(found_terminate_threads);
-    try std.testing.expect(found_restart);
-}
-
-test "dispatch routes to new Phase 12 handlers" {
-    const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
-
-    // Each new tool should return "Unknown session" error (not "Unknown tool")
-    // because the dispatch found the handler, which then checked the session
-    const new_tools = [_][]const u8{
-        \\{"name":"debug_instruction_breakpoint","arguments":{"session_id":"fake","instruction_reference":"0x1000"}}
-        ,
-        \\{"name":"debug_step_in_targets","arguments":{"session_id":"fake","frame_id":0}}
-        ,
-        \\{"name":"debug_breakpoint_locations","arguments":{"session_id":"fake","source":"test.zig","line":1}}
-        ,
-        \\{"name":"debug_cancel","arguments":{"session_id":"fake"}}
-        ,
-        \\{"name":"debug_terminate_threads","arguments":{"session_id":"fake","thread_ids":[1]}}
-        ,
-        \\{"name":"debug_restart","arguments":{"session_id":"fake"}}
-        ,
-    };
-
-    for (new_tools) |tool_params| {
-        const params_parsed = try json.parseFromSlice(json.Value, allocator, tool_params, .{});
-        defer params_parsed.deinit();
-
-        const response = try mcp.handleRequest(allocator, "tools/call", params_parsed.value, null);
-        defer allocator.free(response);
-
-        const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-        defer parsed.deinit();
-
-        // Should get an error response with "Unknown session" (not "Unknown tool")
-        const err_obj = parsed.value.object.get("error").?.object;
-        try std.testing.expectEqualStrings("Unknown session", err_obj.get("message").?.string);
-        try std.testing.expectEqual(@as(i64, INVALID_PARAMS), err_obj.get("code").?.integer);
-    }
-}
-
-test "Phase 12 handlers return error for missing session" {
-    const allocator = std.testing.allocator;
-    var mcp = McpServer.init(allocator);
-    defer mcp.deinit();
-
-    // Test debug_instruction_breakpoint with nonexistent session
-    const params_str =
-        \\{"name":"debug_instruction_breakpoint","arguments":{"session_id":"nonexistent","instruction_reference":"0x4000"}}
-    ;
-    const params_parsed = try json.parseFromSlice(json.Value, allocator, params_str, .{});
-    defer params_parsed.deinit();
-
-    const response = try mcp.handleRequest(allocator, "tools/call", params_parsed.value, null);
-    defer allocator.free(response);
-
-    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
-    defer parsed.deinit();
-
-    const err_obj = parsed.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings("Unknown session", err_obj.get("message").?.string);
 }
 
 test "enriched debug_run schema includes granularity" {
