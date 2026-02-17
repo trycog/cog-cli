@@ -20,14 +20,17 @@ Persistent memory, code intelligence, and debugging for developers and AI agents
 
 ### Homebrew
 
-Install from this repository as a tap:
+Install from the official tap:
 
 ```sh
-brew tap bcardarella/cog-cli https://github.com/bcardarella/cog-cli
-brew install bcardarella/cog-cli/cog-cli
+brew install trycog/tap/cog
 ```
 
-This currently installs the latest `main` branch (HEAD formula).
+Install the latest `main` branch:
+
+```sh
+brew install --HEAD trycog/tap/cog
+```
 
 ### Prerequisites
 
