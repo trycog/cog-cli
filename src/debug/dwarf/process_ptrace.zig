@@ -327,14 +327,21 @@ pub const PtraceProcessControl = struct {
             const file = std.fs.openFileAbsolute(path, .{}) catch return error.TextBaseNotFound;
             defer file.close();
 
-            var buf: [4096]u8 = undefined;
+            // Read the entire maps file into a stack buffer and parse lines manually.
+            var buf: [16384]u8 = undefined;
             var read_buf: [4096]u8 = undefined;
-            while (true) {
-                const line = file.reader(&read_buf).readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    else => return error.TextBaseNotFound,
-                };
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = file.read(&read_buf) catch return error.TextBaseNotFound;
+                if (n == 0) break;
+                @memcpy(buf[total..][0..n], read_buf[0..n]);
+                total += n;
+            }
+            const data = buf[0..total];
 
+            // Parse line by line
+            var iter = std.mem.splitScalar(u8, data, '\n');
+            while (iter.next()) |line| {
                 // Format: <start>-<end> <perms> <offset> <dev> <inode> <pathname>
                 // Example: 00400000-00452000 r-xp 00000000 08:02 173521 /usr/bin/foo
                 // We want the first mapping with execute permission ('x' in perms)
