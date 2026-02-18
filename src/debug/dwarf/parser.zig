@@ -376,6 +376,28 @@ pub fn freeAbbrevTable(entries: []AbbrevEntry, allocator: std.mem.Allocator) voi
     allocator.free(entries);
 }
 
+/// Cache for parsed abbreviation tables, keyed by byte offset into .debug_abbrev.
+/// Avoids re-parsing the same abbreviation table on every parseScopedVariables call.
+pub const AbbrevCache = struct {
+    map: std.AutoHashMapUnmanaged(u64, []AbbrevEntry) = .empty,
+
+    pub fn getOrParse(self: *AbbrevCache, data: []const u8, abbrev_offset: u64, allocator: std.mem.Allocator) ?[]AbbrevEntry {
+        if (self.map.get(abbrev_offset)) |entries| return entries;
+        const abbrev_data = if (abbrev_offset < data.len) data[@intCast(abbrev_offset)..] else return null;
+        const entries = parseAbbrevTable(abbrev_data, allocator) catch return null;
+        self.map.put(allocator, abbrev_offset, entries) catch {};
+        return entries;
+    }
+
+    pub fn deinit(self: *AbbrevCache, allocator: std.mem.Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            freeAbbrevTable(entry.value_ptr.*, allocator);
+        }
+        self.map.deinit(allocator);
+    }
+};
+
 // ── Line Program Parser ────────────────────────────────────────────────
 
 pub const LineProgramHeader = struct {
@@ -2738,6 +2760,7 @@ pub fn parseScopedVariables(
     extra: ExtraSections,
     target_pc: u64,
     allocator: std.mem.Allocator,
+    abbrev_cache: ?*AbbrevCache,
 ) !ScopedVariableResult {
     var variables: std.ArrayListUnmanaged(VariableInfo) = .empty;
     errdefer {
@@ -2802,13 +2825,16 @@ pub fn parseScopedVariables(
             pos += 1;
         }
 
-        const abbrev_data = if (abbrev_offset < debug_abbrev.len)
-            debug_abbrev[@intCast(abbrev_offset)..]
-        else
-            continue;
-
-        const abbrevs = parseAbbrevTable(abbrev_data, allocator) catch continue;
-        defer freeAbbrevTable(abbrevs, allocator);
+        const abbrevs = if (abbrev_cache) |cache|
+            cache.getOrParse(debug_abbrev, abbrev_offset, allocator) orelse continue
+        else blk: {
+            const abbrev_data = if (abbrev_offset < debug_abbrev.len)
+                debug_abbrev[@intCast(abbrev_offset)..]
+            else
+                continue;
+            break :blk parseAbbrevTable(abbrev_data, allocator) catch continue;
+        };
+        defer if (abbrev_cache == null) freeAbbrevTable(abbrevs, allocator);
 
         // DWARF 5: extract str_offsets_base and addr_base from the CU DIE
         var str_offsets_base: u64 = 0;
