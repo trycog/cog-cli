@@ -451,16 +451,36 @@ pub fn installExtension(allocator: std.mem.Allocator, git_url: []const u8) !void
         },
     };
 
-    // Clone the repo
-    const clone_args: []const []const u8 = &.{ "git", "clone", git_url, ext_dir };
-    var clone = std.process.Child.init(clone_args, allocator);
-    clone.stderr_behavior = .Inherit;
-    clone.stdout_behavior = .Inherit;
-    try clone.spawn();
-    const clone_term = try clone.wait();
-    if (clone_term.Exited != 0) {
-        printErr("error: git clone failed\n");
-        return error.Explained;
+    // Clone or update the repo
+    const already_exists = blk: {
+        std.fs.accessAbsolute(ext_dir, .{}) catch break :blk false;
+        break :blk true;
+    };
+
+    if (already_exists) {
+        // Pull latest changes
+        const pull_args: []const []const u8 = &.{ "git", "pull" };
+        var pull = std.process.Child.init(pull_args, allocator);
+        pull.cwd = ext_dir;
+        pull.stderr_behavior = .Inherit;
+        pull.stdout_behavior = .Inherit;
+        try pull.spawn();
+        const pull_term = try pull.wait();
+        if (pull_term.Exited != 0) {
+            printErr("error: git pull failed\n");
+            return error.Explained;
+        }
+    } else {
+        const clone_args: []const []const u8 = &.{ "git", "clone", git_url, ext_dir };
+        var clone = std.process.Child.init(clone_args, allocator);
+        clone.stderr_behavior = .Inherit;
+        clone.stdout_behavior = .Inherit;
+        try clone.spawn();
+        const clone_term = try clone.wait();
+        if (clone_term.Exited != 0) {
+            printErr("error: git clone failed\n");
+            return error.Explained;
+        }
     }
 
     // Read manifest
