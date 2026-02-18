@@ -328,8 +328,9 @@ pub const PtraceProcessControl = struct {
             defer file.close();
 
             var buf: [4096]u8 = undefined;
+            var read_buf: [4096]u8 = undefined;
             while (true) {
-                const line = file.reader().readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
+                const line = file.reader(&read_buf).readUntilDelimiter(&buf, '\n') catch |err| switch (err) {
                     error.EndOfStream => break,
                     else => return error.TextBaseNotFound,
                 };
