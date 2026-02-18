@@ -109,11 +109,23 @@ pub const MachProcessControl = struct {
     stderr_pipe_read: ?posix.fd_t = null,
     cached_task: ?std.c.mach_port_name_t = null,
     cached_thread: ?std.c.mach_port_t = null,
+    pending_stdout: ?[]const u8 = null,
+    pending_stderr: ?[]const u8 = null,
+    alloc: ?std.mem.Allocator = null,
 
     /// Read available data from the captured stdout pipe.
     /// Returns null if no stdout pipe is configured.
     /// Caller owns the returned memory.
     pub fn readCapturedOutput(self: *MachProcessControl, allocator: std.mem.Allocator) !?[]const u8 {
+        // Return pending data drained at process exit first
+        if (self.pending_stdout) |pending| {
+            self.pending_stdout = null;
+            // Re-allocate with caller's allocator so they own it
+            const copy = try allocator.alloc(u8, pending.len);
+            @memcpy(copy, pending);
+            if (self.alloc) |a| a.free(pending);
+            return copy;
+        }
         const fd = self.stdout_pipe_read orelse return null;
         var buf = try allocator.alloc(u8, 4096);
         errdefer allocator.free(buf);
@@ -136,6 +148,22 @@ pub const MachProcessControl = struct {
         @memcpy(exact, buf[0..n]);
         allocator.free(buf);
         return exact;
+    }
+
+    /// Drain all remaining data from a pipe FD into a single allocation.
+    fn drainPipe(fd: posix.fd_t, allocator: std.mem.Allocator) ?[]const u8 {
+        var result = std.ArrayListUnmanaged(u8).empty;
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = posix.read(fd, &buf) catch break;
+            if (n == 0) break;
+            result.appendSlice(allocator, buf[0..n]) catch break;
+        }
+        if (result.items.len == 0) {
+            result.deinit(allocator);
+            return null;
+        }
+        return result.toOwnedSlice(allocator) catch null;
     }
 
     pub fn spawn(self: *MachProcessControl, allocator: std.mem.Allocator, program: []const u8, args: []const []const u8) !void {
@@ -200,6 +228,7 @@ pub const MachProcessControl = struct {
 
         self.pid = pid;
         self.is_running = false;
+        self.alloc = allocator;
 
         // Parent: close write ends, keep read ends, set non-blocking
         if (stdout_pipe) |p| {
@@ -253,11 +282,18 @@ pub const MachProcessControl = struct {
                 self.pid = null;
                 self.cached_task = null;
                 self.cached_thread = null;
+                // Drain remaining pipe data before closing
                 if (self.stdout_pipe_read) |fd| {
+                    if (self.alloc) |a| {
+                        self.pending_stdout = drainPipe(fd, a);
+                    }
                     posix.close(fd);
                     self.stdout_pipe_read = null;
                 }
                 if (self.stderr_pipe_read) |fd| {
+                    if (self.alloc) |a| {
+                        self.pending_stderr = drainPipe(fd, a);
+                    }
                     posix.close(fd);
                     self.stderr_pipe_read = null;
                 }
@@ -268,11 +304,18 @@ pub const MachProcessControl = struct {
                 self.pid = null;
                 self.cached_task = null;
                 self.cached_thread = null;
+                // Drain remaining pipe data before closing
                 if (self.stdout_pipe_read) |fd| {
+                    if (self.alloc) |a| {
+                        self.pending_stdout = drainPipe(fd, a);
+                    }
                     posix.close(fd);
                     self.stdout_pipe_read = null;
                 }
                 if (self.stderr_pipe_read) |fd| {
+                    if (self.alloc) |a| {
+                        self.pending_stderr = drainPipe(fd, a);
+                    }
                     posix.close(fd);
                     self.stderr_pipe_read = null;
                 }
@@ -555,13 +598,32 @@ pub const MachProcessControl = struct {
 
     pub fn kill(self: *MachProcessControl) !void {
         if (self.pid) |pid| {
-            // Resume traced-stopped process so signals can be delivered
-            if (!self.is_running and builtin.os.tag == .macos) {
-                const PT_CONTINUE = 7;
-                _ = std.c.ptrace(PT_CONTINUE, pid, @ptrFromInt(1), 0);
+            if (builtin.os.tag == .macos) {
+                // PT_KILL atomically sends SIGKILL and resumes a ptrace-stopped process.
+                // This avoids the macOS deadlock where signals queue but don't deliver
+                // to stopped processes.
+                const PT_KILL = 8;
+                _ = std.c.ptrace(PT_KILL, pid, @ptrFromInt(1), 0);
+            } else {
+                posix.kill(pid, SIGKILL) catch {};
             }
-            posix.kill(pid, SIGKILL) catch {};
-            _ = posix.waitpid(pid, 0);
+
+            // Non-blocking reap with bounded retry to prevent daemon deadlock
+            var reaped = false;
+            for (0..20) |_| { // ~100ms max (20 * 5ms)
+                const result = posix.waitpid(pid, 1); // WNOHANG = 1
+                if (result.pid != 0) {
+                    reaped = true;
+                    break;
+                }
+                posix.nanosleep(0, 5_000_000); // 5ms
+            }
+            if (!reaped) {
+                // Final attempt: SIGKILL + blocking waitpid
+                posix.kill(pid, SIGKILL) catch {};
+                _ = posix.waitpid(pid, 0);
+            }
+
             self.pid = null;
             self.is_running = false;
             self.cached_task = null;
@@ -593,12 +655,18 @@ pub const MachProcessControl = struct {
     pub fn detach(self: *MachProcessControl) !void {
         if (self.pid) |pid| {
             if (builtin.os.tag == .macos) {
+                // Resume before detach so the process can run independently
+                if (!self.is_running) {
+                    const PT_CONTINUE = 7;
+                    _ = std.c.ptrace(PT_CONTINUE, pid, @ptrFromInt(1), 0);
+                }
                 const PT_DETACH = 11;
                 _ = std.c.ptrace(PT_DETACH, pid, null, 0);
             }
-            // Do NOT null self.pid — let kill() in deinit handle cleanup
-            // so the process is properly killed and reaped
+            self.pid = null; // We no longer own this process
             self.is_running = false;
+            self.cached_task = null;
+            self.cached_thread = null;
             // Close pipes since we are done with this session
             if (self.stdout_pipe_read) |fd| {
                 posix.close(fd);

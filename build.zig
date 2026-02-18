@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addTreeSitter(b, mod);
+    addCurl(b, mod, target, optimize);
 
     // Build options (version)
     const build_options = b.addOptions();
@@ -107,8 +108,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bench_query.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
+    addCurl(b, bench_exe.root_module, target, optimize);
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.step.dependOn(b.getInstallStep()); // ensure cog binary is built
     const bench_step = b.step("bench", "Run query benchmark");
@@ -122,8 +125,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/test_integration.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
+    addCurl(b, integ_exe.root_module, target, optimize);
     const integ_run = b.addRunArtifact(integ_exe);
     integ_run.step.dependOn(b.getInstallStep());
     const integ_step = b.step("test-integration", "Run integration tests");
@@ -192,6 +197,12 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFile(.{ .file = b.path("grammars/cpp/scanner.c"), .flags = c_flags });
 }
 
+/// Add libcurl (with mbedTLS and zlib) to a module via the zig-curl package.
+fn addCurl(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const curl_dep = b.dependency("curl", .{ .target = target, .optimize = optimize });
+    mod.addImport("curl", curl_dep.module("curl"));
+}
+
 fn addRelease(
     b: *std.Build,
     release_step: *std.Build.Step,
@@ -210,6 +221,7 @@ fn addRelease(
         .link_libc = true,
     });
     addTreeSitter(b, release_mod);
+    addCurl(b, release_mod, release_target, .ReleaseSafe);
 
     const release_options = b.addOptions();
     release_options.addOption([]const u8, "version", version);

@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="trycog/cog-cli"
+APP="cog"
+INSTALL_DIR="$HOME/.cog/bin"
+
+# Colors — cyan is the brand accent
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+usage() {
+    cat <<EOF
+Cog Installer
+
+Usage: install.sh [options]
+
+Options:
+    -h, --help              Display this help message
+    -v, --version <version> Install a specific version (e.g., 0.1.0)
+        --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
+
+Examples:
+    curl -fsSL https://raw.githubusercontent.com/trycog/cog-cli/main/install | bash
+    curl -fsSL https://raw.githubusercontent.com/trycog/cog-cli/main/install | bash -s -- --version 0.1.0
+EOF
+}
+
+requested_version=${VERSION:-}
+no_modify_path=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            if [[ -n "${2:-}" ]]; then
+                requested_version="$2"
+                shift 2
+            else
+                echo -e "${RED}Error: --version requires a version argument${NC}"
+                exit 1
+            fi
+            ;;
+        --no-modify-path)
+            no_modify_path=true
+            shift
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown option '$1'${NC}" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Detect OS
+raw_os=$(uname -s)
+case "$raw_os" in
+    Darwin*) os="darwin" ;;
+    Linux*)  os="linux" ;;
+    *)
+        echo -e "${RED}Error: Unsupported operating system: $raw_os${NC}"
+        exit 1
+        ;;
+esac
+
+# Detect architecture
+arch=$(uname -m)
+case "$arch" in
+    aarch64|arm64) arch="arm64" ;;
+    x86_64)        arch="x86_64" ;;
+    *)
+        echo -e "${RED}Error: Unsupported architecture: $arch${NC}"
+        exit 1
+        ;;
+esac
+
+# On macOS x86_64, check for Rosetta — prefer native arm64
+if [ "$os" = "darwin" ] && [ "$arch" = "x86_64" ]; then
+    rosetta=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
+    if [ "$rosetta" = "1" ]; then
+        arch="arm64"
+    fi
+fi
+
+target="$os-$arch"
+filename="cog-${target}.tar.gz"
+
+# Ensure tar is available
+if ! command -v tar >/dev/null 2>&1; then
+    echo -e "${RED}Error: 'tar' is required but not installed${NC}"
+    exit 1
+fi
+
+# Resolve version
+if [ -z "$requested_version" ]; then
+    specific_version=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" \
+        | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+    if [ -z "$specific_version" ]; then
+        echo -e "${RED}Error: Failed to fetch latest version${NC}"
+        exit 1
+    fi
+    url="https://github.com/$REPO/releases/latest/download/$filename"
+else
+    # Strip leading 'v' if present
+    requested_version="${requested_version#v}"
+    specific_version="$requested_version"
+
+    # Verify the release exists
+    http_status=$(curl -sI -o /dev/null -w "%{http_code}" \
+        "https://github.com/$REPO/releases/tag/v${requested_version}")
+    if [ "$http_status" = "404" ]; then
+        echo -e "${RED}Error: Release v${requested_version} not found${NC}"
+        echo -e "${DIM}Available releases: https://github.com/$REPO/releases${NC}"
+        exit 1
+    fi
+    url="https://github.com/$REPO/releases/download/v${requested_version}/$filename"
+fi
+
+# Check if already installed at this version
+if command -v cog >/dev/null 2>&1; then
+    installed_version=$(cog --version 2>/dev/null || echo "")
+    if [ "$installed_version" = "$specific_version" ]; then
+        echo -e "${DIM}cog v${specific_version} is already installed${NC}"
+        exit 0
+    fi
+fi
+
+# Download and install
+echo -e "${DIM}Installing ${NC}${BOLD}cog${NC} ${DIM}v${specific_version} (${target})${NC}"
+
+tmp_dir="${TMPDIR:-/tmp}/cog_install_$$"
+mkdir -p "$tmp_dir"
+trap 'rm -rf "$tmp_dir"' EXIT
+
+curl -#fL -o "$tmp_dir/$filename" "$url"
+
+tar -xzf "$tmp_dir/$filename" -C "$tmp_dir"
+
+mkdir -p "$INSTALL_DIR"
+mv "$tmp_dir/cog" "$INSTALL_DIR/cog"
+chmod 755 "$INSTALL_DIR/cog"
+
+# Modify PATH in shell config
+add_to_path() {
+    local config_file=$1
+    local command=$2
+
+    if grep -Fxq "$command" "$config_file" 2>/dev/null; then
+        return 0
+    elif [[ -w "$config_file" ]]; then
+        echo -e "\n# cog" >> "$config_file"
+        echo "$command" >> "$config_file"
+        echo -e "${DIM}Added to \$PATH in ${NC}${config_file}"
+    else
+        echo -e "${DIM}Manually add to ${NC}${config_file}${DIM}:${NC}"
+        echo -e "  $command"
+    fi
+}
+
+if [[ "$no_modify_path" != "true" ]] && [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+    XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+    current_shell=$(basename "${SHELL:-bash}")
+
+    case $current_shell in
+        fish) config_files="$HOME/.config/fish/config.fish" ;;
+        zsh)  config_files="${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash) config_files="$HOME/.bashrc $HOME/.bash_profile" ;;
+        *)    config_files="$HOME/.bashrc $HOME/.bash_profile" ;;
+    esac
+
+    config_file=""
+    for file in $config_files; do
+        if [[ -f "$file" ]]; then
+            config_file="$file"
+            break
+        fi
+    done
+
+    if [[ -z "$config_file" ]]; then
+        echo -e "${DIM}Add to your PATH:${NC}"
+        echo -e "  export PATH=$INSTALL_DIR:\$PATH"
+    else
+        case $current_shell in
+            fish) add_to_path "$config_file" "fish_add_path $INSTALL_DIR" ;;
+            *)    add_to_path "$config_file" "export PATH=$INSTALL_DIR:\$PATH" ;;
+        esac
+    fi
+fi
+
+# GitHub Actions support
+if [ -n "${GITHUB_ACTIONS-}" ] && [ "${GITHUB_ACTIONS}" = "true" ]; then
+    echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+fi
+
+# Success
+echo ""
+echo -e "${CYAN}  ${BOLD}┌─┐┌─┐┌─┐${NC}"
+echo -e "${CYAN}  ${BOLD}│  │ ││ ┐${NC}"
+echo -e "${CYAN}  ${BOLD}└─┘└─┘└─┘${NC}"
+echo -e "${DIM}  Memory for AI agents${NC}"
+echo ""
+echo -e "${DIM}Installed ${NC}${BOLD}cog v${specific_version}${NC}${DIM} to ${NC}${INSTALL_DIR}/cog"
+echo ""
+echo -e "${DIM}To get started:${NC}"
+echo ""
+echo -e "  cd ${DIM}<project>${NC}"
+echo -e "  cog init"
+echo ""
+echo -e "${DIM}Documentation: ${NC}https://github.com/$REPO"
+echo ""

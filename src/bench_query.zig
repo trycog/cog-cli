@@ -379,37 +379,61 @@ fn parseOpenRouterResponse(allocator: std.mem.Allocator, body: []const u8) !Pars
 // ── HTTP Client ────────────────────────────────────────────────────────
 
 fn openrouterPost(allocator: std.mem.Allocator, api_key: []const u8, body: []const u8) ![]const u8 {
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_value);
+    const curl_mod = @import("curl").libcurl;
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth_header);
 
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var response_aw: Writer.Allocating = .init(allocator);
-    errdefer response_aw.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = OPENROUTER_URL },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_value },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept", .value = "application/json" },
-        },
-        .response_writer = &response_aw.writer,
-    }) catch {
-        printErr("  error: failed to connect to OpenRouter\n");
+    const handle = curl_mod.curl_easy_init() orelse {
+        printErr("  error: failed to init curl\n");
         return error.HttpError;
     };
+    defer curl_mod.curl_easy_cleanup(handle);
 
-    if (result.status != .ok) {
-        const resp_body = response_aw.toOwnedSlice() catch return error.HttpError;
+    const url_z: [*:0]const u8 = OPENROUTER_URL;
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_URL, url_z);
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_POST, @as(c_long, 1));
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_POSTFIELDSIZE, @as(c_long, @intCast(body.len)));
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_POSTFIELDS, body.ptr);
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_ACCEPT_ENCODING, @as([*:0]const u8, ""));
+
+    const auth_z = try allocator.dupeZ(u8, auth_header);
+    defer allocator.free(auth_z);
+    var header_list: ?*curl_mod.struct_curl_slist = null;
+    header_list = curl_mod.curl_slist_append(header_list, auth_z.ptr);
+    header_list = curl_mod.curl_slist_append(header_list, "Content-Type: application/json");
+    header_list = curl_mod.curl_slist_append(header_list, "Accept: application/json");
+    defer if (header_list) |hl| curl_mod.curl_slist_free_all(hl);
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_HTTPHEADER, header_list);
+
+    const WriteData = struct { list: std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, err: bool };
+    var write_data = WriteData{ .list = .empty, .alloc = allocator, .err = false };
+    const write_cb = struct {
+        fn cb(ptr: [*]const u8, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
+            const d: *WriteData = @ptrCast(@alignCast(userdata));
+            const total = size * nmemb;
+            d.list.appendSlice(d.alloc, ptr[0..total]) catch { d.err = true; return 0; };
+            return total;
+        }
+    }.cb;
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_WRITEFUNCTION, write_cb);
+    _ = curl_mod.curl_easy_setopt(handle, curl_mod.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(&write_data)));
+
+    const res = curl_mod.curl_easy_perform(handle);
+    if (res != curl_mod.CURLE_OK) {
+        write_data.list.deinit(allocator);
+        printErr("  error: failed to connect to OpenRouter\n");
+        return error.HttpError;
+    }
+
+    var status_code: c_long = 0;
+    _ = curl_mod.curl_easy_getinfo(handle, curl_mod.CURLINFO_RESPONSE_CODE, &status_code);
+
+    if (status_code != 200) {
+        const resp_body = write_data.list.toOwnedSlice(allocator) catch { write_data.list.deinit(allocator); return error.HttpError; };
         defer allocator.free(resp_body);
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "  error: HTTP status {d}\n", .{@intFromEnum(result.status)}) catch "  error: HTTP error\n";
+        const msg = std.fmt.bufPrint(&msg_buf, "  error: HTTP status {d}\n", .{status_code}) catch "  error: HTTP error\n";
         printErr(msg);
-        // Try to show error message from body
         if (json.parseFromSlice(json.Value, allocator, resp_body, .{})) |p| {
             defer p.deinit();
             if (p.value == .object) {
@@ -429,7 +453,7 @@ fn openrouterPost(allocator: std.mem.Allocator, api_key: []const u8, body: []con
         return error.HttpError;
     }
 
-    return response_aw.toOwnedSlice();
+    return write_data.list.toOwnedSlice(allocator);
 }
 
 // ── Tool Execution ─────────────────────────────────────────────────────

@@ -324,6 +324,9 @@ bash prompts/fixtures/setup.sh
 This copies the source files from `prompts/fixtures/` to `/tmp/` and compiles them with
 `cc -g -O0`. Run the setup script at the start of every session to ensure clean state.
 
+**Do NOT kill any running processes.** The daemon auto-starts on first `debug/send` use.
+Killing processes (e.g., `pkill`) can destroy the user's running dashboard or other sessions.
+
 ### Programs
 
 | Program | Source | Binary | Used by |

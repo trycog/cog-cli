@@ -127,6 +127,7 @@ pub const UnwindFrame = struct {
     file: []const u8,
     line: u32,
     frame_index: u32,
+    fp: u64 = 0,
 };
 
 pub const CieEntry = struct {
@@ -1167,6 +1168,7 @@ pub fn unwindStackFP(
             .file = if (loc) |l| l.file else "<unknown>",
             .line = if (loc) |l| l.line else 0,
             .frame_index = frame_idx,
+            .fp = fp,
         });
 
         // Stop at main or _start

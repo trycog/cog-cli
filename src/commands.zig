@@ -1314,7 +1314,7 @@ fn promptCreateBrain(
     };
     defer allocator.free(result.body);
 
-    if (result.status == .created or result.status == .ok) {
+    if (result.status_code == 201 or result.status_code == 200) {
         tui.checkmark();
         printErr("\n\n");
         return brain_name;

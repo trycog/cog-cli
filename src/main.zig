@@ -25,6 +25,10 @@ pub fn main() void {
 }
 
 fn mainInner() !void {
+    const curl = @import("cog").curl;
+    curl.globalInit();
+    defer curl.globalCleanup();
+
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

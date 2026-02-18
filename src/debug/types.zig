@@ -20,6 +20,7 @@ pub const StackFrame = struct {
     language: []const u8 = "",
     is_boundary: bool = false,
     address: u64 = 0,
+    fp: u64 = 0,
 
     pub fn jsonStringify(self: *const StackFrame, jw: anytype) !void {
         try jw.beginObject();

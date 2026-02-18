@@ -382,7 +382,19 @@ pub const PtraceProcessControl = struct {
     pub fn kill(self: *PtraceProcessControl) !void {
         if (self.pid) |pid| {
             posix.kill(pid, SIGKILL) catch {};
-            _ = posix.waitpid(pid, 0);
+            // Non-blocking reap with bounded retry
+            var reaped = false;
+            for (0..20) |_| { // ~100ms max (20 * 5ms)
+                const result = posix.waitpid(pid, 1); // WNOHANG = 1
+                if (result.pid != 0) {
+                    reaped = true;
+                    break;
+                }
+                posix.nanosleep(0, 5_000_000); // 5ms
+            }
+            if (!reaped) {
+                _ = posix.waitpid(pid, 0); // final blocking attempt
+            }
             self.pid = null;
             self.is_running = false;
         }
@@ -406,8 +418,7 @@ pub const PtraceProcessControl = struct {
             if (builtin.os.tag == .linux) {
                 _ = std.os.linux.ptrace(PTRACE_DETACH, pid, 0, 0, 0);
             }
-            // Do NOT null self.pid — let kill() in deinit handle cleanup
-            // so the process is properly killed and reaped
+            self.pid = null; // We no longer own this process
             self.is_running = false;
         }
     }

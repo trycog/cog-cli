@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const Writer = std.io.Writer;
+const curl = @import("curl.zig");
 
 pub const ClientError = error{
     Explained,
@@ -30,44 +31,25 @@ pub fn post(
     body: []const u8,
 ) ![]const u8 {
     // Build auth header
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_value);
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth_header);
 
-    // Make HTTP request
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var response_aw: Writer.Allocating = .init(allocator);
-    defer response_aw.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_value },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept", .value = "application/json" },
-        },
-        .response_writer = &response_aw.writer,
-    }) catch {
+    const result = curl.post(allocator, url, &.{
+        auth_header,
+        "Content-Type: application/json",
+        "Accept: application/json",
+    }, body) catch {
         printErr("error: failed to connect to ");
         printErr(url);
         printErr("\n");
         return error.Explained;
     };
 
-    if (result.status != .ok and result.status != .created) {
-        // Try to parse error response body for a message
-        const response_body = response_aw.toOwnedSlice() catch {
-            var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "error: HTTP status {d}\n", .{@intFromEnum(result.status)}) catch "error: HTTP error\n";
-            printErr(msg);
-            return error.Explained;
-        };
-        defer allocator.free(response_body);
+    defer allocator.free(result.body);
 
-        if (json.parseFromSlice(json.Value, allocator, response_body, .{})) |parsed| {
+    if (result.status_code != 200 and result.status_code != 201) {
+
+        if (json.parseFromSlice(json.Value, allocator, result.body, .{})) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 if (parsed.value.object.get("error")) |err_val| {
@@ -86,19 +68,16 @@ pub fn post(
         } else |_| {}
 
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "error: HTTP status {d}\n", .{@intFromEnum(result.status)}) catch "error: HTTP error\n";
+        const msg = std.fmt.bufPrint(&msg_buf, "error: HTTP status {d}\n", .{result.status_code}) catch "error: HTTP error\n";
         printErr(msg);
         return error.Explained;
     }
 
-    const response_body = try response_aw.toOwnedSlice();
-    defer allocator.free(response_body);
-
-    return parseResponse(allocator, response_body);
+    return parseResponse(allocator, result.body);
 }
 
 pub const RawResponse = struct {
-    status: std.http.Status,
+    status_code: u16,
     body: []const u8,
 };
 
@@ -108,76 +87,51 @@ pub fn postRaw(
     api_key: []const u8,
     body: []const u8,
 ) !RawResponse {
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_value);
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth_header);
 
-    var client: std.http.Client = .{ .allocator = allocator };
-    defer client.deinit();
-
-    var response_aw: Writer.Allocating = .init(allocator);
-    errdefer response_aw.deinit();
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_value },
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept", .value = "application/json" },
-        },
-        .response_writer = &response_aw.writer,
-    }) catch {
+    const result = curl.post(allocator, url, &.{
+        auth_header,
+        "Content-Type: application/json",
+        "Accept: application/json",
+    }, body) catch {
         return error.HttpError;
     };
 
     return .{
-        .status = result.status,
-        .body = try response_aw.toOwnedSlice(),
+        .status_code = result.status_code,
+        .body = result.body,
     };
 }
 
 pub fn httpGetPublic(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
-    var http_client: std.http.Client = .{ .allocator = allocator };
-    defer http_client.deinit();
+    const result = curl.get(allocator, url, &.{}) catch return error.HttpError;
+    errdefer allocator.free(result.body);
 
-    var response_aw: Writer.Allocating = .init(allocator);
-    defer response_aw.deinit();
+    if (result.status_code != 200) {
+        allocator.free(result.body);
+        return error.HttpError;
+    }
 
-    const result = http_client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .response_writer = &response_aw.writer,
-    }) catch return error.HttpError;
-
-    if (result.status != .ok) return error.HttpError;
-
-    return response_aw.toOwnedSlice();
+    return result.body;
 }
 
 pub fn httpGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8) ![]const u8 {
-    const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_value);
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth_header);
 
-    var http_client: std.http.Client = .{ .allocator = allocator };
-    defer http_client.deinit();
-
-    var response_aw: Writer.Allocating = .init(allocator);
-    defer response_aw.deinit();
-
-    const result = http_client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .extra_headers = &.{
-            .{ .name = "Authorization", .value = auth_value },
-            .{ .name = "Accept", .value = "application/json" },
-        },
-        .response_writer = &response_aw.writer,
+    const result = curl.get(allocator, url, &.{
+        auth_header,
+        "Accept: application/json",
     }) catch return error.HttpError;
+    errdefer allocator.free(result.body);
 
-    if (result.status != .ok) return error.HttpError;
+    if (result.status_code != 200) {
+        allocator.free(result.body);
+        return error.HttpError;
+    }
 
-    return response_aw.toOwnedSlice();
+    return result.body;
 }
 
 fn parseResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {

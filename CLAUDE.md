@@ -207,6 +207,8 @@ For predicates, hub node patterns, staleness verification, consolidation guidanc
 **RECALL → WORK+RECORD → REINFORCE → CONSOLIDATE.** Skipping recall wastes time rediscovering known solutions. Deferring recording loses details while they're fresh. Skipping reinforcement loses the higher-level lesson. Skipping consolidation lets memories decay within 24 hours. Every step exists because the alternative is measurably worse.
 </cog>
 
+**No MCP.** Cog does not use MCP and never will. Do not propose, add, or reference MCP servers, MCP tools, or MCP protocol in this project.
+
 ## Release Process
 
 When the user says "release" (or similar), follow this procedure:

@@ -11,6 +11,7 @@ pub const paths = @import("paths.zig");
 pub const extensions = @import("extensions.zig");
 pub const help_text = @import("help_text.zig");
 pub const debug = @import("debug.zig");
+pub const curl = @import("curl.zig");
 pub const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
 
 test {
@@ -27,5 +28,6 @@ test {
     _ = extensions;
     _ = help_text;
     _ = debug;
+    _ = curl;
     _ = tree_sitter_indexer;
 }

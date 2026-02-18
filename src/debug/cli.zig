@@ -12,6 +12,7 @@ const ArgKind = enum {
     positional_int, // next positional → integer field
     positional_file_line, // "path:N" → sets file + line fields
     flag_string, // --name value → string field
+    flag_string_list, // --name a,b → string array field (comma-separated)
     flag_int, // --name N → integer field
     flag_bool, // --name → true
     collect_strings, // remaining positionals → string array
@@ -119,7 +120,7 @@ const cli_tools = [_]CliToolDef{
         .description = "Set an exception breakpoint",
         .args = &.{
             .{ .kind = .flag_string, .flag = "--session", .json_name = "session_id", .description = "Session ID" },
-            .{ .kind = .flag_string, .flag = "--filters", .json_name = "filters", .description = "Exception filters (comma-separated)" },
+            .{ .kind = .flag_string_list, .flag = "--filters", .json_name = "filters", .description = "Exception filters (comma-separated)" },
         },
     },
     .{
@@ -641,6 +642,22 @@ fn parseAndBuildRequest(allocator: std.mem.Allocator, def: *const CliToolDef, ar
                     if (flag_values.get(flag)) |val| {
                         try jw.objectField(arg_def.json_name);
                         try jw.write(val);
+                    }
+                }
+            },
+            .flag_string_list => {
+                if (arg_def.flag) |flag| {
+                    if (flag_values.get(flag)) |val| {
+                        try jw.objectField(arg_def.json_name);
+                        try jw.beginArray();
+                        var it = std.mem.splitScalar(u8, val, ',');
+                        while (it.next()) |item| {
+                            const trimmed = std.mem.trim(u8, item, " ");
+                            if (trimmed.len > 0) {
+                                try jw.write(trimmed);
+                            }
+                        }
+                        try jw.endArray();
                     }
                 }
             },

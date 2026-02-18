@@ -747,10 +747,47 @@ pub const DwarfEngine = struct {
                             try self.process.singleStep();
                             return self.waitAndHandleStop();
                         };
+                        // Also set a safety-net breakpoint at the return address.
+                        // If the current line calls a function, execution enters the callee
+                        // and misses the next-line BP. The return-address BP catches it
+                        // when the callee returns.
+                        var has_ret_bp = false;
+                        const ret_addr = self.getReturnAddress(regs) catch null;
+                        if (ret_addr) |ra| {
+                            if (ra != next_addr) {
+                                const ret_id = self.bp_manager.setTemporary(ra) catch null;
+                                if (ret_id) |rid| {
+                                    self.bp_manager.writeBreakpoint(rid, &self.process) catch {};
+                                    has_ret_bp = true;
+                                }
+                            }
+                        }
                         try self.process.continueExecution();
                         const result = try self.waitAndHandleStop();
-                        // Clean up temporary breakpoints
                         self.bp_manager.cleanupTemporary(&self.process);
+                        // If we stopped at the return address (not the next line),
+                        // advance past the return value store to the next source line
+                        // (Phase 2, same pattern as step_out).
+                        if (has_ret_bp) {
+                            const stop_reason = result.stop_reason;
+                            if (stop_reason == .breakpoint or stop_reason == .step) {
+                                const post_regs = self.process.readRegisters() catch return result;
+                                const post_line = self.getLineForPC(post_regs.pc);
+                                const next_line = self.getLineForPC(next_addr);
+                                // If we didn't land on the expected next line, we hit the return BP
+                                if (post_line == null or next_line == null or post_line.? != next_line.?) {
+                                    self.stepping_past_bp = null;
+                                    if (self.findNextLineAddress(post_regs.pc)) |phase2_addr| {
+                                        const tmp2_id = self.bp_manager.setTemporary(phase2_addr) catch return result;
+                                        self.bp_manager.writeBreakpoint(tmp2_id, &self.process) catch return result;
+                                        self.process.continueExecution() catch return result;
+                                        const phase2_result = self.waitAndHandleStop() catch return result;
+                                        self.bp_manager.cleanupTemporary(&self.process);
+                                        return phase2_result;
+                                    }
+                                }
+                            }
+                        }
                         return result;
                     }
                 }
@@ -1332,6 +1369,7 @@ pub const DwarfEngine = struct {
                 .source = uf.file,
                 .line = uf.line,
                 .address = uf.address,
+                .fp = uf.fp,
             });
             next_id += 1;
         }
@@ -1881,30 +1919,43 @@ pub const DwarfEngine = struct {
             filtered_vars = filtered_buf.items;
         }
 
-        // 7. If no expression (or variable_ref request), return all variables in the requested scope
+        // 7. Adjust registers for target frame — use frame's FP for parent frame inspection
+        var frame_regs = regs;
+        if (request.frame_id) |frame_id| {
+            if (frame_id > 0) {
+                for (self.cached_stack_trace) |frame| {
+                    if (frame.id == frame_id and frame.fp != 0) {
+                        frame_regs.fp = frame.fp;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 8. If no expression (or variable_ref request), return all variables in the requested scope
         if (is_variable_ref_request) {
-            return self.buildScopeResult(filtered_vars, regs, scoped.frame_base_expr, allocator);
+            return self.buildScopeResult(filtered_vars, frame_regs, scoped.frame_base_expr, allocator);
         }
         const expr_str = request.expression orelse {
-            return self.buildScopeResult(filtered_vars, regs, scoped.frame_base_expr, allocator);
+            return self.buildScopeResult(filtered_vars, frame_regs, scoped.frame_base_expr, allocator);
         };
         if (expr_str.len == 0) {
-            return self.buildScopeResult(filtered_vars, regs, scoped.frame_base_expr, allocator);
+            return self.buildScopeResult(filtered_vars, frame_regs, scoped.frame_base_expr, allocator);
         }
 
         if (filtered_vars.len == 0) {
             return .{ .result = "<no variables in scope>", .@"type" = "" };
         }
 
-        // 8. Build register adapter
-        var reg_adapter = RegisterAdapter{ .regs = regs };
+        // 9. Build register adapter
+        var reg_adapter = RegisterAdapter{ .regs = frame_regs };
         const reg_provider = reg_adapter.provider();
 
-        // 9. Build memory adapter
+        // 10. Build memory adapter
         var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
-        // 10. Evaluate frame base expression
+        // 11. Evaluate frame base expression
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
             const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
             break :blk switch (fb_result) {
@@ -1915,7 +1966,7 @@ pub const DwarfEngine = struct {
             };
         } else null;
 
-        // 11. Evaluate the expression
+        // 12. Evaluate the expression
         return evaluateExpression(
             expr_str,
             filtered_vars,
@@ -3410,14 +3461,10 @@ pub const DwarfEngine = struct {
 
     fn engineTerminate(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        if (self.process.pid) |pid| {
-            // Send SIGTERM for graceful termination (vs SIGKILL in kill)
-            std.posix.kill(pid, 15) catch {}; // 15 = SIGTERM
-            // Wait for process to exit
-            _ = std.posix.waitpid(pid, 0);
-            self.process.pid = null;
-            self.process.is_running = false;
-        }
+        // Use process.kill() which handles ptrace-stopped processes correctly.
+        // SIGTERM can't be delivered to a ptrace-stopped process on macOS,
+        // causing the same deadlock as SIGKILL without PT_KILL.
+        try self.process.kill();
         self.launched = false;
     }
 
