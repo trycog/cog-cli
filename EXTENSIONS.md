@@ -211,7 +211,7 @@ Both drivers expose the same interface to the user: launch, breakpoints, steppin
 
 ### Debug launch flow
 
-When `cog debug/send_launch` is called with a program path:
+When `cog debug/send launch` is called with a program path:
 
 1. Cog determines the file extension of the target program
 2. Looks up the extension (installed first, then built-in) for that file type

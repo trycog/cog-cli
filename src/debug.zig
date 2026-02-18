@@ -53,8 +53,8 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     if (std.mem.eql(u8, subcmd, "debug/status")) return debugStatus(allocator, args);
     if (std.mem.eql(u8, subcmd, "debug/kill")) return debugKill(args);
 
-    // Route debug/send_* commands to CLI dispatch
-    if (cli.isCliCommand(subcmd)) return cli.dispatch(allocator, subcmd, args);
+    // Route debug/send to CLI dispatch
+    if (std.mem.eql(u8, subcmd, "debug/send")) return cli.dispatch(allocator, args);
 
     printErr("error: unknown command '");
     printErr(subcmd);

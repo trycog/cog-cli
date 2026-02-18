@@ -517,14 +517,14 @@ pub const debug_serve =
     bold ++ "  cog debug/serve" ++ reset ++ "\n"
     ++ "\n"
     ++ "  Start the debug daemon. Listens on a Unix domain socket and\n"
-    ++ "  dispatches debug tool calls from CLI commands (debug/send_*).\n"
+    ++ "  dispatches debug tool calls from debug/send.\n"
     ++ "\n"
     ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
     ++ "    cog debug/serve\n"
     ++ "\n"
     ++ cyan ++ bold ++ "  Transport" ++ reset ++ "\n"
     ++ "    Unix domain socket at /tmp/cog-debug-<uid>.sock.\n"
-    ++ "    Auto-started by debug/send_* commands when not running.\n"
+    ++ "    Auto-started by debug/send commands when not running.\n"
     ++ "\n"
 ;
 
