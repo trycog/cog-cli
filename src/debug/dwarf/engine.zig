@@ -2622,12 +2622,12 @@ pub const DwarfEngine = struct {
             0xCC => .{ .mnemonic = "int3", .len = 1 },
             0xC3 => .{ .mnemonic = "ret", .len = 1 },
             0x90 => .{ .mnemonic = "nop", .len = 1 },
-            0x50...0x57 => .{ .mnemonic = "push", .len = 1 },
+            0x55 => .{ .mnemonic = "push rbp", .len = 1 },
+            0x50...0x54, 0x56, 0x57 => .{ .mnemonic = "push", .len = 1 },
             0x58...0x5f => .{ .mnemonic = "pop", .len = 1 },
             0xE8 => .{ .mnemonic = "call", .len = 5 },
             0xE9 => .{ .mnemonic = "jmp", .len = 5 },
             0xEB => .{ .mnemonic = "jmp short", .len = 2 },
-            0x55 => .{ .mnemonic = "push rbp", .len = 1 },
             0x48 => blk: {
                 if (bytes.len < 2) break :blk .{ .mnemonic = "rex.w", .len = 1 };
                 break :blk switch (bytes[1]) {

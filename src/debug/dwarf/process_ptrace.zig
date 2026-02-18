@@ -67,7 +67,7 @@ pub const PtraceProcessControl = struct {
         const pid = try posix.fork();
         if (pid == 0) {
             if (builtin.os.tag == .linux) {
-                _ = std.os.linux.ptrace(.TRACEME, 0, 0, 0);
+                _ = std.os.linux.ptrace(.TRACEME, 0, 0, 0, 0);
             }
             posix.execvpeZ(prog_z.ptr, @ptrCast(argv.items.ptr), @ptrCast(std.c.environ)) catch {};
             std.posix.exit(127);
@@ -82,7 +82,7 @@ pub const PtraceProcessControl = struct {
     pub fn continueExecution(self: *PtraceProcessControl) !void {
         if (self.pid) |pid| {
             if (builtin.os.tag == .linux) {
-                _ = std.os.linux.ptrace(.CONT, pid, 0, 0);
+                _ = std.os.linux.ptrace(.CONT, pid, 0, 0, 0);
             }
             self.is_running = true;
         }
@@ -91,7 +91,7 @@ pub const PtraceProcessControl = struct {
     pub fn singleStep(self: *PtraceProcessControl) !void {
         if (self.pid) |pid| {
             if (builtin.os.tag == .linux) {
-                _ = std.os.linux.ptrace(.SINGLESTEP, pid, 0, 0);
+                _ = std.os.linux.ptrace(.SINGLESTEP, pid, 0, 0, 0);
             }
             self.is_running = true;
         }
@@ -124,7 +124,7 @@ pub const PtraceProcessControl = struct {
 
         if (builtin.os.tag == .linux) {
             var regs: UserRegsStruct = undefined;
-            const rc = std.os.linux.ptrace(.GETREGS, pid, 0, @intFromPtr(&regs));
+            const rc = std.os.linux.ptrace(.GETREGS, pid, 0, @intFromPtr(&regs), 0);
             if (rc != 0) return error.PtraceGetRegsFailed;
 
             var state = process_mach.RegisterState{};
@@ -175,7 +175,7 @@ pub const PtraceProcessControl = struct {
             // First read current registers so we preserve fields not in RegisterState
             // (orig_rax, cs, ss, segment bases, etc.)
             var kregs: UserRegsStruct = undefined;
-            var rc = std.os.linux.ptrace(.GETREGS, pid, 0, @intFromPtr(&kregs));
+            var rc = std.os.linux.ptrace(.GETREGS, pid, 0, @intFromPtr(&kregs), 0);
             if (rc != 0) return error.PtraceGetRegsFailed;
 
             // Map RegisterState back to kernel struct
@@ -198,7 +198,7 @@ pub const PtraceProcessControl = struct {
             kregs.rip = regs.pc;
             kregs.eflags = regs.flags;
 
-            rc = std.os.linux.ptrace(.SETREGS, pid, 0, @intFromPtr(&kregs));
+            rc = std.os.linux.ptrace(.SETREGS, pid, 0, @intFromPtr(&kregs), 0);
             if (rc != 0) return error.PtraceSetRegsFailed;
         }
     }
@@ -248,7 +248,7 @@ pub const PtraceProcessControl = struct {
                 var offset: usize = 0;
                 while (offset < size) {
                     const addr = address + offset;
-                    const rc = std.os.linux.ptrace(.PEEKDATA, pid, addr, 0);
+                    const rc = std.os.linux.ptrace(.PEEKDATA, pid, addr, 0, 0);
                     // PEEKDATA returns the word value in the return code
                     const word_bytes = std.mem.asBytes(&rc);
                     const remaining = size - offset;
@@ -283,16 +283,16 @@ pub const PtraceProcessControl = struct {
                     var word: usize = 0;
                     const word_bytes = std.mem.asBytes(&word);
                     @memcpy(word_bytes[0..word_size], data[offset..][0..word_size]);
-                    const rc = std.os.linux.ptrace(.POKEDATA, pid, addr, word);
+                    const rc = std.os.linux.ptrace(.POKEDATA, pid, addr, word, 0);
                     const signed_rc: isize = @bitCast(rc);
                     if (signed_rc != 0) return error.PtracePokeDataFailed;
                 } else {
                     // Partial word at the end: read-modify-write
-                    const existing = std.os.linux.ptrace(.PEEKDATA, pid, addr, 0);
+                    const existing = std.os.linux.ptrace(.PEEKDATA, pid, addr, 0, 0);
                     var word: usize = @bitCast(existing);
                     const word_bytes = std.mem.asBytes(&word);
                     @memcpy(word_bytes[0..remaining], data[offset..][0..remaining]);
-                    const rc = std.os.linux.ptrace(.POKEDATA, pid, addr, word);
+                    const rc = std.os.linux.ptrace(.POKEDATA, pid, addr, word, 0);
                     const signed_rc: isize = @bitCast(rc);
                     if (signed_rc != 0) return error.PtracePokeDataFailed;
                 }
@@ -364,17 +364,21 @@ pub const PtraceProcessControl = struct {
 
     pub fn attach(self: *PtraceProcessControl, pid: posix.pid_t) !void {
         if (builtin.os.tag == .linux) {
-            _ = std.os.linux.ptrace(.ATTACH, pid, 0, 0);
+            _ = std.os.linux.ptrace(.ATTACH, pid, 0, 0, 0);
         }
         self.pid = pid;
         self.is_running = false;
         _ = posix.waitpid(pid, WUNTRACED);
     }
 
+    pub fn readCapturedOutput(_: *PtraceProcessControl, _: std.mem.Allocator) !?[]const u8 {
+        return null;
+    }
+
     pub fn detach(self: *PtraceProcessControl) !void {
         if (self.pid) |pid| {
             if (builtin.os.tag == .linux) {
-                _ = std.os.linux.ptrace(.DETACH, pid, 0, 0);
+                _ = std.os.linux.ptrace(.DETACH, pid, 0, 0, 0);
             }
             self.pid = null;
             self.is_running = false;

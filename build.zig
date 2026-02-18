@@ -157,7 +157,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(b.path("grammars/rust"));
     mod.addIncludePath(b.path("grammars/cpp"));
 
-    const c_flags = &[_][]const u8{ "-std=c11", "-fno-exceptions" };
+    const c_flags = &[_][]const u8{ "-std=gnu11", "-fno-exceptions" };
 
     // Tree-sitter core (unity build via lib.c)
     mod.addCSourceFile(.{
