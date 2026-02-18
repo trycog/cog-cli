@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const config_mod = @import("cog").config;
 const commands = @import("cog").commands;
 const code_intel = @import("cog").code_intel;
@@ -6,6 +7,8 @@ const extensions_mod = @import("cog").extensions;
 const debug_mod = @import("cog").debug;
 const tui = @import("cog").tui;
 const help = @import("cog").help_text;
+
+const version = build_options.version;
 
 const Config = config_mod.Config;
 
@@ -43,6 +46,12 @@ fn mainInner() !void {
 
     const subcmd: []const u8 = args[1];
     const cmd_args = args[2..];
+
+    // Handle --version
+    if (std.mem.eql(u8, subcmd, "--version") or std.mem.eql(u8, subcmd, "-v")) {
+        printStdout(version);
+        return;
+    }
 
     // Handle --help at top level
     if (std.mem.eql(u8, subcmd, "--help") or std.mem.eql(u8, subcmd, "-h") or std.mem.eql(u8, subcmd, "help")) {
@@ -118,6 +127,9 @@ fn mainInner() !void {
 
 fn printHelp() void {
     tui.header();
+    printErr(dim ++ "  v");
+    printErr(version);
+    printErr(reset ++ "\n\n");
     printErr(
         bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n"
         ++ "\n"
@@ -249,6 +261,14 @@ fn resolveCommand(name: []const u8) ?CommandFn {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];
     }
     return null;
+}
+
+fn printStdout(msg: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    w.interface.writeAll(msg) catch {};
+    w.interface.writeByte('\n') catch {};
+    w.interface.flush() catch {};
 }
 
 fn printErr(msg: []const u8) void {

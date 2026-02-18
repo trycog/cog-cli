@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const version = "0.0.1";
+
 const tree_sitter_version = "v0.25.4";
 
 const GrammarSource = struct {
@@ -43,6 +45,10 @@ pub fn build(b: *std.Build) void {
     });
     addTreeSitter(b, mod);
 
+    // Build options (version)
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     // Executable
     const exe = b.addExecutable(.{
         .name = "cog",
@@ -52,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "cog", .module = mod },
+                .{ .name = "build_options", .module = build_options.createModule() },
             },
         }),
     });
@@ -204,6 +211,9 @@ fn addRelease(
     });
     addTreeSitter(b, release_mod);
 
+    const release_options = b.addOptions();
+    release_options.addOption([]const u8, "version", version);
+
     const release_exe = b.addExecutable(.{
         .name = "cog",
         .root_module = b.createModule(.{
@@ -212,6 +222,7 @@ fn addRelease(
             .optimize = .ReleaseSafe,
             .imports = &.{
                 .{ .name = "cog", .module = release_mod },
+                .{ .name = "build_options", .module = release_options.createModule() },
             },
         }),
     });
