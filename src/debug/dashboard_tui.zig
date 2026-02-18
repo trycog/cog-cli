@@ -7,6 +7,9 @@ const cyan = "\x1B[36m";
 const bold = "\x1B[1m";
 const dim = "\x1B[2m";
 const reset = "\x1B[0m";
+const bg_cyan = "\x1B[46m";
+const black = "\x1B[30m";
+const yellow = "\x1B[33m";
 
 // ── Unicode Glyphs ──────────────────────────────────────────────────────
 
@@ -1056,6 +1059,13 @@ pub const DashboardTui = struct {
     // ── Rendering ────────────────────────────────────────────────────
 
     fn render(self: *DashboardTui) void {
+        render_active = true;
+        render_len = 0;
+        defer {
+            flushRenderBuffer();
+            render_active = false;
+        }
+
         // Refresh terminal size
         const size = getTerminalSize();
         self.term_width = size.width;
@@ -1064,8 +1074,8 @@ pub const DashboardTui = struct {
         const w: usize = self.term_width;
         const h: usize = self.term_height;
 
-        // Clear screen and move to top
-        stderrWrite("\x1B[2J\x1B[H");
+        // Move cursor to top-left (no full clear — overwrite in place)
+        stderrWrite("\x1B[H");
 
         // Layout calculations
         const header_height: usize = 1; // session bar
@@ -1118,7 +1128,7 @@ pub const DashboardTui = struct {
             } else {
                 stderrWrite(dim ++ vv ++ reset);
             }
-            stderrWrite("\n");
+            stderrWrite("\x1B[K\n");
         }
 
         // ── Separator between main and log ──
@@ -1137,7 +1147,7 @@ pub const DashboardTui = struct {
     fn renderSessionBar(self: *const DashboardTui, w: usize) void {
         _ = w;
         if (self.session_count == 0) {
-            stderrWrite(dim ++ " Waiting for connections..." ++ reset ++ "\n");
+            stderrWrite(dim ++ " Waiting for connections..." ++ reset ++ "\x1B[K\n");
             return;
         }
         stderrWrite(" ");
@@ -1155,7 +1165,7 @@ pub const DashboardTui = struct {
                 stderrWrite("  " ++ dim ++ vv ++ reset ++ " ");
             }
         }
-        stderrWrite("\n");
+        stderrWrite("\x1B[K\n");
     }
 
     fn renderTopBorder(self: *const DashboardTui, source_width: usize, sidebar_width: usize, session: ?*const TuiSession) void {
@@ -1209,7 +1219,7 @@ pub const DashboardTui = struct {
             self.writeHorizontal(sidebar_width - sb_title_used);
         }
 
-        stderrWrite(reset ++ dim ++ tr ++ reset ++ "\n");
+        stderrWrite(reset ++ dim ++ tr ++ reset ++ "\x1B[K\n");
     }
 
     fn renderSourceRow(self: *const DashboardTui, row: usize, source_width: usize, session: ?*const TuiSession) void {
@@ -1241,11 +1251,6 @@ pub const DashboardTui = struct {
         const sl = &s.source_lines[line_idx];
         const is_current = (line_idx == s.source_current_idx);
 
-        // Build the line content into a buffer
-        // Format: " BP│NNNN → text" or " BP│NNNN   text"
-        var line_out: [512]u8 = undefined;
-        var pos: usize = 0;
-
         // Breakpoint marker (1 char visual)
         var has_bp = false;
         for (s.breakpoints[0..s.bp_count]) |*bp| {
@@ -1257,14 +1262,24 @@ pub const DashboardTui = struct {
             }
         }
 
+        // Current line: cyan background highlight across entire row
+        if (is_current) {
+            stderrWrite(bg_cyan ++ black);
+        }
+
         if (has_bp) {
-            // Write cyan bullet
-            stderrWrite(cyan ++ bullet_filled ++ reset);
+            if (is_current) {
+                stderrWrite(bullet_filled);
+            } else {
+                stderrWrite(cyan ++ bullet_filled ++ reset);
+            }
         } else {
             stderrWrite(" ");
         }
 
         // Line number (right-aligned to 4 chars)
+        var line_out: [512]u8 = undefined;
+        var pos: usize = 0;
         var num_buf: [12]u8 = undefined;
         const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{sl.line_num}) catch "?";
         if (num_str.len < 4) {
@@ -1275,43 +1290,36 @@ pub const DashboardTui = struct {
         @memcpy(line_out[pos..][0..num_str.len], num_str);
         pos += num_str.len;
 
-        // Current line marker or space
-        if (is_current) {
-            line_out[pos] = ' ';
-            pos += 1;
-            // We'll write the arrow with ANSI below
-        } else {
-            @memcpy(line_out[pos..][0..3], "   ");
-            pos += 3;
+        // Spacing after line number
+        @memcpy(line_out[pos..][0..3], "   ");
+        pos += 3;
+
+        // Write the gutter + line number
+        if (!is_current) {
+            stderrWrite(dim);
         }
-
-        // Write the gutter + line number portion
-        stderrWrite(dim);
         stderrWrite(line_out[0..pos]);
-        stderrWrite(reset);
-
-        if (is_current) {
-            stderrWrite(cyan ++ arrow_curr ++ reset ++ " ");
+        if (!is_current) {
+            stderrWrite(reset);
         }
 
         // Line text - remaining width after gutter
-        // Visual: BP(1) + num(4) + marker(3) = 8 chars used before text
+        // Visual: BP(1) + num(4) + space(3) = 8 chars used before text
         const gutter_used: usize = 8;
         const text_width: usize = if (source_width > gutter_used) source_width - gutter_used else 1;
         const line_text = sl.textSlice();
         const display_text = truncate(line_text, text_width);
 
-        if (is_current) {
-            stderrWrite(bold);
-            stderrWrite(display_text);
-            stderrWrite(reset);
-        } else {
-            stderrWrite(display_text);
-        }
+        stderrWrite(display_text);
 
-        // Pad to fill source_width
+        // Pad to fill source_width (important for background highlight)
         if (display_text.len < text_width) {
             self.writeSpaces(text_width - display_text.len);
+        }
+
+        // Reset after current line highlight
+        if (is_current) {
+            stderrWrite(reset);
         }
     }
 
@@ -1361,47 +1369,80 @@ pub const DashboardTui = struct {
         const item_idx = item_idx_raw;
 
         if (item_idx < stack_end) {
-            // Stack frame
+            // Stack frame — colored: index in dim, name in bold, location in dim
             const fi = item_idx;
             const f = &s.frames[fi];
-            var buf: [256]u8 = undefined;
             var fline_buf: [12]u8 = undefined;
             const fline_str = std.fmt.bufPrint(&fline_buf, "{d}", .{f.line}) catch "?";
             var idx_buf: [8]u8 = undefined;
             const idx_str = std.fmt.bufPrint(&idx_buf, "#{d}", .{fi}) catch "?";
 
-            const text = std.fmt.bufPrint(&buf, " {s}  {s}  {s}:{s}", .{
-                idx_str, truncate(f.nameSlice(), 16), truncate(f.sourceSlice(), 20), fline_str,
-            }) catch " (frame)";
-            self.writePadded(text, sidebar_width);
+            stderrWrite(" " ++ dim);
+            stderrWrite(idx_str);
+            stderrWrite(reset ++ "  " ++ cyan ++ bold);
+            stderrWrite(truncate(f.nameSlice(), 16));
+            stderrWrite(reset ++ "  " ++ dim);
+            stderrWrite(truncate(f.sourceSlice(), 20));
+            stderrWrite(":");
+            stderrWrite(fline_str);
+            stderrWrite(reset);
+
+            // Pad to sidebar_width
+            const used = 1 + idx_str.len + 2 + @min(f.nameSlice().len, 16) + 2 + @min(f.sourceSlice().len, 20) + 1 + fline_str.len;
+            if (used < sidebar_width) {
+                self.writeSpaces(sidebar_width - used);
+            }
         } else if (s.local_count > 0 and item_idx == locals_header) {
             // Locals header separator
             self.renderSidebarSectionHeader("Locals", sidebar_width);
         } else if (item_idx >= locals_start and item_idx < locals_end) {
-            // Local variable
+            // Local variable — colored: name in bold, value in yellow, type in dim
             const li = item_idx - locals_start;
             const l = &s.locals[li];
-            var buf: [256]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, " {s}  {s}  {s}", .{
-                truncate(l.nameSlice(), 14), truncate(l.valueSlice(), 14), truncate(l.typeSlice(), 10),
-            }) catch " (local)";
-            self.writePadded(text, sidebar_width);
+
+            stderrWrite(" " ++ bold);
+            const name_display = truncate(l.nameSlice(), 14);
+            stderrWrite(name_display);
+            stderrWrite(reset ++ "  " ++ yellow);
+            const val_display = truncate(l.valueSlice(), 14);
+            stderrWrite(val_display);
+            stderrWrite(reset ++ "  " ++ dim);
+            const type_display = truncate(l.typeSlice(), 10);
+            stderrWrite(type_display);
+            stderrWrite(reset);
+
+            // Pad to sidebar_width
+            const used = 1 + name_display.len + 2 + val_display.len + 2 + type_display.len;
+            if (used < sidebar_width) {
+                self.writeSpaces(sidebar_width - used);
+            }
         } else if (s.bp_count > 0 and item_idx == bp_header) {
             // Breakpoints header separator
             self.renderSidebarSectionHeader("Breakpoints", sidebar_width);
         } else if (item_idx > bp_header and item_idx < total_items) {
-            // Breakpoint
+            // Breakpoint — colored: file in normal, line in cyan, check in cyan
             const bi = item_idx - bp_header - 1;
             if (bi < s.bp_count) {
                 const bp = &s.breakpoints[bi];
-                var buf: [256]u8 = undefined;
                 var bpline_buf: [12]u8 = undefined;
                 const bpline_str = std.fmt.bufPrint(&bpline_buf, "{d}", .{bp.line}) catch "?";
-                const v_str: []const u8 = if (bp.verified) " " ++ check else "";
-                const text = std.fmt.bufPrint(&buf, " {s}:{s}{s}", .{
-                    truncate(bp.fileSlice(), 20), bpline_str, v_str,
-                }) catch " (bp)";
-                self.writePadded(text, sidebar_width);
+                const file_display = truncate(bp.fileSlice(), 20);
+
+                stderrWrite(" ");
+                stderrWrite(file_display);
+                stderrWrite(":" ++ cyan);
+                stderrWrite(bpline_str);
+                stderrWrite(reset);
+                if (bp.verified) {
+                    stderrWrite(" " ++ cyan ++ check ++ reset);
+                }
+
+                // check visual = 1 char (unicode), verified suffix = 2 visual chars (" ✓")
+                const v_len: usize = if (bp.verified) 2 else 0;
+                const used = 1 + file_display.len + 1 + bpline_str.len + v_len;
+                if (used < sidebar_width) {
+                    self.writeSpaces(sidebar_width - used);
+                }
             } else {
                 self.writePadded("", sidebar_width);
             }
@@ -1413,7 +1454,7 @@ pub const DashboardTui = struct {
     fn renderSidebarSectionHeader(self: *const DashboardTui, title: []const u8, sidebar_width: usize) void {
         // "─ Locals ────────────"
         stderrWrite(dim ++ hh ++ reset);
-        stderrWrite(dim ++ bold ++ " ");
+        stderrWrite(cyan ++ bold ++ " ");
         stderrWrite(title);
         stderrWrite(" " ++ reset ++ dim);
         // title visual len = 1(─) + 1( ) + title.len + 1( ) = title.len + 3
@@ -1450,7 +1491,7 @@ pub const DashboardTui = struct {
         self.writeHorizontal(sidebar_width);
 
         stderrWrite(reset);
-        stderrWrite(dim ++ tee_right ++ reset ++ "\n");
+        stderrWrite(dim ++ tee_right ++ reset ++ "\x1B[K\n");
     }
 
     fn renderLogPane(self: *const DashboardTui, log_height: usize, w: usize) void {
@@ -1520,7 +1561,7 @@ pub const DashboardTui = struct {
             stderrWrite(log_border);
             stderrWrite(vv);
             stderrWrite(reset);
-            stderrWrite("\n");
+            stderrWrite("\x1B[K\n");
         }
     }
 
@@ -1531,7 +1572,7 @@ pub const DashboardTui = struct {
         const fill = if (w > 2) w - 2 else 1;
         self.writeHorizontal(fill);
         stderrWrite(br);
-        stderrWrite(reset ++ "\n");
+        stderrWrite(reset ++ "\x1B[K\n");
     }
 
     fn renderFooter(self: *const DashboardTui) void {
@@ -1541,6 +1582,8 @@ pub const DashboardTui = struct {
         if (self.session_count > 1) {
             stderrWrite(dim ++ "[]" ++ reset ++ " session  ");
         }
+        // Clear rest of line and everything below (handles terminal shrink)
+        stderrWrite("\x1B[K\x1B[J");
     }
 
     // ── Render Helpers ──────────────────────────────────────────────
@@ -1592,6 +1635,8 @@ fn loadSourceContext(session: *TuiSession, file_path: []const u8, target_line: u
     session.source_current_idx = 0;
     session.source_file_len = 0;
     if (target_line == 0) return;
+    if (file_path.len == 0) return;
+    if (!std.fs.path.isAbsolute(file_path)) return;
 
     const file = std.fs.openFileAbsolute(file_path, .{}) catch return;
     defer file.close();
@@ -1701,9 +1746,27 @@ pub fn getSocketPath(buf: []u8) ?[]const u8 {
 
 // ── I/O Helpers ─────────────────────────────────────────────────────────
 
+var render_buf: [65536]u8 = undefined;
+var render_len: usize = 0;
+var render_active: bool = false;
+
 fn stderrWrite(data: []const u8) void {
     if (@import("builtin").is_test) return;
-    _ = posix.write(posix.STDERR_FILENO, data) catch {};
+    if (render_active) {
+        const remaining = render_buf.len - render_len;
+        const to_copy = @min(data.len, remaining);
+        @memcpy(render_buf[render_len..][0..to_copy], data[0..to_copy]);
+        render_len += to_copy;
+    } else {
+        _ = posix.write(posix.STDERR_FILENO, data) catch {};
+    }
+}
+
+fn flushRenderBuffer() void {
+    if (render_len > 0) {
+        _ = posix.write(posix.STDERR_FILENO, render_buf[0..render_len]) catch {};
+        render_len = 0;
+    }
 }
 
 fn printErr(data: []const u8) void {
