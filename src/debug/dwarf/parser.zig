@@ -376,6 +376,147 @@ pub fn freeAbbrevTable(entries: []AbbrevEntry, allocator: std.mem.Allocator) voi
     allocator.free(entries);
 }
 
+/// CU index entry for fast PC-to-CU lookup.
+pub const CuIndexEntry = struct {
+    start_pos: usize, // byte offset of CU start in .debug_info
+    unit_end: usize, // byte offset past CU end
+    low_pc: u64, // CU address range start (0 if unknown)
+    high_pc: u64, // CU address range end (max if unknown)
+};
+
+/// Build a CU index from .debug_info for fast PC-to-CU lookup.
+/// Parses CU headers and root DIE low_pc/high_pc where possible.
+pub fn buildCuIndex(debug_info: []const u8, debug_abbrev: []const u8, allocator: std.mem.Allocator) ![]CuIndexEntry {
+    var entries: std.ArrayListUnmanaged(CuIndexEntry) = .empty;
+    errdefer entries.deinit(allocator);
+
+    var cu_pos: usize = 0;
+    while (cu_pos < debug_info.len) {
+        const cu_start = cu_pos;
+        var pos = cu_pos;
+
+        const unit_length_32 = readU32(debug_info, &pos) catch break;
+        var is_64bit = false;
+        var unit_length: u64 = unit_length_32;
+        if (unit_length_32 == 0xFFFFFFFF) {
+            unit_length = readU64(debug_info, &pos) catch break;
+            is_64bit = true;
+        }
+        if (unit_length == 0) break;
+        const unit_end = pos + @as(usize, @intCast(unit_length));
+
+        cu_pos = unit_end;
+
+        const version = readU16(debug_info, &pos) catch continue;
+        var address_size: u8 = 8;
+        var abbrev_offset: u64 = undefined;
+        if (version >= 5) {
+            if (pos >= debug_info.len) continue;
+            pos += 1; // unit_type
+            if (pos >= debug_info.len) continue;
+            address_size = debug_info[pos];
+            pos += 1;
+            abbrev_offset = if (is_64bit) readU64(debug_info, &pos) catch continue else readU32(debug_info, &pos) catch continue;
+        } else {
+            abbrev_offset = if (is_64bit) readU64(debug_info, &pos) catch continue else readU32(debug_info, &pos) catch continue;
+            if (pos >= debug_info.len) continue;
+            address_size = debug_info[pos];
+            pos += 1;
+        }
+
+        // Parse root DIE to extract low_pc / high_pc
+        var low_pc: u64 = 0;
+        var high_pc: u64 = std.math.maxInt(u64);
+        var found_range = false;
+
+        const abbrev_data = if (abbrev_offset < debug_abbrev.len) debug_abbrev[@intCast(abbrev_offset)..] else continue;
+        const abbrevs = parseAbbrevTable(abbrev_data, allocator) catch continue;
+        defer freeAbbrevTable(abbrevs, allocator);
+
+        const first_code = readULEB128(debug_info, &pos) catch continue;
+        if (first_code != 0) {
+            if (findAbbrev(abbrevs, first_code)) |first_abbrev| {
+                for (first_abbrev.attributes) |attr| {
+                    if (attr.form == DW_FORM_implicit_const) continue;
+                    if (attr.name == DW_AT_low_pc and attr.form == DW_FORM_addr) {
+                        low_pc = if (address_size == 8) readU64(debug_info, &pos) catch 0 else readU32(debug_info, &pos) catch 0;
+                        found_range = true;
+                        continue;
+                    }
+                    if (attr.name == DW_AT_high_pc) {
+                        if (attr.form == DW_FORM_addr) {
+                            high_pc = if (address_size == 8) readU64(debug_info, &pos) catch 0 else readU32(debug_info, &pos) catch 0;
+                        } else if (attr.form == DW_FORM_data4) {
+                            high_pc = low_pc + @as(u64, readU32(debug_info, &pos) catch 0);
+                        } else if (attr.form == DW_FORM_data8) {
+                            high_pc = low_pc + (readU64(debug_info, &pos) catch 0);
+                        } else if (attr.form == DW_FORM_udata) {
+                            high_pc = low_pc + (readULEB128(debug_info, &pos) catch 0);
+                        } else {
+                            skipForm(debug_info, &pos, attr.form, is_64bit, address_size) catch break;
+                        }
+                        continue;
+                    }
+                    skipForm(debug_info, &pos, attr.form, is_64bit, address_size) catch break;
+                }
+            }
+        }
+
+        // If we found a valid range, use it; otherwise keep 0..max so this CU is always checked
+        if (found_range and high_pc <= low_pc) {
+            high_pc = std.math.maxInt(u64); // Bad range, always check
+        }
+
+        try entries.append(allocator, .{
+            .start_pos = cu_start,
+            .unit_end = unit_end,
+            .low_pc = low_pc,
+            .high_pc = high_pc,
+        });
+    }
+
+    const result = try entries.toOwnedSlice(allocator);
+
+    // Sort by low_pc for binary search
+    std.mem.sort(CuIndexEntry, result, {}, struct {
+        fn lessThan(_: void, a: CuIndexEntry, b: CuIndexEntry) bool {
+            return a.low_pc < b.low_pc;
+        }
+    }.lessThan);
+
+    return result;
+}
+
+/// Binary search the CU index for the CU containing a given PC.
+/// Returns the start_pos of the matching CU, or null if not found.
+pub fn findCuForPC(cu_index: []const CuIndexEntry, pc: u64) ?usize {
+    if (cu_index.len == 0) return null;
+    // Binary search: find rightmost CU with low_pc <= pc
+    var lo: usize = 0;
+    var hi: usize = cu_index.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cu_index[mid].low_pc <= pc) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // Check entries from lo-1 backwards
+    var i = lo;
+    while (i > 0) {
+        i -= 1;
+        if (pc >= cu_index[i].low_pc and pc < cu_index[i].high_pc) {
+            return cu_index[i].start_pos;
+        }
+        // If this CU's high_pc == maxInt, it could match any PC
+        if (cu_index[i].low_pc == 0 and cu_index[i].high_pc == std.math.maxInt(u64)) {
+            return cu_index[i].start_pos;
+        }
+    }
+    return null;
+}
+
 /// Cache for parsed abbreviation tables, keyed by byte offset into .debug_abbrev.
 /// Avoids re-parsing the same abbreviation table on every parseScopedVariables call.
 pub const AbbrevCache = struct {
@@ -2761,6 +2902,7 @@ pub fn parseScopedVariables(
     target_pc: u64,
     allocator: std.mem.Allocator,
     abbrev_cache: ?*AbbrevCache,
+    cu_start_hint: ?usize,
 ) !ScopedVariableResult {
     var variables: std.ArrayListUnmanaged(VariableInfo) = .empty;
     errdefer {
@@ -2780,10 +2922,11 @@ pub fn parseScopedVariables(
     const DW_AT_str_offsets_base_c: u64 = 0x72;
     const DW_AT_addr_base_c: u64 = 0x73;
 
-    var cu_pos: usize = 0;
+    var cu_pos: usize = cu_start_hint orelse 0;
     var found = false;
+    var hint_tried = false;
 
-    // Iterate over all compilation units
+    // Iterate over compilation units (starting from hint if provided)
     while (cu_pos < debug_info.len and !found) {
         var pos = cu_pos;
 
@@ -2800,6 +2943,15 @@ pub fn parseScopedVariables(
 
         // Advance cu_pos for next iteration
         cu_pos = unit_end;
+
+        // If we used a hint and this was the hinted CU, check if we need to fall back
+        if (cu_start_hint != null and !hint_tried) {
+            hint_tried = true;
+            if (!found) {
+                // Hint didn't match — restart from beginning for full scan
+                cu_pos = 0;
+            }
+        }
 
         const version = readU16(debug_info, &pos) catch continue;
 

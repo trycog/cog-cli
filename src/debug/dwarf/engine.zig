@@ -66,6 +66,8 @@ pub const DwarfEngine = struct {
     cie_cache: ?unwind.CieCache = null,
     /// Abbreviation table cache to avoid re-parsing on every parseScopedVariables call
     abbrev_cache: ?parser.AbbrevCache = null,
+    /// CU index for fast PC-to-CU lookup
+    cu_index: []parser.CuIndexEntry = &.{},
 
     pub fn init(allocator: std.mem.Allocator) DwarfEngine {
         return .{
@@ -98,6 +100,7 @@ pub const DwarfEngine = struct {
         if (self.dwo_elf_binaries.len > 0) self.allocator.free(self.dwo_elf_binaries);
         if (self.type_units.len > 0) self.allocator.free(self.type_units);
         if (self.skeleton_cus.len > 0) self.allocator.free(self.skeleton_cus);
+        if (self.cu_index.len > 0) self.allocator.free(self.cu_index);
         if (self.eh_frame_index) |*idx| idx.deinit(self.allocator);
         if (self.cie_cache) |*cc| cc.deinit(self.allocator);
         if (self.abbrev_cache) |*ac| ac.deinit(self.allocator);
@@ -230,6 +233,11 @@ pub const DwarfEngine = struct {
 
         // Initialize abbreviation cache for parseScopedVariables
         self.abbrev_cache = .{};
+
+        // Build CU index for fast PC-to-CU lookup
+        if (self.resolveDebugData()) |dd| {
+            self.cu_index = parser.buildCuIndex(dd.info_data, dd.abbrev_data, self.allocator) catch &.{};
+        }
 
         // Sort line entries and functions for binary search lookups
         if (self.line_entries.len > 0) {
@@ -1291,6 +1299,11 @@ pub const DwarfEngine = struct {
         loclists_data: ?[]const u8,
     };
 
+    /// Find the CU start position for a given DWARF PC using the CU index.
+    fn cuHintForPC(self: *const DwarfEngine, dwarf_pc: u64) ?usize {
+        return parser.findCuForPC(self.cu_index, dwarf_pc);
+    }
+
     fn resolveDebugData(self: *const DwarfEngine) ?DebugData {
         // Try Mach-O binaries (dSYM first, then main)
         if (self.dsym_binary) |*dsym| {
@@ -1429,6 +1442,7 @@ pub const DwarfEngine = struct {
             dwarf_pc,
             self.allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         ) catch return &.{};
         defer parser.freeScopedVariables(scoped, self.allocator);
 
@@ -1461,6 +1475,7 @@ pub const DwarfEngine = struct {
                     best_addr,
                     self.allocator,
                     if (self.abbrev_cache) |*ac| ac else null,
+                    null,
                 ) catch scoped;
                 if (fallback_scoped.variables.len > 0) {
                     parser.freeScopedVariables(scoped, self.allocator);
@@ -1724,6 +1739,7 @@ pub const DwarfEngine = struct {
             target_pc,
             allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         ) catch {
             return .{ .result = "<parse error>", .@"type" = "" };
         };
@@ -1786,6 +1802,7 @@ pub const DwarfEngine = struct {
                     best_addr,
                     allocator,
                     if (self.abbrev_cache) |*ac| ac else null,
+                    null,
                 ) catch scoped;
                 if (fallback_scoped.variables.len > 0) {
                     parser.freeScopedVariables(scoped, allocator);
@@ -1961,6 +1978,7 @@ pub const DwarfEngine = struct {
             target_pc,
             allocator,
             null,
+            null,
         );
     }
 
@@ -1989,6 +2007,7 @@ pub const DwarfEngine = struct {
             },
             target_pc,
             allocator,
+            null,
             null,
         );
     }
@@ -2260,6 +2279,7 @@ pub const DwarfEngine = struct {
             dwarf_pc,
             self.allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         ) catch return null;
 
         if (scoped.variables.len == 0) {
@@ -2340,6 +2360,7 @@ pub const DwarfEngine = struct {
             dwarf_pc,
             self.allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         ) catch return self.allocator.dupe(u8, template) catch null;
         defer parser.freeScopedVariables(scoped, self.allocator);
 
@@ -2832,6 +2853,7 @@ pub const DwarfEngine = struct {
             dwarf_pc,
             allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         );
         defer parser.freeScopedVariables(scoped, allocator);
 
@@ -2901,6 +2923,7 @@ pub const DwarfEngine = struct {
                     best_addr,
                     allocator,
                     if (self.abbrev_cache) |*ac| ac else null,
+                    null,
                 ) catch return error.VariableNotFound;
 
                 for (scoped.variables) |v| {
@@ -3057,6 +3080,7 @@ pub const DwarfEngine = struct {
             dwarf_pc,
             allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         ) catch return error.NoDebugInfo;
         defer parser.freeScopedVariables(scoped, allocator);
 
@@ -3173,6 +3197,7 @@ pub const DwarfEngine = struct {
             },
             dwarf_pc, allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            self.cuHintForPC(dwarf_pc),
         ) catch return try items.toOwnedSlice(allocator);
         defer parser.freeScopedVariables(scoped, allocator);
 
@@ -3773,6 +3798,7 @@ pub const DwarfEngine = struct {
             dwarf_pc,
             allocator,
             if (self.abbrev_cache) |*ac| ac else null,
+            null,
         ) catch return .{
             .name = try allocator.dupe(u8, name),
             .location_type = try allocator.dupe(u8, "unknown"),
