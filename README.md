@@ -10,7 +10,7 @@
 
 Persistent memory, code intelligence, and debugging for developers and AI agents. A zero-dependency native CLI built in Zig.
 
-[Getting Started](#getting-started) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Extensions](#extensions)
+[Getting Started](#getting-started) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [MCP Server](#mcp-server) · [Debug](#debug) · [Extensions](#extensions)
 
 </div>
 
@@ -52,7 +52,9 @@ Run the interactive setup:
 cog init
 ```
 
-You'll be prompted to choose between **Memory + Tools** (full setup with brain selection, agent prompts, and skill installation) or **Tools only** (code intelligence and debug server).
+You'll be prompted to choose between **Memory + Tools** (full setup with brain selection) or **Tools only** (code intelligence and debug server), then select which AI coding agents to configure. For each selected agent, `cog init` writes the system prompt, installs the skill, configures the MCP server, and sets up hooks.
+
+**Supported agents:** Claude Code, Gemini CLI, GitHub Copilot, Windsurf, Cursor, OpenAI Codex CLI, Amp, Goose, Roo Code, OpenCode.
 
 On macOS, `cog init` also code-signs the binary with debug entitlements for the native debugger.
 
@@ -99,9 +101,10 @@ Run `cog --help` for an overview, or `cog <group> --help` to list commands in a 
 |-------|-------------|
 | `mem` | Persistent associative memory powered by a knowledge graph |
 | `code` | SCIP-based code indexing, querying, and file mutations |
+| `mcp` | MCP server over stdio for AI agent integration |
 | `debug` | Debug daemon for AI agents |
 | `install` | Language extension management |
-| `init` | Interactive project setup |
+| `init` | Interactive multi-agent project setup |
 | `update` | Fetch latest prompt and skill |
 
 ---
@@ -491,163 +494,118 @@ Installed extensions (`~/.config/cog/extensions/`) override built-ins. See [Writ
 
 ### `code/query`
 
-Unified code query command. Specify exactly one query mode.
-
-```
-cog code/query --find <name> [--kind KIND] [--limit N]
-cog code/query --refs <name> [--kind KIND] [--limit N]
-cog code/query --symbols <file> [--kind KIND]
-cog code/query --structure
-```
-
-**Modes:**
-
-| Mode | Description |
-|------|-------------|
-| `--find NAME` | Find symbol definitions by name (ranked by relevance) |
-| `--refs NAME` | Find all references to a symbol |
-| `--symbols FILE` | List symbols defined in a file |
-| `--structure` | Project structure overview |
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--kind KIND` | Filter by symbol kind (`function`, `struct`, `method`, `type`, etc.) |
-| `--limit N` | Max results for `--find`/`--refs` (default: 1 for find, 100 for refs) |
-
-```sh
-cog code/query --find Server --kind struct
-cog code/query --find Component --limit 10
-cog code/query --refs Config --limit 20
-cog code/query --symbols src/main.zig
-cog code/query --structure
-```
+Removed from CLI. Use MCP `cog_code_query`.
 
 ### `code/edit`
 
-Edit a file using string replacement and re-index. Finds the exact old text, replaces with new text, then rebuilds the SCIP index to keep code intelligence current.
-
-```
-cog code/edit <file> --old OLD --new NEW
-```
-
-| Option | Description |
-|--------|-------------|
-| `--old TEXT` | Exact text to find (must be unique in file) |
-| `--new TEXT` | Replacement text |
-
-```sh
-cog code/edit src/main.zig --old "fn old()" --new "fn new()"
-```
-
-Uses `.cog/settings.json` editor config if present, otherwise built-in string replacement.
+Removed from CLI. Use MCP `cog_code_edit`.
 
 ### `code/create`
 
-Create a new file and add it to the SCIP index.
-
-```
-cog code/create <file> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--content TEXT` | Initial file content |
-
-```sh
-cog code/create src/new.zig --content "const std = @import(\"std\");"
-```
-
-Uses `.cog/settings.json` creator config if present, otherwise built-in file creation.
+Removed from CLI. Use MCP `cog_code_create`.
 
 ### `code/delete`
 
-Delete a file and remove it from the SCIP index.
-
-```
-cog code/delete <file>
-```
-
-```sh
-cog code/delete src/old.zig
-```
-
-Uses `.cog/settings.json` deleter config if present, otherwise built-in file deletion.
+Removed from CLI. Use MCP `cog_code_delete`.
 
 ### `code/rename`
 
-Rename a file and update the SCIP index.
-
-```
-cog code/rename <old-path> --to <new-path>
-```
-
-| Option | Description |
-|--------|-------------|
-| `--to PATH` | New file path (required) |
-
-```sh
-cog code/rename src/old.zig --to src/new.zig
-```
-
-Uses `.cog/settings.json` renamer config if present, otherwise built-in rename.
+Removed from CLI. Use MCP `cog_code_rename`.
 
 ### `code/status`
 
-Report the status of the SCIP code index. Shows whether an index exists, document/symbol counts, and indexer info.
+Removed from CLI. Use MCP `cog_code_status`.
+
+---
+
+## MCP Server
+
+MCP (Model Context Protocol) server over stdio. Exposes Cog's code intelligence tools to any MCP-compatible AI agent. Configured automatically by `cog init`.
+
+### `mcp`
+
+Start the MCP server. Reads JSON-RPC 2.0 messages from stdin, writes responses to stdout.
 
 ```
-cog code/status
+cog mcp
+cog mcp --help
 ```
+
+This is not typically run manually — agents connect to it via their MCP configuration (`.mcp.json`, `.vscode/mcp.json`, etc.).
+
+Transport is stdio with MCP framing (`Content-Length` headers).
+
+**Protocol methods:** `initialize`, `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/read`, `shutdown`, `exit`.
+
+**Tool discovery:**
+
+- Use `tools/list` as the runtime source of truth for all exposed tools and schemas.
+- Use `resources/read` with `cog://tools/catalog` for a stable JSON tool catalog snapshot.
+- Tool families exposed by Cog include `cog_code_*`, `debug_*`, and (when configured) `cog_mem_*`.
+
+**Prompts:**
+
+- `cog_reference` via `prompts/get`
+
+**Resources:**
+
+- `cog://index/status` (JSON status of current code index)
+- `cog://debug/tools` (JSON catalog of `debug_*` MCP tools)
+- `cog://tools/catalog` (JSON catalog of all tools currently exposed by this runtime)
+
+### Per-agent MCP config files
+
+`cog init` writes project-local MCP config for agents that support it, preserving unrelated existing entries and replacing only the `cog` server block.
+
+| Agent | Local MCP config |
+|-------|------------------|
+| Claude Code | `.mcp.json` (`mcpServers`) |
+| Gemini CLI | `.gemini/settings.json` (`mcpServers`) |
+| GitHub Copilot (VS Code) | `.vscode/mcp.json` (`servers`) |
+| Cursor | `.cursor/mcp.json` (`mcpServers`) |
+| OpenAI Codex CLI | `.codex/config.toml` (`[mcp_servers.cog]`) |
+| Amp | `.amp/settings.json` (`amp.mcpServers`) |
+| Roo Code | `.roo/mcp.json` (`mcpServers`) |
+| OpenCode | `opencode.json` (`mcp`) |
+
+Agents that currently require global-only MCP configuration:
+
+- Windsurf (`~/.codeium/windsurf/mcp_config.json`)
+- Goose (`~/.config/goose/config.yaml`)
+
+### Hooks
+
+`cog init` can configure hooks for agents that support them. Hooks enforce that file mutations go through Cog's MCP tools (keeping the code index in sync) and auto-reindex after changes.
+
+| Agent | Hook mechanism |
+|-------|---------------|
+| Claude Code | `.claude/settings.json` — PreToolUse blocks native Edit/Write, PostToolUse reindexes |
+| Gemini CLI | `.gemini/settings.json` — BeforeTool/AfterTool |
+| Windsurf | `.windsurf/hooks.json` — pre/post write code |
+| Cursor | `.cursor/hooks.json` — afterFileEdit |
+| Amp | `.amp/settings.json` — amp.tools.disable |
+
+Hook scripts are generated in `.cog/hooks/` and shared across agents.
 
 ---
 
 ## Debug
 
-Debug daemon for AI agents. The daemon runs as a background process, communicates over a Unix domain socket, and is auto-started by `debug/send` when not running.
+Debug daemon utilities. Debug tool operations are now exposed through MCP `debug_*` tools.
 
 ### `debug/serve`
 
-Start the debug daemon. Listens on a Unix domain socket and dispatches debug tool calls from `debug/send`.
+Start the debug daemon. Useful for direct daemon troubleshooting.
 
 ```
 cog debug/serve
 ```
 
-The daemon is auto-started by `debug/send` commands when not already running. You typically don't need to start it manually.
+You typically do not need this for normal MCP tool usage.
 
 ### `debug/send`
 
-Send a debug command to the daemon. All debug operations go through this unified command.
-
-```
-cog debug/send <tool> [args] [--flags]
-cog debug/send <tool> --help
-```
-
-**Tools:**
-
-| Category | Tools |
-|----------|-------|
-| Core | `launch`, `stop`, `attach`, `restart`, `sessions` |
-| Breakpoints | `breakpoint_set`, `breakpoint_set_function`, `breakpoint_set_exception`, `breakpoint_remove`, `breakpoint_list`, `breakpoint_locations`, `instruction_breakpoint`, `watchpoint` |
-| Execution | `run`, `goto_targets`, `step_in_targets`, `restart_frame` |
-| Inspection | `inspect`, `set_variable`, `set_expression` |
-| Threads & Stack | `threads`, `stacktrace`, `scopes`, `variable_location` |
-| Memory & Low-Level | `memory`, `disassemble`, `registers`, `write_register`, `find_symbol` |
-| Capabilities | `capabilities`, `modules`, `loaded_sources`, `source`, `completions` |
-| Events | `exception_info`, `poll_events`, `cancel`, `terminate_threads` |
-
-```sh
-cog debug/send launch ./my_program --stop-on-entry
-cog debug/send breakpoint_set src/main.c:42
-cog debug/send run continue
-cog debug/send inspect "my_var" --frame 0
-cog debug/send stop
-```
-
-Run `cog debug/send --help` to list all tools, or `cog debug/send <tool> --help` for tool-specific usage.
+Removed from CLI. Use MCP `debug_*` tools via `tools/call`.
 
 ### `debug/dashboard`
 
@@ -709,7 +667,7 @@ See **[Writing a Language Extension](EXTENSIONS.md)** for a complete guide on bu
 
 ### `init`
 
-Interactive setup for the current directory. Verifies your API key, lets you select or create a brain, writes `.cog/settings.json`, and installs the agent skill.
+Interactive multi-agent setup for the current directory. Optionally configures memory, then sets up system prompts, skills, MCP server, and hooks for your selected AI coding agents.
 
 ```
 cog init [options]
@@ -721,7 +679,7 @@ cog init [options]
 
 ### `update`
 
-Fetch the latest system prompt and agent skill. Updates `CLAUDE.md`/`AGENTS.md` and the installed `SKILL.md`.
+Fetch the latest system prompt and agent skill. Updates existing prompt files and the installed `SKILL.md`.
 
 ```
 cog update [options]
