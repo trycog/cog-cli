@@ -16,7 +16,7 @@
 
 ## Why Cog?
 
-AI coding can feel fast but it's still limited by suboptimal methods and tooling. Your agent doesn't remember the architectural decisions from last week. It can't look up where a function is defined without grepping through your entire codebase. It can't set a breakpoint.
+AI coding can feel fast but it's still limited by suboptimal methods and tooling. Your agent doesn't remember the architectural decisions from last week. It can't look up where a function is defined without grepping through your entire codebase. When something breaks it can't set a breakpoint, inspect a variable, or step through the code. It's stuck adding print statements and guessing.
 
 We built Cog to fix that. It's a single native binary that runs as an MCP server and gives your agent three capabilities it doesn't have on its own:
 
@@ -25,6 +25,23 @@ We built Cog to fix that. It's a single native binary that runs as an MCP server
 3. **An interactive debugger** your agent drives directly. Breakpoints, variable inspection, stepping through code. No more print statement debugging.
 
 ### The numbers
+
+#### Memory
+
+We benchmarked Cog's memory recall against Sonnet 4.5 doing full code exploration across 114 questions about a production codebase.
+
+| Metric | Cog | Code Exploration | Delta |
+|--------|-----|------------------|-------|
+| Accuracy | 86.0% | 89.5% | -3.9% |
+| Adequate answers (>=50%) | 93.9% | 89.9% | **+4.4%** |
+| Duration | 24m 39s | 61m 39s | **-60%** |
+| Total tokens | 548.4K | 46.6M | **-98.8%** |
+| Tokens per question | 4.6K | 391.2K | **-98.8%** |
+
+
+Cog answers nearly as many questions correctly while using 98.8% fewer tokens and finishing in less than half the time. The adequate answer rate is actually higher because memory recall surfaces connected context that code exploration misses.
+
+#### Code intelligence
 
 We benchmarked Cog's code intelligence against standard agent tools (grep, glob, read) on the React codebase:
 
