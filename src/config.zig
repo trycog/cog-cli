@@ -156,16 +156,6 @@ pub fn resolveBrainUrl(allocator: std.mem.Allocator, cog_content: []const u8) ![
         return error.InvalidCogUrl;
     } else |_| {}
 
-    // Legacy format: cog://host/user/brain
-    const prefix = "cog://";
-    if (std.mem.startsWith(u8, cog_content, prefix)) {
-        const rest = cog_content[prefix.len..];
-        if (rest.len == 0) return error.InvalidCogUrl;
-        if (std.mem.indexOfScalar(u8, rest, '/')) |_| {
-            return std.fmt.allocPrint(allocator, "https://{s}", .{rest});
-        }
-    }
-
     return error.InvalidCogUrl;
 }
 
@@ -195,13 +185,6 @@ test "resolveUrl JSON format" {
     const url = try resolveUrl(allocator,
         \\{"brain":{"url":"https://trycog.ai/user/brain"}}
     );
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("https://trycog.ai/api/v1/user/brain", url);
-}
-
-test "resolveUrl legacy cog:// format" {
-    const allocator = std.testing.allocator;
-    const url = try resolveUrl(allocator, "cog://trycog.ai/user/brain");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://trycog.ai/api/v1/user/brain", url);
 }

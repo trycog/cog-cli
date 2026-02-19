@@ -492,7 +492,7 @@ fn executeCogQuery(allocator: std.mem.Allocator, args_json: []const u8) ![]const
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ cog_path, "code/query", mode, query },
+        .argv = &.{ cog_path, "code:query", mode, query },
         .cwd = REACT_DIR,
         .max_output_bytes = 64 * 1024,
     }) catch |err| {
@@ -937,7 +937,7 @@ fn ensureCogIndex(allocator: std.mem.Allocator) !void {
         defer allocator.free(cog_path);
 
         // Spawn with inherited stderr so the cog progress bar is visible
-        const argv: []const []const u8 = &.{ cog_path, "code/index" };
+        const argv: []const []const u8 = &.{ cog_path, "code:index" };
         var child = std.process.Child.init(argv, allocator);
         child.cwd = REACT_DIR;
         // stdin/stdout/stderr default to .Inherit — progress bar shows through

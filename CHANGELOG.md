@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- External indexers now invoked per-file instead of per-project, fixing glob pattern expansion for `code/index` with SCIP extensions
+- External indexers now invoked per-file instead of per-project, fixing glob pattern expansion for `code:index` with SCIP extensions
 
 ### Changed
 
-- Updated README to reflect current debug daemon architecture (`debug/send`, dashboard, status, kill, sign)
+- Updated README to reflect current debug daemon architecture (`debug:send`, dashboard, status, kill, sign)
 
 ## [0.2.1] - 2026-02-17
 
@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Consolidated 38 `debug/send_*` commands into single `debug/send <tool>` with proper CLI flags and positional arguments instead of raw JSON
+- Consolidated 38 `debug:send_*` commands into single `debug:send <tool>` with proper CLI flags and positional arguments instead of raw JSON
 
 ### Fixed
 
@@ -42,21 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Associative memory system with engrams, synapses, and spreading activation recall
-- Memory lifecycle commands: `mem/learn`, `mem/recall`, `mem/reinforce`, `mem/flush`, `mem/deprecate`
-- Bulk operations: `mem/bulk-learn`, `mem/bulk-recall`, `mem/bulk-associate`
-- Graph inspection: `mem/get`, `mem/connections`, `mem/trace`, `mem/stats`, `mem/orphans`, `mem/connectivity`, `mem/list-terms`
-- Memory maintenance: `mem/stale`, `mem/verify`, `mem/refactor`, `mem/update`, `mem/unlink`
-- Cross-brain knowledge sharing with `mem/meld`
-- Short-term memory consolidation with `mem/list-short-term`
+- Memory lifecycle commands: `mem:learn`, `mem:recall`, `mem:reinforce`, `mem:flush`, `mem:deprecate`
+- Bulk operations: `mem:bulk-learn`, `mem:bulk-recall`, `mem:bulk-associate`
+- Graph inspection: `mem:get`, `mem:connections`, `mem:trace`, `mem:stats`, `mem:orphans`, `mem:connectivity`, `mem:list-terms`
+- Memory maintenance: `mem:stale`, `mem:verify`, `mem:refactor`, `mem:update`, `mem:unlink`
+- Cross-brain knowledge sharing with `mem:meld`
+- Short-term memory consolidation with `mem:list-short-term`
 - SCIP-based code intelligence with tree-sitter indexing
-- Code index commands: `code/index`, `code/query`, `code/status`
-- Index-aware file mutation commands: `code/edit`, `code/create`, `code/delete`, `code/rename`
+- Code index commands: `code:index`, `code:query`, `code:status`
+- Index-aware file mutation commands: `code:edit`, `code:create`, `code:delete`, `code:rename`
 - Symbol query modes: `--find` (definitions), `--refs` (references), `--symbols` (file symbols), `--structure` (project overview)
 - Built-in tree-sitter grammars for C, C++, Go, Java, JavaScript, Python, Rust, TypeScript, and TSX
 - Language extension system with `cog install` for third-party SCIP indexers
-- Debug daemon with Unix domain socket transport (`debug/serve`)
-- Debug dashboard for live session monitoring (`debug/dashboard`)
-- Debug management commands: `debug/status`, `debug/kill`, `debug/sign`
+- Debug daemon with Unix domain socket transport (`debug:serve`)
+- Debug dashboard for live session monitoring (`debug:dashboard`)
+- Debug management commands: `debug:status`, `debug:kill`, `debug:sign`
 - macOS code signing with debug entitlements for `task_for_pid`
 - Interactive project setup with `cog init`
 - System prompt and agent skill updates with `cog update`

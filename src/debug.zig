@@ -47,15 +47,15 @@ fn printCommandHelp(comptime help_text: []const u8) void {
 
 /// Dispatch debug subcommands.
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
-    if (std.mem.eql(u8, subcmd, "debug/serve")) return debugServe(allocator, args);
-    if (std.mem.eql(u8, subcmd, "debug/sign")) return debugSign(allocator, args);
-    if (std.mem.eql(u8, subcmd, "debug/dashboard")) return debugDashboard(allocator, args);
-    if (std.mem.eql(u8, subcmd, "debug/status")) return debugStatus(allocator, args);
-    if (std.mem.eql(u8, subcmd, "debug/kill")) return debugKill(args);
+    if (std.mem.eql(u8, subcmd, "debug:serve")) return debugServe(allocator, args);
+    if (std.mem.eql(u8, subcmd, "debug:sign")) return debugSign(allocator, args);
+    if (std.mem.eql(u8, subcmd, "debug:dashboard")) return debugDashboard(allocator, args);
+    if (std.mem.eql(u8, subcmd, "debug:status")) return debugStatus(allocator, args);
+    if (std.mem.eql(u8, subcmd, "debug:kill")) return debugKill(args);
 
-    // debug/send moved to MCP tools (debug_*).
-    if (std.mem.eql(u8, subcmd, "debug/send")) {
-        printErr("error: 'debug/send' has been removed from CLI. Use MCP debug_* tools instead.\n");
+    // debug:send moved to MCP tools (debug_*).
+    if (std.mem.eql(u8, subcmd, "debug:send")) {
+        printErr("error: 'debug:send' has been removed from CLI. Use MCP debug_* tools instead.\n");
         printErr("Run " ++ dim ++ "cog mcp --help" ++ reset ++ " for MCP server usage.\n");
         return error.Explained;
     }
@@ -253,19 +253,19 @@ test {
 }
 
 test "cog debug routes to debug dispatch" {
-    // Test that the dispatch function correctly identifies the debug/serve command
+    // Test that the dispatch function correctly identifies the debug:serve command
     // (without actually starting the server which would block)
     const allocator = std.testing.allocator;
 
     // An unknown debug subcommand should return Explained error
-    const result = dispatch(allocator, "debug/unknown", &.{});
+    const result = dispatch(allocator, "debug:unknown", &.{});
     try std.testing.expectError(error.Explained, result);
 }
 
 test "cog debug serve --help prints debug help" {
-    // Calling debug/serve with --help should print help and return without error
+    // Calling debug:serve with --help should print help and return without error
     const allocator = std.testing.allocator;
     const args = [_][:0]const u8{"--help"};
     // This should not error — it prints help text and returns
-    try dispatch(allocator, "debug/serve", &args);
+    try dispatch(allocator, "debug:serve", &args);
 }

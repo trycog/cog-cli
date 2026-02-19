@@ -161,36 +161,36 @@ Your agent uses memory through MCP tools (`cog_mem_*`). The CLI is there for man
 
 | Command | Description |
 |---------|-------------|
-| `mem/recall <query>` | Search with spreading activation |
-| `mem/get <id>` | Retrieve engram by UUID |
-| `mem/connections <id>` | List synaptic connections |
-| `mem/trace <from> <to>` | Find reasoning path between concepts |
-| `mem/bulk-recall <q1> <q2>...` | Multiple queries in one call |
-| `mem/list-short-term` | Pending short-term memories |
-| `mem/stale` | Synapses approaching staleness |
-| `mem/stats` | Brain statistics |
-| `mem/orphans` | Unconnected engrams |
-| `mem/connectivity` | Graph connectivity analysis |
-| `mem/list-terms` | All engram terms |
+| `mem:recall <query>` | Search with spreading activation |
+| `mem:get <id>` | Retrieve engram by UUID |
+| `mem:connections <id>` | List synaptic connections |
+| `mem:trace <from> <to>` | Find reasoning path between concepts |
+| `mem:bulk-recall <q1> <q2>...` | Multiple queries in one call |
+| `mem:list-short-term` | Pending short-term memories |
+| `mem:stale` | Synapses approaching staleness |
+| `mem:stats` | Brain statistics |
+| `mem:orphans` | Unconnected engrams |
+| `mem:connectivity` | Graph connectivity analysis |
+| `mem:list-terms` | All engram terms |
 
 **Write:**
 
 | Command | Description |
 |---------|-------------|
-| `mem/learn --term T --definition D` | Store a new concept |
-| `mem/associate --source S --target T` | Link two concepts |
-| `mem/bulk-learn --item ...` | Batch store concepts |
-| `mem/bulk-associate --link ...` | Batch create links |
-| `mem/update <id>` | Update term or definition |
-| `mem/unlink <synapse-id>` | Remove a synapse |
-| `mem/refactor --term T --definition D` | Update by term lookup |
-| `mem/deprecate --term T` | Mark concept as obsolete |
-| `mem/reinforce <id>` | Convert short-term to long-term |
-| `mem/flush <id>` | Delete short-term memory |
-| `mem/verify <synapse-id>` | Confirm synapse accuracy |
-| `mem/meld --target BRAIN` | Cross-brain knowledge link |
+| `mem:learn --term T --definition D` | Store a new concept |
+| `mem:associate --source S --target T` | Link two concepts |
+| `mem:bulk-learn --item ...` | Batch store concepts |
+| `mem:bulk-associate --link ...` | Batch create links |
+| `mem:update <id>` | Update term or definition |
+| `mem:unlink <synapse-id>` | Remove a synapse |
+| `mem:refactor --term T --definition D` | Update by term lookup |
+| `mem:deprecate --term T` | Mark concept as obsolete |
+| `mem:reinforce <id>` | Convert short-term to long-term |
+| `mem:flush <id>` | Delete short-term memory |
+| `mem:verify <synapse-id>` | Confirm synapse accuracy |
+| `mem:meld --target BRAIN` | Cross-brain knowledge link |
 
-Run `cog mem/<command> --help` for full options.
+Run `cog mem:<command> --help` for full options.
 
 </details>
 
@@ -228,8 +228,8 @@ This runs entirely locally. No account required.
 ### Indexing
 
 ```sh
-cog code/index              # Index everything
-cog code/index "**/*.ts"    # Specific pattern
+cog code:index              # Index everything
+cog code:index "**/*.ts"    # Specific pattern
 ```
 
 Results go into `.cog/index.scip`. Your agent searches it through the `cog_code_query` MCP tool.
@@ -252,10 +252,10 @@ Under the hood, a local daemon communicates with debug adapters (DAP). The daemo
 
 | Command | Description |
 |---------|-------------|
-| `debug/status` | Check daemon health and active sessions |
-| `debug/dashboard` | Live session monitoring TUI |
-| `debug/kill` | Stop the daemon |
-| `debug/sign` | macOS code-signing for debug entitlements |
+| `debug:status` | Check daemon health and active sessions |
+| `debug:dashboard` | Live session monitoring TUI |
+| `debug:kill` | Stop the daemon |
+| `debug:sign` | macOS code-signing for debug entitlements |
 
 On macOS, `cog init` handles the code-signing for you.
 

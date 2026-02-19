@@ -1077,9 +1077,9 @@ fn startDaemon(allocator: std.mem.Allocator) !void {
     const exe_owned = try allocator.dupe(u8, exe_path);
     defer allocator.free(exe_owned);
 
-    // Spawn: cog debug/serve --daemon
+    // Spawn: cog debug:serve --daemon
     var child = std.process.Child.init(
-        &.{ exe_owned, "debug/serve", "--daemon" },
+        &.{ exe_owned, "debug:serve", "--daemon" },
         allocator,
     );
     child.stdin_behavior = .Close;

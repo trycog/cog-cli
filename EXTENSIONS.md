@@ -34,7 +34,7 @@ SCIP extensions are **semantic** — they understand the language's type system,
 
 ### Why both layers exist
 
-Tree-sitter gives every supported language instant, zero-config indexing on the first `cog code/index`. No external tools to install, no build step, no configuration. This is the baseline.
+Tree-sitter gives every supported language instant, zero-config indexing on the first `cog code:index`. No external tools to install, no build step, no configuration. This is the baseline.
 
 SCIP extensions add depth. A tree-sitter grammar can identify that `foo()` is a function call, but it can't tell you which `foo` — the one in `utils.zig` or the one in `math.zig`. A SCIP extension with access to the compiler's symbol table resolves that unambiguously.
 
@@ -42,7 +42,7 @@ For the 9 built-in languages, Cog also ships built-in SCIP extension definitions
 
 ### Indexing flow
 
-When you run `cog code/index`:
+When you run `cog code:index`:
 
 1. Expands the glob pattern to a list of files
 2. For each file, tries the **tree-sitter** indexer first (built-in, per-file, fast)
@@ -197,7 +197,7 @@ Installed extensions take priority over built-in ones. If your extension handles
 
 ## Debugger Support
 
-Extensions can declare a debugger configuration so that `cog debug/*` commands know how to debug programs in that language. The debugger section is optional — an extension can provide indexing only, debugging only, or both.
+Extensions can declare a debugger configuration so that `cog debug:*` commands know how to debug programs in that language. The debugger section is optional — an extension can provide indexing only, debugging only, or both.
 
 ### How debugging works
 
@@ -211,7 +211,7 @@ Both drivers expose the same interface to the user: launch, breakpoints, steppin
 
 ### Debug launch flow
 
-When `cog debug/send launch` is called with a program path:
+When `cog debug:send launch` is called with a program path:
 
 1. Cog determines the file extension of the target program
 2. Looks up the extension (installed first, then built-in) for that file type

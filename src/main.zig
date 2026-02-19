@@ -102,14 +102,14 @@ fn mainInner() !void {
         return;
     }
 
-    // Handle code/* commands (don't need config — use local .cog/index.scip)
-    if (std.mem.startsWith(u8, subcmd, "code/")) {
+    // Handle code:* commands (don't need config — use local .cog/index.scip)
+    if (std.mem.startsWith(u8, subcmd, "code:")) {
         try code_intel.dispatch(allocator, subcmd, cmd_args);
         return;
     }
 
-    // Handle debug/* commands (don't need config — local process debugging)
-    if (std.mem.startsWith(u8, subcmd, "debug/")) {
+    // Handle debug:* commands (don't need config — local process debugging)
+    if (std.mem.startsWith(u8, subcmd, "debug:")) {
         try debug_mod.dispatch(allocator, subcmd, cmd_args);
         return;
     }
@@ -131,12 +131,12 @@ fn printHelp() void {
 
 fn printCodeHelp() void {
     tui.header();
-    printErr(bold ++ "  cog code" ++ reset ++ " — Code indexing\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code/index" ++ reset ++ "            " ++ dim ++ "Build SCIP code index (per-file incremental)" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  code/query, code/status, code/edit, code/create, code/delete, and code/rename" ++ reset ++ "\n" ++ dim ++ "  moved to MCP tools (cog_code_*). Run 'cog mcp --help' for MCP usage." ++ reset ++ "\n" ++ "\n");
+    printErr(bold ++ "  cog code" ++ reset ++ " — Code indexing\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code:index" ++ reset ++ "            " ++ dim ++ "Build SCIP code index (per-file incremental)" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  code:query, code:status, code:edit, code:create, code:delete, and code:rename" ++ reset ++ "\n" ++ dim ++ "  moved to MCP tools (cog_code_*). Run 'cog mcp --help' for MCP usage." ++ reset ++ "\n" ++ "\n");
 }
 
 fn printDebugHelp() void {
     tui.header();
-    printErr(bold ++ "  cog debug" ++ reset ++ " — Debug daemon utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Server" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug/serve" ++ reset ++ "           " ++ dim ++ "Start the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug/dashboard" ++ reset ++ "       " ++ dim ++ "Live debug session dashboard" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug/status" ++ reset ++ "          " ++ dim ++ "Check daemon status and active sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug/kill" ++ reset ++ "            " ++ dim ++ "Stop the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug/sign" ++ reset ++ "            " ++ dim ++ "Code-sign binary with debug entitlements (macOS)" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  debug/send moved to MCP tools (debug_*). Run 'cog mcp --help'." ++ reset ++ "\n" ++ "\n");
+    printErr(bold ++ "  cog debug" ++ reset ++ " — Debug daemon utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Server" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:serve" ++ reset ++ "           " ++ dim ++ "Start the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:dashboard" ++ reset ++ "       " ++ dim ++ "Live debug session dashboard" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:status" ++ reset ++ "          " ++ dim ++ "Check daemon status and active sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:kill" ++ reset ++ "            " ++ dim ++ "Stop the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:sign" ++ reset ++ "            " ++ dim ++ "Code-sign binary with debug entitlements (macOS)" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  debug:send moved to MCP tools (debug_*). Run 'cog mcp --help'." ++ reset ++ "\n" ++ "\n");
 }
 
 fn printMcpHelp() void {

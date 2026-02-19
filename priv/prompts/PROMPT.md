@@ -4,9 +4,11 @@ You have code intelligence via Cog.
 
 ## Announce Cog Operations
 
-Print ⚙️ before Cog tool calls.
+Print an emoji before Cog tool calls to indicate the category:
 
-- Code: `cog_code_query`, `cog_code_status`
+- 🔍 Code: `cog_code_query`, `cog_code_status`, `cog_code_index`
+- 🧠 Memory: all `cog_mem_*` tools
+- 🐞 Debug: all `debug_*` tools
 
 <cog:mem>
 ## Memory
@@ -17,7 +19,7 @@ You also have persistent associative memory. Checking memory before work and rec
 
 ### Announce Memory Operations
 
-- ⚙️ Read: `cog_mem_recall`, `cog_mem_list_short_term`
+- 🧠 Read: `cog_mem_recall`, `cog_mem_list_short_term`
 - 🧠 Write: `cog_mem_learn`, `cog_mem_reinforce`, `cog_mem_update`, `cog_mem_flush`
 
 ### The Memory Lifecycle
@@ -36,13 +38,13 @@ Every task follows four steps. This is your operating procedure, not a guideline
 
 **CRITICAL: `cog_mem_recall` is an MCP tool. Call it directly — NEVER use the Skill tool to load `cog` for recall.** The `cog` skill only loads reference documentation. All memory MCP tools (`cog_mem_recall`, `cog_mem_learn`, etc.) are available directly when memory is configured.
 
-If `cog_mem_*` tools are missing, memory is not configured in this workspace (no brain URL in `.cog/settings.json`). In that case, run `cog init` and choose `Memory + Tools`. Do not use deprecated `cog mem/*` CLI commands.
+If `cog_mem_*` tools are missing, memory is not configured in this workspace (no brain URL in `.cog/settings.json`). In that case, run `cog init` and choose `Memory + Tools`. Do not use deprecated `cog mem:*` CLI commands.
 
 Your first action for any task is querying Cog. Before reading source files, before exploring, before planning — check what you already know. Do not formulate an approach before recalling. Plans made without Cog context miss known solutions and repeat past mistakes.
 
 The recall sequence has three visible steps:
 
-1. Print `⚙️ Querying Cog...` as text to the user
+1. Print `🧠 Querying Cog...` as text to the user
 2. Call the `cog_mem_recall` MCP tool with a reformulated query (not the Skill tool, not Bash — the MCP tool directly)
 3. Report results: briefly tell the user what engrams Cog returned, or state "no relevant memories found"
 
@@ -117,7 +119,7 @@ Short-term memories decay in 24 hours. Before ending, review and preserve what y
 1. Call `cog_mem_list_short_term` MCP tool to see pending short-term memories
 2. For each entry: call `cog_mem_reinforce` if valid and useful, `cog_mem_flush` if wrong or worthless
 3. **Print a visible summary** at the end of your response with these two lines:
-   - `⚙️ Cog recall:` what recall surfaced that was useful (or "nothing relevant" if it didn't help)
+   - `🧠 Cog recall:` what recall surfaced that was useful (or "nothing relevant" if it didn't help)
    - `🧠 Stored to Cog:` list the concept names you stored during this session (or "nothing new" if none)
 
 **This summary is mandatory.** It closes the memory lifecycle and shows the user Cog is working.
@@ -131,14 +133,14 @@ In the example below: `[print]` = visible text you output, `[call]` = real MCP t
 ```
 User: "Fix login sessions expiring early"
 
-1. [print] ⚙️ Querying Cog...
+1. [print] 🧠 Querying Cog...
    [call]  cog_mem_recall({...})
 2. [print] 🧠 Recording to Cog...
    [call]  cog_mem_learn({...})
 3. Implement fix using code tools, then test.
 4. [call]  cog_mem_list_short_term({...}) and reinforce/flush as needed.
 5. Final response includes:
-   [print] ⚙️ Cog recall: ...
+   [print] 🧠 Cog recall: ...
    [print] 🧠 Stored to Cog: ...
 ```
 
@@ -157,6 +159,8 @@ Passwords, API keys, tokens, secrets, SSH/PGP keys, certificates, connection str
 
 <cog:debug>
 ## Debugger
+
+Print 🐞 before all debug tool calls.
 
 You have a full interactive debugger via Cog. **Use it instead of adding print, console.log, logging, or any IO statements to inspect runtime state.** The debugger replaces print debugging entirely. Only fall back to IO-based inspection if the debugger is unavailable for the target language or runtime.
 

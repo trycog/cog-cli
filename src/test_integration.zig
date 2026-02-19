@@ -484,7 +484,7 @@ fn executeCogQuery(allocator: std.mem.Allocator, args_json: []const u8) ![]const
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code/query", mode, query });
+    return runCogCommand(allocator, &.{ cog_path, "code:query", mode, query });
 }
 
 fn executeCogEdit(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -510,7 +510,7 @@ fn executeCogEdit(allocator: std.mem.Allocator, args_json: []const u8) ![]const 
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code/edit", file, "--old", old_text, "--new", new_text });
+    return runCogCommand(allocator, &.{ cog_path, "code:edit", file, "--old", old_text, "--new", new_text });
 }
 
 fn executeCogRename(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -533,7 +533,7 @@ fn executeCogRename(allocator: std.mem.Allocator, args_json: []const u8) ![]cons
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code/rename", old_path, "--to", new_path });
+    return runCogCommand(allocator, &.{ cog_path, "code:rename", old_path, "--to", new_path });
 }
 
 fn executeCogDelete(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -553,7 +553,7 @@ fn executeCogDelete(allocator: std.mem.Allocator, args_json: []const u8) ![]cons
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code/delete", file });
+    return runCogCommand(allocator, &.{ cog_path, "code:delete", file });
 }
 
 fn executeCogCreate(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -576,7 +576,7 @@ fn executeCogCreate(allocator: std.mem.Allocator, args_json: []const u8) ![]cons
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code/create", file, "--content", content });
+    return runCogCommand(allocator, &.{ cog_path, "code:create", file, "--content", content });
 }
 
 fn executeToolCall(allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]const u8 {
@@ -652,7 +652,7 @@ fn directCogQuery(allocator: std.mem.Allocator, mode: []const u8, query: []const
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code/query", mode, query });
+    return runCogCommand(allocator, &.{ cog_path, "code:query", mode, query });
 }
 
 fn verifySymbolExists(allocator: std.mem.Allocator, name: []const u8) !bool {
@@ -722,13 +722,13 @@ fn buildCogIndex(allocator: std.mem.Allocator, pattern: ?[]const u8) !void {
     defer allocator.free(cog_path);
 
     const argv: []const []const u8 = if (pattern) |p|
-        &.{ cog_path, "code/index", p }
+        &.{ cog_path, "code:index", p }
     else
-        &.{ cog_path, "code/index" };
+        &.{ cog_path, "code:index" };
     var child = std.process.Child.init(argv, allocator);
     child.cwd = REACT_DIR;
     child.spawn() catch {
-        printErr("  error: failed to run cog code/index\n");
+        printErr("  error: failed to run cog code:index\n");
         return error.SetupFailed;
     };
     const term = child.wait() catch {

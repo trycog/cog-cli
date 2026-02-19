@@ -305,14 +305,14 @@ pub fn loadIndexForRuntime(allocator: std.mem.Allocator) !CodeIndex {
 // ── Commands ────────────────────────────────────────────────────────────
 
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
-    if (std.mem.eql(u8, subcmd, "code/index")) return codeIndex(allocator, args);
+    if (std.mem.eql(u8, subcmd, "code:index")) return codeIndex(allocator, args);
 
-    if (std.mem.eql(u8, subcmd, "code/query") or
-        std.mem.eql(u8, subcmd, "code/status") or
-        std.mem.eql(u8, subcmd, "code/edit") or
-        std.mem.eql(u8, subcmd, "code/create") or
-        std.mem.eql(u8, subcmd, "code/delete") or
-        std.mem.eql(u8, subcmd, "code/rename"))
+    if (std.mem.eql(u8, subcmd, "code:query") or
+        std.mem.eql(u8, subcmd, "code:status") or
+        std.mem.eql(u8, subcmd, "code:edit") or
+        std.mem.eql(u8, subcmd, "code:create") or
+        std.mem.eql(u8, subcmd, "code:delete") or
+        std.mem.eql(u8, subcmd, "code:rename"))
     {
         printErr("error: '");
         printErr(subcmd);
@@ -327,7 +327,7 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     return error.Explained;
 }
 
-// ── code/index ──────────────────────────────────────────────────────────
+// ── code:index ──────────────────────────────────────────────────────────
 
 fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (hasFlag(args, "--help")) {
