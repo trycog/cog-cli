@@ -69,12 +69,6 @@ fn mainInner() !void {
         return;
     }
 
-    // Handle update command (doesn't need config)
-    if (std.mem.eql(u8, subcmd, "update")) {
-        try commands.updatePrompt(allocator, cmd_args);
-        return;
-    }
-
     // Handle install command (doesn't need config)
     if (std.mem.eql(u8, subcmd, "install")) {
         if (cmd_args.len == 0 or std.mem.eql(u8, cmd_args[0], "--help") or std.mem.eql(u8, cmd_args[0], "-h")) {
@@ -132,7 +126,7 @@ fn printHelp() void {
     printErr(dim ++ "  v");
     printErr(version);
     printErr(reset ++ "\n\n");
-    printErr(bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "    " ++ bold ++ "update" ++ reset ++ "                " ++ dim ++ "Fetch latest system prompt and agent skill" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "install" ++ reset ++ "               " ++ dim ++ "Install a language extension from a git URL" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  Run 'cog <command> --help' for details on a specific command." ++ reset ++ "\n" ++ "\n");
+    printErr(bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "install" ++ reset ++ "               " ++ dim ++ "Install a language extension from a git URL" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  Run 'cog <command> --help' for details on a specific command." ++ reset ++ "\n" ++ "\n");
 }
 
 fn printCodeHelp() void {

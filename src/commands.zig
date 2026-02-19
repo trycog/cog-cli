@@ -384,36 +384,6 @@ fn initBrain(allocator: std.mem.Allocator, host: []const u8) !void {
     }
 }
 
-pub fn updatePrompt(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
-    if (hasFlag(args, "--help")) {
-        printCommandHelp(help.update_cmd);
-        return;
-    }
-
-    tui.header();
-
-    // Detect whether memory is configured by checking for .cog/settings.json with brain.url
-    const has_mem = blk: {
-        const settings = readCwdFile(allocator, ".cog/settings.json") orelse break :blk false;
-        defer allocator.free(settings);
-        const parsed = json.parseFromSlice(json.Value, allocator, settings, .{}) catch break :blk false;
-        defer parsed.deinit();
-        if (parsed.value == .object) {
-            if (parsed.value.object.get("brain")) |brain| {
-                if (brain == .object) {
-                    if (brain.object.get("url")) |url| {
-                        if (url == .string) break :blk true;
-                    }
-                }
-            }
-        }
-        break :blk false;
-    };
-
-    // Update system prompt
-    try setupSystemPrompt(allocator, has_mem);
-}
-
 fn buildAccountLabel(allocator: std.mem.Allocator, account: json.Value) ![]const u8 {
     if (account == .object) {
         const name = if (account.object.get("name")) |s| (if (s == .string) s.string else null) else null;
@@ -745,12 +715,6 @@ fn writeSettingsMerge(allocator: std.mem.Allocator, brain_url: []const u8) !void
 
 // ── System Prompt Setup ─────────────────────────────────────────────────
 
-fn fileExistsInCwd(filename: []const u8) bool {
-    const f = std.fs.cwd().openFile(filename, .{}) catch return false;
-    f.close();
-    return true;
-}
-
 fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
     const f = std.fs.cwd().openFile(filename, .{}) catch return null;
     defer f.close();
@@ -811,50 +775,6 @@ fn updateFileWithPrompt(allocator: std.mem.Allocator, filename: []const u8, prom
     defer allocator.free(new_content);
 
     try writeCwdFile(filename, new_content);
-}
-
-fn setupSystemPrompt(allocator: std.mem.Allocator, setup_mem: bool) !void {
-    const prompt_content = try processCogMemTags(allocator, build_options.prompt_md, setup_mem);
-    defer allocator.free(prompt_content);
-
-    const agents_exists = fileExistsInCwd("AGENTS.md");
-    const claude_exists = fileExistsInCwd("CLAUDE.md");
-
-    if (agents_exists and claude_exists) {
-        try updateFileWithPrompt(allocator, "AGENTS.md", prompt_content);
-        printErr("  Updated AGENTS.md\n");
-        try updateFileWithPrompt(allocator, "CLAUDE.md", prompt_content);
-        printErr("  Updated CLAUDE.md\n");
-    } else if (agents_exists) {
-        try updateFileWithPrompt(allocator, "AGENTS.md", prompt_content);
-        printErr("  Updated AGENTS.md\n");
-    } else if (claude_exists) {
-        try updateFileWithPrompt(allocator, "CLAUDE.md", prompt_content);
-        printErr("  Updated CLAUDE.md\n");
-    } else {
-        const file_options = [_]tui.MenuItem{
-            .{ .label = "CLAUDE.md" },
-            .{ .label = "AGENTS.md" },
-        };
-        const result = try tui.select(allocator, .{
-            .prompt = "Create system prompt in:",
-            .items = &file_options,
-        });
-        switch (result) {
-            .selected => |idx| {
-                const filename = file_options[idx].label;
-                try updateFileWithPrompt(allocator, filename, prompt_content);
-                printErr("  Created ");
-                printErr(filename);
-                printErr("\n");
-            },
-            .back, .cancelled => {
-                printErr("  Skipped system prompt setup.\n");
-                return;
-            },
-            .input => unreachable,
-        }
-    }
 }
 
 fn ensureGitignore(allocator: std.mem.Allocator) void {

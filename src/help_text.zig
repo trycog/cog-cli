@@ -23,20 +23,6 @@ pub const init =
     ++ "\n"
 ;
 
-pub const update_cmd =
-    bold ++ "  cog update" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Fetch the latest system prompt. Updates\n"
-    ++ "  CLAUDE.md/AGENTS.md.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog update " ++ dim ++ "[options]" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--host" ++ reset ++ " HOST             " ++ dim ++ "Server hostname (default: trycog.ai)" ++ reset ++ "\n"
-    ++ "\n"
-;
-
 // ── Code Intelligence ──────────────────────────────────────────────────
 
 pub const code_index =
