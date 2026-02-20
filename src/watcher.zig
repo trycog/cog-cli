@@ -17,6 +17,7 @@ pub const Watcher = struct {
     read_len: usize,
     read_start: usize,
     macos_run_loop: if (builtin.os.tag == .macos) ?*anyopaque else void,
+    macos_cf_run_loop_stop: if (builtin.os.tag == .macos) ?CF.CFRunLoopStopFn else void,
 
     /// Initialize the watcher. Returns null if no index exists or platform unsupported.
     pub fn init(allocator: std.mem.Allocator) ?Watcher {
@@ -54,6 +55,7 @@ pub const Watcher = struct {
             .read_len = 0,
             .read_start = 0,
             .macos_run_loop = if (builtin.os.tag == .macos) null else {},
+            .macos_cf_run_loop_stop = if (builtin.os.tag == .macos) null else {},
         };
     }
 
@@ -72,7 +74,9 @@ pub const Watcher = struct {
 
         if (builtin.os.tag == .macos) {
             if (self.macos_run_loop) |rl| {
-                CoreFoundation.CFRunLoopStop(@ptrCast(rl));
+                if (self.macos_cf_run_loop_stop) |stop_fn| {
+                    stop_fn(@ptrCast(rl));
+                }
             }
         }
 
@@ -182,9 +186,11 @@ fn setNonBlock(fd: posix.fd_t) void {
 }
 
 // ── macOS Backend (FSEvents) ────────────────────────────────────────────
+// Frameworks are loaded dynamically at runtime via std.DynLib so that
+// cross-compilation works without macOS SDK stubs.
 
-const CoreFoundation = if (builtin.os.tag == .macos) struct {
-    // Types
+const CF = struct {
+    // Opaque CF/FSEvents types
     const CFIndex = isize;
     const CFStringEncoding = u32;
     const CFAllocatorRef = ?*anyopaque;
@@ -228,70 +234,143 @@ const CoreFoundation = if (builtin.os.tag == .macos) struct {
     const kFSEventStreamEventFlagItemRemoved: u32 = 0x00000200;
     const kFSEventStreamEventFlagItemRenamed: u32 = 0x00000800;
 
-    // CoreFoundation externs
-    extern "CoreFoundation" fn CFStringCreateWithCString(
-        alloc: CFAllocatorRef,
-        cStr: [*:0]const u8,
-        encoding: CFStringEncoding,
-    ) ?CFStringRef;
-    extern "CoreFoundation" fn CFArrayCreate(
-        alloc: CFAllocatorRef,
-        values: [*]const ?*const anyopaque,
-        num_values: CFIndex,
-        callbacks: ?*const anyopaque,
-    ) ?CFArrayRef;
-    extern "CoreFoundation" fn CFRelease(cf: *anyopaque) void;
-    extern "CoreFoundation" fn CFRunLoopGetCurrent() CFRunLoopRef;
-    extern "CoreFoundation" fn CFRunLoopRun() void;
-    extern "CoreFoundation" fn CFRunLoopStop(rl: CFRunLoopRef) void;
+    // Function pointer types for dynamic loading
+    const CFStringCreateWithCStringFn = *const fn (CFAllocatorRef, [*:0]const u8, CFStringEncoding) callconv(.c) ?CFStringRef;
+    const CFArrayCreateFn = *const fn (CFAllocatorRef, [*]const ?*const anyopaque, CFIndex, ?*const anyopaque) callconv(.c) ?CFArrayRef;
+    const CFReleaseFn = *const fn (*anyopaque) callconv(.c) void;
+    const CFRunLoopGetCurrentFn = *const fn () callconv(.c) CFRunLoopRef;
+    const CFRunLoopRunFn = *const fn () callconv(.c) void;
+    const CFRunLoopStopFn = *const fn (CFRunLoopRef) callconv(.c) void;
 
-    // CoreServices (FSEvents) externs
-    extern "CoreServices" fn FSEventStreamCreate(
-        alloc: CFAllocatorRef,
-        callback: FSEventStreamCallback,
-        context: *const FSEventStreamContext,
-        paths_to_watch: CFArrayRef,
-        since_when: FSEventStreamEventId,
-        latency: f64,
-        flags: FSEventStreamCreateFlags,
-    ) ?FSEventStreamRef;
-    extern "CoreServices" fn FSEventStreamScheduleWithRunLoop(
-        stream: FSEventStreamRef,
-        run_loop: CFRunLoopRef,
-        mode: CFRunLoopMode,
-    ) void;
-    extern "CoreServices" fn FSEventStreamStart(stream: FSEventStreamRef) bool;
-    extern "CoreServices" fn FSEventStreamStop(stream: FSEventStreamRef) void;
-    extern "CoreServices" fn FSEventStreamInvalidate(stream: FSEventStreamRef) void;
-    extern "CoreServices" fn FSEventStreamRelease(stream: FSEventStreamRef) void;
+    const FSEventStreamCreateFn = *const fn (CFAllocatorRef, FSEventStreamCallback, *const FSEventStreamContext, CFArrayRef, FSEventStreamEventId, f64, FSEventStreamCreateFlags) callconv(.c) ?FSEventStreamRef;
+    const FSEventStreamScheduleWithRunLoopFn = *const fn (FSEventStreamRef, CFRunLoopRef, CFRunLoopMode) callconv(.c) void;
+    const FSEventStreamStartFn = *const fn (FSEventStreamRef) callconv(.c) bool;
+    const FSEventStreamStopFn = *const fn (FSEventStreamRef) callconv(.c) void;
+    const FSEventStreamInvalidateFn = *const fn (FSEventStreamRef) callconv(.c) void;
+    const FSEventStreamReleaseFn = *const fn (FSEventStreamRef) callconv(.c) void;
 
-    // kCFRunLoopDefaultMode is a global CFStringRef
-    extern "CoreFoundation" var kCFRunLoopDefaultMode: CFRunLoopMode;
-} else struct {};
+    // Resolved function pointers
+    CFStringCreateWithCString: CFStringCreateWithCStringFn = undefined,
+    CFArrayCreate: CFArrayCreateFn = undefined,
+    CFRelease: CFReleaseFn = undefined,
+    CFRunLoopGetCurrent: CFRunLoopGetCurrentFn = undefined,
+    CFRunLoopRun: CFRunLoopRunFn = undefined,
+    CFRunLoopStop: CFRunLoopStopFn = undefined,
+
+    FSEventStreamCreate: FSEventStreamCreateFn = undefined,
+    FSEventStreamScheduleWithRunLoop: FSEventStreamScheduleWithRunLoopFn = undefined,
+    FSEventStreamStart: FSEventStreamStartFn = undefined,
+    FSEventStreamStop: FSEventStreamStopFn = undefined,
+    FSEventStreamInvalidate: FSEventStreamInvalidateFn = undefined,
+    FSEventStreamRelease: FSEventStreamReleaseFn = undefined,
+
+    kCFRunLoopDefaultMode: CFRunLoopMode = undefined,
+
+    cf_lib: std.DynLib = undefined,
+    cs_lib: std.DynLib = undefined,
+
+    fn load() ?CF {
+        var self: CF = .{};
+
+        self.cf_lib = std.DynLib.open("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation") catch return null;
+        self.cs_lib = std.DynLib.open("/System/Library/Frameworks/CoreServices.framework/CoreServices") catch {
+            self.cf_lib.close();
+            return null;
+        };
+
+        // CoreFoundation functions
+        self.CFStringCreateWithCString = self.cf_lib.lookup(CFStringCreateWithCStringFn, "CFStringCreateWithCString") orelse {
+            self.close();
+            return null;
+        };
+        self.CFArrayCreate = self.cf_lib.lookup(CFArrayCreateFn, "CFArrayCreate") orelse {
+            self.close();
+            return null;
+        };
+        self.CFRelease = self.cf_lib.lookup(CFReleaseFn, "CFRelease") orelse {
+            self.close();
+            return null;
+        };
+        self.CFRunLoopGetCurrent = self.cf_lib.lookup(CFRunLoopGetCurrentFn, "CFRunLoopGetCurrent") orelse {
+            self.close();
+            return null;
+        };
+        self.CFRunLoopRun = self.cf_lib.lookup(CFRunLoopRunFn, "CFRunLoopRun") orelse {
+            self.close();
+            return null;
+        };
+        self.CFRunLoopStop = self.cf_lib.lookup(CFRunLoopStopFn, "CFRunLoopStop") orelse {
+            self.close();
+            return null;
+        };
+
+        // CoreServices functions
+        self.FSEventStreamCreate = self.cs_lib.lookup(FSEventStreamCreateFn, "FSEventStreamCreate") orelse {
+            self.close();
+            return null;
+        };
+        self.FSEventStreamScheduleWithRunLoop = self.cs_lib.lookup(FSEventStreamScheduleWithRunLoopFn, "FSEventStreamScheduleWithRunLoop") orelse {
+            self.close();
+            return null;
+        };
+        self.FSEventStreamStart = self.cs_lib.lookup(FSEventStreamStartFn, "FSEventStreamStart") orelse {
+            self.close();
+            return null;
+        };
+        self.FSEventStreamStop = self.cs_lib.lookup(FSEventStreamStopFn, "FSEventStreamStop") orelse {
+            self.close();
+            return null;
+        };
+        self.FSEventStreamInvalidate = self.cs_lib.lookup(FSEventStreamInvalidateFn, "FSEventStreamInvalidate") orelse {
+            self.close();
+            return null;
+        };
+        self.FSEventStreamRelease = self.cs_lib.lookup(FSEventStreamReleaseFn, "FSEventStreamRelease") orelse {
+            self.close();
+            return null;
+        };
+
+        // Global variable: kCFRunLoopDefaultMode is a pointer to a CFStringRef
+        const mode_ptr = self.cf_lib.lookup(*const CFRunLoopMode, "kCFRunLoopDefaultMode") orelse {
+            self.close();
+            return null;
+        };
+        self.kCFRunLoopDefaultMode = mode_ptr.*;
+
+        return self;
+    }
+
+    fn close(self: *CF) void {
+        self.cs_lib.close();
+        self.cf_lib.close();
+    }
+};
 
 fn watcherThreadMacos(self: *Watcher) void {
     if (builtin.os.tag != .macos) return;
 
-    const CF = CoreFoundation;
+    // Load frameworks dynamically
+    var cf = CF.load() orelse return;
+    defer cf.close();
 
     // Create CFString from project root
     const root_z = self.allocator.dupeZ(u8, self.project_root) catch return;
     defer self.allocator.free(root_z);
 
-    const cf_path = CF.CFStringCreateWithCString(null, root_z.ptr, CF.kCFStringEncodingUTF8) orelse return;
-    defer CF.CFRelease(cf_path);
+    const cf_path = cf.CFStringCreateWithCString(null, root_z.ptr, CF.kCFStringEncodingUTF8) orelse return;
+    defer cf.CFRelease(cf_path);
 
     // Create CFArray with single path
     var path_values = [_]?*const anyopaque{cf_path};
-    const cf_paths = CF.CFArrayCreate(null, &path_values, 1, null) orelse return;
-    defer CF.CFRelease(cf_paths);
+    const cf_paths = cf.CFArrayCreate(null, &path_values, 1, null) orelse return;
+    defer cf.CFRelease(cf_paths);
 
     // Create stream context pointing to self
     var context = CF.FSEventStreamContext{
         .info = @ptrCast(self),
     };
 
-    const stream = CF.FSEventStreamCreate(
+    const stream = cf.FSEventStreamCreate(
         null,
         &fseventsCallback,
         &context,
@@ -301,37 +380,35 @@ fn watcherThreadMacos(self: *Watcher) void {
         CF.kFSEventStreamCreateFlagFileEvents | CF.kFSEventStreamCreateFlagNoDefer,
     ) orelse return;
 
-    // Store run loop ref so deinit() can stop it
-    const run_loop = CF.CFRunLoopGetCurrent();
+    // Store run loop ref and stop fn so deinit() can stop it
+    const run_loop = cf.CFRunLoopGetCurrent();
     self.macos_run_loop = @ptrCast(run_loop);
+    self.macos_cf_run_loop_stop = cf.CFRunLoopStop;
 
-    CF.FSEventStreamScheduleWithRunLoop(stream, run_loop, CF.kCFRunLoopDefaultMode);
-    if (!CF.FSEventStreamStart(stream)) {
-        CF.FSEventStreamInvalidate(stream);
-        CF.FSEventStreamRelease(stream);
+    cf.FSEventStreamScheduleWithRunLoop(stream, run_loop, cf.kCFRunLoopDefaultMode);
+    if (!cf.FSEventStreamStart(stream)) {
+        cf.FSEventStreamInvalidate(stream);
+        cf.FSEventStreamRelease(stream);
         return;
     }
 
     // Block until CFRunLoopStop() is called from deinit()
-    CF.CFRunLoopRun();
+    cf.CFRunLoopRun();
 
     // Cleanup
-    CF.FSEventStreamStop(stream);
-    CF.FSEventStreamInvalidate(stream);
-    CF.FSEventStreamRelease(stream);
+    cf.FSEventStreamStop(stream);
+    cf.FSEventStreamInvalidate(stream);
+    cf.FSEventStreamRelease(stream);
 }
 
 fn fseventsCallback(
-    _: CoreFoundation.ConstFSEventStreamRef,
+    _: CF.ConstFSEventStreamRef,
     info: ?*anyopaque,
     num_events: usize,
     event_paths: [*]const [*:0]const u8,
     event_flags: [*]const u32,
-    _: [*]const CoreFoundation.FSEventStreamEventId,
+    _: [*]const CF.FSEventStreamEventId,
 ) callconv(.c) void {
-    if (builtin.os.tag != .macos) return;
-
-    const CF = CoreFoundation;
     const self: *Watcher = @ptrCast(@alignCast(info orelse return));
     if (self.stop_flag.load(.acquire)) return;
 

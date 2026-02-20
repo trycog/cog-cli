@@ -45,8 +45,6 @@ pub fn build(b: *std.Build) void {
     });
     addTreeSitter(b, mod);
     addCurl(b, mod, target, optimize);
-    addPlatformFrameworks(mod);
-
     // Build options (version + embedded prompts)
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -208,11 +206,8 @@ fn addCurl(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarg
     mod.addImport("curl", curl_dep.module("curl"));
 }
 
-/// Link platform frameworks needed by the file watcher (FSEvents on macOS).
-fn addPlatformFrameworks(mod: *std.Build.Module) void {
-    mod.linkFramework("CoreFoundation", .{});
-    mod.linkFramework("CoreServices", .{});
-}
+// Platform frameworks (CoreFoundation, CoreServices) are loaded dynamically
+// at runtime via std.DynLib so cross-compilation works without macOS SDK stubs.
 
 fn addRelease(
     b: *std.Build,
@@ -233,8 +228,6 @@ fn addRelease(
     });
     addTreeSitter(b, release_mod);
     addCurl(b, release_mod, release_target, .ReleaseSafe);
-    addPlatformFrameworks(release_mod);
-
     const release_options = b.addOptions();
     release_options.addOption([]const u8, "version", version);
     release_options.addOption([]const u8, "prompt_md", @embedFile("priv/prompts/PROMPT.md"));
