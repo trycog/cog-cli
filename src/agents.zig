@@ -34,6 +34,8 @@ pub const Agent = struct {
     prompt_target: PromptTarget,
     mcp_path: ?[]const u8,
     mcp_format: McpFormat,
+    agent_file_path: ?[]const u8,
+    agent_file_header: ?[]const u8,
 
     pub fn supportsToolPermissions(self: *const Agent) bool {
         return std.mem.eql(u8, self.id, "claude_code") or
@@ -49,81 +51,155 @@ pub const agents = [_]Agent{
         .id = "claude_code",
         .display_name = "Claude Code",
         .prompt_target = .claude_md,
-
         .mcp_path = ".mcp.json",
         .mcp_format = .json_mcpServers,
+        .agent_file_path = ".claude/agents/cog-code-query.md",
+        .agent_file_header =
+        \\---
+        \\name: cog-code-query
+        \\description: Explore code structure using the Cog SCIP index
+        \\tools:
+        \\  - Read
+        \\  - Glob
+        \\  - Grep
+        \\mcpServers:
+        \\  - cog
+        \\model: haiku
+        \\---
+        \\
+        ,
     },
     .{
         .id = "gemini",
         .display_name = "Gemini CLI",
         .prompt_target = .gemini_md,
-
         .mcp_path = ".gemini/settings.json",
         .mcp_format = .json_mcpServers,
+        .agent_file_path = ".gemini/agents/cog-code-query.md",
+        .agent_file_header =
+        \\---
+        \\name: cog-code-query
+        \\description: Explore code structure using the Cog SCIP index
+        \\tools:
+        \\  - read_file
+        \\  - glob
+        \\  - search_file_content
+        \\---
+        \\
+        ,
     },
     .{
         .id = "copilot",
         .display_name = "GitHub Copilot",
         .prompt_target = .copilot_instructions,
-
         .mcp_path = ".vscode/mcp.json",
         .mcp_format = .json_servers,
+        .agent_file_path = ".github/agents/cog-code-query.agent.md",
+        .agent_file_header =
+        \\---
+        \\name: cog-code-query
+        \\description: Explore code structure using the Cog SCIP index
+        \\tools:
+        \\  - read
+        \\  - search
+        \\---
+        \\
+        ,
     },
     .{
         .id = "windsurf",
         .display_name = "Windsurf",
         .prompt_target = .agents_md,
-
         .mcp_path = null,
         .mcp_format = .global_only,
+        .agent_file_path = ".windsurf/workflows/cog-code-query.md",
+        .agent_file_header =
+        \\---
+        \\description: Explore code structure using the Cog SCIP index
+        \\---
+        \\
+        ,
     },
     .{
         .id = "cursor",
         .display_name = "Cursor",
         .prompt_target = .agents_md,
-
         .mcp_path = ".cursor/mcp.json",
         .mcp_format = .json_mcpServers,
+        .agent_file_path = ".cursor/agents/cog-code-query.md",
+        .agent_file_header =
+        \\---
+        \\name: cog-code-query
+        \\description: Explore code structure using the Cog SCIP index
+        \\readonly: true
+        \\---
+        \\
+        ,
     },
     .{
         .id = "codex",
         .display_name = "OpenAI Codex CLI",
         .prompt_target = .agents_md,
-
         .mcp_path = ".codex/config.toml",
         .mcp_format = .toml,
+        .agent_file_path = ".codex/config.toml",
+        .agent_file_header = null,
     },
     .{
         .id = "amp",
         .display_name = "Amp",
         .prompt_target = .agents_md,
-
         .mcp_path = ".amp/settings.json",
         .mcp_format = .json_amp,
+        .agent_file_path = ".agents/skills/cog-code-query.md",
+        .agent_file_header =
+        \\---
+        \\description: Explore code structure using the Cog SCIP index
+        \\---
+        \\
+        ,
     },
     .{
         .id = "goose",
         .display_name = "Goose",
         .prompt_target = .agents_md,
-
         .mcp_path = null,
         .mcp_format = .global_only,
+        .agent_file_path = ".goose/cog-code-query.yaml",
+        .agent_file_header =
+        \\---
+        \\title: cog-code-query
+        \\description: Explore code structure using the Cog SCIP index
+        \\---
+        \\
+        ,
     },
     .{
         .id = "roo",
         .display_name = "Roo Code",
         .prompt_target = .agents_md,
-
         .mcp_path = ".roo/mcp.json",
         .mcp_format = .json_mcpServers,
+        .agent_file_path = ".roomodes",
+        .agent_file_header = null,
     },
     .{
         .id = "opencode",
         .display_name = "OpenCode",
         .prompt_target = .agents_md,
-
         .mcp_path = "opencode.json",
         .mcp_format = .json_mcp,
+        .agent_file_path = ".opencode/agents/cog-code-query.md",
+        .agent_file_header =
+        \\---
+        \\description: Explore code structure using the Cog SCIP index
+        \\mode: subagent
+        \\tools:
+        \\  write: false
+        \\  edit: false
+        \\---
+        \\
+        ,
     },
 };
 

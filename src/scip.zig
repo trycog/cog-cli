@@ -43,6 +43,7 @@ pub const Occurrence = struct {
     symbol: []const u8,
     symbol_roles: i32,
     syntax_kind: i32,
+    enclosing_range: ?Range = null,
 };
 
 pub const SymbolInformation = struct {
@@ -324,6 +325,25 @@ fn decodeOccurrence(allocator: std.mem.Allocator, data: []const u8) !Occurrence 
             2 => result.symbol = try dec.readString(),
             3 => result.symbol_roles = @intCast(try dec.readVarint()),
             5 => result.syntax_kind = @intCast(try dec.readVarint()),
+            7 => { // enclosing_range - packed int32 (same encoding as range)
+                const range_vals = try dec.readPackedInt32(allocator);
+                defer allocator.free(range_vals);
+                if (range_vals.len == 3) {
+                    result.enclosing_range = .{
+                        .start_line = range_vals[0],
+                        .start_char = range_vals[1],
+                        .end_line = range_vals[0],
+                        .end_char = range_vals[2],
+                    };
+                } else if (range_vals.len >= 4) {
+                    result.enclosing_range = .{
+                        .start_line = range_vals[0],
+                        .start_char = range_vals[1],
+                        .end_line = range_vals[2],
+                        .end_char = range_vals[3],
+                    };
+                }
+            },
             else => try dec.skipField(field.wire_type),
         }
     }

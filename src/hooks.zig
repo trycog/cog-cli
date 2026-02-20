@@ -3,6 +3,7 @@ const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const agents_mod = @import("agents.zig");
+const build_options = @import("build_options");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -500,6 +501,139 @@ fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void
     try writeCwdFile(mcp_path, new_content);
 }
 
+// ── Agent File Deployment ────────────────────────────────────────────
+
+pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
+    const agent_path = agent.agent_file_path orelse return;
+
+    if (agent.agent_file_header) |header| {
+        try writeMarkdownAgent(allocator, agent_path, header);
+    } else if (std.mem.eql(u8, agent.id, "codex")) {
+        try writeTomlAgent(allocator, agent_path);
+    } else if (std.mem.eql(u8, agent.id, "roo")) {
+        try writeRooAgent(allocator, agent_path);
+    }
+}
+
+fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        try ensureDir(parent);
+    }
+
+    const body = build_options.agent_body;
+    const content = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
+    defer allocator.free(content);
+    try writeCwdFile(path, content);
+}
+
+fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| {
+        try ensureDir(parent);
+    }
+
+    const existing = readCwdFile(allocator, path);
+    defer if (existing) |e| allocator.free(e);
+
+    const section_marker = "[agents.cog-code-query]";
+
+    if (existing) |content| {
+        if (std.mem.indexOf(u8, content, section_marker) != null) return;
+
+        const toml_section = try std.fmt.allocPrint(allocator,
+            \\
+            \\{s}
+            \\description = "Explore code structure using the Cog SCIP index"
+            \\developer_instructions = """
+            \\{s}"""
+            \\
+        , .{ section_marker, build_options.agent_body });
+        defer allocator.free(toml_section);
+
+        const new_content = try std.fmt.allocPrint(allocator, "{s}{s}", .{ content, toml_section });
+        defer allocator.free(new_content);
+        try writeCwdFile(path, new_content);
+    } else {
+        const toml_content = try std.fmt.allocPrint(allocator,
+            \\{s}
+            \\description = "Explore code structure using the Cog SCIP index"
+            \\developer_instructions = """
+            \\{s}"""
+            \\
+        , .{ section_marker, build_options.agent_body });
+        defer allocator.free(toml_content);
+        try writeCwdFile(path, toml_content);
+    }
+}
+
+fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8) !void {
+    const existing = readCwdFile(allocator, path);
+    defer if (existing) |e| allocator.free(e);
+
+    const mode_slug = "cog-code-query";
+    const mode_name = "Cog Code Query";
+    const role_definition = "You are a code index exploration agent. Use cog_code_query to answer questions about code structure. Always follow this order: 1) find to locate definitions, 2) symbols to understand the file, 3) refs to see usage, 4) Read source only after you know where to look. Never guess filenames. Return concise summaries with file paths and line numbers.";
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+
+    try s.beginObject();
+    try s.objectField("customModes");
+    try s.beginArray();
+
+    var found_existing = false;
+
+    if (existing) |content| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("customModes")) |modes| {
+                    if (modes == .array) {
+                        for (modes.array.items) |mode| {
+                            if (mode == .object) {
+                                if (mode.object.get("slug")) |slug_val| {
+                                    if (slug_val == .string and std.mem.eql(u8, slug_val.string, mode_slug)) {
+                                        found_existing = true;
+                                        // Write updated entry
+                                        try s.beginObject();
+                                        try s.objectField("slug");
+                                        try s.write(mode_slug);
+                                        try s.objectField("name");
+                                        try s.write(mode_name);
+                                        try s.objectField("roleDefinition");
+                                        try s.write(role_definition);
+                                        try s.endObject();
+                                        continue;
+                                    }
+                                }
+                            }
+                            try s.write(mode);
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    }
+
+    if (!found_existing) {
+        try s.beginObject();
+        try s.objectField("slug");
+        try s.write(mode_slug);
+        try s.objectField("name");
+        try s.write(mode_name);
+        try s.objectField("roleDefinition");
+        try s.write(role_definition);
+        try s.endObject();
+    }
+
+    try s.endArray();
+    try s.endObject();
+
+    const new_content = try aw.toOwnedSlice();
+    defer allocator.free(new_content);
+    try writeCwdFile(path, new_content);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 fn withTempCwd(comptime body: fn (std.mem.Allocator) anyerror!void) !void {
@@ -775,6 +909,158 @@ test "writeAmpPermissions is idempotent" {
 
             const perms = parsed.value.object.get("amp.permissions").?;
             try std.testing.expectEqual(@as(usize, 1), perms.array.items.len);
+        }
+    }.run);
+}
+
+test "writeMarkdownAgent creates correct file" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const header =
+                \\---
+                \\name: cog-code-query
+                \\description: Test agent
+                \\---
+            ;
+
+            try writeMarkdownAgent(allocator, ".claude/agents/cog-code-query.md", header);
+
+            const content = readCwdFile(allocator, ".claude/agents/cog-code-query.md") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            // Contains the header
+            try std.testing.expect(std.mem.indexOf(u8, content, "name: cog-code-query") != null);
+            // Contains the body
+            try std.testing.expect(std.mem.indexOf(u8, content, "code index exploration agent") != null);
+            // Contains workflow content
+            try std.testing.expect(std.mem.indexOf(u8, content, "Batch explore") != null);
+        }
+    }.run);
+}
+
+test "writeMarkdownAgent is idempotent" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const header =
+                \\---
+                \\name: cog-code-query
+                \\---
+            ;
+
+            try writeMarkdownAgent(allocator, ".test/agent.md", header);
+            const first = readCwdFile(allocator, ".test/agent.md") orelse return error.TestUnexpectedResult;
+            defer allocator.free(first);
+
+            try writeMarkdownAgent(allocator, ".test/agent.md", header);
+            const second = readCwdFile(allocator, ".test/agent.md") orelse return error.TestUnexpectedResult;
+            defer allocator.free(second);
+
+            try std.testing.expectEqualStrings(first, second);
+        }
+    }.run);
+}
+
+test "writeTomlAgent appends section" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const initial =
+                \\model = "gpt-5"
+                \\
+                \\[mcp_servers.cog]
+                \\command = "cog"
+                \\args = ["mcp"]
+            ;
+            std.fs.cwd().makeDir(".codex") catch {};
+            try writeCwdFile(".codex/config.toml", initial);
+
+            try writeTomlAgent(allocator, ".codex/config.toml");
+
+            const content = readCwdFile(allocator, ".codex/config.toml") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            // Has the original content
+            try std.testing.expect(std.mem.indexOf(u8, content, "model = \"gpt-5\"") != null);
+            // Has the agent section
+            try std.testing.expect(std.mem.indexOf(u8, content, "[agents.cog-code-query]") != null);
+            // Has the description
+            try std.testing.expect(std.mem.indexOf(u8, content, "description = \"Explore code structure") != null);
+        }
+    }.run);
+}
+
+test "writeTomlAgent is idempotent" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            std.fs.cwd().makeDir(".codex") catch {};
+            try writeCwdFile(".codex/config.toml", "model = \"gpt-5\"\n");
+
+            try writeTomlAgent(allocator, ".codex/config.toml");
+            try writeTomlAgent(allocator, ".codex/config.toml");
+
+            const content = readCwdFile(allocator, ".codex/config.toml") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const marker = "[agents.cog-code-query]";
+            const first = std.mem.indexOf(u8, content, marker) orelse return error.TestUnexpectedResult;
+            const second = std.mem.indexOfPos(u8, content, first + marker.len, marker);
+            try std.testing.expect(second == null);
+        }
+    }.run);
+}
+
+test "writeRooAgent creates .roomodes" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeRooAgent(allocator, ".roomodes");
+
+            const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const modes = parsed.value.object.get("customModes") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(modes == .array);
+            try std.testing.expectEqual(@as(usize, 1), modes.array.items.len);
+
+            const mode = modes.array.items[0];
+            try std.testing.expect(mode == .object);
+            const slug = mode.object.get("slug") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("cog-code-query", slug.string);
+            try std.testing.expect(mode.object.get("roleDefinition") != null);
+        }
+    }.run);
+}
+
+test "writeRooAgent merges with existing modes" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const existing =
+                \\{"customModes":[{"slug":"my-mode","name":"My Mode","roleDefinition":"custom"}]}
+            ;
+            try writeCwdFile(".roomodes", existing);
+
+            try writeRooAgent(allocator, ".roomodes");
+
+            const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const modes = parsed.value.object.get("customModes") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(modes == .array);
+            try std.testing.expectEqual(@as(usize, 2), modes.array.items.len);
+
+            // Original mode preserved
+            const first = modes.array.items[0];
+            const first_slug = first.object.get("slug") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("my-mode", first_slug.string);
+
+            // Cog mode added
+            const second = modes.array.items[1];
+            const second_slug = second.object.get("slug") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("cog-code-query", second_slug.string);
         }
     }.run);
 }

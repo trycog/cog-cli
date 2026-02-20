@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "prompt_md", @embedFile("priv/prompts/PROMPT.md"));
+    build_options.addOption([]const u8, "agent_body", @embedFile("priv/agents/cog-code-query.md"));
     const build_options_mod = build_options.createModule();
 
     mod.addImport("build_options", build_options_mod);
@@ -231,6 +232,7 @@ fn addRelease(
     const release_options = b.addOptions();
     release_options.addOption([]const u8, "version", version);
     release_options.addOption([]const u8, "prompt_md", @embedFile("priv/prompts/PROMPT.md"));
+    release_options.addOption([]const u8, "agent_body", @embedFile("priv/agents/cog-code-query.md"));
     const release_options_mod = release_options.createModule();
 
     release_mod.addImport("build_options", release_options_mod);

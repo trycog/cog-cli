@@ -275,8 +275,10 @@ pub const Indexer = struct {
         // Phase 1: Collect raw definitions
         const RawDef = struct {
             name_text: []const u8, // slice into source, not allocated
-            start_point: c.TSPoint,
-            end_point: c.TSPoint,
+            start_point: c.TSPoint, // name identifier start
+            end_point: c.TSPoint, // name identifier end
+            def_start_point: c.TSPoint, // full definition node start (for enclosing_range)
+            def_end_point: c.TSPoint, // full definition node end (for enclosing_range)
             kind: i32,
         };
 
@@ -343,10 +345,13 @@ pub const Indexer = struct {
             }
             if (is_dup) continue;
 
+            const def_n = def_node orelse name_n;
             try raw_defs.append(allocator, .{
                 .name_text = name_text,
                 .start_point = c.ts_node_start_point(name_n),
                 .end_point = c.ts_node_end_point(name_n),
+                .def_start_point = c.ts_node_start_point(def_n),
+                .def_end_point = c.ts_node_end_point(def_n),
                 .kind = kind,
             });
         }
@@ -415,6 +420,12 @@ pub const Indexer = struct {
                 .symbol = symbol_id,
                 .symbol_roles = scip.SymbolRole.Definition,
                 .syntax_kind = 0,
+                .enclosing_range = .{
+                    .start_line = @intCast(def.def_start_point.row),
+                    .start_char = @intCast(def.def_start_point.column),
+                    .end_line = @intCast(def.def_end_point.row),
+                    .end_char = @intCast(def.def_end_point.column),
+                },
             };
 
             symbols[i] = .{

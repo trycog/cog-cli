@@ -216,6 +216,10 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var written_prompts: [4]agents_mod.PromptTarget = undefined;
     var written_prompts_count: usize = 0;
 
+    // Track which agent files have been written (for dedup)
+    var written_agents: [16][]const u8 = undefined;
+    var written_agents_count: usize = 0;
+
     for (selected_indices) |idx| {
         const agent = agents_mod.agents[idx];
 
@@ -281,6 +285,29 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             printErr("    ");
             tui.checkmark();
             printErr(" tool permissions\n");
+        }
+
+        // d. Deploy agent file (dedup by path)
+        if (agent.agent_file_path) |agent_path| {
+            var agent_already_written = false;
+            for (written_agents[0..written_agents_count]) |wa| {
+                if (std.mem.eql(u8, wa, agent_path)) {
+                    agent_already_written = true;
+                    break;
+                }
+            }
+            if (!agent_already_written) {
+                hooks_mod.configureAgentFile(allocator, agent) catch {};
+                printErr("    ");
+                tui.checkmark();
+                printErr(" ");
+                printErr(agent_path);
+                printErr("\n");
+                if (written_agents_count < 16) {
+                    written_agents[written_agents_count] = agent_path;
+                    written_agents_count += 1;
+                }
+            }
         }
     }
 

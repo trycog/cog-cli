@@ -491,8 +491,6 @@ fn handleToolsCall(runtime: *Runtime, id: ?json.Value, params: ?json.Value, stdo
         const err_msg = switch (err) {
             error.MissingName => "Missing required parameter: name",
             error.MissingFile => "Missing required parameter: file",
-            error.SymbolNotFound => "Symbol not found",
-            error.FileNotFound => "File not found in index",
             error.NotConfigured => "Memory not configured. Run 'cog init' with memory enabled.",
             error.Explained => "Operation failed (see stderr)",
             else => "Internal error",
@@ -753,15 +751,19 @@ fn buildToolCatalogResourceJson(runtime: *Runtime) ![]u8 {
 }
 
 fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringify) !void {
-    try writeToolDef(s, "cog_code_query", "Query the SCIP code index for symbol information. Use mode 'find' to locate where a symbol is defined, 'refs' to find all references to a symbol, 'symbols' to list all symbols in a specific file, or 'structure' to get a project-wide overview of files and their symbols.", &.{
-        .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find' (locate definition by name), 'refs' (find all references by name), 'symbols' (list symbols in a file), 'structure' (project-wide file/symbol overview)", .required = true },
-        .{ .name = "name", .typ = "string", .desc = "Symbol name to search for (required for find and refs modes)", .required = false },
-        .{ .name = "file", .typ = "string", .desc = "File path to list symbols from (required for symbols mode)", .required = false },
+    try writeToolDef(s, "cog_code_query", "Query the SCIP code index for symbol information. Use mode 'find' to locate where a symbol is defined, 'refs' to find all references to a symbol, or 'symbols' to list all symbols in a specific file.", &.{
+        .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find' (locate a symbol's definition), 'refs' (find all references to a symbol), 'symbols' (list all symbols in a file)", .required = true },
+        .{ .name = "name", .typ = "string", .desc = "Symbol name to search for (required for find and refs modes). Supports glob patterns: '*' (zero or more chars) and '?' (one char). Examples: '*init*', 'get*', 'Handle?'", .required = false },
+        .{ .name = "file", .typ = "string", .desc = "File path filter. Required for symbols mode. Optional for find/refs to scope results to a specific file.", .required = false },
         .{ .name = "kind", .typ = "string", .desc = "Filter results by symbol kind (e.g. function, class, method, variable)", .required = false },
-        .{ .name = "limit", .typ = "integer", .desc = "Max results to return (default: unlimited)", .required = false },
     });
 
     try writeToolDef(s, "cog_code_status", "Check whether the SCIP code index exists, how many files are indexed, and which languages are covered. Use this to verify the index is available before querying.", &.{});
+
+    try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore",
+        "Find multiple symbols by name and return full definition bodies with auto-discovered related symbols. Combines find + read in a single call. Auto-retries failed lookups with glob patterns, reads complete function/struct bodies (not fixed-line windows), and includes related project symbols referenced in the same files. Single call replaces multi-step find + read + follow-up loops.",
+        \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"}},"required":["queries"]}
+    );
 
     // Lazily discover remote memory tools on first tools/list
     if (runtime.hasMemory() and runtime.remote_tools == null) {
@@ -787,6 +789,8 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
         return callCodeQuery(runtime, arguments);
     } else if (std.mem.eql(u8, tool_name, "cog_code_status")) {
         return callCodeStatus(runtime);
+    } else if (std.mem.eql(u8, tool_name, "cog_code_explore")) {
+        return callCodeExplore(runtime, arguments);
     } else if (std.mem.startsWith(u8, tool_name, "cog_debug_")) {
         return callDebugTool(runtime, tool_name, arguments);
     }
@@ -1041,8 +1045,6 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
         .refs
     else if (std.mem.eql(u8, mode_str, "symbols"))
         .symbols
-    else if (std.mem.eql(u8, mode_str, "structure"))
-        .structure
     else
         return error.Explained;
 
@@ -1052,7 +1054,6 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
         .name = getStr(args, "name"),
         .file = getStr(args, "file"),
         .kind = getStr(args, "kind"),
-        .limit = getInt(args, "limit"),
     });
 }
 
@@ -1062,6 +1063,35 @@ fn callCodeStatus(runtime: *Runtime) ![]const u8 {
         return code_intel.codeStatusFromLoadedIndex(allocator, ci);
     }
     return code_intel.codeStatusInner(allocator);
+}
+
+fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
+    const allocator = runtime.allocator;
+    const args = arguments orelse return error.Explained;
+
+    // Parse context_lines (default 15)
+    const context_lines: usize = getInt(args, "context_lines") orelse 15;
+
+    // Parse queries array
+    const queries_val = if (args == .object) args.object.get("queries") else null;
+    const queries_arr = if (queries_val) |v| (if (v == .array) v.array.items else null) else null;
+    if (queries_arr == null) return error.Explained;
+
+    var queries: std.ArrayListUnmanaged(code_intel.ExploreQuery) = .empty;
+    defer queries.deinit(allocator);
+
+    for (queries_arr.?) |item| {
+        const name = getStr(item, "name") orelse continue;
+        try queries.append(allocator, .{
+            .name = name,
+            .kind = getStr(item, "kind"),
+        });
+    }
+
+    if (queries.items.len == 0) return error.Explained;
+
+    const ci = try runtime.ensureCodeCache();
+    return code_intel.codeExploreWithLoadedIndex(allocator, ci, queries.items, context_lines);
 }
 
 // ── File Watcher Event Processing ───────────────────────────────────────

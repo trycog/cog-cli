@@ -15,14 +15,72 @@ Print an emoji before Cog tool calls to indicate the category:
 
 The code index updates automatically when files change. A file watcher detects edits, creates, deletes, and renames — no manual re-indexing needed.
 
-### Query Rules
+### Code Query First
 
-- **Prefer `cog_code_query`** for symbol lookups (find definitions, references, file symbols, project structure)
-- Use `mode: "find"` to locate symbol definitions by name
-- Use `mode: "refs"` to find all references to a symbol
-- Use `mode: "symbols"` with a file path to list all symbols in a file
-- Use `mode: "structure"` to see project-wide file/symbol overview
-- **`cog_code_status`** reports the current index state (files indexed, languages, etc.)
+**`cog_code_query` is your primary code exploration tool.** Before using Grep, Glob, file search agents, or explore agents to understand code structure — query the index first. The index knows every symbol, definition, and reference in the project. It answers in milliseconds what file-scanning tools take seconds to find.
+
+**Do NOT** bypass the code index by delegating to subagents that use Grep, Glob, or file search for symbol lookups. If a subagent needs code structure information, it should use `cog_code_query`, not file-scanning tools. Subagents are appropriate for: tasks beyond the index (reading file contents, analyzing logic, cross-referencing documentation), and broad index queries that return many results (see **Subagent Pattern** below).
+
+**Do NOT** use Grep or Glob to find symbol definitions, function locations, or file structure when `cog_code_query` covers it. Fall back to Grep/Glob only when the index doesn't have what you need (e.g., searching for string literals, comments, or content that isn't a symbol).
+
+### Query Modes
+
+| Mode | Use for | Required params |
+|------|---------|-----------------|
+| `find` | Locate where a symbol is defined | `name` |
+| `refs` | Find all references to a symbol | `name` |
+| `symbols` | List all symbols in a specific file | `file` |
+
+**`find` is always your first code query.** It takes a symbol name and returns the file and line where it's defined. Never guess filenames — let `find` tell you. Only use `symbols` mode after `find` has given you the file path. Only use `refs` after you understand the definition.
+
+**Pattern matching:** The `name` parameter supports glob patterns — `*` (zero or more chars) and `?` (one char). Examples: `*init*` finds all symbols containing "init", `get*` finds all symbols starting with "get". Matching is case-insensitive.
+
+**`kind` filter:** Use the `kind` parameter to filter by symbol type (function, class, method, variable, etc.). This is a structural advantage over grep — `name=*init*, kind=function` is a one-shot precise query that grep can only approximate with regex hacks.
+
+**File scoping:** The `file` parameter can be used with `find` and `refs` modes to scope results to a specific file. For `find`, only symbols defined in the matching file are returned. For `refs`, only references located in the matching file are shown.
+
+### Exploration Sequence
+
+**This sequence is mandatory. Do not skip or reorder steps.**
+
+When you need to understand unfamiliar code:
+
+1. **`cog_code_query` with `find`** — locate the symbol definition by name. This tells you the file and line. **Never skip this step.**
+2. **`cog_code_query` with `symbols`** — understand the file that `find` pointed you to
+3. **`cog_code_query` with `refs`** — see how it's used across the project
+4. **Read** only the lines you need — use the line numbers from `find`/`symbols`/`refs` with `Read`'s `offset` and `limit` parameters to read a targeted window (20-30 lines) around the symbol. **Never read an entire file when the index has already told you the exact line.**
+
+**NEVER do any of the following:**
+- Guess a filename and use `symbols` mode without first using `find` to confirm the file exists
+- Use Glob or file search to locate a symbol that `find` can resolve
+- Jump to `Read` before the index has told you where to look
+- Use `symbols` on a file path you assumed rather than one `find` returned
+- Read an entire file when you only need to see a specific symbol — use `offset` and `limit`
+
+This sequence replaces broad file searches. You should arrive at a `Read` call knowing the exact file and line — reading only the relevant section, not the whole file.
+
+### Batch Exploration with `cog_code_explore`
+
+**`cog_code_explore`** combines find + read into a single call. Pass an array of symbol queries and get back the source code snippet around each definition — no multi-step find→read loop needed.
+
+```json
+cog_code_explore({ queries: [{ name: "init", kind: "function" }, { name: "Settings" }], context_lines: 15 })
+```
+
+Each result returns the **top match** (highest relevance score) with the code snippet. Use this when you need to see the actual source of multiple symbols. Fall back to `cog_code_query` when you need all matches, references, or file symbol listings.
+
+### Subagent Pattern
+
+For multi-symbol exploration, **launch a subagent** instead of dumping all results into the main context.
+
+- **Direct inline calls:** Single-symbol lookups with `find` or up to ~3 symbols with `cog_code_explore` — small, focused results go straight into your context
+- **Subagent calls:** Broad searches (glob patterns, 4+ symbols, or any query where you expect many results). The subagent uses `cog_code_explore` for batch find+read, then `cog_code_query` for refs/symbols as needed, and returns only a summary
+
+This keeps the main context clean. The SCIP index returns results in milliseconds — the subagent can make many queries cheaply without flooding the caller.
+
+### Other Tools
+
+- **`cog_code_status`** — reports the current index state (files indexed, languages, etc.)
 - **Do not** try to index or remove files — the watcher handles all index maintenance automatically
 </cog:code>
 
@@ -40,7 +98,7 @@ You also have persistent associative memory. Checking memory before work and rec
 
 ### The Memory Lifecycle
 
-Every task follows four steps. This is your operating procedure, not a guideline.
+The primary agent follows four steps for every task. This is your operating procedure, not a guideline. **Subagents do not follow this lifecycle** — see the Subagents section below.
 
 ### Active Policy Digest
 
@@ -162,7 +220,9 @@ User: "Fix login sessions expiring early"
 
 ### Subagents
 
-Subagents follow the same memory lifecycle as the primary agent. Query Cog before exploring code — same recall-first rule, same query reformulation. Record any concept-shaped knowledge produced during subagent work via `cog_mem_learn`. If a subagent synthesizes, discovers, or receives knowledge that Cog doesn't have, it records it before returning results.
+**Subagents do not perform memory operations.** The primary agent owns the memory lifecycle — it recalls before delegating work and records after receiving results. Subagents focus exclusively on their delegated task (code exploration, testing, analysis, etc.) and return results to the primary agent, which decides what to store.
+
+This keeps subagents lean and fast. Memory recall and recording happen at the orchestration layer, not in every worker.
 
 ### Never Store
 
