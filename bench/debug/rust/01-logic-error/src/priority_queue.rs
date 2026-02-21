@@ -71,13 +71,10 @@ impl MinPriorityQueue {
     }
 
     /// Restore heap property upward from index `idx`.
-    ///
-    /// For a min-heap, a child should move up when its priority is
-    /// LESS THAN its parent's priority.
     fn sift_up(&mut self, mut idx: usize) {
         while idx > 0 {
             let parent = (idx - 1) / 2;
-            if self.data[idx].priority > self.data[parent].priority {
+            if self.data[idx].priority < self.data[parent].priority {
                 self.swap_entries(idx, parent);
                 idx = parent;
             } else {
@@ -92,18 +89,18 @@ impl MinPriorityQueue {
         loop {
             let left = 2 * idx + 1;
             let right = 2 * idx + 2;
-            let mut smallest = idx;
+            let mut candidate = idx;
 
-            if left < len && self.data[left].priority > self.data[smallest].priority {
-                smallest = left;
+            if left < len && self.data[left].priority < self.data[candidate].priority {
+                candidate = left;
             }
-            if right < len && self.data[right].priority > self.data[smallest].priority {
-                smallest = right;
+            if right < len && self.data[right].priority < self.data[candidate].priority {
+                candidate = right;
             }
 
-            if smallest != idx {
-                self.swap_entries(idx, smallest);
-                idx = smallest;
+            if candidate != idx {
+                self.swap_entries(idx, candidate);
+                idx = candidate;
             } else {
                 break;
             }

@@ -9,7 +9,7 @@ function groupBy(dataframe, keyColumn, valueColumn) {
   const groups = new Map();
 
   for (const row of dataframe.rows) {
-    const key = row[keyIdx]; // This is a NUMBER (e.g., 2021)
+    const key = row[keyIdx];
     const value = row[valIdx];
 
     if (!groups.has(key)) {

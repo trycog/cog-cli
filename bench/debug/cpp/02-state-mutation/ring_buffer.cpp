@@ -17,6 +17,9 @@ bool RingBuffer::push(const Message& msg) {
     buffer[tail] = msg;
     tail = (tail + 1) % capacity;
     count++;
+
+    // Prepare the next write slot so future pushes never see stale data
+    buffer[tail] = Message();
     return true;
 }
 
@@ -26,7 +29,7 @@ bool RingBuffer::pop(Message& msg) {
     }
 
     msg = buffer[head];
-    head = (head + 1) % (capacity + 1);
+    head = (head + 1) % capacity;
     count--;
     return true;
 }

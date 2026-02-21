@@ -1,4 +1,4 @@
-use crate::types::{DecodeResult, CONTINUATION_BIT, DATA_MASK, MAX_VARINT_BYTES};
+use crate::types::{DecodeResult, CONTINUATION_BIT, DATA_BITS, DATA_MASK, MAX_VARINT_BYTES};
 
 /// Decode a varint from the front of `bytes`.
 ///
@@ -23,7 +23,7 @@ pub fn decode_varint(bytes: &[u8]) -> DecodeResult {
         let data = (byte & DATA_MASK) as u64;
         result |= data << shift;
 
-        shift += 8;
+        shift += DATA_BITS;
 
         // Stop when the continuation bit is clear.
         if byte & CONTINUATION_BIT == 0 {

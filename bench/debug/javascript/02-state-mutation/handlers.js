@@ -2,8 +2,9 @@ function createHandlerA() {
   return function handleA(event) {
     return {
       handler: 'A',
-      receivedKeys: Object.keys(event).sort(),
       amount: event.amount,
+      timestamps: Object.keys(event.metadata.timestamps),
+      lastProcessor: event.metadata.lastProcessor,
     };
   };
 }
@@ -12,8 +13,10 @@ function createHandlerB() {
   return function handleB(event) {
     return {
       handler: 'B',
-      receivedKeys: Object.keys(event).sort(),
       amount: event.amount,
+      timestamps: Object.keys(event.metadata.timestamps),
+      lastProcessor: event.metadata.lastProcessor,
+      logEntries: [...event.metadata.log],
     };
   };
 }

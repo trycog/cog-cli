@@ -34,3 +34,5 @@ opencode.json
 /bench/**/program
 /bench/**/target/
 /bench/**/__pycache__/
+/bench/swedebug/workspace/
+/bench/swedebug/candidates.json

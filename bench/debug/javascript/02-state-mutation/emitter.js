@@ -13,8 +13,8 @@ class EventEmitter {
     for (const registration of this.handlers) {
       if (registration.eventType !== eventType) continue;
 
-      // Apply middleware chain to the event
-      let processedEvent = eventData;
+      // Deep-clone the event so each handler gets an independent copy
+      let processedEvent = JSON.parse(JSON.stringify(eventData));
       for (const mw of registration.middleware) {
         processedEvent = mw(processedEvent);
       }

@@ -42,9 +42,9 @@ Then run this command to update the dashboard: bash ../collect.sh
 ```
 You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
-The program in 02-state-mutation/ is an event system with middleware that enriches events before delivery to handlers. When you run `node 02-state-mutation/main.js`, Handler B should receive a clean event but instead receives keys leaked from Handler A's middleware processing.
+The program in 02-state-mutation/ is an event system with middleware factories that enrich events before delivery to handlers. The emitter deep-clones events so each handler gets an independent copy. When you run `node 02-state-mutation/main.js`, it should output "OK: Handler B received clean event, no cross-handler leakage" but instead shows Handler B received metadata contaminated by Handler A's middleware.
 
-Use the debugger to inspect the event object as it flows through the middleware pipeline. Fix the source code and verify your fix.
+Use the debugger to inspect the middleware state and how context is shared across middleware instances. Fix the source code and verify your fix.
 
 After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/javascript-7-debug.json in this format: {"test": 7, "name": "State mutation: event middleware", "variant": "debug", "calls": N, "rounds": N}
 
@@ -55,7 +55,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 ```
 You must NOT use any cog_* MCP tools. Diagnose and fix the bug using only standard tools (Read, Grep, Glob, Edit, Bash).
 
-The program in 02-state-mutation/ is an event system with middleware that enriches events before delivery to handlers. When you run `node 02-state-mutation/main.js`, Handler B should receive a clean event but instead receives keys leaked from Handler A's middleware processing.
+The program in 02-state-mutation/ is an event system with middleware factories that enrich events before delivery to handlers. The emitter deep-clones events so each handler gets an independent copy. When you run `node 02-state-mutation/main.js`, it should output "OK: Handler B received clean event, no cross-handler leakage" but instead shows Handler B received metadata contaminated by Handler A's middleware.
 
 Diagnose the root cause, fix the source code, and verify your fix.
 
@@ -96,17 +96,17 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ---
 
-## Test 9: Concurrency — Async Iterator Race
+## Test 9: Concurrency — Parallel Workers with Cache
 
 ### Debug variant
 ```
 You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
-The program in 04-concurrency/ is a paginated data processor with two concurrent consumers sharing the same paginator. When you run `node 04-concurrency/main.js`, it should output "Processed 100 unique items" but instead shows fewer unique items.
+The program in 04-concurrency/ uses a WorkScheduler to partition paginated API data across two parallel workers. A shared cache deduplicates API calls. When you run `node 04-concurrency/main.js`, it should output "Processed 100 unique items" but instead outputs "Processed 200 items (100 unique)" — double the expected count.
 
-Use the debugger to inspect the paginator state during concurrent access. Fix the source code and verify your fix.
+Use the debugger to trace how work is partitioned and assigned to each worker. Fix the source code and verify your fix.
 
-After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/javascript-9-debug.json in this format: {"test": 9, "name": "Concurrency: async iterator race", "variant": "debug", "calls": N, "rounds": N}
+After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/javascript-9-debug.json in this format: {"test": 9, "name": "Concurrency: parallel workers with cache", "variant": "debug", "calls": N, "rounds": N}
 
 Then run this command to update the dashboard: bash ../collect.sh
 ```
@@ -115,11 +115,11 @@ Then run this command to update the dashboard: bash ../collect.sh
 ```
 You must NOT use any cog_* MCP tools. Diagnose and fix the bug using only standard tools (Read, Grep, Glob, Edit, Bash).
 
-The program in 04-concurrency/ is a paginated data processor with two concurrent consumers sharing the same paginator. When you run `node 04-concurrency/main.js`, it should output "Processed 100 unique items" but instead shows fewer unique items.
+The program in 04-concurrency/ uses a WorkScheduler to partition paginated API data across two parallel workers. A shared cache deduplicates API calls. When you run `node 04-concurrency/main.js`, it should output "Processed 100 unique items" but instead outputs "Processed 200 items (100 unique)" — double the expected count.
 
 Diagnose the root cause, fix the source code, and verify your fix.
 
-After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/javascript-9-traditional.json in this format: {"test": 9, "name": "Concurrency: async iterator race", "variant": "traditional", "calls": N, "rounds": N}
+After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/javascript-9-traditional.json in this format: {"test": 9, "name": "Concurrency: parallel workers with cache", "variant": "traditional", "calls": N, "rounds": N}
 
 Then run this command to update the dashboard: bash ../collect.sh
 ```
@@ -132,9 +132,9 @@ Then run this command to update the dashboard: bash ../collect.sh
 ```
 You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
-The program in 05-silent-wrong/ groups and pivots tabular sales data by year. When you run `node 05-silent-wrong/main.js`, it should output "Pivot: 2021=$1200 2022=$1500 2023=$1800 2024=$2100" but instead outputs "Pivot: other=$6600" — all data collapsed into one column.
+The program in 05-silent-wrong/ groups and pivots tabular sales data by year using a stats module for summation. When you run `node 05-silent-wrong/main.js`, it should output "Pivot: 2021=$1200 2022=$1500 2023=$1800 2024=$2100" but instead outputs "Pivot: 2021=$1200 2022=$2700 2023=$4500 2024=$6600" — values grow cumulatively instead of being independent per year.
 
-Use the debugger to inspect intermediate values in the group-by and pivot steps. Fix the source code and verify your fix.
+Use the debugger to inspect intermediate values in the summation and aggregation steps. Fix the source code and verify your fix.
 
 After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/javascript-10-debug.json in this format: {"test": 10, "name": "Silent wrong: data pivot", "variant": "debug", "calls": N, "rounds": N}
 
@@ -145,7 +145,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 ```
 You must NOT use any cog_* MCP tools. Diagnose and fix the bug using only standard tools (Read, Grep, Glob, Edit, Bash).
 
-The program in 05-silent-wrong/ groups and pivots tabular sales data by year. When you run `node 05-silent-wrong/main.js`, it should output "Pivot: 2021=$1200 2022=$1500 2023=$1800 2024=$2100" but instead outputs "Pivot: other=$6600" — all data collapsed into one column.
+The program in 05-silent-wrong/ groups and pivots tabular sales data by year using a stats module for summation. When you run `node 05-silent-wrong/main.js`, it should output "Pivot: 2021=$1200 2022=$1500 2023=$1800 2024=$2100" but instead outputs "Pivot: 2021=$1200 2022=$2700 2023=$4500 2024=$6600" — values grow cumulatively instead of being independent per year.
 
 Diagnose the root cause, fix the source code, and verify your fix.
 

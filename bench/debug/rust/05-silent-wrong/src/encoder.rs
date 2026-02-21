@@ -9,21 +9,19 @@ use crate::types::{CONTINUATION_BIT, DATA_BITS, DATA_MASK, MAX_VARINT_BYTES};
 /// Examples:
 ///   0       -> [0x00]                  (1 byte)
 ///   127     -> [0x7F]                  (1 byte)
-///   128     -> [0x80, 0x01]            (2 bytes)
-///   300     -> [0xAC, 0x02]            (2 bytes)
-///   16383   -> [0xFF, 0x7F]            (2 bytes)
-///   16384   -> [0x80, 0x80, 0x01]      (3 bytes)
-///   65535   -> [0xFF, 0xFF, 0x03]      (3 bytes)
+///   128     -> [0x01, 0x80]            (2 bytes)
+///   300     -> [0x02, 0xAC]            (2 bytes)
+///   16383   -> [0x7F, 0xFF]            (2 bytes)
+///   16384   -> [0x01, 0x80, 0x80]      (3 bytes)
+///   65535   -> [0x03, 0xFF, 0xFF]      (3 bytes)
 pub fn encode_varint(mut value: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(MAX_VARINT_BYTES);
 
     loop {
-        // Take the lowest 7 bits.
         let mut byte = (value & DATA_MASK as u64) as u8;
         value >>= DATA_BITS;
 
         if value != 0 {
-            // More bytes to come -- set the continuation bit.
             byte |= CONTINUATION_BIT;
         }
 
@@ -34,6 +32,8 @@ pub fn encode_varint(mut value: u64) -> Vec<u8> {
         }
     }
 
+    // Store in network byte order (most significant byte first)
+    buf.reverse();
     buf
 }
 
@@ -66,6 +66,8 @@ pub fn encode_varint_into(mut value: u64, buf: &mut [u8], offset: usize) -> usiz
         }
     }
 
+    // Reverse to network byte order
+    buf[offset..i].reverse();
     i - offset
 }
 
@@ -94,31 +96,26 @@ mod tests {
 
     #[test]
     fn encode_two_byte_min() {
-        assert_eq!(encode_varint(128), vec![0x80, 0x01]);
+        // 128: LE would be [0x80, 0x01], reversed to [0x01, 0x80]
+        assert_eq!(encode_varint(128), vec![0x01, 0x80]);
     }
 
     #[test]
     fn encode_300() {
-        // 300 = 0b100101100
-        // Low 7 bits: 0101100 = 0x2C, with continuation: 0xAC
-        // Remaining: 0b10 = 2
-        assert_eq!(encode_varint(300), vec![0xAC, 0x02]);
+        // 300: LE would be [0xAC, 0x02], reversed to [0x02, 0xAC]
+        assert_eq!(encode_varint(300), vec![0x02, 0xAC]);
     }
 
     #[test]
     fn encode_two_byte_max() {
-        // 16383 = 0b11111111111111 (14 ones)
-        // Low 7: 0x7F | 0x80 = 0xFF, high 7: 0x7F
-        assert_eq!(encode_varint(16383), vec![0xFF, 0x7F]);
+        // 16383: LE would be [0xFF, 0x7F], reversed to [0x7F, 0xFF]
+        assert_eq!(encode_varint(16383), vec![0x7F, 0xFF]);
     }
 
     #[test]
     fn encode_three_bytes() {
-        // 65535 = 0xFFFF = 0b1111111111111111
-        // Byte 0: bits 0-6 = 1111111 | 0x80 = 0xFF
-        // Byte 1: bits 7-13 = 1111111 | 0x80 = 0xFF
-        // Byte 2: bits 14-15 = 11 = 0x03
-        assert_eq!(encode_varint(65535), vec![0xFF, 0xFF, 0x03]);
+        // 65535: LE would be [0xFF, 0xFF, 0x03], reversed to [0x03, 0xFF, 0xFF]
+        assert_eq!(encode_varint(65535), vec![0x03, 0xFF, 0xFF]);
     }
 
     #[test]
@@ -126,13 +123,14 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = encode_varint_into(300, &mut buf, 0);
         assert_eq!(n, 2);
-        assert_eq!(&buf[..2], &[0xAC, 0x02]);
+        assert_eq!(&buf[..2], &[0x02, 0xAC]);
     }
 
     #[test]
     fn encode_many_values() {
         let values = vec![0, 127, 128, 300];
         let encoded = encode_many(&values);
-        assert_eq!(encoded, vec![0x00, 0x7F, 0x80, 0x01, 0xAC, 0x02]);
+        // 0 → [0x00], 127 → [0x7F], 128 → [0x01, 0x80], 300 → [0x02, 0xAC]
+        assert_eq!(encoded, vec![0x00, 0x7F, 0x01, 0x80, 0x02, 0xAC]);
     }
 }

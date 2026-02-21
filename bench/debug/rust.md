@@ -12,9 +12,9 @@ Run each prompt in a fresh Claude Code session from `bench/debug/rust/`.
 ```
 You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
-The program in 01-logic-error/ implements Dijkstra's shortest path algorithm using a custom binary heap priority queue. When you run `cd 01-logic-error && cargo run 2>/dev/null`, it should output "Shortest A→E: cost 7, path A→B→D→E" but instead finds a suboptimal path with cost 10.
+The program in 01-logic-error/ implements Dijkstra's shortest path algorithm using a custom binary heap priority queue and a graph construction module. When you run `cd 01-logic-error && cargo run 2>/dev/null`, it should output "Shortest A->E: cost 7, path A -> B -> D -> E" but instead finds a suboptimal path with cost 10.
 
-Set breakpoints in the heap's comparison/sift operations and inspect element ordering. Fix the source code and verify your fix.
+Use the debugger to trace which edges are explored during the search and inspect the graph structure. Fix the source code and verify your fix.
 
 After fixing, count your tool calls and LLM rounds. Write the result as JSON to ../.bench/rust-16-debug.json in this format: {"test": 16, "name": "Logic error: Dijkstra priority queue", "variant": "debug", "calls": N, "rounds": N}
 
@@ -25,7 +25,7 @@ Then run this command to update the dashboard: bash ../../collect.sh
 ```
 You must NOT use any cog_* MCP tools. Diagnose and fix the bug using only standard tools (Read, Grep, Glob, Edit, Bash).
 
-The program in 01-logic-error/ implements Dijkstra's shortest path algorithm using a custom binary heap priority queue. When you run `cd 01-logic-error && cargo run 2>/dev/null`, it should output "Shortest A→E: cost 7, path A→B→D→E" but instead finds a suboptimal path with cost 10.
+The program in 01-logic-error/ implements Dijkstra's shortest path algorithm using a custom binary heap priority queue and a graph construction module. When you run `cd 01-logic-error && cargo run 2>/dev/null`, it should output "Shortest A->E: cost 7, path A -> B -> D -> E" but instead finds a suboptimal path with cost 10.
 
 Diagnose the root cause, fix the source code, and verify your fix.
 
@@ -132,9 +132,9 @@ Then run this command to update the dashboard: bash ../../collect.sh
 ```
 You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
-The program in 05-silent-wrong/ implements a variable-length integer codec (varint). When you run `cd 05-silent-wrong && cargo run 2>/dev/null`, single-byte values (0-127) roundtrip correctly but multi-byte values decode to wrong values.
+The program in 05-silent-wrong/ implements a variable-length integer codec (varint) with separate encoder and decoder modules. When you run `cd 05-silent-wrong && cargo run 2>/dev/null`, single-byte values (0-127) roundtrip correctly but multi-byte values decode to wrong values.
 
-Use the debugger to inspect intermediate values in the decode process. Fix the source code and verify your fix.
+Use the debugger to inspect the encoded bytes and trace the decode process to find the mismatch between encoder and decoder. Fix the source code and verify your fix.
 
 After fixing, count your tool calls and LLM rounds. Write the result as JSON to ../.bench/rust-20-debug.json in this format: {"test": 20, "name": "Silent wrong: binary codec", "variant": "debug", "calls": N, "rounds": N}
 
@@ -145,7 +145,7 @@ Then run this command to update the dashboard: bash ../../collect.sh
 ```
 You must NOT use any cog_* MCP tools. Diagnose and fix the bug using only standard tools (Read, Grep, Glob, Edit, Bash).
 
-The program in 05-silent-wrong/ implements a variable-length integer codec (varint). When you run `cd 05-silent-wrong && cargo run 2>/dev/null`, single-byte values (0-127) roundtrip correctly but multi-byte values decode to wrong values.
+The program in 05-silent-wrong/ implements a variable-length integer codec (varint) with separate encoder and decoder modules. When you run `cd 05-silent-wrong && cargo run 2>/dev/null`, single-byte values (0-127) roundtrip correctly but multi-byte values decode to wrong values.
 
 Diagnose the root cause, fix the source code, and verify your fix.
 

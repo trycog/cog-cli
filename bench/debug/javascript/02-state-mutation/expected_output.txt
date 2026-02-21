@@ -1,1 +1,1 @@
-OK: Handler B received 7 keys, no leakage
+OK: Handler B received clean event, no cross-handler leakage

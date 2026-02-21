@@ -25,6 +25,16 @@ pub fn errorToCode(err: anyerror) i32 {
     return if (err == error.NotSupported) NOT_SUPPORTED else INTERNAL_ERROR;
 }
 
+/// Map dependency errors to human-readable messages with install instructions.
+pub fn errorMessage(err: anyerror) []const u8 {
+    if (err == error.PythonNotFound) return "python3 not found on PATH";
+    if (err == error.DebugpyNotInstalled) return "debugpy module not found for python3";
+    if (err == error.DelveNotFound) return "dlv (Delve) not found on PATH";
+    if (err == error.NodeNotFound) return "node not found on PATH";
+    if (err == error.UnsupportedLanguage) return "Unsupported language for debugging";
+    return @errorName(err);
+}
+
 // ── Tool Definitions ────────────────────────────────────────────────────
 
 pub const tool_definitions = [_]ToolDef{
@@ -527,8 +537,9 @@ pub const DebugServer = struct {
 
             var driver = proxy.activeDriver();
             driver.launch(allocator, config) catch |err| {
-                self.dashboard.onError("cog_debug_launch", @errorName(err));
-                return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
+                const msg = errorMessage(err);
+                self.dashboard.onError("cog_debug_launch", msg);
+                return .{ .err = .{ .code = errorToCode(err), .message = msg } };
             };
 
             const session_id = try self.session_manager.createSession(driver, client_pid, .terminate);
@@ -560,8 +571,9 @@ pub const DebugServer = struct {
 
             var driver = engine.activeDriver();
             driver.launch(allocator, config) catch |err| {
-                self.dashboard.onError("cog_debug_launch", @errorName(err));
-                return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
+                const msg = errorMessage(err);
+                self.dashboard.onError("cog_debug_launch", msg);
+                return .{ .err = .{ .code = errorToCode(err), .message = msg } };
             };
 
             const session_id = try self.session_manager.createSession(driver, client_pid, .terminate);

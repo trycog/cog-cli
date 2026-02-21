@@ -417,6 +417,79 @@ pub const CodeIndex = struct {
         }
         return result;
     }
+
+    /// Return a table of contents for a file: all definition symbols with name, kind, line, end_line.
+    /// Excludes symbols listed in `exclude_symbols`. Results sorted by line number.
+    const FileTOCEntry = struct {
+        name: []const u8,
+        kind: i32,
+        line: i32,
+        end_line: i32,
+    };
+
+    /// Returns true if a SCIP kind represents a top-level definition worth showing in a TOC.
+    /// Filters out parameters, local variables, fields, and other noise.
+    fn isTOCKind(kind: i32) bool {
+        return switch (kind) {
+            7, // class
+            8, // constant
+            9, // constructor
+            11, // enum
+            12, // enum_member
+            17, // function
+            21, // interface
+            25, // macro
+            26, // method
+            29, // module
+            49, // struct
+            53, // trait
+            54, // type
+            55, // type_alias
+            59, // union
+            => true,
+            else => false,
+        };
+    }
+
+    fn getFileSymbolsTOC(
+        self: *const CodeIndex,
+        allocator: std.mem.Allocator,
+        file_path: []const u8,
+        exclude_symbols: *const std.StringHashMapUnmanaged(void),
+    ) std.ArrayListUnmanaged(FileTOCEntry) {
+        var result: std.ArrayListUnmanaged(FileTOCEntry) = .empty;
+        const doc_idx = self.path_to_doc_idx.get(file_path) orelse return result;
+        const doc = self.index.documents[doc_idx];
+
+        for (doc.symbols) |sym| {
+            if (sym.symbol.len == 0) continue;
+            if (!isTOCKind(sym.kind)) continue;
+            if (exclude_symbols.contains(sym.symbol)) continue;
+
+            const def = self.symbol_to_defs.get(sym.symbol) orelse continue;
+            const name = if (sym.display_name.len > 0) sym.display_name else scip.extractSymbolName(sym.symbol);
+            if (name.len == 0) continue;
+            // Skip test functions — real symbol names never contain spaces
+            if (std.mem.indexOfScalar(u8, name, ' ') != null) continue;
+
+            result.append(allocator, .{
+                .name = name,
+                .kind = sym.kind,
+                .line = def.line,
+                .end_line = def.end_line,
+            }) catch continue;
+        }
+
+        // Sort by line number
+        const SortCtx = struct {
+            fn lessThan(_: void, a: FileTOCEntry, b: FileTOCEntry) bool {
+                return a.line < b.line;
+            }
+        };
+        std.mem.sortUnstable(FileTOCEntry, result.items, {}, SortCtx.lessThan);
+
+        return result;
+    }
 };
 
 // ── Batch Disambiguation ────────────────────────────────────────────────
@@ -2307,8 +2380,6 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
     defer allocator.free(selected);
 
     // Phase 4: Read definition bodies and collect queried file/symbol info
-    var queried_files: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer queried_files.deinit(allocator);
     var queried_symbols: std.StringHashMapUnmanaged(void) = .empty;
     defer queried_symbols.deinit(allocator);
 
@@ -2327,8 +2398,7 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
         const match = matches.items[sel_idx];
         if (match.def.path.len == 0) continue;
 
-        // Track files and symbols for related discovery
-        try queried_files.append(allocator, match.def.path);
+        // Track queried symbols so file_symbols TOC excludes them
         queried_symbols.put(allocator, match.symbol, {}) catch {};
 
         // Read full definition body
@@ -2339,39 +2409,16 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
         }
     }
 
-    // Phase 5: Discover related symbols
-    var related = try discoverRelatedSymbols(allocator, ci, queried_files.items, &queried_symbols, MAX_RELATED);
-    defer related.deinit(allocator);
-
-    // Read bodies for related symbols (budget-limited)
-    var related_bodies: std.ArrayListUnmanaged(?ReadBodyResult) = .empty;
-    defer {
-        for (related_bodies.items) |*rb| {
-            if (rb.*) |r| allocator.free(r.snippet);
-        }
-        related_bodies.deinit(allocator);
-    }
-
-    for (related.items) |rel| {
-        if (total_bytes >= MAX_TOTAL_BYTES) {
-            try related_bodies.append(allocator, null);
-            continue;
-        }
-        const body = readDefinitionBody(allocator, project_root, rel.def.path, rel.def.line, rel.def.end_line, context_lines) catch null;
-        if (body) |b| {
-            total_bytes += b.snippet.len;
-            try related_bodies.append(allocator, b);
-        } else {
-            try related_bodies.append(allocator, null);
-        }
-    }
-
-    // Phase 6: Output JSON
+    // Phase 5: Output JSON
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
 
     try s.beginArray();
+
+    // Track files we've already emitted TOCs for (avoid duplicates across queries)
+    var emitted_file_tocs: std.StringHashMapUnmanaged(void) = .empty;
+    defer emitted_file_tocs.deinit(allocator);
 
     // Primary results
     for (0..n) |i| {
@@ -2419,49 +2466,35 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
                 try s.endArray();
             }
         }
-        if (retry_used[i]) {
-            try s.objectField("retry");
-            try s.write(retry_globs[i].?);
-        }
-        try s.endObject();
-    }
-
-    // Related symbols
-    for (related.items, 0..) |rel, ri| {
-        try s.beginObject();
-        try s.objectField("name");
-        try s.write(if (rel.def.display_name.len > 0) rel.def.display_name else scip.extractSymbolName(rel.symbol));
-        try s.objectField("kind");
-        try s.write(scip.kindName(rel.def.kind));
-        try s.objectField("path");
-        try s.write(rel.def.path);
-        try s.objectField("line");
-        try s.write(rel.def.line);
-        if (rel.def.end_line > rel.def.line) {
-            try s.objectField("end_line");
-            try s.write(rel.def.end_line);
-        }
-        if (ri < related_bodies.items.len) {
-            if (related_bodies.items[ri]) |body| {
-                try s.objectField("snippet");
-                try s.write(body.snippet);
-            }
-        }
-        // Emit references from SCIP cross-reference data
-        if (rel.def.end_line > rel.def.line) {
-            var refs = ci.findReferencesInRange(allocator, rel.def.path, rel.symbol, rel.def.line, rel.def.end_line);
-            defer refs.deinit(allocator);
-            if (refs.items.len > 0) {
-                try s.objectField("references");
+        // Emit file_symbols TOC (once per unique file)
+        if (!emitted_file_tocs.contains(match.def.path)) {
+            emitted_file_tocs.put(allocator, match.def.path, {}) catch {};
+            var toc = ci.getFileSymbolsTOC(allocator, match.def.path, &queried_symbols);
+            defer toc.deinit(allocator);
+            if (toc.items.len > 0) {
+                try s.objectField("file_symbols");
                 try s.beginArray();
-                for (refs.items) |ref_name| {
-                    try s.write(ref_name);
+                for (toc.items) |entry| {
+                    try s.beginObject();
+                    try s.objectField("name");
+                    try s.write(entry.name);
+                    try s.objectField("kind");
+                    try s.write(scip.kindName(entry.kind));
+                    try s.objectField("line");
+                    try s.write(entry.line);
+                    if (entry.end_line > entry.line) {
+                        try s.objectField("end_line");
+                        try s.write(entry.end_line);
+                    }
+                    try s.endObject();
                 }
                 try s.endArray();
             }
         }
-        try s.objectField("related");
-        try s.write(true);
+        if (retry_used[i]) {
+            try s.objectField("retry");
+            try s.write(retry_globs[i].?);
+        }
         try s.endObject();
     }
 

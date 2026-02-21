@@ -36,7 +36,7 @@ const Runtime = struct {
     watcher: ?watcher_mod.Watcher = null,
 
     fn init(allocator: std.mem.Allocator) Runtime {
-        var rt = Runtime{
+        return .{
             .allocator = allocator,
             .mem_config = Config.load(allocator) catch null,
             .debug_server = DebugServer.init(allocator),
@@ -45,11 +45,6 @@ const Runtime = struct {
             .mcp_session_id = null,
             .watcher = watcher_mod.Watcher.init(allocator),
         };
-        if (rt.watcher != null) {
-            rt.watcher.?.start();
-            debugLog("File watcher started", .{});
-        }
-        return rt;
     }
 
     fn deinit(self: *Runtime) void {
@@ -115,6 +110,12 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8) !void {
 
     var runtime = Runtime.init(allocator);
     defer runtime.deinit();
+    // Start the watcher thread AFTER runtime is in its final stack location.
+    // The thread captures a pointer to runtime.watcher, so it must not move.
+    if (runtime.watcher != null) {
+        runtime.watcher.?.start();
+        debugLog("File watcher started", .{});
+    }
     debugLog("Runtime initialized, mem_config={s}, entering main loop", .{if (runtime.mem_config != null) "present" else "null"});
 
     const stdin = std.fs.File.stdin();
@@ -176,6 +177,10 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8) !void {
             defer allocator.free(msg);
             processMessage(&runtime, msg) catch |err| {
                 logErr("MCP processMessage error: ", err);
+                if (err == error.WriteFailure) {
+                    shutdown_requested.store(true, .release);
+                    break;
+                }
             };
         }
     }
@@ -191,6 +196,15 @@ fn setupSignalHandler() void {
     };
     posix.sigaction(posix.SIG.INT, &act, null);
     posix.sigaction(posix.SIG.TERM, &act, null);
+
+    // Ignore SIGPIPE so that writes to a closed stdout return
+    // error.BrokenPipe instead of killing the process.
+    const ign: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &ign, null);
 }
 
 fn sigHandler(_: c_int) callconv(.c) void {
@@ -761,7 +775,7 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     try writeToolDef(s, "cog_code_status", "Check whether the SCIP code index exists, how many files are indexed, and which languages are covered. Use this to verify the index is available before querying.", &.{});
 
     try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore",
-        "Find multiple symbols by name and return full definition bodies with auto-discovered related symbols. Combines find + read in a single call. Auto-retries failed lookups with glob patterns, reads complete function/struct bodies (not fixed-line windows), and includes related project symbols referenced in the same files. Single call replaces multi-step find + read + follow-up loops.",
+        "Find multiple symbols by name and return full definition bodies with file table of contents. Combines find + read in a single call. Auto-retries failed lookups with glob patterns, reads compact function/struct bodies, and includes a file_symbols TOC listing every symbol in each matched file. Also includes references (symbols called within each function body).",
         \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"}},"required":["queries"]}
     );
 

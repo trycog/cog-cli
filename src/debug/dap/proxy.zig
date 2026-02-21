@@ -751,6 +751,16 @@ pub const DapProxy = struct {
 
     // ── Driver Interface (vtable functions) ─────────────────────────────
 
+    fn checkDependency(allocator: std.mem.Allocator, argv: []const []const u8, not_found_err: anyerror, not_installed_err: anyerror) anyerror!void {
+        var check = std.process.Child.init(argv, allocator);
+        check.stdin_behavior = .Ignore;
+        check.stdout_behavior = .Ignore;
+        check.stderr_behavior = .Ignore;
+        check.spawn() catch return not_found_err;
+        const term = check.wait() catch return not_found_err;
+        if (term.Exited != 0) return not_installed_err;
+    }
+
     fn proxyLaunch(ctx: *anyopaque, allocator: std.mem.Allocator, config: LaunchConfig) anyerror!void {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
 
@@ -761,13 +771,16 @@ pub const DapProxy = struct {
         defer argv_list.deinit(allocator);
 
         if (std.mem.eql(u8, ext, ".py")) {
+            try checkDependency(allocator, &.{ "python3", "-c", "import debugpy" }, error.PythonNotFound, error.DebugpyNotInstalled);
             try argv_list.append(allocator, "python3");
             try argv_list.append(allocator, "-m");
             try argv_list.append(allocator, "debugpy.adapter");
         } else if (std.mem.eql(u8, ext, ".go")) {
+            try checkDependency(allocator, &.{ "dlv", "version" }, error.DelveNotFound, error.DelveNotFound);
             try argv_list.append(allocator, "dlv");
             try argv_list.append(allocator, "dap");
         } else if (std.mem.eql(u8, ext, ".js")) {
+            try checkDependency(allocator, &.{ "node", "--version" }, error.NodeNotFound, error.NodeNotFound);
             // CDP transport handles JS via node --inspect
             return;
         } else {

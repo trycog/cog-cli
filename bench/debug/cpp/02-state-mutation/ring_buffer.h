@@ -18,8 +18,8 @@ public:
 private:
     Message* buffer;
     size_t capacity;
-    size_t head;   // read position
-    size_t tail;   // write position
+    size_t head;
+    size_t tail;
     size_t count;
 };
 

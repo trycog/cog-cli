@@ -1,12 +1,12 @@
-class Processor {
+class Collector {
   constructor() {
     this.items = [];
     this.seenIds = new Set();
   }
 
-  addItems(items) {
+  add(items, source) {
     for (const item of items) {
-      this.items.push(item);
+      this.items.push({ ...item, source });
       this.seenIds.add(item.id);
     }
   }
@@ -20,4 +20,4 @@ class Processor {
   }
 }
 
-module.exports = { Processor };
+module.exports = { Collector };

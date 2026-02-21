@@ -1,29 +1,31 @@
-const { AsyncPaginator } = require('./paginator');
-const { fetchPage } = require('./fetcher');
-const { Processor } = require('./processor');
-
-async function consume(paginator, processor, name) {
-  while (true) {
-    const result = await fetchPage(paginator);
-    if (!result) break;
-    processor.addItems(result.items);
-  }
-}
+const { RequestCache } = require('./cache');
+const { Collector } = require('./collector');
+const { processPages } = require('./worker');
+const { WorkScheduler } = require('./scheduler');
 
 async function main() {
-  const paginator = new AsyncPaginator(100, 10); // 100 items, 10 per page
-  const processor = new Processor();
+  const totalItems = 100;
+  const pageSize = 10;
+  const pageCount = Math.ceil(totalItems / pageSize);
 
-  // Two concurrent consumers sharing the same paginator
-  await Promise.all([
-    consume(paginator, processor, 'consumer-1'),
-    consume(paginator, processor, 'consumer-2'),
-  ]);
+  const cache = new RequestCache();
+  const collector = new Collector();
+  const workerIds = [1, 2];
 
-  if (processor.totalItems === processor.uniqueItems && processor.uniqueItems === 100) {
-    console.log(`Processed ${processor.uniqueItems} unique items`);
+  // Create a work plan that partitions pages among responsive workers
+  const scheduler = new WorkScheduler(pageCount, workerIds);
+  const plan = scheduler.createPlan();
+
+  await Promise.all(
+    workerIds.map(id =>
+      processPages(id, plan.getPages(id), pageSize, totalItems, cache, collector)
+    )
+  );
+
+  if (collector.totalItems === collector.uniqueItems && collector.uniqueItems === totalItems) {
+    console.log(`Processed ${collector.uniqueItems} unique items`);
   } else {
-    console.log(`Processed ${processor.totalItems} items (${processor.uniqueItems} unique)`);
+    console.log(`Processed ${collector.totalItems} items (${collector.uniqueItems} unique)`);
   }
 }
 

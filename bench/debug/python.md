@@ -12,7 +12,7 @@ Run each prompt in a fresh Claude Code session from `bench/debug/python/`.
 ```
 You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
-The program in 01-logic-error/ is a meeting room scheduler that merges overlapping time intervals to determine the minimum number of rooms needed. When you run `python3 01-logic-error/main.py`, it should output "Rooms needed: 4" but instead outputs "Rooms needed: 2".
+The program in 01-logic-error/ is a meeting room scheduler that merges overlapping time intervals to determine the minimum number of rooms needed. When you run `python3 01-logic-error/main.py`, it should output "Rooms needed: 3" but instead outputs "Rooms needed: 6".
 
 Diagnose the root cause using the debugger, fix the source code, and verify your fix by running the program again.
 
@@ -25,7 +25,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 ```
 You must NOT use any cog_* MCP tools. Diagnose and fix the bug using only standard tools (Read, Grep, Glob, Edit, Bash).
 
-The program in 01-logic-error/ is a meeting room scheduler that merges overlapping time intervals to determine the minimum number of rooms needed. When you run `python3 01-logic-error/main.py`, it should output "Rooms needed: 4" but instead outputs "Rooms needed: 2".
+The program in 01-logic-error/ is a meeting room scheduler that merges overlapping time intervals to determine the minimum number of rooms needed. When you run `python3 01-logic-error/main.py`, it should output "Rooms needed: 3" but instead outputs "Rooms needed: 6".
 
 Diagnose the root cause, fix the source code, and verify your fix by running the program again.
 

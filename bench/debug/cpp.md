@@ -44,7 +44,7 @@ You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger 
 
 The program in 02-state-mutation/ is a circular buffer used as a message queue. When you run `make -C 02-state-mutation && ./02-state-mutation/program`, it should receive all 1000 messages correctly but instead reports corrupted messages.
 
-Use the debugger to inspect the buffer state when corruption occurs. Fix the source code and verify your fix.
+Use the debugger to inspect the buffer's head/tail positions and buffer contents as messages are pushed and popped, especially near the wrap-around boundary. Fix the source code and verify your fix.
 
 After fixing, count your tool calls and LLM rounds. Write the result as JSON to .bench/cpp-12-debug.json in this format: {"test": 12, "name": "State mutation: ring buffer", "variant": "debug", "calls": N, "rounds": N}
 

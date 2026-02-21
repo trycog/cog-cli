@@ -16,8 +16,6 @@ pub const Watcher = struct {
     read_buf: [4096]u8,
     read_len: usize,
     read_start: usize,
-    macos_run_loop: if (builtin.os.tag == .macos) ?*anyopaque else void,
-    macos_cf_run_loop_stop: if (builtin.os.tag == .macos) ?CF.CFRunLoopStopFn else void,
 
     /// Initialize the watcher. Returns null if no index exists or platform unsupported.
     pub fn init(allocator: std.mem.Allocator) ?Watcher {
@@ -54,8 +52,6 @@ pub const Watcher = struct {
             .read_buf = undefined,
             .read_len = 0,
             .read_start = 0,
-            .macos_run_loop = if (builtin.os.tag == .macos) null else {},
-            .macos_cf_run_loop_stop = if (builtin.os.tag == .macos) null else {},
         };
     }
 
@@ -71,14 +67,6 @@ pub const Watcher = struct {
     /// Stop the watcher thread and release resources.
     pub fn deinit(self: *Watcher) void {
         self.stop_flag.store(true, .release);
-
-        if (builtin.os.tag == .macos) {
-            if (self.macos_run_loop) |rl| {
-                if (self.macos_cf_run_loop_stop) |stop_fn| {
-                    stop_fn(@ptrCast(rl));
-                }
-            }
-        }
 
         // Write a byte to unblock any pending read on the pipe
         _ = posix.write(self.pipe_write, "!") catch {};
@@ -239,8 +227,7 @@ const CF = struct {
     const CFArrayCreateFn = *const fn (CFAllocatorRef, [*]const ?*const anyopaque, CFIndex, ?*const anyopaque) callconv(.c) ?CFArrayRef;
     const CFReleaseFn = *const fn (*anyopaque) callconv(.c) void;
     const CFRunLoopGetCurrentFn = *const fn () callconv(.c) CFRunLoopRef;
-    const CFRunLoopRunFn = *const fn () callconv(.c) void;
-    const CFRunLoopStopFn = *const fn (CFRunLoopRef) callconv(.c) void;
+    const CFRunLoopRunInModeFn = *const fn (CFRunLoopMode, f64, u8) callconv(.c) i32;
 
     const FSEventStreamCreateFn = *const fn (CFAllocatorRef, FSEventStreamCallback, *const FSEventStreamContext, CFArrayRef, FSEventStreamEventId, f64, FSEventStreamCreateFlags) callconv(.c) ?FSEventStreamRef;
     const FSEventStreamScheduleWithRunLoopFn = *const fn (FSEventStreamRef, CFRunLoopRef, CFRunLoopMode) callconv(.c) void;
@@ -254,8 +241,7 @@ const CF = struct {
     CFArrayCreate: CFArrayCreateFn = undefined,
     CFRelease: CFReleaseFn = undefined,
     CFRunLoopGetCurrent: CFRunLoopGetCurrentFn = undefined,
-    CFRunLoopRun: CFRunLoopRunFn = undefined,
-    CFRunLoopStop: CFRunLoopStopFn = undefined,
+    CFRunLoopRunInMode: CFRunLoopRunInModeFn = undefined,
 
     FSEventStreamCreate: FSEventStreamCreateFn = undefined,
     FSEventStreamScheduleWithRunLoop: FSEventStreamScheduleWithRunLoopFn = undefined,
@@ -295,11 +281,7 @@ const CF = struct {
             self.close();
             return null;
         };
-        self.CFRunLoopRun = self.cf_lib.lookup(CFRunLoopRunFn, "CFRunLoopRun") orelse {
-            self.close();
-            return null;
-        };
-        self.CFRunLoopStop = self.cf_lib.lookup(CFRunLoopStopFn, "CFRunLoopStop") orelse {
+        self.CFRunLoopRunInMode = self.cf_lib.lookup(CFRunLoopRunInModeFn, "CFRunLoopRunInMode") orelse {
             self.close();
             return null;
         };
@@ -353,6 +335,9 @@ fn watcherThreadMacos(self: *Watcher) void {
     var cf = CF.load() orelse return;
     defer cf.close();
 
+    // Check if shutdown was requested while we were loading frameworks.
+    if (self.stop_flag.load(.acquire)) return;
+
     // Create CFString from project root
     const root_z = self.allocator.dupeZ(u8, self.project_root) catch return;
     defer self.allocator.free(root_z);
@@ -380,10 +365,7 @@ fn watcherThreadMacos(self: *Watcher) void {
         CF.kFSEventStreamCreateFlagFileEvents | CF.kFSEventStreamCreateFlagNoDefer,
     ) orelse return;
 
-    // Store run loop ref and stop fn so deinit() can stop it
     const run_loop = cf.CFRunLoopGetCurrent();
-    self.macos_run_loop = @ptrCast(run_loop);
-    self.macos_cf_run_loop_stop = cf.CFRunLoopStop;
 
     cf.FSEventStreamScheduleWithRunLoop(stream, run_loop, cf.kCFRunLoopDefaultMode);
     if (!cf.FSEventStreamStart(stream)) {
@@ -392,8 +374,12 @@ fn watcherThreadMacos(self: *Watcher) void {
         return;
     }
 
-    // Block until CFRunLoopStop() is called from deinit()
-    cf.CFRunLoopRun();
+    // Run the event loop with periodic stop_flag checks.
+    // CFRunLoopRunInMode returns after the timeout (0.5s) or when a source
+    // fires, letting us check stop_flag without needing CFRunLoopStop().
+    while (!self.stop_flag.load(.acquire)) {
+        _ = cf.CFRunLoopRunInMode(cf.kCFRunLoopDefaultMode, 0.5, 0);
+    }
 
     // Cleanup
     cf.FSEventStreamStop(stream);

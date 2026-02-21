@@ -120,6 +120,15 @@ pub fn encodeOccurrence(allocator: std.mem.Allocator, occ: scip.Occurrence) ![]c
     // field 5: syntax_kind
     try enc.writeVarintField(5, @intCast(occ.syntax_kind));
 
+    // field 7: enclosing_range (packed int32, same encoding as range)
+    if (occ.enclosing_range) |er| {
+        if (er.start_line == er.end_line) {
+            try enc.writePackedInt32(7, &.{ er.start_line, er.start_char, er.end_char });
+        } else {
+            try enc.writePackedInt32(7, &.{ er.start_line, er.start_char, er.end_line, er.end_char });
+        }
+    }
+
     return enc.toOwnedSlice();
 }
 

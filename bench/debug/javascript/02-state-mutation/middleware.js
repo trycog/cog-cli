@@ -1,33 +1,49 @@
+const contexts = new Map();
+
+function getOrCreateContext(type) {
+  if (!contexts.has(type)) {
+    contexts.set(type, { timestamps: {}, log: [] });
+  }
+  return contexts.get(type);
+}
+
 function createTimestampMiddleware(handlerName) {
+  const ctx = getOrCreateContext('timestamp');
   return function (event) {
-    const enriched = event;
-    enriched[`_timestamp_${handlerName}`] = Date.now();
-    enriched._last_processed_by = handlerName;
-    return enriched;
+    ctx.timestamps[handlerName] = Date.now();
+    return {
+      ...event,
+      metadata: {
+        ...event.metadata,
+        timestamps: { ...ctx.timestamps },
+        lastProcessor: handlerName,
+      },
+    };
   };
 }
 
 function createValidationMiddleware() {
+  const ctx = getOrCreateContext('validation');
   return function (event) {
-    const validated = event;
-    validated._validated = true;
-
+    const result = {
+      ...event,
+      metadata: { ...event.metadata, validated: true },
+    };
     if (typeof event.amount === 'number' && event.amount < 0) {
-      validated._validation_error = 'Negative amount';
+      result.metadata.validationError = 'Negative amount';
     }
-
-    return validated;
+    return result;
   };
 }
 
 function createLoggingMiddleware(handlerName) {
+  const ctx = getOrCreateContext('logging');
   return function (event) {
-    const logged = event;
-    if (!logged._processing_log) {
-      logged._processing_log = [];
-    }
-    logged._processing_log.push(handlerName);
-    return logged;
+    ctx.log.push(handlerName);
+    return {
+      ...event,
+      metadata: { ...event.metadata, log: [...ctx.log] },
+    };
   };
 }
 

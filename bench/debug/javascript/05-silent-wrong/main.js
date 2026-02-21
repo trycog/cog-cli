@@ -1,10 +1,10 @@
 const { DataFrame } = require('./dataframe');
 const { groupBy } = require('./groupby');
-const { sum, aggregate } = require('./aggregator');
+const { sum } = require('./stats');
+const { aggregate } = require('./aggregator');
 const { pivot } = require('./pivot');
 
 function main() {
-  // Sales data by year
   const df = new DataFrame(
     ['year', 'quarter', 'revenue'],
     [
@@ -27,17 +27,12 @@ function main() {
     ]
   );
 
-  // Group by year, sum revenue
   const groups = groupBy(df, 'year', 'revenue');
   const totals = aggregate(groups, sum);
 
-  // Pivot into year columns
-  // NOTE: column order uses strings — this is where the type mismatch happens
-  // because groupBy keys are numbers (from the raw data rows)
-  const years = ['2021', '2022', '2023', '2024'];
+  const years = [2021, 2022, 2023, 2024];
   const pivoted = pivot(totals, years);
 
-  // Format output
   const parts = Object.entries(pivoted)
     .map(([k, v]) => `${k}=$${v}`)
     .join(' ');

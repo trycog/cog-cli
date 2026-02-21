@@ -13,25 +13,31 @@ function main() {
   ]);
 
   // Handler B with its own middleware chain
-  // Should receive a CLEAN event, not one polluted by A's middleware
+  // Should receive a clean event, not one polluted by A's middleware
   emitter.on('order', createHandlerB(), [
     createValidationMiddleware(),
     createTimestampMiddleware('B'),
     createLoggingMiddleware('B'),
   ]);
 
-  // Emit an event
-  const event = { type: 'order', amount: 100, item: 'Widget' };
+  // Emit an event with nested metadata
+  const event = {
+    type: 'order',
+    amount: 100,
+    item: 'Widget',
+    metadata: { timestamps: {}, log: [], validated: false, lastProcessor: null },
+  };
   const results = emitter.emit('order', event);
 
-  // Check if handler B's event was contaminated by handler A's middleware
+  // Check if handler B's metadata was contaminated by handler A's middleware
   const bResult = results[1];
-  const leakedKeys = bResult.receivedKeys.filter(k => k.includes('_A'));
+  const hasLeakedTimestamps = bResult.timestamps.some(t => t === 'A');
+  const hasLeakedLog = bResult.logEntries.some(e => e === 'A');
 
-  if (leakedKeys.length > 0) {
-    console.log(`FAIL: Handler B received ${bResult.receivedKeys.length} keys (leaked: ${leakedKeys.join(', ')})`);
+  if (hasLeakedTimestamps || hasLeakedLog) {
+    console.log(`FAIL: Handler B received cross-handler leakage (timestamps: [${bResult.timestamps}], log: [${bResult.logEntries}])`);
   } else {
-    console.log(`OK: Handler B received ${bResult.receivedKeys.length} keys, no leakage`);
+    console.log('OK: Handler B received clean event, no cross-handler leakage');
   }
 }
 

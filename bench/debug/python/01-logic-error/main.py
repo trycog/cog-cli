@@ -5,21 +5,18 @@ from scheduler import find_max_concurrent
 def main():
     """Schedule meetings and report the minimum number of rooms needed.
 
-    The meeting data is arranged in two back-to-back blocks that share
-    an exact boundary point (10:00).  Meetings within each block run
-    concurrently, but the two blocks are merely *adjacent* -- they do
-    NOT overlap.
-
+    The meeting data includes several overlapping sessions spread across
+    a wide time range.  The scheduler merges overlapping intervals into
+    groups, then computes the peak concurrency within each group.
     """
 
     meetings = [
-        # --- Morning block: two parallel meetings, 9:00 - 10:00 ---
-        Interval(9.0, 10.0),    # Engineering standup
-        Interval(9.0, 10.0),    # Client sync
-
-        # --- Mid-morning block: two parallel meetings, 10:00 - 11:00 ---
-        Interval(10.0, 11.0),   # Design review
-        Interval(10.0, 11.0),   # Sprint planning
+        Interval(1.0, 10.0),   # All-hands (long anchor)
+        Interval(2.0, 3.0),    # Quick sync
+        Interval(5.0, 6.0),    # Design review
+        Interval(5.0, 6.0),    # Sprint planning
+        Interval(8.0, 9.0),    # Late standup
+        Interval(8.0, 9.0),    # Client call
     ]
 
     rooms = find_max_concurrent(meetings)
