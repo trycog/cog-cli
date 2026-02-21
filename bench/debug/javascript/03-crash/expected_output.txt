@@ -1,0 +1,1 @@
+Pool intact: 42 completed, 8 failed, 3 resources tracked

@@ -1,0 +1,1 @@
+Cache test: 15 hits, 4 misses, 0 errors

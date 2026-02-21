@@ -28,5 +28,9 @@ opencode.json
 # External indexer config
 /tsconfig.json
 
-# Benchmark data
-/bench/
+# Benchmark results (not source)
+/bench/**/.*
+/bench/**/*.o
+/bench/**/program
+/bench/**/target/
+/bench/**/__pycache__/
