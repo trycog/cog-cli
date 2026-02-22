@@ -16,6 +16,10 @@ pub const Watcher = struct {
     read_buf: [4096]u8,
     read_len: usize,
     read_start: usize,
+    // CFRunLoop cross-thread wakeup (macOS only).
+    // Stored as usize for atomic access; 0 means not yet set.
+    macos_run_loop: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    macos_stop_fn: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// Initialize the watcher. Returns null if no index exists or platform unsupported.
     pub fn init(allocator: std.mem.Allocator) ?Watcher {
@@ -52,6 +56,8 @@ pub const Watcher = struct {
             .read_buf = undefined,
             .read_len = 0,
             .read_start = 0,
+            .macos_run_loop = std.atomic.Value(usize).init(0),
+            .macos_stop_fn = std.atomic.Value(usize).init(0),
         };
     }
 
@@ -67,6 +73,15 @@ pub const Watcher = struct {
     /// Stop the watcher thread and release resources.
     pub fn deinit(self: *Watcher) void {
         self.stop_flag.store(true, .release);
+
+        // Wake up the macOS CFRunLoop so the thread exits immediately
+        // instead of waiting for the next timeout.
+        const rl_ptr = self.macos_run_loop.load(.acquire);
+        const stop_fn_ptr = self.macos_stop_fn.load(.acquire);
+        if (rl_ptr != 0 and stop_fn_ptr != 0) {
+            const stop_fn: *const fn (*anyopaque) callconv(.c) void = @ptrFromInt(stop_fn_ptr);
+            stop_fn(@ptrFromInt(rl_ptr));
+        }
 
         // Write a byte to unblock any pending read on the pipe
         _ = posix.write(self.pipe_write, "!") catch {};
@@ -228,6 +243,7 @@ const CF = struct {
     const CFReleaseFn = *const fn (*anyopaque) callconv(.c) void;
     const CFRunLoopGetCurrentFn = *const fn () callconv(.c) CFRunLoopRef;
     const CFRunLoopRunInModeFn = *const fn (CFRunLoopMode, f64, u8) callconv(.c) i32;
+    const CFRunLoopStopFn = *const fn (*anyopaque) callconv(.c) void;
 
     const FSEventStreamCreateFn = *const fn (CFAllocatorRef, FSEventStreamCallback, *const FSEventStreamContext, CFArrayRef, FSEventStreamEventId, f64, FSEventStreamCreateFlags) callconv(.c) ?FSEventStreamRef;
     const FSEventStreamScheduleWithRunLoopFn = *const fn (FSEventStreamRef, CFRunLoopRef, CFRunLoopMode) callconv(.c) void;
@@ -242,6 +258,7 @@ const CF = struct {
     CFRelease: CFReleaseFn = undefined,
     CFRunLoopGetCurrent: CFRunLoopGetCurrentFn = undefined,
     CFRunLoopRunInMode: CFRunLoopRunInModeFn = undefined,
+    CFRunLoopStop: CFRunLoopStopFn = undefined,
 
     FSEventStreamCreate: FSEventStreamCreateFn = undefined,
     FSEventStreamScheduleWithRunLoop: FSEventStreamScheduleWithRunLoopFn = undefined,
@@ -282,6 +299,10 @@ const CF = struct {
             return null;
         };
         self.CFRunLoopRunInMode = self.cf_lib.lookup(CFRunLoopRunInModeFn, "CFRunLoopRunInMode") orelse {
+            self.close();
+            return null;
+        };
+        self.CFRunLoopStop = self.cf_lib.lookup(CFRunLoopStopFn, "CFRunLoopStop") orelse {
             self.close();
             return null;
         };
@@ -366,6 +387,11 @@ fn watcherThreadMacos(self: *Watcher) void {
     ) orelse return;
 
     const run_loop = cf.CFRunLoopGetCurrent();
+
+    // Publish the run loop ref and stop function so deinit() can wake us up
+    // via CFRunLoopStop() from the main thread.
+    self.macos_run_loop.store(@intFromPtr(run_loop), .release);
+    self.macos_stop_fn.store(@intFromPtr(cf.CFRunLoopStop), .release);
 
     cf.FSEventStreamScheduleWithRunLoop(stream, run_loop, cf.kCFRunLoopDefaultMode);
     if (!cf.FSEventStreamStart(stream)) {

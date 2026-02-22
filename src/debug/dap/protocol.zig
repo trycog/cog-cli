@@ -201,8 +201,13 @@ pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
     try s.write(true);
     try s.objectField("columnsStartAt1");
     try s.write(true);
+    // Do NOT advertise runInTerminal or startDebugging — we run headless
+    // and cannot provide a terminal or manage sub-sessions. Setting these
+    // to false forces the adapter to launch the debuggee internally.
     try s.objectField("supportsRunInTerminalRequest");
-    try s.write(true);
+    try s.write(false);
+    try s.objectField("supportsStartDebuggingRequest");
+    try s.write(false);
     // Advertise client capabilities
     try s.objectField("supportsVariableType");
     try s.write(true);
@@ -215,8 +220,6 @@ pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
     try s.objectField("supportsInvalidatedEvent");
     try s.write(true);
     try s.objectField("supportsMemoryEvent");
-    try s.write(true);
-    try s.objectField("supportsStartDebuggingRequest");
     try s.write(true);
     try s.objectField("supportsANSIStyling");
     try s.write(true);
@@ -252,6 +255,10 @@ pub fn launchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8
     }
     try s.objectField("stopOnEntry");
     try s.write(stop_on_entry);
+    // Use internalConsole to prevent debugpy from spawning a terminal
+    // (integratedTerminal is the default and causes SIGTTIN when running headless)
+    try s.objectField("console");
+    try s.write("internalConsole");
     try s.endObject();
     try s.endObject();
 
@@ -1859,7 +1866,8 @@ test "InitializeRequest advertises client capabilities" {
     try std.testing.expect(args.get("supportsProgressReporting").?.bool);
     try std.testing.expect(args.get("supportsInvalidatedEvent").?.bool);
     try std.testing.expect(args.get("supportsMemoryEvent").?.bool);
-    try std.testing.expect(args.get("supportsStartDebuggingRequest").?.bool);
+    try std.testing.expect(!args.get("supportsStartDebuggingRequest").?.bool);
+    try std.testing.expect(!args.get("supportsRunInTerminalRequest").?.bool);
     try std.testing.expect(args.get("supportsANSIStyling").?.bool);
 }
 

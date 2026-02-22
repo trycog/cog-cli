@@ -1,5 +1,15 @@
 # Cog Debug Server — End-to-End Test Prompt (C++)
 
+## CRITICAL EXECUTION RULES
+
+- Run ALL 33 scenarios in a single pass without stopping
+- Do NOT pause between scenarios to report results
+- Do NOT output verbose step-by-step results during execution
+- Accumulate results internally and output ONLY the final summary table
+- If a scenario fails, note the failure and continue to the next scenario
+- Never stop to ask for confirmation between scenarios
+- Context management: You have limited context. Minimize output during execution. Only output the final summary table after all 33 scenarios.
+
 ## How the MCP Debug Tools Work
 
 You have direct access to Cog MCP debug tools in this environment.
@@ -151,12 +161,11 @@ Killing processes (e.g., `pkill`) can destroy the user's running dashboard or ot
 
 ## Test Scenarios
 
-Each scenario is independent. For each debug command, report:
+Each scenario is independent. Execute each scenario's steps sequentially:
 
-1. **What you're doing** — state the action and why
-2. **The raw response** — show the full response from the tool
-3. **Interpretation** — explain what the response means
-4. **Current debugger state** — summarize active sessions, breakpoints, execution position
+- If all steps pass: record PASS and move to the next scenario immediately
+- If a step fails: record the step number, error, and move to the next scenario
+- Do NOT output intermediate results — only record the final pass/fail per scenario
 
 ---
 
@@ -818,99 +827,43 @@ Uses Program A.
 
 ## Reporting
 
-After completing all scenarios, provide a summary table:
+After completing all 33 scenarios, output this summary table and nothing else:
 
-| Scenario | Description | Result | Notes |
-|----------|-------------|--------|-------|
-| 1 | Basic breakpoint + inspect | ? | |
-| 2 | Step into / step out | ? | |
-| 3 | Multiple breakpoints + continue | ? | |
-| 4 | Loop breakpoint | ? | |
-| 5 | Step over | ? | |
-| 6 | Breakpoint removal + list | ? | |
-| 7 | Recursive function | ? | |
-| 8 | Expression evaluation | ? | |
-| 9 | Restart | ? | |
-| 10 | Error handling | ? | |
-| 11 | Threads + stack traces | ? | |
-| 12 | Scopes | ? | |
-| 13 | Set variable / set expression | ? | |
-| 14 | Memory read + disassembly | ? | |
-| 15 | Instruction breakpoints | ? | |
-| 16 | CPU registers (native) | ? | |
-| 17 | Function breakpoints | ? | |
-| 18 | Breakpoint locations | ? | |
-| 19 | Exception breakpoints + info | ? | |
-| 20 | Goto targets + goto | ? | |
-| 21 | Step-in targets | ? | |
-| 22 | Stepping granularity | ? | |
-| 23 | Session listing + multiple sessions | ? | |
-| 24 | Capabilities query | ? | |
-| 25 | Restart tool + stop variants | ? | |
-| 26 | Modules + loaded sources | ? | |
-| 27 | Completions | ? | |
-| 28 | Advanced inspect (contexts/scopes/frames) | ? | |
-| 29 | Watchpoints | ? | |
-| 30 | Event polling | ? | |
-| 31 | Cancel + terminate threads | ? | |
-| 32 | Restart frame | ? | |
-| 33 | Extended error handling + error codes | ? | |
+| # | Description | Result | Failed Step | Error |
+|---|-------------|--------|-------------|-------|
+| 1 | Basic breakpoint + inspect | PASS/FAIL | | |
+| 2 | Step into / step out | PASS/FAIL | | |
+| 3 | Multiple breakpoints + continue | PASS/FAIL | | |
+| 4 | Loop breakpoint | PASS/FAIL | | |
+| 5 | Step over | PASS/FAIL | | |
+| 6 | Breakpoint removal + list | PASS/FAIL | | |
+| 7 | Recursive function | PASS/FAIL | | |
+| 8 | Expression evaluation | PASS/FAIL | | |
+| 9 | Restart | PASS/FAIL | | |
+| 10 | Error handling | PASS/FAIL | | |
+| 11 | Threads + stack traces | PASS/FAIL | | |
+| 12 | Scopes | PASS/FAIL | | |
+| 13 | Set variable / set expression | PASS/FAIL | | |
+| 14 | Memory + disassembly (NOT_SUPPORTED) | PASS/FAIL | | |
+| 15 | Instruction breakpoints (NOT_SUPPORTED) | PASS/FAIL | | |
+| 16 | CPU registers + native tools (NOT_SUPPORTED) | PASS/FAIL | | |
+| 17 | Function breakpoints | PASS/FAIL | | |
+| 18 | Breakpoint locations | PASS/FAIL | | |
+| 19 | Exception breakpoints + info | PASS/FAIL | | |
+| 20 | Goto targets + goto | PASS/FAIL | | |
+| 21 | Step-in targets | PASS/FAIL | | |
+| 22 | Stepping granularity | PASS/FAIL | | |
+| 23 | Session listing + multiple sessions | PASS/FAIL | | |
+| 24 | Capabilities query | PASS/FAIL | | |
+| 25 | Restart tool + stop variants | PASS/FAIL | | |
+| 26 | Modules + loaded sources | PASS/FAIL | | |
+| 27 | Completions | PASS/FAIL | | |
+| 28 | Advanced inspect (contexts/scopes/frames) | PASS/FAIL | | |
+| 29 | Watchpoints | PASS/FAIL | | |
+| 30 | Event polling | PASS/FAIL | | |
+| 31 | Cancel + terminate threads | PASS/FAIL | | |
+| 32 | Restart frame | PASS/FAIL | | |
+| 33 | Extended error handling + error codes | PASS/FAIL | | |
 
-### Tools Coverage Matrix
-
-| Tool | Scenario(s) |
-|------|-------------|
-| `debug_launch` | 1-33 (all) |
-| `debug_breakpoint` (set) | 1, 3-9, 14-15, 28-30 |
-| `debug_breakpoint` (remove) | 6, 15 |
-| `debug_breakpoint` (list) | 3, 6, 17 |
-| `debug_breakpoint` (set_function) | 17 |
-| `debug_breakpoint` (set_exception) | 19 |
-| `debug_run` (continue) | 1-9, 14-15, 17, 19-20, 29-30 |
-| `debug_run` (step_into) | 2, 21 |
-| `debug_run` (step_over) | 5, 13, 22 |
-| `debug_run` (step_out) | 2 |
-| `debug_run` (restart) | 9 |
-| `debug_run` (goto) | 20 |
-| `debug_run` (granularity) | 22 |
-| `debug_inspect` | 1-8, 12-13, 28-29 |
-| `debug_inspect` (context) | 28 |
-| `debug_inspect` (variable_ref) | 12 |
-| `debug_inspect` (scope) | 28 |
-| `debug_inspect` (frame_id) | 28 |
-| `debug_stop` | 1-33 (all) |
-| `debug_stop` (detach) | 25 |
-| `debug_stop` (terminate_only) | 25 |
-| `debug_threads` | 11 |
-| `debug_stacktrace` | 11, 32 |
-| `debug_scopes` | 12 |
-| `debug_set_variable` | 13 |
-| `debug_set_expression` | 13 |
-| `debug_memory` (read) | 14, 33 |
-| `debug_memory` (write) | 33 |
-| `debug_disassemble` | 14, 15 |
-| `debug_instruction_breakpoint` | 15, 33 |
-| `debug_breakpoint_locations` | 18 |
-| `debug_goto_targets` | 20 |
-| `debug_step_in_targets` | 21 |
-| `debug_capabilities` | 24 |
-| `debug_modules` | 26 |
-| `debug_loaded_sources` | 26 |
-| `debug_source` | 33 |
-| `debug_completions` | 27 |
-| `debug_exception_info` | 19 |
-| `debug_registers` | 16, 33 |
-| `debug_write_register` | 16 |
-| `debug_find_symbol` | 16 |
-| `debug_variable_location` | 16 |
-| `debug_sessions` | 23, 25 |
-| `debug_restart` | 25 |
-| `debug_restart_frame` | 32 |
-| `debug_watchpoint` | 29 |
-| `debug_poll_events` | 30 |
-| `debug_cancel` | 31 |
-| `debug_terminate_threads` | 31 |
-
-For any failures, include the raw response and describe what went wrong vs what
-was expected. If a scenario cannot complete (e.g., due to a prior step failing), note which
-step failed and skip the rest of that scenario.
+For failures, fill in the Failed Step and Error columns. If a scenario cannot complete
+(e.g., due to a prior step failing), note which step failed and skip the rest of that scenario.

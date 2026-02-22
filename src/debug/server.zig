@@ -9,6 +9,25 @@ const driver_mod = @import("driver.zig");
 const dashboard_mod = @import("dashboard.zig");
 const dashboard_tui = @import("dashboard_tui.zig");
 
+// Debug logging to file
+var server_log_file: ?std.fs.File = null;
+
+fn serverLog(comptime fmt: []const u8, args: anytype) void {
+    if (server_log_file == null) {
+        server_log_file = std.fs.cwd().createFile("/tmp/cog-dap-debug.log", .{ .truncate = false }) catch null;
+        if (server_log_file) |f| f.seekFromEnd(0) catch {};
+    }
+    const f = server_log_file orelse return;
+    var buf: [128]u8 = undefined;
+    const ts = std.time.timestamp();
+    const prefix = std.fmt.bufPrint(&buf, "[{d}] ", .{ts}) catch return;
+    f.writeAll(prefix) catch return;
+    var msg_buf: [8192]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch return;
+    f.writeAll(msg) catch return;
+    f.writeAll("\n") catch return;
+}
+
 const SessionManager = session_mod.SessionManager;
 
 // Standard error codes
@@ -416,7 +435,9 @@ pub const DebugServer = struct {
     /// Dispatch a tool call and return the raw result.
     /// Used by the daemon socket transport.
     pub fn callTool(self: *DebugServer, allocator: std.mem.Allocator, tool_name: []const u8, tool_args: ?json.Value) !ToolResult {
+        serverLog("[DebugServer.callTool] Dispatching tool: {s}", .{tool_name});
         if (std.mem.eql(u8, tool_name, "cog_debug_launch")) {
+            serverLog("[DebugServer.callTool] -> toolLaunch", .{});
             return self.toolLaunch(allocator, tool_args);
         } else if (std.mem.eql(u8, tool_name, "cog_debug_breakpoint")) {
             return self.toolBreakpoint(allocator, tool_args);
@@ -496,13 +517,17 @@ pub const DebugServer = struct {
     // ── Tool Implementations ────────────────────────────────────────────
 
     fn toolLaunch(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
+        serverLog("[toolLaunch] Entered toolLaunch", .{});
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
 
+        serverLog("[toolLaunch] Parsing launch config...", .{});
         const config = types.LaunchConfig.parseFromJson(allocator, a) catch {
+            serverLog("[toolLaunch] Failed to parse launch config", .{});
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Invalid launch config: program is required" } };
         };
         defer config.deinit(allocator);
+        serverLog("[toolLaunch] Config parsed: program={s}", .{config.program});
 
         const client_pid: ?std.posix.pid_t = if (a.object.get("client_pid")) |v|
             (if (v == .integer) @as(std.posix.pid_t, @intCast(v.integer)) else null)
@@ -527,6 +552,7 @@ pub const DebugServer = struct {
         };
 
         if (use_dap) {
+            serverLog("[toolLaunch] Using DAP transport, creating proxy...", .{});
             const dap_proxy = @import("dap/proxy.zig");
             var proxy = try allocator.create(dap_proxy.DapProxy);
             proxy.* = dap_proxy.DapProxy.init(allocator);
@@ -535,12 +561,15 @@ pub const DebugServer = struct {
                 allocator.destroy(proxy);
             }
 
+            serverLog("[toolLaunch] Calling driver.launch()...", .{});
             var driver = proxy.activeDriver();
             driver.launch(allocator, config) catch |err| {
+                serverLog("[toolLaunch] driver.launch() FAILED: {s}", .{@errorName(err)});
                 const msg = errorMessage(err);
                 self.dashboard.onError("cog_debug_launch", msg);
                 return .{ .err = .{ .code = errorToCode(err), .message = msg } };
             };
+            serverLog("[toolLaunch] driver.launch() succeeded", .{});
 
             const session_id = try self.session_manager.createSession(driver, client_pid, .terminate);
             if (self.session_manager.getSession(session_id)) |s| {

@@ -7,6 +7,25 @@ const driver_mod = @import("../driver.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 
+// Debug logging to file (stderr not visible when running as MCP subprocess)
+var dap_log_file: ?std.fs.File = null;
+
+fn dapLog(comptime fmt: []const u8, args: anytype) void {
+    if (dap_log_file == null) {
+        dap_log_file = std.fs.cwd().createFile("/tmp/cog-dap-debug.log", .{ .truncate = false }) catch null;
+        if (dap_log_file) |f| f.seekFromEnd(0) catch {};
+    }
+    const f = dap_log_file orelse return;
+    var buf: [128]u8 = undefined;
+    const ts = std.time.timestamp();
+    const prefix = std.fmt.bufPrint(&buf, "[{d}] ", .{ts}) catch return;
+    f.writeAll(prefix) catch return;
+    var msg_buf: [8192]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch return;
+    f.writeAll(msg) catch return;
+    f.writeAll("\n") catch return;
+}
+
 const RunAction = types.RunAction;
 const StopState = types.StopState;
 const StopReason = types.StopReason;
@@ -33,10 +52,111 @@ const DriverVTable = driver_mod.DriverVTable;
 
 // ── DAP Proxy ───────────────────────────────────────────────────────────
 
+const BufferedEvent = struct {
+    event_name: []const u8,
+    body: []const u8,
+};
+
+/// A child process spawned with setsid() so it cannot access the
+/// controlling terminal.  Replaces std.process.Child for the debug
+/// adapter to prevent SIGTTIN in the parent (Claude CLI) process.
+const DetachedProcess = struct {
+    id: std.posix.pid_t,
+    stdin: ?std.fs.File = null,
+    stdout: ?std.fs.File = null,
+    stderr: ?std.fs.File = null,
+
+    fn kill(self: *DetachedProcess) !void {
+        std.posix.kill(self.id, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => return err,
+        };
+    }
+};
+
+/// Fork+exec a child process in a **new session** (`setsid`).
+/// This fully detaches from the controlling terminal so the adapter
+/// (and any processes it spawns) can never steal the foreground
+/// process group — which would send SIGTTIN to the parent.
+fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !DetachedProcess {
+    const posix = std.posix;
+
+    // Create pipes with CLOEXEC — they auto-close after exec in the child.
+    const stdin_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(stdin_pipe[0]);
+        posix.close(stdin_pipe[1]);
+    }
+    const stdout_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(stdout_pipe[0]);
+        posix.close(stdout_pipe[1]);
+    }
+    const stderr_pipe = try posix.pipe2(.{ .CLOEXEC = true });
+    errdefer {
+        posix.close(stderr_pipe[0]);
+        posix.close(stderr_pipe[1]);
+    }
+
+    // Prepare null-terminated argv and capture environ BEFORE fork
+    // (no allocations are safe between fork and exec).
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const argv_buf = try a.allocSentinel(?[*:0]const u8, argv.len, null);
+    for (argv, 0..) |arg, i| argv_buf[i] = (try a.dupeZ(u8, arg)).ptr;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        // ── Child ──
+        // Create a new session — fully detaches from the controlling
+        // terminal so the adapter cannot call tcsetpgrp().
+        _ = std.c.setsid();
+
+        // Wire up pipes to stdin/stdout/stderr (dup2 clears CLOEXEC on
+        // the target fd, so 0/1/2 survive exec).
+        _ = posix.dup2(stdin_pipe[0], posix.STDIN_FILENO) catch posix.exit(1);
+        _ = posix.dup2(stdout_pipe[1], posix.STDOUT_FILENO) catch posix.exit(1);
+        _ = posix.dup2(stderr_pipe[1], posix.STDERR_FILENO) catch posix.exit(1);
+
+        // Close the original pipe fds (they have CLOEXEC but be explicit).
+        posix.close(stdin_pipe[0]);
+        posix.close(stdin_pipe[1]);
+        posix.close(stdout_pipe[0]);
+        posix.close(stdout_pipe[1]);
+        posix.close(stderr_pipe[0]);
+        posix.close(stderr_pipe[1]);
+
+        // exec — does not return on success
+        _ = @intFromError(posix.execvpeZ_expandArg0(.no_expand, argv_buf[0].?, argv_buf.ptr, envp));
+        posix.exit(127);
+    }
+
+    // ── Parent ── close unused pipe ends
+    posix.close(stdin_pipe[0]);
+    posix.close(stdout_pipe[1]);
+    posix.close(stderr_pipe[1]);
+
+    return .{
+        .id = pid,
+        .stdin = .{ .handle = stdin_pipe[1] },
+        .stdout = .{ .handle = stdout_pipe[0] },
+        .stderr = .{ .handle = stderr_pipe[0] },
+    };
+}
+
 pub const DapProxy = struct {
-    process: ?std.process.Child = null,
+    process: ?DetachedProcess = null,
     seq: i64 = 1,
     thread_id: i64 = 1,
+    // Topmost frame ID from the most recent stopped event's stack trace.
+    // Used as the default frame for evaluate when the caller omits frame_id.
+    current_frame_id: ?i64 = null,
+    // DAP frame IDs from the most recent stack trace, indexed by user-facing
+    // 0-based position (0=topmost).  MCP tools use positional indices while
+    // DAP uses opaque adapter-assigned IDs; this cache bridges the two.
+    cached_frame_ids: std.ArrayListUnmanaged(i64) = .empty,
     initialized: bool = false,
     allocator: std.mem.Allocator,
     // Buffered data from the adapter
@@ -46,6 +166,10 @@ pub const DapProxy = struct {
     next_bp_id: u32 = 1,
     // Map from our bp_id to file path + line for removal
     bp_registry: std.AutoHashMapUnmanaged(u32, BpRegistryEntry) = .empty,
+    // Function breakpoint tracking (for listing and restart re-arming)
+    function_breakpoints: std.ArrayListUnmanaged(FunctionBreakpointEntry) = .empty,
+    // Active exception filter IDs (for restart re-arming)
+    active_exception_filters: ?[]const []const u8 = null,
     // Output buffer for captured debuggee output
     output_buffer: std.ArrayListUnmanaged(types.OutputEntry) = .empty,
     // Loaded modules tracked from module events
@@ -62,8 +186,15 @@ pub const DapProxy = struct {
     invalidated_areas: std.ArrayListUnmanaged(InvalidatedEvent) = .empty,
     // Pending notifications for MCP server to emit
     pending_notifications: std.ArrayListUnmanaged(types.DebugNotification) = .empty,
+    // Buffered events consumed by readResponse but needed by waitForEvent
+    buffered_events: std.ArrayListUnmanaged(BufferedEvent) = .empty,
     // Request timeout in milliseconds (default 30s)
     request_timeout_ms: i32 = 30_000,
+    // Saved launch state for emulated restart (adapters without supportsRestartRequest)
+    saved_launch_program: ?[]const u8 = null,
+    saved_launch_args: ?[]const []const u8 = null,
+    saved_launch_stop_on_entry: bool = false,
+    saved_adapter_argv: ?[]const []const u8 = null,
 
     pub const MemoryEvent = struct {
         memory_reference: []const u8,
@@ -108,6 +239,12 @@ pub const DapProxy = struct {
         line: u32,
     };
 
+    const FunctionBreakpointEntry = struct {
+        bp_id: u32,
+        name: []const u8,
+        condition: ?[]const u8 = null,
+    };
+
     pub fn init(allocator: std.mem.Allocator) DapProxy {
         return .{
             .allocator = allocator,
@@ -116,13 +253,30 @@ pub const DapProxy = struct {
 
     pub fn deinit(self: *DapProxy) void {
         self.read_buffer.deinit(self.allocator);
-        // Clean up breakpoint tracking
+        // Clean up breakpoint tracking (owned strings)
         var it = self.file_breakpoints.iterator();
         while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.items) |bp| {
+                if (bp.condition) |c| self.allocator.free(c);
+                if (bp.hit_condition) |h| self.allocator.free(h);
+                if (bp.log_message) |l| self.allocator.free(l);
+            }
             entry.value_ptr.deinit(self.allocator);
         }
         self.file_breakpoints.deinit(self.allocator);
         self.bp_registry.deinit(self.allocator);
+        // Clean up function breakpoints
+        for (self.function_breakpoints.items) |entry| {
+            self.allocator.free(entry.name);
+            if (entry.condition) |c| self.allocator.free(c);
+        }
+        self.function_breakpoints.deinit(self.allocator);
+        // Clean up active exception filters
+        if (self.active_exception_filters) |filters| {
+            for (filters) |f| self.allocator.free(f);
+            self.allocator.free(filters);
+        }
         // Clean up output buffer
         for (self.output_buffer.items) |entry| {
             self.allocator.free(entry.category);
@@ -169,7 +323,20 @@ pub const DapProxy = struct {
             self.allocator.free(entry.params_json);
         }
         self.pending_notifications.deinit(self.allocator);
+        // Clean up buffered events
+        for (self.buffered_events.items) |entry| {
+            self.allocator.free(entry.event_name);
+            self.allocator.free(entry.body);
+        }
+        self.buffered_events.deinit(self.allocator);
         if (self.process) |*proc| {
+            // Kill the entire process group (adapter + launcher + debuggee).
+            // setsid() makes the adapter the session+group leader, so
+            // kill(-pid) targets exactly that group.
+            if (proc.id != 0) {
+                const neg_pid: i32 = -@as(i32, @intCast(proc.id));
+                std.posix.kill(@bitCast(neg_pid), std.posix.SIG.TERM) catch {};
+            }
             _ = proc.kill() catch {};
         }
     }
@@ -232,10 +399,37 @@ pub const DapProxy = struct {
         return s;
     }
 
+    /// Translate a user-facing 0-based frame index into the actual DAP frame
+    /// ID assigned by the adapter.  Falls back to `current_frame_id` when the
+    /// index is out of range (or the cache is empty).
+    fn resolveFrameId(self: *DapProxy, user_index: u32) ?i64 {
+        if (user_index < self.cached_frame_ids.items.len) {
+            return self.cached_frame_ids.items[user_index];
+        }
+        return self.current_frame_id;
+    }
+
     /// Send a DAP request and wait for matching response.
     /// Handles interleaved events (stopped, output, etc.) by storing them.
     /// Returns the raw JSON body of the response.
+    /// Send a DAP message without waiting for a response.
+    fn sendRaw(self: *DapProxy, allocator: std.mem.Allocator, msg: []const u8) !void {
+        const encoded = try transport.encodeMessage(allocator, msg);
+        defer allocator.free(encoded);
+
+        const proc = &(self.process orelse return error.NotInitialized);
+        if (proc.stdin) |stdin| {
+            var buf: [8192]u8 = undefined;
+            var w = stdin.writer(&buf);
+            dapLog("[DAP sendRaw] Writing {d} bytes to adapter stdin...", .{encoded.len});
+            w.interface.writeAll(encoded) catch return error.WriteFailed;
+            w.interface.flush() catch return error.WriteFailed;
+            dapLog("[DAP sendRaw] Write complete", .{});
+        } else return error.NotInitialized;
+    }
+
     fn sendRequest(self: *DapProxy, allocator: std.mem.Allocator, msg: []const u8) ![]const u8 {
+        dapLog("[DAP sendRequest] Encoding message ({d} bytes)", .{msg.len});
         // Encode with Content-Length framing
         const encoded = try transport.encodeMessage(allocator, msg);
         defer allocator.free(encoded);
@@ -245,8 +439,10 @@ pub const DapProxy = struct {
         if (proc.stdin) |stdin| {
             var buf: [8192]u8 = undefined;
             var w = stdin.writer(&buf);
+            dapLog("[DAP sendRequest] Writing to adapter stdin...", .{});
             w.interface.writeAll(encoded) catch return error.WriteFailed;
             w.interface.flush() catch return error.WriteFailed;
+            dapLog("[DAP sendRequest] Write complete, waiting for response", .{});
         } else return error.NotInitialized;
 
         // Read response (may need to skip events)
@@ -258,12 +454,15 @@ pub const DapProxy = struct {
     /// Events are processed inline (e.g., update thread_id from stopped events).
     fn readResponse(self: *DapProxy, allocator: std.mem.Allocator) ![]const u8 {
         const expected_seq = self.seq - 1; // seq used by the most recent sendRequest
+        dapLog("[DAP readResponse] Waiting for response to seq={d}, buffer={d} bytes", .{ expected_seq, self.read_buffer.items.len });
         const proc = &(self.process orelse return error.NotInitialized);
         const stdout = proc.stdout orelse return error.NotInitialized;
 
         var read_buf: [8192]u8 = undefined;
+        var loop_count: u32 = 0;
 
         while (true) {
+            loop_count += 1;
             // Try to decode a message from the buffer
             while (true) {
                 const decoded = transport.decodeMessage(allocator, self.read_buffer.items) catch |err| switch (err) {
@@ -428,6 +627,13 @@ pub const DapProxy = struct {
                                         }
                                     }
                                     self.queueNotification("debug/invalidated", decoded.body);
+                                } else {
+                                    // Unrecognized event — buffer it for waitForEvent
+                                    dapLog("[DAP readResponse] Buffering unrecognized event: {s}", .{evt.string});
+                                    self.buffered_events.append(self.allocator, .{
+                                        .event_name = self.allocator.dupe(u8, evt.string) catch "",
+                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
+                                    }) catch {};
                                 }
                             }
                         }
@@ -438,6 +644,7 @@ pub const DapProxy = struct {
                         // Reverse request from adapter (e.g., startDebugging, runInTerminal)
                         if (parsed.value.object.get("command")) |cmd| {
                             if (cmd == .string) {
+                                dapLog("[DAP readResponse] Reverse request: command={s}", .{cmd.string});
                                 if (std.mem.eql(u8, cmd.string, "startDebugging")) {
                                     // Queue notification with the launch config
                                     self.queueNotification("debug/start_debugging", decoded.body);
@@ -446,6 +653,7 @@ pub const DapProxy = struct {
                                         (if (v == .integer) v.integer else 0)
                                     else
                                         0;
+                                    dapLog("[DAP readResponse] Responding to startDebugging (req_seq={d})", .{req_seq});
                                     self.sendReverseResponse(allocator, req_seq, "startDebugging");
                                 } else if (std.mem.eql(u8, cmd.string, "runInTerminal")) {
                                     // Queue notification for AI agent to handle
@@ -455,7 +663,10 @@ pub const DapProxy = struct {
                                         (if (v == .integer) v.integer else 0)
                                     else
                                         0;
+                                    dapLog("[DAP readResponse] Responding to runInTerminal (req_seq={d})", .{req_seq});
                                     self.sendReverseResponse(allocator, req_seq, "runInTerminal");
+                                } else {
+                                    dapLog("[DAP readResponse] Unhandled reverse request: {s}", .{cmd.string});
                                 }
                             }
                         }
@@ -467,17 +678,25 @@ pub const DapProxy = struct {
             }
 
             // Poll with timeout before reading
+            dapLog("[DAP readResponse] Polling (timeout={d}ms, loop {d})...", .{ self.request_timeout_ms, loop_count });
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = stdout.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
             const poll_result = std.posix.poll(&poll_fds, self.request_timeout_ms) catch return error.ReadFailed;
-            if (poll_result == 0) return error.Timeout;
+            if (poll_result == 0) {
+                dapLog("[DAP readResponse] TIMEOUT after {d}ms", .{self.request_timeout_ms});
+                return error.Timeout;
+            }
 
             // Read more data from stdout
             const n = stdout.read(&read_buf) catch return error.ReadFailed;
-            if (n == 0) return error.ConnectionClosed;
+            if (n == 0) {
+                dapLog("[DAP readResponse] Connection closed (0 bytes)", .{});
+                return error.ConnectionClosed;
+            }
+            dapLog("[DAP readResponse] Read {d} bytes from adapter", .{n});
             try self.read_buffer.appendSlice(self.allocator, read_buf[0..n]);
         }
     }
@@ -485,12 +704,27 @@ pub const DapProxy = struct {
     /// Wait for a specific event type from the adapter.
     /// Returns the raw JSON body of the event.
     fn waitForEvent(self: *DapProxy, allocator: std.mem.Allocator, event_name: []const u8) ![]const u8 {
+        dapLog("[DAP waitForEvent] Waiting for event: {s} (buffer={d} bytes, buffered_events={d})", .{ event_name, self.read_buffer.items.len, self.buffered_events.items.len });
+
+        // Check buffered events first (events consumed by readResponse during request handling)
+        for (self.buffered_events.items, 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.event_name, event_name)) {
+                dapLog("[DAP waitForEvent] Found buffered event: {s}", .{event_name});
+                const body = entry.body;
+                self.allocator.free(entry.event_name);
+                _ = self.buffered_events.orderedRemove(i);
+                return body;
+            }
+        }
+
         const proc = &(self.process orelse return error.NotInitialized);
         const stdout = proc.stdout orelse return error.NotInitialized;
 
         var read_buf: [8192]u8 = undefined;
+        var loop_count: u32 = 0;
 
         while (true) {
+            loop_count += 1;
             // Try to decode from buffer
             while (true) {
                 const decoded = transport.decodeMessage(allocator, self.read_buffer.items) catch |err| switch (err) {
@@ -511,11 +745,26 @@ pub const DapProxy = struct {
                 defer parsed.deinit();
 
                 if (parsed.value == .object) {
+                    const msg_type_str = if (parsed.value.object.get("type")) |t| (if (t == .string) t.string else "?") else "?";
+                    const evt_str = if (parsed.value.object.get("event")) |e| (if (e == .string) e.string else "?") else "?";
+                    dapLog("[DAP waitForEvent] Got message type={s} event={s} (want={s}, loop {d})", .{ msg_type_str, evt_str, event_name, loop_count });
                     if (parsed.value.object.get("type")) |t| {
                         if (t == .string and std.mem.eql(u8, t.string, "event")) {
                             if (parsed.value.object.get("event")) |evt| {
                                 if (evt == .string and std.mem.eql(u8, evt.string, event_name)) {
+                                    dapLog("[DAP waitForEvent] Found target event: {s}", .{event_name});
                                     return decoded.body;
+                                }
+                                // Buffer non-matching events so they are not lost.
+                                // Without this, events like `terminated` or `stopped`
+                                // arriving while waiting for a different event would
+                                // be silently discarded.
+                                if (evt == .string) {
+                                    dapLog("[DAP waitForEvent] Buffering non-target event: {s}", .{evt.string});
+                                    self.buffered_events.append(self.allocator, .{
+                                        .event_name = self.allocator.dupe(u8, evt.string) catch "",
+                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
+                                    }) catch {};
                                 }
                             }
                         }
@@ -524,8 +773,23 @@ pub const DapProxy = struct {
                 allocator.free(decoded.body);
             }
 
+            dapLog("[DAP waitForEvent] Polling stdout (loop {d}, timeout={d}ms)...", .{ loop_count, self.request_timeout_ms });
+            var poll_fds = [_]std.posix.pollfd{.{
+                .fd = stdout.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const poll_result = std.posix.poll(&poll_fds, self.request_timeout_ms) catch return error.ReadFailed;
+            if (poll_result == 0) {
+                dapLog("[DAP waitForEvent] TIMEOUT waiting for event: {s}", .{event_name});
+                return error.Timeout;
+            }
             const n = stdout.read(&read_buf) catch return error.ReadFailed;
-            if (n == 0) return error.ConnectionClosed;
+            if (n == 0) {
+                dapLog("[DAP waitForEvent] Connection closed (0 bytes)", .{});
+                return error.ConnectionClosed;
+            }
+            dapLog("[DAP waitForEvent] Read {d} bytes from adapter", .{n});
             try self.read_buffer.appendSlice(self.allocator, read_buf[0..n]);
         }
     }
@@ -764,6 +1028,8 @@ pub const DapProxy = struct {
     fn proxyLaunch(ctx: *anyopaque, allocator: std.mem.Allocator, config: LaunchConfig) anyerror!void {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
 
+        dapLog("[DAP launch] Starting proxyLaunch for program: {s}", .{config.program});
+
         // Build adapter command based on file extension
         const ext = std.fs.path.extension(config.program);
 
@@ -771,7 +1037,9 @@ pub const DapProxy = struct {
         defer argv_list.deinit(allocator);
 
         if (std.mem.eql(u8, ext, ".py")) {
+            dapLog("[DAP launch] Checking Python/debugpy dependency...", .{});
             try checkDependency(allocator, &.{ "python3", "-c", "import debugpy" }, error.PythonNotFound, error.DebugpyNotInstalled);
+            dapLog("[DAP launch] Dependency check passed", .{});
             try argv_list.append(allocator, "python3");
             try argv_list.append(allocator, "-m");
             try argv_list.append(allocator, "debugpy.adapter");
@@ -787,42 +1055,58 @@ pub const DapProxy = struct {
             return error.UnsupportedLanguage;
         }
 
-        // Spawn the adapter subprocess
-        var child = std.process.Child.init(argv_list.items, allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        try child.spawn();
+        // Save launch state for potential emulated restart (adapters
+        // that lack supportsRestartRequest, e.g. debugpy).
+        self.saveLaunchState(config, argv_list.items);
+
+        // Spawn the adapter in a new session (setsid) so it is fully
+        // detached from the controlling terminal — prevents SIGTTIN.
+        dapLog("[DAP launch] Spawning adapter process (detached)...", .{});
+        const child = try spawnDetached(allocator, argv_list.items);
+        dapLog("[DAP launch] Adapter process spawned (pid={d})", .{child.id});
 
         self.process = child;
         self.initialized = false;
 
         // 1. Send initialize request and wait for response
+        dapLog("[DAP launch] Step 1: Sending initialize request (seq={d})...", .{self.seq});
         const init_msg = try protocol.initializeRequest(allocator, self.nextSeq());
         defer allocator.free(init_msg);
         const init_resp = try self.sendRequest(allocator, init_msg);
         defer allocator.free(init_resp);
+        dapLog("[DAP launch] Step 1: Initialize response received ({d} bytes)", .{init_resp.len});
 
         // Parse capabilities from the initialize response body
         self.parseAdapterCapabilities(allocator, init_resp);
 
-        // 2. Wait for the 'initialized' event from the adapter (per DAP spec)
-        const init_event = try self.waitForEvent(allocator, "initialized");
-        allocator.free(init_event);
-
-        // 3. Send launch request and wait for response
+        // 2. Send launch request WITHOUT waiting for response.
+        //    Per DAP spec, the adapter sends 'initialized' event after receiving
+        //    launch, then waits for configurationDone before sending the launch
+        //    response. So we must not block here.
+        dapLog("[DAP launch] Step 2: Sending launch request (seq={d})...", .{self.seq});
         const launch_msg = try protocol.launchRequest(allocator, self.nextSeq(), config.program, config.args, config.stop_on_entry);
         defer allocator.free(launch_msg);
-        const launch_resp = try self.sendRequest(allocator, launch_msg);
-        allocator.free(launch_resp);
+        try self.sendRaw(allocator, launch_msg);
+        dapLog("[DAP launch] Step 2: Launch request sent (not waiting for response)", .{});
 
-        // 4. Send configurationDone to tell the adapter we're ready
+        // 3. Wait for 'initialized' event from the adapter
+        dapLog("[DAP launch] Step 3: Waiting for initialized event...", .{});
+        const init_event = try self.waitForEvent(allocator, "initialized");
+        allocator.free(init_event);
+        dapLog("[DAP launch] Step 3: initialized event received", .{});
+
+        // 4. Send configurationDone — the adapter will then send both the
+        //    configurationDone response and the launch response. readResponse
+        //    returns the first response it sees (either one is fine).
+        dapLog("[DAP launch] Step 4: Sending configurationDone request (seq={d})...", .{self.seq});
         const config_done_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
         defer allocator.free(config_done_msg);
         const config_resp = try self.sendRequest(allocator, config_done_msg);
         allocator.free(config_resp);
+        dapLog("[DAP launch] Step 4: configurationDone/launch response received", .{});
 
         self.initialized = true;
+        dapLog("[DAP launch] Launch complete, session initialized", .{});
     }
 
     fn proxyRun(ctx: *anyopaque, allocator: std.mem.Allocator, action: RunAction, options: types.RunOptions) anyerror!StopState {
@@ -854,6 +1138,15 @@ pub const DapProxy = struct {
         if (self.sendRequest(allocator, st_msg)) |st_resp| {
             defer allocator.free(st_resp);
             state.stack_trace = translateStackTrace(allocator, st_resp) catch &.{};
+            // Cache the topmost frame ID so evaluate defaults to it
+            if (state.stack_trace.len > 0) {
+                self.current_frame_id = @intCast(state.stack_trace[0].id);
+            }
+            // Cache all DAP frame IDs for user-index → DAP-ID translation
+            self.cached_frame_ids.clearRetainingCapacity();
+            for (state.stack_trace) |frame| {
+                self.cached_frame_ids.append(self.allocator, @intCast(frame.id)) catch {};
+            }
         } else |_| {}
 
         // Attach captured output to state and clear buffer
@@ -974,12 +1267,24 @@ pub const DapProxy = struct {
         const encoded = transport.encodeMessage(allocator, msg) catch return;
         defer allocator.free(encoded);
 
-        const proc = &(self.process orelse return);
+        const proc = &(self.process orelse {
+            dapLog("[DAP sendReverseResponse] No process!", .{});
+            return;
+        });
         if (proc.stdin) |stdin| {
             var buf: [8192]u8 = undefined;
             var w = stdin.writer(&buf);
-            w.interface.writeAll(encoded) catch {};
-            w.interface.flush() catch {};
+            w.interface.writeAll(encoded) catch {
+                dapLog("[DAP sendReverseResponse] Write failed!", .{});
+                return;
+            };
+            w.interface.flush() catch {
+                dapLog("[DAP sendReverseResponse] Flush failed!", .{});
+                return;
+            };
+            dapLog("[DAP sendReverseResponse] Sent response for {s} (req_seq={d}, {d} bytes)", .{ command, request_seq, encoded.len });
+        } else {
+            dapLog("[DAP sendReverseResponse] No stdin pipe!", .{});
         }
     }
 
@@ -1099,28 +1404,38 @@ pub const DapProxy = struct {
         const bp_id = self.next_bp_id;
         self.next_bp_id += 1;
 
+        // Dupe strings onto self.allocator — the caller's slices point into
+        // the JSON parse tree which is freed after this call returns.
+        const file_owned = try self.allocator.dupe(u8, file);
+        const cond_owned: ?[]const u8 = if (condition) |c| try self.allocator.dupe(u8, c) else null;
+        const hit_owned: ?[]const u8 = if (hit_condition) |h| try self.allocator.dupe(u8, h) else null;
+        const log_owned: ?[]const u8 = if (log_message) |l| try self.allocator.dupe(u8, l) else null;
+
         // Track this breakpoint per file (DAP requires all BPs for a file in one request)
-        const gop = try self.file_breakpoints.getOrPut(self.allocator, file);
+        const gop = try self.file_breakpoints.getOrPut(self.allocator, file_owned);
         if (!gop.found_existing) {
             gop.value_ptr.* = .empty;
+        } else {
+            // Key already existed — free our dupe, use existing key
+            self.allocator.free(file_owned);
         }
         try gop.value_ptr.append(self.allocator, .{
             .line = line,
-            .condition = condition,
-            .hit_condition = hit_condition,
-            .log_message = log_message,
+            .condition = cond_owned,
+            .hit_condition = hit_owned,
+            .log_message = log_owned,
             .bp_id = bp_id,
         });
 
-        // Register for removal lookup
-        try self.bp_registry.put(self.allocator, bp_id, .{ .file = file, .line = line });
+        // Register for removal lookup (use the key that's in the hash map)
+        try self.bp_registry.put(self.allocator, bp_id, .{ .file = gop.key_ptr.*, .line = line });
 
         // If adapter is connected, send the DAP setBreakpoints request with conditions
         if (self.initialized and self.process != null) {
-            try self.sendFileBreakpoints(allocator, file, gop.value_ptr.items);
+            try self.sendFileBreakpoints(allocator, gop.key_ptr.*, gop.value_ptr.items);
         }
 
-        return .{ .id = bp_id, .verified = true, .file = file, .line = line, .condition = condition, .hit_condition = hit_condition };
+        return .{ .id = bp_id, .verified = true, .file = gop.key_ptr.*, .line = line, .condition = cond_owned, .hit_condition = hit_owned };
     }
 
     /// Build and send a setBreakpoints request with full breakpoint options for a file.
@@ -1159,6 +1474,11 @@ pub const DapProxy = struct {
             var i: usize = 0;
             while (i < bp_list.items.len) {
                 if (bp_list.items[i].bp_id == id) {
+                    // Free owned strings before removing
+                    const removed = bp_list.items[i];
+                    if (removed.condition) |c| self.allocator.free(c);
+                    if (removed.hit_condition) |h| self.allocator.free(h);
+                    if (removed.log_message) |l| self.allocator.free(l);
                     _ = bp_list.swapRemove(i);
                     break;
                 }
@@ -1178,6 +1498,7 @@ pub const DapProxy = struct {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
 
         var result = std.ArrayListUnmanaged(BreakpointInfo).empty;
+        // File breakpoints
         var it = self.file_breakpoints.iterator();
         while (it.next()) |entry| {
             const file = entry.key_ptr.*;
@@ -1191,6 +1512,16 @@ pub const DapProxy = struct {
                     .hit_condition = bp.hit_condition,
                 });
             }
+        }
+        // Function breakpoints
+        for (self.function_breakpoints.items) |fb| {
+            try result.append(allocator, .{
+                .id = fb.bp_id,
+                .verified = true,
+                .file = "",
+                .line = 0,
+                .condition = fb.condition,
+            });
         }
         return try result.toOwnedSlice(allocator);
     }
@@ -1208,6 +1539,17 @@ pub const DapProxy = struct {
                 const resp = try self.sendRequest(allocator, msg);
                 defer allocator.free(resp);
 
+                // Check for error response before parsing variables
+                const check = try json.parseFromSlice(json.Value, allocator, resp, .{});
+                defer check.deinit();
+                if (check.value == .object) {
+                    const success = if (check.value.object.get("success")) |v| v == .bool and v.bool else false;
+                    if (!success) {
+                        const err_msg = if (check.value.object.get("message")) |v| if (v == .string) v.string else "variables request failed" else "variables request failed";
+                        return .{ .result = try allocator.dupe(u8, err_msg), .@"type" = "", .result_allocated = true };
+                    }
+                }
+
                 // Parse using existing translateVariables
                 const children = translateVariables(allocator, resp) catch {
                     return .{ .result = "<failed to expand variable>", .@"type" = "" };
@@ -1223,11 +1565,82 @@ pub const DapProxy = struct {
             }
         }
 
+        // If scope is provided, fetch variables for that scope
+        if (request.scope) |scope_name| {
+            const fid: i64 = if (request.frame_id) |f| self.resolveFrameId(f) orelse return .{ .result = "", .@"type" = "" } else self.current_frame_id orelse return .{ .result = "", .@"type" = "" };
+
+            // Get scopes for the frame
+            const scopes_msg = try protocol.scopesRequest(allocator, self.nextSeq(), fid);
+            defer allocator.free(scopes_msg);
+            const scopes_resp = try self.sendRequest(allocator, scopes_msg);
+            defer allocator.free(scopes_resp);
+
+            // Parse and find matching scope
+            const scopes_parsed = try json.parseFromSlice(json.Value, allocator, scopes_resp, .{});
+            defer scopes_parsed.deinit();
+
+            var scope_var_ref: i64 = 0;
+            if (scopes_parsed.value == .object) {
+                if (scopes_parsed.value.object.get("body")) |body| {
+                    if (body == .object) {
+                        if (body.object.get("scopes")) |scopes| {
+                            if (scopes == .array) {
+                                for (scopes.array.items) |item| {
+                                    if (item != .object) continue;
+                                    const scope_name_val = if (item.object.get("name")) |v| (if (v == .string) v.string else continue) else continue;
+                                    // Match scope names case-insensitively
+                                    if (std.ascii.eqlIgnoreCase(scope_name_val, scope_name) or
+                                        (std.mem.eql(u8, scope_name, "locals") and std.ascii.eqlIgnoreCase(scope_name_val, "locals")) or
+                                        (std.mem.eql(u8, scope_name, "globals") and std.ascii.eqlIgnoreCase(scope_name_val, "globals")) or
+                                        (std.mem.eql(u8, scope_name, "arguments") and
+                                        (std.ascii.eqlIgnoreCase(scope_name_val, "arguments") or
+                                        std.mem.indexOf(u8, scope_name_val, "arg") != null or
+                                        std.mem.indexOf(u8, scope_name_val, "Arg") != null)))
+                                    {
+                                        if (item.object.get("variablesReference")) |vr| {
+                                            if (vr == .integer) {
+                                                scope_var_ref = vr.integer;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (scope_var_ref > 0) {
+                const vars_msg = try protocol.variablesRequest(allocator, self.nextSeq(), @intCast(scope_var_ref));
+                defer allocator.free(vars_msg);
+                const vars_resp = try self.sendRequest(allocator, vars_msg);
+                defer allocator.free(vars_resp);
+
+                const children = translateVariables(allocator, vars_resp) catch {
+                    return .{ .result = "<failed to list scope variables>", .@"type" = "" };
+                };
+
+                return .{
+                    .result = try std.fmt.allocPrint(allocator, "{d} variables", .{children.len}),
+                    .@"type" = "",
+                    .children = children,
+                    .result_allocated = true,
+                    .children_allocated = true,
+                };
+            }
+
+            return .{ .result = try allocator.dupe(u8, "scope not found"), .@"type" = "", .result_allocated = true };
+        }
+
         const expr = request.expression orelse return .{ .result = "", .@"type" = "" };
         if (expr.len == 0) return .{ .result = "", .@"type" = "" };
 
-        // Send DAP evaluate request with context
-        const frame_id: ?i64 = if (request.frame_id) |fid| @intCast(fid) else null;
+        // Send DAP evaluate request with context.
+        // When no frame_id is specified, use the topmost frame from the last
+        // stopped event — omitting frameId causes DAP to evaluate in the
+        // global scope where local variables are not visible (NameError).
+        const frame_id: ?i64 = if (request.frame_id) |fid| self.resolveFrameId(fid) else self.current_frame_id;
         const msg = try protocol.evaluateRequestEx(allocator, self.nextSeq(), expr, frame_id, request.context, null, null, null);
         defer allocator.free(msg);
 
@@ -1366,6 +1779,7 @@ pub const DapProxy = struct {
     fn proxyReadMemory(ctx: *anyopaque, allocator: std.mem.Allocator, address: u64, size: u64) anyerror![]const u8 {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_read_memory) return error.NotSupported;
 
         // DAP readMemory uses a string memoryReference
         var addr_buf: [20]u8 = undefined;
@@ -1392,6 +1806,7 @@ pub const DapProxy = struct {
     fn proxyWriteMemory(ctx: *anyopaque, allocator: std.mem.Allocator, address: u64, data: []const u8) anyerror!void {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_write_memory) return error.NotSupported;
 
         var addr_buf: [20]u8 = undefined;
         const addr_str = std.fmt.bufPrint(&addr_buf, "0x{x}", .{address}) catch return error.InvalidAddress;
@@ -1409,6 +1824,7 @@ pub const DapProxy = struct {
     fn proxyDisassemble(ctx: *anyopaque, allocator: std.mem.Allocator, address: u64, count: u32, instruction_offset: ?i64, resolve_symbols: ?bool) anyerror![]const DisassembledInstruction {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_disassemble) return error.NotSupported;
 
         var addr_buf: [20]u8 = undefined;
         const addr_str = std.fmt.bufPrint(&addr_buf, "0x{x}", .{address}) catch return error.InvalidAddress;
@@ -1473,19 +1889,21 @@ pub const DapProxy = struct {
 
             // Parse capabilities from the initialize response body
             self.parseAdapterCapabilities(allocator, init_resp);
+        }
 
-            // Wait for the 'initialized' event from the adapter (per DAP spec)
+        // Send attach request WITHOUT waiting for response (same DAP ordering
+        // as launch: adapter won't respond until after configurationDone).
+        const msg = try protocol.attachRequest(allocator, self.nextSeq(), @intCast(pid));
+        defer allocator.free(msg);
+        try self.sendRaw(allocator, msg);
+
+        // Wait for 'initialized' event
+        if (!self.initialized) {
             const init_event = try self.waitForEvent(allocator, "initialized");
             allocator.free(init_event);
         }
 
-        // Send attach request (instead of launch)
-        const msg = try protocol.attachRequest(allocator, self.nextSeq(), @intCast(pid));
-        defer allocator.free(msg);
-        const resp = try self.sendRequest(allocator, msg);
-        allocator.free(resp);
-
-        // Send configurationDone
+        // Send configurationDone — adapter will then send both responses
         const config_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
         defer allocator.free(config_msg);
         const config_resp = try self.sendRequest(allocator, config_msg);
@@ -1499,16 +1917,17 @@ pub const DapProxy = struct {
         const bp_id = self.next_bp_id;
         self.next_bp_id += 1;
 
+        // Track the function breakpoint
+        try self.function_breakpoints.append(self.allocator, .{
+            .bp_id = bp_id,
+            .name = try self.allocator.dupe(u8, name),
+            .condition = if (condition) |c| try self.allocator.dupe(u8, c) else null,
+        });
+
         if (self.initialized and self.process != null) {
-            const names = [_][]const u8{name};
-            const conditions = [_]?[]const u8{condition};
-            const hit_conditions = [_]?[]const u8{null};
-            const msg = try protocol.setFunctionBreakpointsRequest(allocator, self.nextSeq(), &names, &conditions, &hit_conditions);
-            defer allocator.free(msg);
-            const resp = self.sendRequest(allocator, msg) catch {
+            self.sendFunctionBreakpoints(allocator) catch {
                 return .{ .id = bp_id, .verified = false, .file = "", .line = 0 };
             };
-            allocator.free(resp);
         }
 
         return .{ .id = bp_id, .verified = true, .file = "", .line = 0, .condition = condition };
@@ -1518,18 +1937,29 @@ pub const DapProxy = struct {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return;
 
-        const msg = try protocol.setExceptionBreakpointsRequest(allocator, self.nextSeq(), filters);
-        defer allocator.free(msg);
-        const resp = self.sendRequest(allocator, msg) catch return;
-        allocator.free(resp);
+        // Store active exception filters for restart re-arming
+        if (self.active_exception_filters) |old| {
+            for (old) |f| self.allocator.free(f);
+            self.allocator.free(old);
+        }
+        const duped = try self.allocator.alloc([]const u8, filters.len);
+        for (filters, 0..) |f, i| {
+            duped[i] = try self.allocator.dupe(u8, f);
+        }
+        self.active_exception_filters = duped;
+
+        self.sendExceptionBreakpoints(allocator, filters) catch return;
     }
 
     fn proxySetVariable(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, value: []const u8, frame_id: u32) anyerror!InspectResult {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
 
+        // Use current_frame_id when caller passes 0 (invalid default in debugpy)
+        const effective_frame_id: i64 = if (frame_id != 0) @intCast(frame_id) else self.current_frame_id orelse return error.NotSupported;
+
         // First get scopes for the frame to find the local variables reference
-        const scopes_msg = try protocol.scopesRequest(allocator, self.nextSeq(), @intCast(frame_id));
+        const scopes_msg = try protocol.scopesRequest(allocator, self.nextSeq(), effective_frame_id);
         defer allocator.free(scopes_msg);
         const scopes_resp = try self.sendRequest(allocator, scopes_msg);
         defer allocator.free(scopes_resp);
@@ -1592,7 +2022,7 @@ pub const DapProxy = struct {
         const parsed = try json.parseFromSlice(json.Value, allocator, targets_resp, .{});
         defer parsed.deinit();
 
-        var target_id: i64 = 0;
+        var target_id: ?i64 = null;
         if (parsed.value == .object) {
             if (parsed.value.object.get("body")) |body| {
                 if (body == .object) {
@@ -1609,10 +2039,10 @@ pub const DapProxy = struct {
             }
         }
 
-        if (target_id == 0) return error.NotSupported;
+        const tid = target_id orelse return error.NotSupported;
 
         // 2. Send goto request
-        const goto_msg = try protocol.gotoRequest(allocator, self.nextSeq(), self.thread_id, target_id);
+        const goto_msg = try protocol.gotoRequest(allocator, self.nextSeq(), self.thread_id, tid);
         defer allocator.free(goto_msg);
         const goto_resp = try self.sendRequest(allocator, goto_msg);
         allocator.free(goto_resp);
@@ -1630,7 +2060,8 @@ pub const DapProxy = struct {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
 
-        const msg = try protocol.scopesRequest(allocator, self.nextSeq(), @intCast(frame_id));
+        const resolved_fid: i64 = self.resolveFrameId(frame_id) orelse self.current_frame_id orelse return error.NotSupported;
+        const msg = try protocol.scopesRequest(allocator, self.nextSeq(), resolved_fid);
         defer allocator.free(msg);
         const resp = try self.sendRequest(allocator, msg);
         defer allocator.free(resp);
@@ -1667,6 +2098,7 @@ pub const DapProxy = struct {
     fn proxyDataBreakpointInfo(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, frame_id: ?u32) anyerror!DataBreakpointInfo {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_data_breakpoints) return error.NotSupported;
 
         const fid: ?i64 = if (frame_id) |f| @intCast(f) else null;
         const msg = try protocol.dataBreakpointInfoRequest(allocator, self.nextSeq(), name, fid, null, null, null);
@@ -1695,6 +2127,7 @@ pub const DapProxy = struct {
     fn proxySetDataBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, data_id: []const u8, access_type: DataBreakpointAccessType) anyerror!BreakpointInfo {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_data_breakpoints) return error.NotSupported;
 
         const access_str = @tagName(access_type);
         const bp_specs = [_]protocol.DataBreakpointSpec{.{ .data_id = data_id, .access_type = access_str }};
@@ -1739,8 +2172,10 @@ pub const DapProxy = struct {
     fn proxyCompletions(ctx: *anyopaque, allocator: std.mem.Allocator, text: []const u8, column: u32, frame_id: ?u32) anyerror![]const CompletionItem {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_completions) return error.NotSupported;
 
-        const fid: ?i64 = if (frame_id) |f| @intCast(f) else null;
+        // Fall back to current_frame_id when caller doesn't provide one
+        const fid: ?i64 = if (frame_id) |f| @intCast(f) else self.current_frame_id;
         const msg = try protocol.completionsRequest(allocator, self.nextSeq(), text, @intCast(column), fid, null);
         defer allocator.free(msg);
         const resp = try self.sendRequest(allocator, msg);
@@ -1830,7 +2265,7 @@ pub const DapProxy = struct {
     fn proxyLoadedSources(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const types.LoadedSource {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
-
+        if (!self.adapter_capabilities.supports_loaded_sources) return error.NotSupported;
         const msg = try protocol.loadedSourcesRequest(allocator, self.nextSeq());
         defer allocator.free(msg);
         const resp = try self.sendRequest(allocator, msg);
@@ -1890,7 +2325,9 @@ pub const DapProxy = struct {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
 
-        const msg = try protocol.setExpressionRequest(allocator, self.nextSeq(), expression, value, @as(?i64, @intCast(frame_id)), null);
+        // Use current_frame_id when caller passes 0 (invalid default in debugpy)
+        const effective_frame_id: ?i64 = if (frame_id != 0) @intCast(frame_id) else self.current_frame_id;
+        const msg = try protocol.setExpressionRequest(allocator, self.nextSeq(), expression, value, effective_frame_id, null);
         defer allocator.free(msg);
         const resp = try self.sendRequest(allocator, msg);
         defer allocator.free(resp);
@@ -1910,6 +2347,7 @@ pub const DapProxy = struct {
     fn proxyRestartFrame(ctx: *anyopaque, allocator: std.mem.Allocator, frame_id: u32) anyerror!void {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_restart_frame) return error.NotSupported;
 
         const msg = try protocol.restartFrameRequest(allocator, self.nextSeq(), @intCast(frame_id));
         defer allocator.free(msg);
@@ -2007,6 +2445,7 @@ pub const DapProxy = struct {
     fn proxySetInstructionBreakpoints(ctx: *anyopaque, allocator: std.mem.Allocator, breakpoints: []const InstructionBreakpoint) anyerror![]const BreakpointInfo {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_instruction_breakpoints) return error.NotSupported;
 
         const msg = try protocol.setInstructionBreakpointsRequest(allocator, self.nextSeq(), breakpoints);
         defer allocator.free(msg);
@@ -2095,6 +2534,7 @@ pub const DapProxy = struct {
     fn proxyBreakpointLocations(ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32, end_line: ?u32) anyerror![]const BreakpointLocation {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
+        if (!self.adapter_capabilities.supports_breakpoint_locations) return error.NotSupported;
 
         const el: ?i64 = if (end_line) |e| @intCast(e) else null;
         const msg = try protocol.breakpointLocationsRequest(allocator, self.nextSeq(), file, @intCast(line), el, null, null);
@@ -2166,7 +2606,208 @@ pub const DapProxy = struct {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized or self.process == null) return error.NotSupported;
 
-        const msg = try protocol.restartRequest(allocator, self.nextSeq(), null);
+        if (self.adapter_capabilities.supports_restart_request) {
+            // ── Native restart ─────────────────────────────────────────
+            // The adapter supports the restart request natively.
+            // Flow: restart → wait initialized → re-arm → configurationDone
+            dapLog("[DAP restart] Adapter supports native restart (seq={d})", .{self.seq});
+
+            const msg = try protocol.restartRequest(allocator, self.nextSeq(), null);
+            defer allocator.free(msg);
+            const resp = self.sendRequest(allocator, msg) catch return;
+            allocator.free(resp);
+
+            // Counteract the `terminated` event setting initialized=false.
+            self.initialized = true;
+
+            // Wait for the `initialized` event (adapter re-enters config phase).
+            const init_event = self.waitForEvent(allocator, "initialized") catch {
+                dapLog("[DAP restart] No initialized event after native restart, re-arming anyway", .{});
+                self.rearmBreakpoints(allocator);
+                self.initialized = true;
+                return;
+            };
+            allocator.free(init_event);
+
+            self.rearmBreakpoints(allocator);
+
+            const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
+            defer allocator.free(cd_msg);
+            const cd_resp = self.sendRequest(allocator, cd_msg) catch {
+                self.initialized = true;
+                return;
+            };
+            allocator.free(cd_resp);
+            self.initialized = true;
+            dapLog("[DAP restart] Native restart complete", .{});
+        } else {
+            // ── Emulated restart ───────────────────────────────────────
+            // The adapter does NOT support the restart request (e.g.
+            // debugpy).  Emulate by disconnecting, killing the adapter,
+            // spawning a fresh one, and running the full init handshake.
+            dapLog("[DAP restart] Adapter lacks restart support, emulating via disconnect+relaunch", .{});
+
+            const program = self.saved_launch_program orelse return error.NotSupported;
+            const adapter_argv = self.saved_adapter_argv orelse return error.NotSupported;
+
+            // 1. Disconnect from the current adapter (restart hint = true).
+            {
+                const disc_msg = protocol.disconnectRequestEx(allocator, self.nextSeq(), true, false, true) catch |err| {
+                    dapLog("[DAP restart] Failed to build disconnect: {any}", .{err});
+                    return err;
+                };
+                defer allocator.free(disc_msg);
+                _ = self.sendRequest(allocator, disc_msg) catch {};
+            }
+
+            // 2. Kill the old adapter process.
+            if (self.process) |*proc| {
+                _ = proc.kill() catch {};
+            }
+
+            // 3. Reset session state for the new adapter.
+            self.process = null;
+            self.initialized = false;
+            self.seq = 1;
+            self.current_frame_id = null;
+            self.cached_frame_ids.clearRetainingCapacity();
+            self.read_buffer.clearRetainingCapacity();
+            for (self.buffered_events.items) |entry| {
+                self.allocator.free(entry.event_name);
+                self.allocator.free(entry.body);
+            }
+            self.buffered_events.clearRetainingCapacity();
+
+            // 4. Spawn a new adapter process.
+            dapLog("[DAP restart] Spawning new adapter process...", .{});
+            const child = spawnDetached(allocator, adapter_argv) catch |err| {
+                dapLog("[DAP restart] Failed to spawn adapter: {any}", .{err});
+                return err;
+            };
+            self.process = child;
+            dapLog("[DAP restart] New adapter spawned (pid={d})", .{child.id});
+
+            // 5. Full DAP initialization sequence (mirrors proxyLaunch).
+
+            // 5a. initialize → get capabilities
+            const init_msg = try protocol.initializeRequest(allocator, self.nextSeq());
+            defer allocator.free(init_msg);
+            const init_resp = try self.sendRequest(allocator, init_msg);
+            defer allocator.free(init_resp);
+            self.parseAdapterCapabilities(allocator, init_resp);
+
+            // 5b. Send launch request (don't wait — adapter sends
+            //     initialized event before the launch response).
+            const launch_msg = try protocol.launchRequest(
+                allocator,
+                self.nextSeq(),
+                program,
+                self.saved_launch_args orelse &.{},
+                self.saved_launch_stop_on_entry,
+            );
+            defer allocator.free(launch_msg);
+            try self.sendRaw(allocator, launch_msg);
+
+            // 5c. Wait for initialized event.
+            const init_event = try self.waitForEvent(allocator, "initialized");
+            allocator.free(init_event);
+
+            // 5d. Re-arm all breakpoints during the configuration phase.
+            self.initialized = true;
+            self.rearmBreakpoints(allocator);
+
+            // 5e. Send configurationDone to complete the init handshake.
+            const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
+            defer allocator.free(cd_msg);
+            const cd_resp = try self.sendRequest(allocator, cd_msg);
+            allocator.free(cd_resp);
+
+            self.initialized = true;
+            dapLog("[DAP restart] Emulated restart complete", .{});
+        }
+    }
+
+    /// Re-send all tracked breakpoints to the adapter.
+    fn rearmBreakpoints(self: *DapProxy, allocator: std.mem.Allocator) void {
+        var it = self.file_breakpoints.iterator();
+        while (it.next()) |entry| {
+            self.sendFileBreakpoints(allocator, entry.key_ptr.*, entry.value_ptr.items) catch {};
+        }
+
+        if (self.function_breakpoints.items.len > 0) {
+            self.sendFunctionBreakpoints(allocator) catch {};
+        }
+
+        if (self.active_exception_filters) |filters| {
+            self.sendExceptionBreakpoints(allocator, filters) catch {};
+        }
+    }
+
+    /// Save launch configuration and adapter argv so that emulated restart
+    /// (disconnect + relaunch) can respawn the adapter with the same settings.
+    fn saveLaunchState(self: *DapProxy, config: LaunchConfig, adapter_argv: []const []const u8) void {
+        // Free any previously saved state
+        if (self.saved_launch_program) |p| self.allocator.free(p);
+        if (self.saved_launch_args) |args| {
+            for (args) |a| self.allocator.free(a);
+            self.allocator.free(args);
+        }
+        if (self.saved_adapter_argv) |argv| {
+            for (argv) |a| self.allocator.free(a);
+            self.allocator.free(argv);
+        }
+
+        self.saved_launch_program = self.allocator.dupe(u8, config.program) catch null;
+        self.saved_launch_stop_on_entry = config.stop_on_entry;
+
+        // Dupe program args
+        if (config.args.len > 0) {
+            const args = self.allocator.alloc([]const u8, config.args.len) catch {
+                self.saved_launch_args = null;
+                return;
+            };
+            for (config.args, 0..) |arg, i| {
+                args[i] = self.allocator.dupe(u8, arg) catch "";
+            }
+            self.saved_launch_args = args;
+        } else {
+            self.saved_launch_args = null;
+        }
+
+        // Dupe adapter argv
+        const argv = self.allocator.alloc([]const u8, adapter_argv.len) catch {
+            self.saved_adapter_argv = null;
+            return;
+        };
+        for (adapter_argv, 0..) |arg, i| {
+            argv[i] = self.allocator.dupe(u8, arg) catch "";
+        }
+        self.saved_adapter_argv = argv;
+    }
+
+    /// Send all tracked function breakpoints to the adapter.
+    fn sendFunctionBreakpoints(self: *DapProxy, allocator: std.mem.Allocator) !void {
+        const len = self.function_breakpoints.items.len;
+        var names = try allocator.alloc([]const u8, len);
+        defer allocator.free(names);
+        var conditions = try allocator.alloc(?[]const u8, len);
+        defer allocator.free(conditions);
+        var hit_conditions = try allocator.alloc(?[]const u8, len);
+        defer allocator.free(hit_conditions);
+        for (self.function_breakpoints.items, 0..) |fb, i| {
+            names[i] = fb.name;
+            conditions[i] = fb.condition;
+            hit_conditions[i] = null;
+        }
+        const msg = try protocol.setFunctionBreakpointsRequest(allocator, self.nextSeq(), names, conditions, hit_conditions);
+        defer allocator.free(msg);
+        const resp = self.sendRequest(allocator, msg) catch return;
+        allocator.free(resp);
+    }
+
+    /// Send exception breakpoint filters to the adapter.
+    fn sendExceptionBreakpoints(self: *DapProxy, allocator: std.mem.Allocator, filters: []const []const u8) !void {
+        const msg = try protocol.setExceptionBreakpointsRequest(allocator, self.nextSeq(), filters);
         defer allocator.free(msg);
         const resp = self.sendRequest(allocator, msg) catch return;
         allocator.free(resp);
@@ -2214,40 +2855,11 @@ pub const DapProxy = struct {
     }
 
     fn proxyFindSymbol(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const types.SymbolInfo {
+        _ = allocator;
+        _ = name;
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
-        if (!self.initialized or self.process == null) return error.NotSupported;
-
-        // Use completions request to find symbols
-        const msg = try protocol.completionsRequest(allocator, self.nextSeq(), name, @intCast(name.len), null, null);
-        defer allocator.free(msg);
-        const resp = try self.sendRequest(allocator, msg);
-        defer allocator.free(resp);
-
-        const parsed = try json.parseFromSlice(json.Value, allocator, resp, .{});
-        defer parsed.deinit();
-
-        if (parsed.value != .object) return error.InvalidResponse;
-        const body = parsed.value.object.get("body") orelse return &.{};
-        if (body != .object) return &.{};
-        const targets = body.object.get("targets") orelse return &.{};
-        if (targets != .array) return &.{};
-
-        var symbols = std.ArrayListUnmanaged(types.SymbolInfo).empty;
-        errdefer symbols.deinit(allocator);
-
-        for (targets.array.items) |item| {
-            if (item != .object) continue;
-            const obj = item.object;
-            const label = if (obj.get("label")) |v| (if (v == .string) try allocator.dupe(u8, v.string) else continue) else continue;
-            const kind = if (obj.get("type")) |v| (if (v == .string) try allocator.dupe(u8, v.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
-
-            try symbols.append(allocator, .{
-                .name = label,
-                .kind = kind,
-            });
-        }
-
-        return try symbols.toOwnedSlice(allocator);
+        _ = self;
+        return error.NotSupported;
     }
 
     fn proxyDrainNotifications(ctx: *anyopaque, allocator: std.mem.Allocator) []const types.DebugNotification {

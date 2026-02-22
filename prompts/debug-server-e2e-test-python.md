@@ -1,5 +1,15 @@
 # Cog Debug Server — End-to-End Test Prompt (Python / DAP)
 
+## CRITICAL EXECUTION RULES
+
+- Run ALL 30 scenarios in a single pass without stopping
+- Do NOT pause between scenarios to report results
+- Do NOT output verbose step-by-step results during execution
+- Accumulate results internally and output ONLY the final summary table
+- If a scenario fails, note the failure and continue to the next scenario
+- Never stop to ask for confirmation between scenarios
+- Context management: You have limited context. Minimize output during execution. Only output the final summary table after all 30 scenarios.
+
 ## How the MCP Debug Tools Work
 
 You have direct access to Cog MCP debug tools in this environment.
@@ -129,9 +139,9 @@ Killing processes (e.g., `pkill`) can destroy the user's running dashboard or ot
 
 | Program | Source | Used by |
 |---------|--------|---------|
-| A: Basic | `/tmp/debug_test.py` | Scenarios 1-11, 14-18, 20-28, 30-33 |
-| B: Crasher | `/tmp/debug_crash.py` | Scenario 19 |
-| C: Multi-variable | `/tmp/debug_vars.py` | Scenarios 12-13, 29 |
+| A: Basic | `/tmp/debug_test.py` | Scenarios 1-11, 14-30 |
+| B: Crasher | `/tmp/debug_crash.py` | Scenario 18 |
+| C: Multi-variable | `/tmp/debug_vars.py` | Scenarios 12-13 |
 
 ### Key Line References
 
@@ -162,12 +172,11 @@ Killing processes (e.g., `pkill`) can destroy the user's running dashboard or ot
 
 ## Test Scenarios
 
-Each scenario is independent. For each debug command, report:
+Each scenario is independent. Execute each scenario's steps sequentially:
 
-1. **What you're doing** — state the action and why
-2. **The raw response** — show the full response from the tool
-3. **Interpretation** — explain what the response means
-4. **Current debugger state** — summarize active sessions, breakpoints, execution position
+- If all steps pass: record PASS and move to the next scenario immediately
+- If a step fails: record the step number, error, and move to the next scenario
+- Do NOT output intermediate results — only record the final pass/fail per scenario
 
 ---
 
@@ -487,7 +496,7 @@ rejected with NOT_SUPPORTED when the backend is DAP/debugpy.
 
 ---
 
-### Part 4: Advanced Breakpoints (Scenarios 17-19)
+### Part 4: Advanced Breakpoints (Scenarios 17-18)
 
 ### Scenario 17: Function Breakpoints
 
@@ -506,24 +515,7 @@ Uses Program A.
 **What this tests:** Function breakpoints resolve the function name and fire
 when execution enters the function.
 
-### Scenario 18: Breakpoint Locations
-
-Test querying valid breakpoint positions in a source file.
-
-Uses Program A.
-
-1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint_locations` with `source: "/tmp/debug_test.py"`, `line: 4`, `end_line: 7`
-   — should return valid breakpoint positions within `add()` (lines 5 and 6 at minimum)
-3. `debug_breakpoint_locations` with `source: "/tmp/debug_test.py"`, `line: 13`
-   — query a single line, may return line 15 as the nearest valid position
-4. Verify each result has `line` and optionally `endLine`, `column`, `endColumn`
-5. `debug_stop`
-
-**What this tests:** The debugger can report which source locations are valid breakpoint
-targets. This is critical for IDEs that need to snap breakpoints to valid positions.
-
-### Scenario 19: Exception Breakpoints and Exception Info
+### Scenario 18: Exception Breakpoints and Exception Info
 
 Test exception breakpoint configuration and exception information retrieval.
 
@@ -543,9 +535,9 @@ the program calls `dereference_none()` which triggers an `AttributeError`.
 
 ---
 
-### Part 5: Navigation (Scenarios 20-22)
+### Part 5: Navigation (Scenarios 19-21)
 
-### Scenario 20: Goto Targets and Goto Execution
+### Scenario 19: Goto Targets and Goto Execution
 
 Test discovering and jumping to goto targets.
 
@@ -563,7 +555,7 @@ Uses Program A.
 **What this tests:** Goto targets can be discovered for a source location. The goto action
 repositions execution to a different line within the same function.
 
-### Scenario 21: Step-In Targets
+### Scenario 20: Step-In Targets
 
 Test listing available step-in targets when a line has multiple function calls.
 
@@ -581,7 +573,7 @@ Uses Program A.
 **What this tests:** Step-in targets enumerate the callable functions at the current execution
 point.
 
-### Scenario 22: Stepping Granularity
+### Scenario 21: Stepping Granularity
 
 Test line-level stepping. Instruction-level stepping is not available via DAP/debugpy.
 
@@ -602,9 +594,9 @@ granularity is not available via DAP/debugpy.
 
 ---
 
-### Part 6: Session Management (Scenarios 23-25)
+### Part 6: Session Management (Scenarios 22-24)
 
-### Scenario 23: Session Listing and Multiple Sessions
+### Scenario 22: Session Listing and Multiple Sessions
 
 Test the session management tools.
 
@@ -623,7 +615,7 @@ Uses Program A.
 **What this tests:** `debug_sessions` accurately reflects the current set of active sessions.
 Multiple debug sessions can coexist. Stopping a session removes it from the list.
 
-### Scenario 24: Capabilities Query
+### Scenario 23: Capabilities Query
 
 Test querying debug engine capabilities.
 
@@ -645,7 +637,7 @@ Uses Program A.
 and returns boolean values. Some capabilities may differ from native (e.g.,
 `supportsReadMemoryRequest` and `supportsDisassembleRequest` may be false).
 
-### Scenario 25: Restart (Tool) and Stop Variants
+### Scenario 24: Restart (Tool) and Stop Variants
 
 Test the `debug_restart` tool and `debug_stop` options.
 
@@ -667,25 +659,26 @@ Uses Program A.
 
 ---
 
-### Part 7: Introspection (Scenarios 26-28)
+### Part 7: Introspection (Scenarios 25-27)
 
-### Scenario 26: Modules and Loaded Sources
+### Scenario 25: Modules
 
-Test module and source file enumeration.
+Test module enumeration after program execution.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_modules` — should return loaded modules/libraries
-3. The main module (`debug_test`) should appear in the modules list
-4. Verify each module has identifying fields (name, path, or id)
-5. `debug_loaded_sources` — should return source files
-6. `/tmp/debug_test.py` should appear in the sources list
+2. `debug_breakpoint` with `action: "set"` at line 5 (inside `add()`)
+3. `debug_run` with `action: "continue"` to hit the breakpoint
+4. `debug_modules` — should return loaded modules/libraries
+5. The main module (`__main__`) should appear in the modules list
+6. Verify each module has identifying fields (name, path, or id)
 7. `debug_stop`
 
-**What this tests:** Module enumeration exposes loaded Python modules.
+**What this tests:** Module enumeration exposes loaded Python modules after execution begins.
+Note: `debug_loaded_sources` is not supported by debugpy and has been removed from this scenario.
 
-### Scenario 27: Completions
+### Scenario 26: Completions
 
 Test expression completion suggestions.
 
@@ -702,7 +695,7 @@ Uses Program A.
 **What this tests:** The completion engine suggests variable names and expressions that match
 partial input.
 
-### Scenario 28: Advanced Inspect (Contexts, Scopes, and Frames)
+### Scenario 27: Advanced Inspect (Contexts, Scopes, and Frames)
 
 Test inspect with different evaluation contexts, frame IDs, and scope filtering.
 
@@ -726,29 +719,9 @@ frame-relative inspection all work correctly.
 
 ---
 
-### Part 8: Watchpoints and Events (Scenarios 29-30)
+### Part 8: Events (Scenario 28)
 
-### Scenario 29: Watchpoints (Data Breakpoints)
-
-Test setting a data breakpoint on a variable.
-
-Uses Program D (`/tmp/debug_vars.py`).
-
-1. `debug_launch` with `/tmp/debug_vars.py`, `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 30 (`x = modify(x, 3)` in `main()`)
-3. `debug_run` with `action: "continue"` to hit line 30
-4. `debug_watchpoint` with `variable: "x"`, `access_type: "write"`
-5. Verify the response has `breakpoint` and `description` fields
-6. `debug_run` with `action: "continue"` — should trigger watchpoint when `x` is written
-7. `debug_inspect` with `expression: "x"` — should show modified value (8 = 5 + 3)
-8. `debug_stop`
-
-**What this tests:** Data breakpoints (watchpoints) fire when a watched variable is written.
-
-**Note:** Watchpoint support depends on the DAP adapter (debugpy). If the debugger returns
-an error indicating watchpoints are not supported, document the error and mark as expected.
-
-### Scenario 30: Event Polling
+### Scenario 28: Event Polling
 
 Test the event polling mechanism.
 
@@ -768,9 +741,9 @@ Uses Program A.
 
 ---
 
-### Part 9: Error Paths and Edge Cases (Scenarios 31-33)
+### Part 9: Error Paths and Edge Cases (Scenarios 29-30)
 
-### Scenario 31: Cancel and Terminate Threads
+### Scenario 29: Cancel and Terminate Threads
 
 Test cancellation and thread termination tools.
 
@@ -784,24 +757,7 @@ Uses Program A.
 
 **What this tests:** Cancel and terminate tools handle both valid and invalid targets gracefully.
 
-### Scenario 32: Restart Frame
-
-Test restarting execution from a specific stack frame.
-
-Uses Program A.
-
-1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 5 (inside `add()`)
-3. `debug_run` with `action: "continue"` to hit line 5
-4. `debug_stacktrace` — should show `add` at frame 0, `compute` at frame 1
-5. `debug_restart_frame` with `frame_id: 0` — should return `{"restarted": true}`
-   (or an error if the engine doesn't support frame restart)
-6. If successful, execution should restart at the beginning of `add()`
-7. `debug_stop`
-
-**What this tests:** Frame restart repositions execution to the start of a specific function.
-
-### Scenario 33: Extended Error Handling and Error Codes
+### Scenario 30: Extended Error Handling and Error Codes
 
 Test error differentiation and edge cases.
 
@@ -827,99 +783,40 @@ Uses Program A.
 
 ## Reporting
 
-After completing all scenarios, provide a summary table:
+After completing all 30 scenarios, output this summary table and nothing else:
 
-| Scenario | Description | Result | Notes |
-|----------|-------------|--------|-------|
-| 1 | Basic breakpoint + inspect | ? | |
-| 2 | Step into / step out | ? | |
-| 3 | Multiple breakpoints + continue | ? | |
-| 4 | Loop breakpoint | ? | |
-| 5 | Step over | ? | |
-| 6 | Breakpoint removal + list | ? | |
-| 7 | Recursive function | ? | |
-| 8 | Expression evaluation | ? | |
-| 9 | Restart | ? | |
-| 10 | Error handling | ? | |
-| 11 | Threads + stack traces | ? | |
-| 12 | Scopes | ? | |
-| 13 | Set variable / set expression | ? | |
-| 14 | Memory + disassembly (NOT_SUPPORTED) | ? | |
-| 15 | Instruction breakpoints (NOT_SUPPORTED) | ? | |
-| 16 | CPU registers + native tools (NOT_SUPPORTED) | ? | |
-| 17 | Function breakpoints | ? | |
-| 18 | Breakpoint locations | ? | |
-| 19 | Exception breakpoints + info | ? | |
-| 20 | Goto targets + goto | ? | |
-| 21 | Step-in targets | ? | |
-| 22 | Stepping granularity | ? | |
-| 23 | Session listing + multiple sessions | ? | |
-| 24 | Capabilities query | ? | |
-| 25 | Restart tool + stop variants | ? | |
-| 26 | Modules + loaded sources | ? | |
-| 27 | Completions | ? | |
-| 28 | Advanced inspect (contexts/scopes/frames) | ? | |
-| 29 | Watchpoints | ? | |
-| 30 | Event polling | ? | |
-| 31 | Cancel + terminate threads | ? | |
-| 32 | Restart frame | ? | |
-| 33 | Extended error handling + error codes | ? | |
+| # | Description | Result | Failed Step | Error |
+|---|-------------|--------|-------------|-------|
+| 1 | Basic breakpoint + inspect | PASS/FAIL | | |
+| 2 | Step into / step out | PASS/FAIL | | |
+| 3 | Multiple breakpoints + continue | PASS/FAIL | | |
+| 4 | Loop breakpoint | PASS/FAIL | | |
+| 5 | Step over | PASS/FAIL | | |
+| 6 | Breakpoint removal + list | PASS/FAIL | | |
+| 7 | Recursive function | PASS/FAIL | | |
+| 8 | Expression evaluation | PASS/FAIL | | |
+| 9 | Restart | PASS/FAIL | | |
+| 10 | Error handling | PASS/FAIL | | |
+| 11 | Threads + stack traces | PASS/FAIL | | |
+| 12 | Scopes | PASS/FAIL | | |
+| 13 | Set variable / set expression | PASS/FAIL | | |
+| 14 | Memory + disassembly (NOT_SUPPORTED) | PASS/FAIL | | |
+| 15 | Instruction breakpoints (NOT_SUPPORTED) | PASS/FAIL | | |
+| 16 | CPU registers + native tools (NOT_SUPPORTED) | PASS/FAIL | | |
+| 17 | Function breakpoints | PASS/FAIL | | |
+| 18 | Exception breakpoints + info | PASS/FAIL | | |
+| 19 | Goto targets + goto | PASS/FAIL | | |
+| 20 | Step-in targets | PASS/FAIL | | |
+| 21 | Stepping granularity | PASS/FAIL | | |
+| 22 | Session listing + multiple sessions | PASS/FAIL | | |
+| 23 | Capabilities query | PASS/FAIL | | |
+| 24 | Restart tool + stop variants | PASS/FAIL | | |
+| 25 | Modules | PASS/FAIL | | |
+| 26 | Completions | PASS/FAIL | | |
+| 27 | Advanced inspect (contexts/scopes/frames) | PASS/FAIL | | |
+| 28 | Event polling | PASS/FAIL | | |
+| 29 | Cancel + terminate threads | PASS/FAIL | | |
+| 30 | Extended error handling + error codes | PASS/FAIL | | |
 
-### Tools Coverage Matrix
-
-| Tool | Scenario(s) |
-|------|-------------|
-| `debug_launch` | 1-33 (all) |
-| `debug_breakpoint` (set) | 1, 3-9, 11-13, 17-19, 28-30, 32 |
-| `debug_breakpoint` (remove) | 6 |
-| `debug_breakpoint` (list) | 3, 6, 17 |
-| `debug_breakpoint` (set_function) | 17 |
-| `debug_breakpoint` (set_exception) | 19 |
-| `debug_run` (continue) | 1-9, 17, 19-20, 29-30 |
-| `debug_run` (step_into) | 2, 21 |
-| `debug_run` (step_over) | 5, 13, 22, 30 |
-| `debug_run` (step_out) | 2 |
-| `debug_run` (restart) | 9 |
-| `debug_run` (goto) | 20 |
-| `debug_run` (granularity) | 22 |
-| `debug_inspect` | 1-8, 12-13, 20, 28-29 |
-| `debug_inspect` (context) | 28 |
-| `debug_inspect` (variable_ref) | 12 |
-| `debug_inspect` (scope) | 28 |
-| `debug_inspect` (frame_id) | 28 |
-| `debug_stop` | 1-33 (all) |
-| `debug_stop` (detach) | 25 |
-| `debug_stop` (terminate_only) | 25 |
-| `debug_threads` | 11 |
-| `debug_stacktrace` | 11, 32 |
-| `debug_scopes` | 12 |
-| `debug_set_variable` | 13 |
-| `debug_set_expression` | 13 |
-| `debug_memory` (read) | 14, 33 |
-| `debug_memory` (write) | 33 |
-| `debug_disassemble` | 14 |
-| `debug_instruction_breakpoint` | 15, 33 |
-| `debug_breakpoint_locations` | 18 |
-| `debug_goto_targets` | 20 |
-| `debug_step_in_targets` | 21 |
-| `debug_capabilities` | 24 |
-| `debug_modules` | 26 |
-| `debug_loaded_sources` | 26 |
-| `debug_source` | 33 |
-| `debug_completions` | 27 |
-| `debug_exception_info` | 19 |
-| `debug_registers` | 16, 33 |
-| `debug_write_register` | 16 |
-| `debug_find_symbol` | 16 |
-| `debug_variable_location` | 16 |
-| `debug_sessions` | 23, 25 |
-| `debug_restart` | 25 |
-| `debug_restart_frame` | 32 |
-| `debug_watchpoint` | 29 |
-| `debug_poll_events` | 30 |
-| `debug_cancel` | 31 |
-| `debug_terminate_threads` | 31 |
-
-For any failures, include the raw response and describe what went wrong vs what
-was expected. If a scenario cannot complete (e.g., due to a prior step failing), note which
-step failed and skip the rest of that scenario.
+For failures, fill in the Failed Step and Error columns. If a scenario cannot complete
+(e.g., due to a prior step failing), note which step failed and skip the rest of that scenario.

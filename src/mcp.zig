@@ -105,11 +105,9 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8) !void {
     server_version = version;
     shutdown_requested.store(false, .release);
     debugLogInit();
-    defer debugLogDeinit();
     setupSignalHandler();
 
     var runtime = Runtime.init(allocator);
-    defer runtime.deinit();
     // Start the watcher thread AFTER runtime is in its final stack location.
     // The thread captures a pointer to runtime.watcher, so it must not move.
     if (runtime.watcher != null) {
@@ -184,6 +182,21 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8) !void {
             };
         }
     }
+
+    debugLog("=== MCP server shutting down ===", .{});
+
+    // Clean up debug sessions before exiting — kills adapter process groups
+    // to prevent orphaned debugpy/launcher/debuggee processes.
+    runtime.debug_server.deinit();
+
+    debugLogDeinit();
+
+    // Force-exit the process. On macOS the file-watcher thread can get
+    // stuck in CFRunLoop's mach_msg2_trap, making thread-join hang
+    // indefinitely and leaving an orphaned process.  Since the MCP server
+    // holds no resources that need flushing beyond what the OS reclaims on
+    // exit, an immediate _exit is the safest shutdown path.
+    std.process.exit(0);
 }
 
 fn setupSignalHandler() void {
@@ -196,6 +209,7 @@ fn setupSignalHandler() void {
     };
     posix.sigaction(posix.SIG.INT, &act, null);
     posix.sigaction(posix.SIG.TERM, &act, null);
+    posix.sigaction(posix.SIG.HUP, &act, null);
 
     // Ignore SIGPIPE so that writes to a closed stdout return
     // error.BrokenPipe instead of killing the process.
@@ -319,100 +333,179 @@ fn processMessage(runtime: *Runtime, line: []const u8) !void {
     // Get request id (may be null for notifications)
     const id = root.object.get("id");
 
+    // For requests (id != null), create a ReplyOnce guard that guarantees
+    // exactly one response is sent. If the handler returns without responding,
+    // the guard's deinit sends a fallback internal error.
+    var reply = ReplyOnce.init(allocator, id, stdout);
+    defer reply.deinit();
+
     // Dispatch
     if (std.mem.eql(u8, method, "initialize")) {
-        handleInitialize(allocator, id, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handleInitialize(allocator, &reply) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "notifications/initialized")) {
-        // No-op notification, no response needed
+        reply.markNotification(); // No response needed
     } else if (std.mem.eql(u8, method, "shutdown")) {
-        handleShutdown(allocator, id, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handleShutdown(allocator, &reply) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "exit")) {
+        reply.markNotification(); // No response needed
         shutdown_requested.store(true, .release);
     } else if (std.mem.eql(u8, method, "ping")) {
-        handlePing(allocator, id, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handlePing(allocator, &reply) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "tools/list")) {
-        handleToolsList(runtime, id, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handleToolsList(runtime, &reply) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "tools/call")) {
         const params = root.object.get("params");
-        handleToolsCall(runtime, id, params, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handleToolsCall(runtime, &reply, params) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "resources/list")) {
-        handleResourcesList(allocator, id, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handleResourcesList(allocator, &reply) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "resources/read")) {
         const params = root.object.get("params");
-        handleResourcesRead(runtime, id, params, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handleResourcesRead(runtime, &reply, params) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "prompts/list")) {
-        handlePromptsList(allocator, id, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handlePromptsList(allocator, &reply) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "prompts/get")) {
         const params = root.object.get("params");
-        handlePromptsGet(allocator, id, params, stdout) catch {
-            writeInternalError(allocator, id, stdout);
+        handlePromptsGet(allocator, &reply, params) catch |err| {
+            reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "notifications/cancelled") or std.mem.eql(u8, method, "notifications/progress")) {
-        // Optional notifications; no-op.
+        reply.markNotification(); // No response needed
     } else {
         if (id != null) {
-            try writeError(allocator, id, -32601, "Method not found", stdout);
+            reply.sendError(-32601, "Method not found") catch {};
+        } else {
+            reply.markNotification();
         }
     }
 }
 
-fn writeInternalError(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) void {
-    if (id == null) return;
-    writeError(allocator, id, -32603, "Internal error", stdout) catch {};
-}
+// ── ReplyOnce Guard ─────────────────────────────────────────────────────
+//
+// Guarantees that every MCP request receives exactly one JSON-RPC response.
+// Create one per request, use `defer reply.deinit()`. If no response has been
+// sent when deinit runs, a fallback -32603 "Internal error" is emitted.
+// For notifications (no id), call `markNotification()` to suppress the guard.
 
-fn handleShutdown(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) !void {
+const ReplyOnce = struct {
+    allocator: std.mem.Allocator,
+    id: ?json.Value,
+    stdout: std.fs.File,
+    responded: bool = false,
+    is_notification: bool = false,
+
+    fn init(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) ReplyOnce {
+        return .{
+            .allocator = allocator,
+            .id = id,
+            .stdout = stdout,
+        };
+    }
+
+    /// Mark this message as a notification (no response expected).
+    fn markNotification(self: *ReplyOnce) void {
+        self.is_notification = true;
+    }
+
+    /// Send a successful tool result. Sets responded = true.
+    fn sendToolResult(self: *ReplyOnce, content: []const u8) !void {
+        if (self.responded) return;
+        self.responded = true;
+        try writeToolResult(self.allocator, self.id, content, self.stdout);
+    }
+
+    /// Send a tool-level error (isError=true in MCP result). Sets responded = true.
+    fn sendToolError(self: *ReplyOnce, message: []const u8) !void {
+        if (self.responded) return;
+        self.responded = true;
+        try writeToolError(self.allocator, self.id, message, self.stdout);
+    }
+
+    /// Send a JSON-RPC error response. Sets responded = true.
+    fn sendError(self: *ReplyOnce, code: i32, message: []const u8) !void {
+        if (self.responded) return;
+        self.responded = true;
+        try writeError(self.allocator, self.id, code, message, self.stdout);
+    }
+
+    /// Send a pre-formatted raw JSON response. Sets responded = true.
+    fn sendRaw(self: *ReplyOnce, data: []const u8) !void {
+        if (self.responded) return;
+        self.responded = true;
+        try writeResponse(self.stdout, data);
+    }
+
+    /// Send a -32603 internal error. Used by catch blocks in processMessage.
+    fn sendInternalError(self: *ReplyOnce, err: anyerror) void {
+        if (self.responded) return;
+        if (self.id == null) return;
+        debugLog("Handler error: {s}, sending internal error response", .{@errorName(err)});
+        self.responded = true;
+        writeError(self.allocator, self.id, -32603, "Internal error", self.stdout) catch {};
+    }
+
+    /// Destructor — the safety net. If no response was sent for a request,
+    /// emit a fallback internal error so the client never hangs.
+    fn deinit(self: *ReplyOnce) void {
+        if (self.is_notification) return;
+        if (self.responded) return;
+        if (self.id == null) return;
+        debugLog("ReplyOnce: handler returned without responding, sending fallback error", .{});
+        writeError(self.allocator, self.id, -32603, "Internal error: no response produced", self.stdout) catch {};
+    }
+};
+
+fn handleShutdown(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.endObject();
     try s.endObject();
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
     shutdown_requested.store(true, .release);
 }
 
-fn handlePing(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) !void {
+fn handlePing(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.endObject();
     try s.endObject();
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
-fn handleInitialize(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) !void {
+fn handleInitialize(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -420,7 +513,7 @@ fn handleInitialize(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.f
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("protocolVersion");
@@ -449,10 +542,10 @@ fn handleInitialize(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.f
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
-fn handleToolsList(runtime: *Runtime, id: ?json.Value, stdout: std.fs.File) !void {
+fn handleToolsList(runtime: *Runtime, reply: *ReplyOnce) !void {
     const allocator = runtime.allocator;
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -461,7 +554,7 @@ fn handleToolsList(runtime: *Runtime, id: ?json.Value, stdout: std.fs.File) !voi
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("tools");
@@ -474,26 +567,26 @@ fn handleToolsList(runtime: *Runtime, id: ?json.Value, stdout: std.fs.File) !voi
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
-fn handleToolsCall(runtime: *Runtime, id: ?json.Value, params: ?json.Value, stdout: std.fs.File) !void {
+fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !void {
     const allocator = runtime.allocator;
     const p = params orelse {
-        try writeError(allocator, id, -32602, "Missing params", stdout);
+        try reply.sendError(-32602, "Missing params");
         return;
     };
     if (p != .object) {
-        try writeError(allocator, id, -32602, "Invalid params", stdout);
+        try reply.sendError(-32602, "Invalid params");
         return;
     }
 
     const name_val = p.object.get("name") orelse {
-        try writeError(allocator, id, -32602, "Missing tool name", stdout);
+        try reply.sendError(-32602, "Missing tool name");
         return;
     };
     if (name_val != .string) {
-        try writeError(allocator, id, -32602, "Tool name must be string", stdout);
+        try reply.sendError(-32602, "Tool name must be string");
         return;
     }
     const tool_name = name_val.string;
@@ -509,15 +602,15 @@ fn handleToolsCall(runtime: *Runtime, id: ?json.Value, params: ?json.Value, stdo
             error.Explained => "Operation failed (see stderr)",
             else => "Internal error",
         };
-        try writeToolError(allocator, id, err_msg, stdout);
+        try reply.sendToolError(err_msg);
         return;
     };
     defer allocator.free(tool_result);
 
-    try writeToolResult(allocator, id, tool_result, stdout);
+    try reply.sendToolResult(tool_result);
 }
 
-fn handlePromptsList(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) !void {
+fn handlePromptsList(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -525,7 +618,7 @@ fn handlePromptsList(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("prompts");
@@ -542,29 +635,29 @@ fn handlePromptsList(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
-fn handlePromptsGet(allocator: std.mem.Allocator, id: ?json.Value, params: ?json.Value, stdout: std.fs.File) !void {
+fn handlePromptsGet(allocator: std.mem.Allocator, reply: *ReplyOnce, params: ?json.Value) !void {
     const p = params orelse {
-        try writeError(allocator, id, -32602, "Missing params", stdout);
+        try reply.sendError(-32602, "Missing params");
         return;
     };
     if (p != .object) {
-        try writeError(allocator, id, -32602, "Invalid params", stdout);
+        try reply.sendError(-32602, "Invalid params");
         return;
     }
     const name_val = p.object.get("name") orelse {
-        try writeError(allocator, id, -32602, "Missing prompt name", stdout);
+        try reply.sendError(-32602, "Missing prompt name");
         return;
     };
     if (name_val != .string) {
-        try writeError(allocator, id, -32602, "Prompt name must be string", stdout);
+        try reply.sendError(-32602, "Prompt name must be string");
         return;
     }
 
     if (!std.mem.eql(u8, name_val.string, "cog_reference")) {
-        try writeError(allocator, id, -32602, "Unknown prompt", stdout);
+        try reply.sendError(-32602, "Unknown prompt");
         return;
     }
 
@@ -579,7 +672,7 @@ fn handlePromptsGet(allocator: std.mem.Allocator, id: ?json.Value, params: ?json
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("description");
@@ -603,10 +696,10 @@ fn handlePromptsGet(allocator: std.mem.Allocator, id: ?json.Value, params: ?json
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
-fn handleResourcesList(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) !void {
+fn handleResourcesList(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -614,7 +707,7 @@ fn handleResourcesList(allocator: std.mem.Allocator, id: ?json.Value, stdout: st
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("resources");
@@ -659,26 +752,26 @@ fn handleResourcesList(allocator: std.mem.Allocator, id: ?json.Value, stdout: st
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
-fn handleResourcesRead(runtime: *Runtime, id: ?json.Value, params: ?json.Value, stdout: std.fs.File) !void {
+fn handleResourcesRead(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !void {
     const allocator = runtime.allocator;
     const p = params orelse {
-        try writeError(allocator, id, -32602, "Missing params", stdout);
+        try reply.sendError(-32602, "Missing params");
         return;
     };
     if (p != .object) {
-        try writeError(allocator, id, -32602, "Invalid params", stdout);
+        try reply.sendError(-32602, "Invalid params");
         return;
     }
 
     const uri_val = p.object.get("uri") orelse {
-        try writeError(allocator, id, -32602, "Missing uri", stdout);
+        try reply.sendError(-32602, "Missing uri");
         return;
     };
     if (uri_val != .string) {
-        try writeError(allocator, id, -32602, "uri must be string", stdout);
+        try reply.sendError(-32602, "uri must be string");
         return;
     }
 
@@ -693,7 +786,7 @@ fn handleResourcesRead(runtime: *Runtime, id: ?json.Value, params: ?json.Value, 
     } else if (std.mem.eql(u8, uri, "cog://tools/catalog")) {
         payload = try buildToolCatalogResourceJson(runtime);
     } else {
-        try writeError(allocator, id, -32602, "Unknown resource uri", stdout);
+        try reply.sendError(-32602, "Unknown resource uri");
         return;
     }
     defer allocator.free(payload);
@@ -704,7 +797,7 @@ fn handleResourcesRead(runtime: *Runtime, id: ?json.Value, params: ?json.Value, 
     try s.beginObject();
     try s.objectField("jsonrpc");
     try s.write("2.0");
-    try writeId(&s, id);
+    try writeId(&s, reply.id);
     try s.objectField("result");
     try s.beginObject();
     try s.objectField("contents");
@@ -723,7 +816,7 @@ fn handleResourcesRead(runtime: *Runtime, id: ?json.Value, params: ?json.Value, 
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try reply.sendRaw(result);
 }
 
 fn buildDebugToolsResourceJson(allocator: std.mem.Allocator) ![]u8 {
@@ -1140,8 +1233,10 @@ fn processWatcherEvents(runtime: *Runtime) void {
 }
 
 fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    debugLog("callDebugTool: dispatching {s}", .{tool_name});
     const allocator = runtime.allocator;
     const result = runtime.debug_server.callTool(allocator, tool_name, arguments) catch return error.Explained;
+    debugLog("callDebugTool: {s} returned", .{tool_name});
     return switch (result) {
         .ok => |payload| payload,
         .ok_static => |payload| try allocator.dupe(u8, payload),
