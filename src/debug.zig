@@ -88,7 +88,7 @@ fn debugSign(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
 /// Sign the current executable with debug entitlements (macOS only).
 /// Idempotent — safe to call on every debug serve start.
-fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
+pub fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag != .macos) return;
 
@@ -143,7 +143,7 @@ fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
 /// binary doesn't grant entitlements to the current process. This re-exec
 /// replaces the process with a fresh instance that has the entitlements active.
 /// Uses COG_DEBUG_SIGNED env var to prevent infinite re-exec.
-fn reexecWithEntitlements() void {
+pub fn reexecWithEntitlements() void {
     const c_fns = struct {
         extern fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
     };

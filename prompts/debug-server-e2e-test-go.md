@@ -1,4 +1,4 @@
-# Cog Debug Server — End-to-End Test Prompt (Go / DAP via Delve)
+# Cog Debug Server — End-to-End Test Prompt (Go / Native DWARF Engine)
 
 ## CRITICAL EXECUTION RULES
 
@@ -32,7 +32,7 @@ AI Agent --MCP tools/call--> debug_* tool in Cog MCP runtime
 ```
 
 ```json
-{"name":"debug_breakpoint","arguments":{"session_id":"session-1","action":"set","file":"/tmp/debug_test.go","line":6}}
+{"name":"debug_breakpoint","arguments":{"session_id":"session-1","action":"set","file":"/tmp/debug_basic/debug_basic.go","line":6}}
 ```
 
 ```json
@@ -104,20 +104,21 @@ Cog exposes 36 debug MCP tools. Prefer runtime discovery (`tools/list`) for exac
 
 Use the scenarios below to validate common and advanced flows across these tools.
 
-### DAP Backend Notes (Go / Delve)
+### Native DWARF Engine Notes (Go)
 
-Go debugging uses the DAP (Debug Adapter Protocol) transport via `dlv dap` (Delve).
-This means **native-only tools are not available** and will return `NOT_SUPPORTED` (-32001):
+Go debugging uses the native DWARF engine directly (same engine used for C/C++/Rust/Zig).
+Go binaries compiled with `go build -gcflags="all=-N -l"` produce standard Mach-O/ELF
+with DWARF debug info that the native engine reads directly.
 
-- `debug_memory` (read/write)
-- `debug_disassemble`
-- `debug_registers`
-- `debug_write_register`
-- `debug_instruction_breakpoint`
-- `debug_find_symbol`
-- `debug_variable_location`
+**All 36 debug tools are available**, including memory, disassembly, registers, instruction
+breakpoints, symbol lookup, and variable location — these are tested in Part 3.
 
-Part 3 of this test suite verifies that these tools correctly return the expected error code.
+**Known limitations:**
+- No goroutine awareness — the native engine sees OS threads, not goroutines
+- Go panics manifest as OS signals (SIGSEGV, SIGFPE) rather than structured exceptions
+- Go-specific expression syntax (slices, channels) is not supported in the evaluator
+- Go runtime frames appear in stack traces alongside user frames
+- Function names use DW_AT_name (e.g., `multiply`) not Go-qualified names (e.g., `main.multiply`)
 
 ---
 
@@ -131,8 +132,10 @@ Before running any scenarios, reset and compile all test fixtures:
 bash prompts/fixtures/go/setup.sh
 ```
 
-This copies the Go source files from `prompts/fixtures/go/` to `/tmp/` and compiles them with
-`go build -gcflags="all=-N -l"` (full debug info, no inlining, no optimization).
+This builds the Go source files from `prompts/fixtures/go/` into stable build directories
+under `/tmp/` and compiles them with `go build -gcflags="all=-N -l"` (full debug info,
+no inlining, no optimization). Build directories are kept so DWARF source paths remain valid.
+Note: `debug_test.go` is renamed to `debug_basic.go` to avoid Go's `_test.go` convention.
 Run the setup script at the start of every session to ensure clean state.
 
 **Do NOT kill any running processes.** The daemon auto-starts on first `debug_*` tool use.
@@ -144,13 +147,13 @@ Killing processes (e.g., `pkill`) can destroy the user's running dashboard or ot
 
 | Program | Source | Binary | Used by |
 |---------|--------|--------|---------|
-| A: Basic | `/tmp/debug_test.go` | `/tmp/debug_test_go` | Scenarios 1-11, 14-18, 20-28, 30-33 |
-| B: Crasher | `/tmp/debug_crash.go` | `/tmp/debug_crash_go` | Scenario 19 |
-| D: Multi-variable | `/tmp/debug_vars.go` | `/tmp/debug_vars_go` | Scenarios 12-13, 29 |
+| A: Basic | `/tmp/debug_basic/debug_basic.go` | `/tmp/debug_test_go` | Scenarios 1-11, 14-18, 20-28, 30-33 |
+| B: Crasher | `/tmp/debug_crash/debug_crash.go` | `/tmp/debug_crash_go` | Scenario 19 |
+| D: Multi-variable | `/tmp/debug_vars/debug_vars.go` | `/tmp/debug_vars_go` | Scenarios 12-13, 29 |
 
 ### Key Line References
 
-**Program A** (`debug_test.go`):
+**Program A** (`debug_basic.go`):
 - Line 6: `result := a + b` (inside `add()`)
 - Line 7: `return result` (inside `add()`)
 - Line 11: `result := a * b` (inside `multiply()`)
@@ -194,7 +197,7 @@ These test the fundamental debug loop using Program A.
 This is the baseline test. Verify the fundamental debug loop works.
 
 1. `debug_launch` with `program: "/tmp/debug_test_go"`, `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"`, `session_id`, `file: "/tmp/debug_test.go"`, `line: 6`
+2. `debug_breakpoint` with `action: "set"`, `session_id`, `file: "/tmp/debug_basic/debug_basic.go"`, `line: 6`
 3. `debug_run` with `action: "continue"` — should hit the breakpoint
 4. `debug_inspect` with `expression: "a"` — should be 10
 5. `debug_inspect` with `expression: "b"` — should be 20
@@ -388,7 +391,7 @@ Uses Program A.
 1. `debug_launch` with `/tmp/debug_test_go`, `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 6 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_threads` — should return at least one thread; Go programs typically show multiple goroutine-backed threads
+4. `debug_threads` — should return at least one thread
 5. Verify each thread has an `id` and `name` field
 6. `debug_stacktrace` with default parameters — should show `add` -> `compute` -> `main` (plus possible Go runtime frames)
 7. `debug_stacktrace` with `start_frame: 1, levels: 1` — should return only the `compute` frame
@@ -398,8 +401,8 @@ Uses Program A.
 **What this tests:** Thread listing works. Stack trace returns correct call chain. Pagination
 parameters (`start_frame`, `levels`) correctly limit the returned frames.
 
-**Note:** Go programs may show goroutine threads (e.g., GC, finalizer) in addition to the
-main goroutine. This is expected behavior.
+**Note:** The native engine sees OS threads, not goroutines. Go programs may have multiple
+OS threads for the Go runtime scheduler.
 
 ### Scenario 12: Scopes
 
@@ -441,67 +444,73 @@ Uses Program D (`/tmp/debug_vars_go`).
 
 ---
 
-### Part 3: Native-Only Tools — NOT_SUPPORTED Verification (Scenarios 14-16)
+### Part 3: Native Engine Features (Scenarios 14-16)
 
-Go uses the DAP transport via `dlv dap` (Delve). Native-only tools are not available
-and must return NOT_SUPPORTED (-32001). These scenarios verify that behavior.
+Go uses the native DWARF engine. These scenarios test native-only features that were
+previously unavailable when Go routed through the DAP transport.
 
-### Scenario 14: Memory and Disassembly
+### Scenario 14: Memory Read and Disassembly
 
-Verify that `debug_memory` and `debug_disassemble` return NOT_SUPPORTED via DAP.
+Test reading process memory and disassembling machine code.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 6 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_memory` with `action: "read"`, `address: "0x1000"`, `size: 32`
-   — should return error with code -32001 (NOT_SUPPORTED)
-5. Verify the error message indicates memory operations are not supported via DAP
-6. `debug_disassemble` with `address: "0x1000"`, `instruction_count: 5`
-   — should return error with code -32001 (NOT_SUPPORTED)
-7. Verify the error message indicates disassembly is not supported via DAP
-8. `debug_stop`
+4. `debug_stacktrace` — get the current PC address from frame 0
+5. `debug_memory` with `action: "read"`, using the PC address from the stacktrace, `size: 64`
+   — should return hex-encoded bytes (not an error)
+6. Verify the response contains `address` and `data` fields
+7. `debug_disassemble` with the same address, `instruction_count: 10`
+   — should return disassembled instructions
+8. Verify each instruction has `address` and `instruction` fields
+9. `debug_stop`
 
-**What this tests:** Native-only memory and disassembly tools correctly refuse to operate
-on DAP sessions with the appropriate error code.
+**What this tests:** The native engine can read raw process memory and disassemble machine
+instructions from a Go binary. This validates that Go binaries are fully accessible to the
+native engine's low-level inspection tools.
 
 ### Scenario 15: Instruction Breakpoints
 
-Verify that `debug_instruction_breakpoint` returns NOT_SUPPORTED via DAP.
+Test setting breakpoints at raw machine instruction addresses.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 6 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_instruction_breakpoint` with `instruction_reference: "0x1000"`
-   — should return error with code -32001 (NOT_SUPPORTED)
-5. Verify the error message indicates instruction breakpoints are not supported via DAP
-6. `debug_stop`
+4. `debug_disassemble` with the current PC, `instruction_count: 5` — get instruction addresses
+5. Pick the address of the 2nd or 3rd instruction from disassembly output
+6. `debug_instruction_breakpoint` with that `instruction_reference`
+   — should succeed and return a breakpoint object
+7. `debug_breakpoint` with `action: "remove"` to remove the line breakpoint at line 6
+8. `debug_run` with `action: "continue"` — should hit the instruction breakpoint
+9. Verify the stop location matches the instruction address
+10. `debug_stop`
 
-**What this tests:** Instruction-level breakpoints correctly return NOT_SUPPORTED when the
-backend is a DAP adapter.
+**What this tests:** Instruction-level breakpoints can be set at arbitrary machine addresses
+in a Go binary and are correctly triggered during execution.
 
-### Scenario 16: CPU Registers and Symbol Tools
+### Scenario 16: CPU Registers and Symbol Lookup
 
-Verify that `debug_registers`, `debug_variable_location`, `debug_find_symbol`, and
-`debug_write_register` return NOT_SUPPORTED via DAP.
+Test reading CPU registers, locating variables in memory, and looking up symbols.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 6 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_registers` — should return error with code -32001 (NOT_SUPPORTED)
-5. `debug_variable_location` with `name: "a"` — should return error with code -32001 (NOT_SUPPORTED)
-6. `debug_find_symbol` with `name: "add"` — should return error with code -32001 (NOT_SUPPORTED)
-7. `debug_write_register` with `name: "rax"`, `value: 0` — should return error with code -32001 (NOT_SUPPORTED)
-8. Verify all four responses have error code -32001
-9. `debug_stop`
+4. `debug_registers` — should return register names and values
+5. Verify the response contains registers (e.g., on x86_64: rax, rsp, rip; on arm64: x0, sp, pc)
+6. `debug_variable_location` with `name: "a"` — should return the storage location of variable `a`
+7. Verify the response indicates register, stack, or memory location
+8. `debug_find_symbol` with `name: "main.add"` — should return the symbol address
+9. Verify the response contains an address field
+10. `debug_stop`
 
-**What this tests:** All native-only register, symbol, and variable-location tools correctly
-return NOT_SUPPORTED when the backend is a DAP adapter.
+**What this tests:** Full native engine introspection works on Go binaries — CPU register
+reads, DWARF variable location lookup, and symbol table queries all succeed.
 
 ---
 
@@ -524,8 +533,9 @@ Uses Program A.
 **What this tests:** Function breakpoints resolve the function name to an address and fire
 when execution enters the function.
 
-**Note:** Go qualifies function names with the package prefix. Use `main.multiply` rather
-than just `multiply`.
+**Note:** The native engine uses DWARF symbol names. Go functions are qualified with their
+package prefix in the symbol table, so use `main.multiply`. If that fails, try just
+`multiply` (DW_AT_name without qualification).
 
 ### Scenario 18: Breakpoint Locations
 
@@ -534,9 +544,9 @@ Test querying valid breakpoint positions in a source file.
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint_locations` with `source: "/tmp/debug_test.go"`, `line: 5`, `end_line: 8`
+2. `debug_breakpoint_locations` with `source: "/tmp/debug_basic/debug_basic.go"`, `line: 5`, `end_line: 8`
    — should return valid breakpoint positions within `add()` (lines 6 and 7 at minimum)
-3. `debug_breakpoint_locations` with `source: "/tmp/debug_test.go"`, `line: 14`
+3. `debug_breakpoint_locations` with `source: "/tmp/debug_basic/debug_basic.go"`, `line: 14`
    — query a single line, may return line 16 as the nearest valid position
 4. Verify each result has `line` and optionally `endLine`, `column`, `endColumn`
 5. `debug_stop`
@@ -546,23 +556,24 @@ targets. This is critical for IDEs that need to snap breakpoints to valid positi
 
 ### Scenario 19: Exception Breakpoints and Exception Info
 
-Test exception/panic breakpoint configuration and exception information retrieval.
+Test exception/signal breakpoint configuration and exception information retrieval.
 
 Uses Program B (`/tmp/debug_crash_go`).
 
 1. `debug_launch` with `/tmp/debug_crash_go`, `args: ["null"]`, `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set_exception"`, `filters: ["uncaught"]`
-3. `debug_run` with `action: "continue"` — should panic with nil pointer dereference at line 15
-4. The stop reason should indicate a panic or exception
-5. `debug_exception_info` — should return exception details
-6. Verify the response has `exceptionId` (required), `breakMode` (required), and optionally `description` and `details`
+3. `debug_run` with `action: "continue"` — should stop on a signal (SIGSEGV from nil pointer dereference)
+4. The stop reason should indicate a signal or exception
+5. `debug_exception_info` — should return exception/signal details
+6. Verify the response has `exceptionId` (required) and `breakMode` (required)
 7. `debug_stop`
 
-**What this tests:** Exception breakpoints cause the debugger to stop on panics/exceptions.
-Exception info retrieves structured details about what went wrong.
+**What this tests:** The native engine catches OS signals triggered by Go panics.
+Go's nil pointer dereference becomes a SIGSEGV at the OS level, which the native engine
+intercepts. The `"null"` argument triggers the nil pointer dereference path in `debug_crash_go`.
 
-**Note:** Go panics (nil dereference, division by zero) are the equivalent of C signals.
-The `"null"` argument triggers the nil pointer dereference path in `debug_crash_go`.
+**Note:** Go panics are not structured exceptions — they manifest as OS signals (SIGSEGV for
+nil dereference, SIGFPE for division by zero) when running under the native engine.
 
 ---
 
@@ -577,8 +588,8 @@ Uses Program A.
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 16 (`sum := add(x, y)` in `compute()`)
 3. `debug_run` with `action: "continue"` to hit line 16
-4. `debug_goto_targets` with `file: "/tmp/debug_test.go"`, `line: 18`
-5. If targets are returned, `debug_run` with `action: "goto"`, `file: "/tmp/debug_test.go"`, `line: 18`
+4. `debug_goto_targets` with `file: "/tmp/debug_basic/debug_basic.go"`, `line: 18`
+5. If targets are returned, `debug_run` with `action: "goto"`, `file: "/tmp/debug_basic/debug_basic.go"`, `line: 18`
    — should jump to line 18, skipping `add()` and `multiply()` calls
 6. `debug_inspect` for `sum` and `product` — may be uninitialized/zero
 7. `debug_stop`
@@ -606,7 +617,7 @@ point.
 
 ### Scenario 22: Stepping Granularity
 
-Test line-level stepping. Instruction-level stepping is not available via DAP.
+Test line-level and instruction-level stepping.
 
 Uses Program A.
 
@@ -615,13 +626,13 @@ Uses Program A.
 3. `debug_run` with `action: "continue"` to hit line 6
 4. `debug_run` with `action: "step_over"`, `granularity: "line"` — advance to next source line
 5. Verify the location changed to line 7 (`return result`)
-6. `debug_run` with `action: "step_over"`, `granularity: "line"` — advance again
-7. Verify the location moved to the caller (back in `compute()`)
+6. `debug_run` with `action: "step_over"`, `granularity: "instruction"` — advance by one machine instruction
+7. Verify the location changed (PC advanced)
 8. `debug_stop`
 
-**What this tests:** Line granularity stepping moves to the next source line.
-Instruction-level granularity is not available via DAP and is not tested here
-(see Part 3 for NOT_SUPPORTED verification of native-only tools).
+**What this tests:** Line granularity stepping moves to the next source line. Instruction
+granularity stepping advances by a single machine instruction. Both are available via the
+native engine.
 
 ---
 
@@ -700,7 +711,7 @@ Uses Program A.
 3. The main executable (`debug_test_go`) should appear in the modules list
 4. Verify each module has identifying fields (name, path, or id)
 5. `debug_loaded_sources` — should return source files
-6. `/tmp/debug_test.go` should appear in the sources list
+6. `/tmp/debug_basic/debug_basic.go` should appear in the sources list
 7. `debug_stop`
 
 **What this tests:** Module enumeration exposes loaded binaries. Source listing exposes
@@ -769,10 +780,7 @@ Uses Program D (`/tmp/debug_vars_go`).
 8. `debug_stop`
 
 **What this tests:** Data breakpoints (watchpoints) fire when a watched variable is written.
-
-**Note:** Delve supports watchpoints on some platforms (Linux amd64, arm64). On platforms
-where watchpoints are not supported, the tool may return an error. Document the error and
-mark as expected on unsupported platforms.
+The native engine uses hardware watchpoints via the debug registers.
 
 ### Scenario 30: Event Polling
 
@@ -834,19 +842,18 @@ Test error differentiation and edge cases.
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_memory` with `action: "read"`, `address: "not_hex"` — should return NOT_SUPPORTED (-32001) or INVALID_PARAMS (-32602)
-3. `debug_memory` with `action: "write"`, `address: "0x1000"`, `data: "GG"` — should return NOT_SUPPORTED (-32001)
+2. `debug_memory` with `action: "read"`, `address: "not_hex"` — should return INVALID_PARAMS (-32602)
+3. `debug_memory` with `action: "write"`, `address: "0x1000"`, `data: "GG"` — should return an error (invalid hex data or access violation)
 4. `debug_breakpoint` with `action: "set"` and missing `file` — should return INVALID_PARAMS (-32602)
 5. `debug_stacktrace` with invalid `session_id` — should return error
-6. `debug_instruction_breakpoint` with missing `instruction_reference` — should return NOT_SUPPORTED (-32001) or INVALID_PARAMS (-32602)
+6. `debug_instruction_breakpoint` with missing `instruction_reference` — should return INVALID_PARAMS (-32602)
 7. `debug_source` with `source_reference: 99999` — should return error
-8. `debug_registers` — should return NOT_SUPPORTED (-32001)
+8. `debug_registers` — should succeed (native engine supports registers)
 9. `debug_stop`
 
 **What this tests:** Different error types return different error codes:
 - `-32602` (INVALID_PARAMS) for malformed/missing parameters
 - `-32601` (METHOD_NOT_FOUND) for unknown MCP tools
-- `-32001` (NOT_SUPPORTED) for features the engine doesn't support (native-only tools via DAP)
 - `-32603` (INTERNAL_ERROR) for runtime failures
 
 ---
@@ -870,9 +877,9 @@ After completing all 33 scenarios, output this summary table and nothing else:
 | 11 | Threads + stack traces | PASS/FAIL | | |
 | 12 | Scopes | PASS/FAIL | | |
 | 13 | Set variable / set expression | PASS/FAIL | | |
-| 14 | Memory + disassembly (NOT_SUPPORTED) | PASS/FAIL | | |
-| 15 | Instruction breakpoints (NOT_SUPPORTED) | PASS/FAIL | | |
-| 16 | CPU registers + native tools (NOT_SUPPORTED) | PASS/FAIL | | |
+| 14 | Memory read + disassembly | PASS/FAIL | | |
+| 15 | Instruction breakpoints | PASS/FAIL | | |
+| 16 | CPU registers + symbol lookup | PASS/FAIL | | |
 | 17 | Function breakpoints | PASS/FAIL | | |
 | 18 | Breakpoint locations | PASS/FAIL | | |
 | 19 | Exception breakpoints + info | PASS/FAIL | | |

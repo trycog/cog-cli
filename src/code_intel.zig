@@ -2,6 +2,7 @@ const std = @import("std");
 const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
+const posix = std.posix;
 const scip = @import("scip.zig");
 const scip_encode = @import("scip_encode.zig");
 const protobuf = @import("protobuf.zig");
@@ -11,6 +12,31 @@ const settings_mod = @import("settings.zig");
 const paths = @import("paths.zig");
 const extensions = @import("extensions.zig");
 const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
+
+// Advisory file locking via flock(2). Auto-released on close/process exit.
+extern "c" fn flock(fd: c_int, operation: c_int) c_int;
+const LOCK_EX: c_int = 2;
+const LOCK_UN: c_int = 8;
+
+/// Acquire an exclusive advisory lock on .cog/index.lock.
+/// Blocks until the lock is acquired. Returns the lock fd, or null on failure.
+fn acquireIndexLock(allocator: std.mem.Allocator, cog_dir: []const u8) ?posix.fd_t {
+    const lock_path = std.fmt.allocPrint(allocator, "{s}/index.lock", .{cog_dir}) catch return null;
+    defer allocator.free(lock_path);
+    const lock_path_z = posix.toPosixPath(lock_path) catch return null;
+    const fd = posix.open(&lock_path_z, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644) catch return null;
+    if (flock(fd, LOCK_EX) != 0) {
+        posix.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// Release the advisory lock and close the fd.
+fn releaseIndexLock(fd: posix.fd_t) void {
+    _ = flock(fd, LOCK_UN);
+    posix.close(fd);
+}
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -1436,9 +1462,13 @@ fn removeDocument(allocator: std.mem.Allocator, index: *scip.Index, rel_path: []
 
 /// Remove a file from the SCIP index on disk.
 /// Returns true if the file was found and removed, false otherwise.
+/// Uses flock() advisory locking to serialize concurrent access.
 pub fn removeFileFromIndex(allocator: std.mem.Allocator, file_path: []const u8) bool {
     const cog_dir = paths.findCogDir(allocator) catch return false;
     defer allocator.free(cog_dir);
+
+    const lock_fd = acquireIndexLock(allocator, cog_dir) orelse return false;
+    defer releaseIndexLock(lock_fd);
 
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
     defer allocator.free(index_path);
@@ -1456,9 +1486,13 @@ pub fn removeFileFromIndex(allocator: std.mem.Allocator, file_path: []const u8) 
 }
 
 /// Re-index a single file and update the master index.
+/// Uses flock() advisory locking to serialize concurrent access.
 pub fn reindexFile(allocator: std.mem.Allocator, file_path: []const u8) bool {
     const cog_dir = paths.findCogDir(allocator) catch return false;
     defer allocator.free(cog_dir);
+
+    const lock_fd = acquireIndexLock(allocator, cog_dir) orelse return false;
+    defer releaseIndexLock(lock_fd);
 
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
     defer allocator.free(index_path);

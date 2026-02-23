@@ -8,6 +8,7 @@ const code_intel = @import("code_intel.zig");
 const config_mod = @import("config.zig");
 const client = @import("client.zig");
 const debug_server_mod = @import("debug/server.zig");
+const debug_mod = @import("debug.zig");
 const watcher_mod = @import("watcher.zig");
 const paths = @import("paths.zig");
 
@@ -104,6 +105,19 @@ const Runtime = struct {
 pub fn serve(allocator: std.mem.Allocator, version: []const u8) !void {
     server_version = version;
     shutdown_requested.store(false, .release);
+
+    // On macOS, ensure debug entitlements are active for task_for_pid().
+    // Sign the binary and re-exec so the kernel grants the entitlement.
+    // execvpe preserves the same PID and stdio file descriptors, so the
+    // MCP client's pipe is unaffected.
+    if (builtin.os.tag == .macos) {
+        if (std.posix.getenv("COG_DEBUG_SIGNED") == null) {
+            debug_mod.ensureDebugEntitlements(allocator) catch {};
+            debug_mod.reexecWithEntitlements();
+            // If re-exec failed, continue without entitlements
+        }
+    }
+
     debugLogInit();
     setupSignalHandler();
 

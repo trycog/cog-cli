@@ -4,7 +4,6 @@ const binary_macho = @import("binary_macho.zig");
 
 // ── ELF Binary Format Loading ──────────────────────────────────────────
 
-const SectionInfo = binary_macho.SectionInfo;
 const DebugSections = binary_macho.DebugSections;
 
 // ELF format constants
@@ -12,6 +11,10 @@ const ELF_MAGIC = [4]u8{ 0x7f, 'E', 'L', 'F' };
 const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
+const SHF_COMPRESSED: u64 = 0x800;
+
+const SectionInfo = binary_macho.SectionInfo;
+const CompressionKind = binary_macho.CompressionKind;
 
 const Elf32Header = extern struct {
     e_ident: [16]u8,
@@ -77,6 +80,7 @@ pub const ElfBinary = struct {
     data: []const u8,
     owned: bool,
     sections: DebugSections,
+    decompressed_buffers: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !ElfBinary {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -102,6 +106,10 @@ pub const ElfBinary = struct {
     }
 
     pub fn deinit(self: *ElfBinary, allocator: std.mem.Allocator) void {
+        for (self.decompressed_buffers.items) |buf| {
+            allocator.free(buf);
+        }
+        self.decompressed_buffers.deinit(allocator);
         if (self.owned) {
             allocator.free(@constCast(self.data));
         }
@@ -112,6 +120,42 @@ pub const ElfBinary = struct {
         const end = start + @as(usize, @intCast(info.size));
         if (end > self.data.len) return null;
         return self.data[start..end];
+    }
+
+    /// Get section data, transparently decompressing if needed.
+    pub fn getSectionDataAlloc(self: *ElfBinary, allocator: std.mem.Allocator, info: SectionInfo) !?[]const u8 {
+        if (info.compression == .none) return self.getSectionData(info);
+        const decompressed = try self.decompressSection(allocator, info);
+        try self.decompressed_buffers.append(allocator, decompressed);
+        return decompressed;
+    }
+
+    /// Decompress a compressed debug section.
+    fn decompressSection(self: *const ElfBinary, allocator: std.mem.Allocator, info: SectionInfo) ![]u8 {
+        const raw = self.getSectionData(.{ .offset = info.offset, .size = info.size }) orelse return error.NoSectionData;
+
+        const header_size: usize = switch (info.compression) {
+            .zdebug => 12, // "ZLIB" + 8-byte BE size
+            .shf_compressed_64 => 24, // Elf64_Chdr
+            .shf_compressed_32 => 12, // Elf32_Chdr
+            .none => return error.NotCompressed,
+        };
+
+        if (raw.len < header_size) return error.InvalidCompressedSection;
+
+        // Validate header
+        if (info.compression == .zdebug) {
+            if (!std.mem.eql(u8, raw[0..4], "ZLIB")) return error.InvalidCompressedSection;
+        }
+
+        const compressed = raw[header_size..];
+
+        var reader = std.Io.Reader.fixed(compressed);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var decompress = std.compress.flate.Decompress.init(&reader, .zlib, &.{});
+        _ = decompress.reader.streamRemaining(&aw.writer) catch return error.DecompressFailed;
+        return aw.toOwnedSlice();
     }
 };
 
@@ -163,11 +207,13 @@ fn parseElf32(data: []const u8) !ElfBinary {
         const name = readStringFromTable(strtab, shdr.sh_name);
         if (name.len == 0) continue;
 
-        // Upcast 32-bit offsets/sizes to u64 for SectionInfo
-        const info = SectionInfo{
+        var info = SectionInfo{
             .offset = @as(u64, shdr.sh_offset),
             .size = @as(u64, shdr.sh_size),
         };
+        if (shdr.sh_flags & @as(u32, @truncate(SHF_COMPRESSED)) != 0) {
+            info.compression = .shf_compressed_32;
+        }
 
         matchDebugSection(name, info, &sections);
     }
@@ -209,10 +255,13 @@ fn parseElf64(data: []const u8) !ElfBinary {
         const name = readStringFromTable(strtab, shdr.sh_name);
         if (name.len == 0) continue;
 
-        const info = SectionInfo{
+        var info = SectionInfo{
             .offset = shdr.sh_offset,
             .size = shdr.sh_size,
         };
+        if (shdr.sh_flags & SHF_COMPRESSED != 0) {
+            info.compression = .shf_compressed_64;
+        }
 
         matchDebugSection(name, info, &sections);
     }
@@ -225,6 +274,7 @@ fn parseElf64(data: []const u8) !ElfBinary {
 }
 
 fn matchDebugSection(name: []const u8, info: SectionInfo, sections: *DebugSections) void {
+    // Uncompressed .debug_* sections
     if (std.mem.eql(u8, name, ".debug_info")) {
         sections.debug_info = info;
     } else if (std.mem.eql(u8, name, ".debug_abbrev")) {
@@ -264,8 +314,45 @@ fn matchDebugSection(name: []const u8, info: SectionInfo, sections: *DebugSectio
     } else if (std.mem.eql(u8, name, ".debug_pubtypes")) {
         sections.debug_pubtypes = info;
     }
-
-    // Also match .dwo suffixed sections (Split DWARF / debug fission)
+    // Compressed .zdebug_* sections (GNU zdebug format)
+    else if (std.mem.eql(u8, name, ".zdebug_info")) {
+        sections.debug_info = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_abbrev")) {
+        sections.debug_abbrev = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_line")) {
+        sections.debug_line = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_str")) {
+        sections.debug_str = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_ranges")) {
+        sections.debug_ranges = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_aranges")) {
+        sections.debug_aranges = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_line_str")) {
+        sections.debug_line_str = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_frame")) {
+        sections.debug_frame = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_loc")) {
+        sections.debug_loc = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_loclists")) {
+        sections.debug_loclists = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_rnglists")) {
+        sections.debug_rnglists = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_str_offsets")) {
+        sections.debug_str_offsets = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_addr")) {
+        sections.debug_addr = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_macro")) {
+        sections.debug_macro = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_names")) {
+        sections.debug_names = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_types")) {
+        sections.debug_types = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_pubnames")) {
+        sections.debug_pubnames = zdebugInfo(info);
+    } else if (std.mem.eql(u8, name, ".zdebug_pubtypes")) {
+        sections.debug_pubtypes = zdebugInfo(info);
+    }
+    // Split DWARF / debug fission (.dwo suffixed sections)
     else if (std.mem.eql(u8, name, ".debug_info.dwo")) {
         sections.debug_info = info;
     } else if (std.mem.eql(u8, name, ".debug_abbrev.dwo")) {
@@ -285,6 +372,13 @@ fn matchDebugSection(name: []const u8, info: SectionInfo, sections: *DebugSectio
     } else if (std.mem.eql(u8, name, ".debug_rnglists.dwo")) {
         sections.debug_rnglists = info;
     }
+}
+
+/// Create a SectionInfo with zdebug compression from an existing info.
+/// If the section was also marked SHF_COMPRESSED, zdebug takes precedence
+/// since the section name determines the format.
+fn zdebugInfo(info: SectionInfo) SectionInfo {
+    return .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
 }
 
 fn readStruct(comptime T: type, data: []const u8, offset: usize) !T {

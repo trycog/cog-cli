@@ -393,9 +393,10 @@ pub const TypeDieCache = struct {
         start_pos: usize,
         unit_end: usize,
         allocator: std.mem.Allocator,
+        cu_header_start: usize,
     ) ?*std.AutoHashMap(u64, TypeDie) {
         if (self.map.getPtr(start_pos)) |cached| return cached;
-        var type_map = collectTypeDies(debug_info, abbrevs, debug_str, extra, str_offsets_base, is_64bit, address_size, start_pos, unit_end, allocator) catch return null;
+        var type_map = collectTypeDies(debug_info, abbrevs, debug_str, extra, str_offsets_base, is_64bit, address_size, start_pos, unit_end, allocator, cu_header_start) catch return null;
         self.map.put(allocator, start_pos, type_map) catch {
             type_map.deinit();
             return null;
@@ -603,6 +604,7 @@ pub const FileEntry = struct {
 pub const LineProgramResult = struct {
     line_entries: []LineEntry,
     file_entries: []FileEntry,
+    allocated_paths: [][]const u8 = &.{}, // heap-allocated full paths that need freeing
 };
 
 /// Parse a DWARF line program and return both line entries and file entries.
@@ -630,6 +632,11 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
     errdefer entries.deinit(allocator);
     var files: std.ArrayListUnmanaged(FileEntry) = .empty;
     defer files.deinit(allocator);
+    var allocated_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (allocated_paths.items) |p| allocator.free(@constCast(p));
+        allocated_paths.deinit(allocator);
+    }
 
     while (pos < data.len) {
         // Unit length
@@ -697,10 +704,12 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
             pos += count; // Skip standard opcode lengths
         }
 
+        // Track file base offset for this CU (files accumulate across CUs)
+        const file_base_offset: u32 = @intCast(files.items.len);
+
         // Directories and files (DWARF 5 uses a different format)
         var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
         defer dirs.deinit(allocator);
-        files.clearRetainingCapacity();
 
         if (version >= 5) {
             // DWARF 5 directory/file entry format
@@ -828,6 +837,21 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
             if (pos < data.len) pos += 1; // Skip terminating 0
         }
 
+        // Resolve full paths: combine directory + filename per DWARF spec Section 6.2.4
+        for (files.items[file_base_offset..]) |*fe| {
+            const di: usize = @intCast(fe.dir_index);
+            if (di < dirs.items.len) {
+                const dir = dirs.items[di];
+                if (dir.len > 0 and fe.name.len > 0 and !std.fs.path.isAbsolute(fe.name)) {
+                    const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, fe.name });
+                    try allocated_paths.append(allocator, full);
+                    fe.name = full;
+                } else if (dir.len > 0 and fe.name.len == 0) {
+                    fe.name = dir;
+                }
+            }
+        }
+
         // Execute line program
         pos = header_end;
 
@@ -855,9 +879,10 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
                 switch (ext_opcode) {
                     DW_LNE_end_sequence => {
                         end_sequence = true;
+                        const norm_fi = normalizeFileIndex(file_index, file_base_offset, version);
                         try entries.append(allocator, .{
                             .address = address,
-                            .file_index = file_index,
+                            .file_index = norm_fi,
                             .line = line,
                             .column = column,
                             .is_stmt = is_stmt,
@@ -896,9 +921,10 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
                 // Standard opcode
                 switch (opcode) {
                     DW_LNS_copy => {
+                        const norm_fi = normalizeFileIndex(file_index, file_base_offset, version);
                         try entries.append(allocator, .{
                             .address = address,
-                            .file_index = file_index,
+                            .file_index = norm_fi,
                             .line = line,
                             .column = column,
                             .is_stmt = is_stmt,
@@ -962,9 +988,10 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
                     if (new_line > 0) {
                         line = @intCast(new_line);
                     }
+                    const norm_fi = normalizeFileIndex(file_index, file_base_offset, version);
                     try entries.append(allocator, .{
                         .address = address,
-                        .file_index = file_index,
+                        .file_index = norm_fi,
                         .line = line,
                         .column = column,
                         .is_stmt = is_stmt,
@@ -984,16 +1011,40 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
 
     if (keep_files) {
         const owned_files = try allocator.dupe(FileEntry, files.items);
+        const owned_paths = try allocated_paths.toOwnedSlice(allocator);
         return .{
             .line_entries = line_result,
             .file_entries = owned_files,
+            .allocated_paths = owned_paths,
         };
     }
+
+    // Not keeping files; free any allocated paths
+    for (allocated_paths.items) |p| allocator.free(@constCast(p));
+    allocated_paths.deinit(allocator);
+    // Reset so errdefer doesn't double-free
+    allocated_paths = .empty;
 
     return .{
         .line_entries = line_result,
         .file_entries = &.{},
     };
+}
+
+/// Normalize a file index from the DWARF state machine to a 0-based index
+/// into the accumulated files array.
+/// DWARF 4: file indices are 1-based, so subtract 1 then add base offset.
+/// DWARF 5: file indices are 0-based, so just add base offset.
+fn normalizeFileIndex(file_index: u32, file_base_offset: u32, version: u16) u32 {
+    if (version >= 5) {
+        return file_base_offset + file_index;
+    } else {
+        // DWARF 4: 1-based
+        if (file_index > 0) {
+            return file_base_offset + file_index - 1;
+        }
+        return file_base_offset;
+    }
 }
 
 /// Resolve an address to a source location using line entries.
@@ -1030,11 +1081,7 @@ pub fn resolveAddress(entries: []const LineEntry, files: []const FileEntry, addr
 }
 
 fn getFileName(files: []const FileEntry, index: u32) []const u8 {
-    // DWARF 4: file indices are 1-based
-    // DWARF 5: file indices are 0-based
-    if (index > 0 and index - 1 < files.len) {
-        return files[index - 1].name;
-    }
+    // After normalization, all file indices are 0-based
     if (index < files.len) {
         return files[index].name;
     }
@@ -2060,9 +2107,10 @@ const TypeDie = struct {
     name: ?[]const u8 = null,
     encoding: u8 = 0,
     byte_size: u8 = 0,
-    type_ref: u64 = 0, // DW_AT_type reference (CU-relative offset)
+    type_ref: u64 = 0, // DW_AT_type reference (CU-relative offset, or absolute for DW_FORM_ref_addr)
     type_sig8: u64 = 0, // DW_FORM_ref_sig8 type signature
     has_type_ref: bool = false,
+    type_ref_is_absolute: bool = false, // true when type_ref is from DW_FORM_ref_addr (absolute .debug_info offset)
     has_type_sig8: bool = false,
     // For struct members
     member_location: u16 = 0,
@@ -2102,6 +2150,7 @@ fn collectTypeDies(
     start_pos: usize,
     unit_end: usize,
     allocator: std.mem.Allocator,
+    cu_header_start: usize,
 ) !std.AutoHashMap(u64, TypeDie) {
     var type_map = std.AutoHashMap(u64, TypeDie).init(allocator);
     errdefer type_map.deinit();
@@ -2185,6 +2234,14 @@ fn collectTypeDies(
                     if (attr.form == DW_FORM_ref_sig8) {
                         die.type_sig8 = readU64(debug_info, &scan_pos) catch break;
                         die.has_type_sig8 = true;
+                    } else if (attr.form == DW_FORM_ref_addr) {
+                        // Absolute offset into .debug_info (cross-CU reference, used by Go)
+                        die.has_type_ref = true;
+                        die.type_ref_is_absolute = true;
+                        die.type_ref = if (is_64bit)
+                            readU64(debug_info, &scan_pos) catch break
+                        else
+                            readU32(debug_info, &scan_pos) catch break;
                     } else {
                         die.has_type_ref = true;
                         if (attr.form == DW_FORM_ref4) {
@@ -2333,6 +2390,15 @@ fn collectTypeDies(
             }
         }
 
+        // Convert CU-relative type/discr references to absolute .debug_info offsets
+        // (skip absolute refs from DW_FORM_ref_addr — they're already absolute)
+        if (die.has_type_ref and die.type_ref != 0 and !die.type_ref_is_absolute) {
+            die.type_ref += cu_header_start;
+        }
+        if (die.has_discr_ref and die.discr_ref != 0) {
+            die.discr_ref += cu_header_start;
+        }
+
         // Store type-related DIEs
         const is_type_die = (abbrev.tag == DW_TAG_base_type or
             abbrev.tag == DW_TAG_structure_type or
@@ -2375,6 +2441,14 @@ fn collectTypeDies(
     return type_map;
 }
 
+/// Optional context for resolving cross-CU type references in resolveTypeDescription.
+const CrossCuContext = struct {
+    debug_info: []const u8,
+    debug_abbrev: []const u8,
+    debug_str: ?[]const u8,
+    extra: ExtraSections,
+};
+
 /// Resolve a type reference through the type graph to produce a TypeDescription.
 /// Follows pointer chains, typedefs, const qualifiers, etc.
 fn resolveTypeDescription(
@@ -2382,7 +2456,17 @@ fn resolveTypeDescription(
     type_ref: u64,
     allocator: std.mem.Allocator,
 ) !TypeDescription {
-    return resolveTypeDescriptionImpl(type_map, type_ref, allocator, 0);
+    return resolveTypeDescriptionImpl(type_map, type_ref, allocator, 0, null);
+}
+
+/// Like resolveTypeDescription but with cross-CU fallback support.
+fn resolveTypeDescriptionCrossCu(
+    type_map: *const std.AutoHashMap(u64, TypeDie),
+    type_ref: u64,
+    allocator: std.mem.Allocator,
+    cross_cu: CrossCuContext,
+) !TypeDescription {
+    return resolveTypeDescriptionImpl(type_map, type_ref, allocator, 0, cross_cu);
 }
 
 fn resolveTypeDescriptionImpl(
@@ -2390,11 +2474,29 @@ fn resolveTypeDescriptionImpl(
     type_ref: u64,
     allocator: std.mem.Allocator,
     depth: u32,
+    cross_cu: ?CrossCuContext,
 ) !TypeDescription {
     // Guard against infinite loops
     if (depth > 20) return TypeDescription{ .kind = .unknown, .name = "<recursive type>" };
 
-    const die = type_map.get(type_ref) orelse return TypeDescription{ .kind = .unknown };
+    const die = type_map.get(type_ref) orelse {
+        // Cross-CU fallback: type is in a different compilation unit
+        if (cross_cu) |ctx| {
+            var enc: u8 = 0;
+            var bsz: u8 = 0;
+            var tname: []const u8 = "";
+            resolveTypeAtOffset(ctx.debug_info, ctx.debug_abbrev, ctx.debug_str, ctx.extra, type_ref, &enc, &bsz, &tname, allocator);
+            if (enc != 0 or bsz != 0 or tname.len > 0) {
+                return TypeDescription{
+                    .kind = .base,
+                    .name = tname,
+                    .encoding = enc,
+                    .byte_size = bsz,
+                };
+            }
+        }
+        return TypeDescription{ .kind = .unknown };
+    };
 
     switch (die.tag) {
         DW_TAG_base_type => {
@@ -2412,7 +2514,7 @@ fn resolveTypeDescriptionImpl(
                 .byte_size = if (die.byte_size > 0) die.byte_size else 8, // pointers are 8 bytes on 64-bit
             };
             if (die.has_type_ref) {
-                const pointee = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1);
+                const pointee = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1, cross_cu);
                 desc.pointee_name = pointee.name;
             } else {
                 desc.pointee_name = "void";
@@ -2583,7 +2685,7 @@ fn resolveTypeDescriptionImpl(
         DW_TAG_typedef => {
             // Follow the typedef to the underlying type
             if (die.has_type_ref) {
-                var resolved = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1);
+                var resolved = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1, cross_cu);
                 // Keep the typedef name as the display name
                 resolved.kind = .typedef_type;
                 if (die.name) |n| {
@@ -2599,7 +2701,7 @@ fn resolveTypeDescriptionImpl(
         DW_TAG_const_type, DW_TAG_volatile_type, DW_TAG_restrict_type, DW_TAG_atomic_type => {
             // Transparent qualifier — follow to underlying type
             if (die.has_type_ref) {
-                var resolved = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1);
+                var resolved = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1, cross_cu);
                 resolved.kind = .const_type;
                 return resolved;
             }
@@ -2609,7 +2711,7 @@ fn resolveTypeDescriptionImpl(
             // Function pointer type — resolve return type if available
             var ret_name: []const u8 = "void";
             if (die.has_type_ref) {
-                const ret = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1);
+                const ret = try resolveTypeDescriptionImpl(type_map, die.type_ref, allocator, depth + 1, cross_cu);
                 ret_name = ret.name;
             }
             return TypeDescription{
@@ -2919,6 +3021,178 @@ pub fn freeVariables(variables: []VariableInfo, allocator: std.mem.Allocator) vo
     allocator.free(variables);
 }
 
+/// Resolve a type DIE at an absolute .debug_info offset by parsing it directly.
+/// Used for cross-CU type references (DW_FORM_ref_addr) where the type is in a
+/// different compilation unit than the one whose type map we have.
+/// Follows type chains (pointer/typedef/const/volatile/restrict) to the underlying type.
+fn resolveTypeAtOffset(
+    debug_info: []const u8,
+    debug_abbrev: []const u8,
+    debug_str: ?[]const u8,
+    extra: ExtraSections,
+    offset: u64,
+    encoding: *u8,
+    byte_size: *u8,
+    type_name: *[]const u8,
+    allocator: std.mem.Allocator,
+) void {
+    resolveTypeAtOffsetImpl(debug_info, debug_abbrev, debug_str, extra, offset, encoding, byte_size, type_name, allocator, 0);
+}
+
+fn resolveTypeAtOffsetImpl(
+    debug_info: []const u8,
+    debug_abbrev: []const u8,
+    debug_str: ?[]const u8,
+    extra: ExtraSections,
+    offset: u64,
+    encoding: *u8,
+    byte_size: *u8,
+    type_name: *[]const u8,
+    allocator: std.mem.Allocator,
+    depth: u32,
+) void {
+    if (depth > 20) return;
+    const off: usize = @intCast(offset);
+    if (off >= debug_info.len) return;
+
+    // Find which CU this offset belongs to by scanning CU headers
+    var cu_pos: usize = 0;
+    var target_cu_abbrev_offset: u64 = 0;
+    var target_cu_is_64bit = false;
+    var found_cu = false;
+    while (cu_pos < debug_info.len) {
+        var hpos = cu_pos;
+        const ul32 = readU32(debug_info, &hpos) catch break;
+        var is64 = false;
+        var ul: u64 = ul32;
+        if (ul32 == 0xFFFFFFFF) {
+            ul = readU64(debug_info, &hpos) catch break;
+            is64 = true;
+        }
+        if (ul == 0) break;
+        const cu_end = hpos + @as(usize, @intCast(ul));
+        const ver = readU16(debug_info, &hpos) catch break;
+        var abbr_off: u64 = undefined;
+        if (ver >= 5) {
+            hpos += 1; // unit_type
+            hpos += 1; // address_size
+            abbr_off = if (is64) readU64(debug_info, &hpos) catch break else readU32(debug_info, &hpos) catch break;
+        } else {
+            abbr_off = if (is64) readU64(debug_info, &hpos) catch break else readU32(debug_info, &hpos) catch break;
+            hpos += 1; // address_size
+        }
+        if (off >= cu_pos and off < cu_end) {
+            target_cu_abbrev_offset = abbr_off;
+            target_cu_is_64bit = is64;
+            found_cu = true;
+            break;
+        }
+        cu_pos = cu_end;
+    }
+    if (!found_cu) return;
+
+    // Parse the abbreviation table for this CU
+    if (target_cu_abbrev_offset >= debug_abbrev.len) return;
+    const abbrevs = parseAbbrevTable(debug_abbrev[@intCast(target_cu_abbrev_offset)..], allocator) catch return;
+    defer freeAbbrevTable(abbrevs, allocator);
+
+    // Parse the DIE at the target offset
+    var pos = off;
+    const abbrev_code = readULEB128(debug_info, &pos) catch return;
+    if (abbrev_code == 0) return;
+    const abbrev = findAbbrev(abbrevs, abbrev_code) orelse return;
+
+    // Track whether this DIE has a DW_AT_type reference (for type chain following)
+    var child_type_ref: u64 = 0;
+    var child_type_ref_is_absolute = false;
+
+    // Read attributes to extract name, encoding, byte_size
+    for (abbrev.attributes) |attr| {
+        if (attr.form == DW_FORM_implicit_const) continue;
+        switch (attr.name) {
+            DW_AT_name => {
+                if (attr.form == DW_FORM_string) {
+                    type_name.* = readNullTermString(debug_info, &pos);
+                } else if (attr.form == DW_FORM_strp) {
+                    const str_off = if (target_cu_is_64bit)
+                        readU64(debug_info, &pos) catch return
+                    else
+                        readU32(debug_info, &pos) catch return;
+                    if (debug_str) |s| {
+                        if (readStringAt(s, @intCast(str_off))) |name| type_name.* = name;
+                    }
+                } else if (attr.form == DW_FORM_strx or attr.form == DW_FORM_strx1 or
+                    attr.form == DW_FORM_strx2 or attr.form == DW_FORM_strx4)
+                {
+                    const index = readFormIndex(debug_info, &pos, attr.form) catch return;
+                    if (resolveStrx(debug_str, extra.debug_str_offsets, 0, index, target_cu_is_64bit)) |name| type_name.* = name;
+                } else {
+                    skipForm(debug_info, &pos, attr.form, target_cu_is_64bit, 8) catch return;
+                }
+            },
+            DW_AT_encoding => {
+                if (attr.form == DW_FORM_data1 and pos < debug_info.len) {
+                    encoding.* = debug_info[pos];
+                    pos += 1;
+                } else {
+                    skipForm(debug_info, &pos, attr.form, target_cu_is_64bit, 8) catch return;
+                }
+            },
+            DW_AT_byte_size => {
+                if (attr.form == DW_FORM_data1 and pos < debug_info.len) {
+                    byte_size.* = debug_info[pos];
+                    pos += 1;
+                } else if (attr.form == DW_FORM_udata) {
+                    const v = readULEB128(debug_info, &pos) catch return;
+                    byte_size.* = if (v <= 255) @intCast(v) else 0;
+                } else {
+                    skipForm(debug_info, &pos, attr.form, target_cu_is_64bit, 8) catch return;
+                }
+            },
+            DW_AT_type => {
+                if (attr.form == DW_FORM_ref_addr) {
+                    child_type_ref = if (target_cu_is_64bit)
+                        readU64(debug_info, &pos) catch return
+                    else
+                        readU32(debug_info, &pos) catch return;
+                    child_type_ref_is_absolute = true;
+                } else if (attr.form == DW_FORM_ref4) {
+                    child_type_ref = readU32(debug_info, &pos) catch return;
+                } else if (attr.form == DW_FORM_ref1 and pos < debug_info.len) {
+                    child_type_ref = debug_info[pos];
+                    pos += 1;
+                } else if (attr.form == DW_FORM_ref2) {
+                    child_type_ref = readU16(debug_info, &pos) catch return;
+                } else if (attr.form == DW_FORM_ref8) {
+                    child_type_ref = readU64(debug_info, &pos) catch return;
+                } else if (attr.form == DW_FORM_ref_udata) {
+                    child_type_ref = readULEB128(debug_info, &pos) catch return;
+                } else {
+                    skipForm(debug_info, &pos, attr.form, target_cu_is_64bit, 8) catch return;
+                }
+            },
+            else => {
+                skipForm(debug_info, &pos, attr.form, target_cu_is_64bit, 8) catch return;
+            },
+        }
+    }
+
+    // Follow type chain for pointer/typedef/const/volatile/restrict types
+    // that don't have their own encoding/byte_size (they delegate to the underlying type).
+    if (encoding.* == 0 and byte_size.* == 0 and child_type_ref != 0) {
+        const is_chain_tag = (abbrev.tag == DW_TAG_pointer_type or
+            abbrev.tag == DW_TAG_typedef or
+            abbrev.tag == DW_TAG_const_type or
+            abbrev.tag == DW_TAG_volatile_type or
+            abbrev.tag == DW_TAG_restrict_type);
+        if (is_chain_tag) {
+            // Convert CU-relative offset to absolute if needed
+            const abs_ref = if (child_type_ref_is_absolute) child_type_ref else cu_pos + child_type_ref;
+            resolveTypeAtOffsetImpl(debug_info, debug_abbrev, debug_str, extra, abs_ref, encoding, byte_size, type_name, allocator, depth + 1);
+        }
+    }
+}
+
 // ── Scoped Variable Parsing ────────────────────────────────────────────
 
 pub const ScopedVariableResult = struct {
@@ -2966,6 +3240,7 @@ pub fn parseScopedVariables(
     // Iterate over compilation units (starting from hint if provided)
     while (cu_pos < debug_info.len and !found) {
         var pos = cu_pos;
+        const cu_header_start = cu_pos; // Save for converting CU-relative type refs to absolute offsets
 
         // CU header
         const unit_length_32 = readU32(debug_info, &pos) catch break;
@@ -3032,7 +3307,11 @@ pub fn parseScopedVariables(
         var loclists_base: u64 = 0;
         var cu_low_pc: u64 = 0;
 
-        if (version >= 5) {
+        // Extract CU DIE attributes needed for variable resolution.
+        // cu_low_pc is required for all DWARF versions (it's the base address
+        // for .debug_loc location lists). DWARF 5 attributes (str_offsets_base,
+        // addr_base, rnglists_base, loclists_base) are only relevant for v5+.
+        {
             var base_pos = pos;
             const first_code = readULEB128(debug_info, &base_pos) catch 0;
             if (first_code != 0) {
@@ -3040,7 +3319,7 @@ pub fn parseScopedVariables(
                     for (first_abbrev.attributes) |attr| {
                         if (attr.form == DW_FORM_implicit_const) continue;
 
-                        if (attr.name == DW_AT_str_offsets_base_c) {
+                        if (version >= 5 and attr.name == DW_AT_str_offsets_base_c) {
                             if (attr.form == DW_FORM_sec_offset) {
                                 str_offsets_base = if (is_64bit)
                                     readU64(debug_info, &base_pos) catch 0
@@ -3049,7 +3328,7 @@ pub fn parseScopedVariables(
                             } else {
                                 skipForm(debug_info, &base_pos, attr.form, is_64bit, 8) catch break;
                             }
-                        } else if (attr.name == DW_AT_addr_base_c) {
+                        } else if (version >= 5 and attr.name == DW_AT_addr_base_c) {
                             if (attr.form == DW_FORM_sec_offset) {
                                 addr_base = if (is_64bit)
                                     readU64(debug_info, &base_pos) catch 0
@@ -3058,7 +3337,7 @@ pub fn parseScopedVariables(
                             } else {
                                 skipForm(debug_info, &base_pos, attr.form, is_64bit, 8) catch break;
                             }
-                        } else if (attr.name == DW_AT_rnglists_base) {
+                        } else if (version >= 5 and attr.name == DW_AT_rnglists_base) {
                             if (attr.form == DW_FORM_sec_offset) {
                                 rnglists_base = if (is_64bit)
                                     readU64(debug_info, &base_pos) catch 0
@@ -3067,7 +3346,7 @@ pub fn parseScopedVariables(
                             } else {
                                 skipForm(debug_info, &base_pos, attr.form, is_64bit, 8) catch break;
                             }
-                        } else if (attr.name == DW_AT_loclists_base) {
+                        } else if (version >= 5 and attr.name == DW_AT_loclists_base) {
                             if (attr.form == DW_FORM_sec_offset) {
                                 loclists_base = if (is_64bit)
                                     readU64(debug_info, &base_pos) catch 0
@@ -3101,9 +3380,9 @@ pub fn parseScopedVariables(
         // First pass: collect all type DIEs into a rich type map
         var type_map_owned: ?std.AutoHashMap(u64, TypeDie) = null;
         const type_map_ptr: *std.AutoHashMap(u64, TypeDie) = if (type_die_cache) |tdc|
-            tdc.getOrBuild(debug_info, abbrevs, debug_str, extra, str_offsets_base, is_64bit, address_size, pos, unit_end, allocator) orelse continue
+            tdc.getOrBuild(debug_info, abbrevs, debug_str, extra, str_offsets_base, is_64bit, address_size, pos, unit_end, allocator, cu_header_start) orelse continue
         else blk: {
-            type_map_owned = collectTypeDies(debug_info, abbrevs, debug_str, extra, str_offsets_base, is_64bit, address_size, pos, unit_end, allocator) catch continue;
+            type_map_owned = collectTypeDies(debug_info, abbrevs, debug_str, extra, str_offsets_base, is_64bit, address_size, pos, unit_end, allocator, cu_header_start) catch continue;
             break :blk &type_map_owned.?;
         };
         defer if (type_map_owned != null) type_map_owned.?.deinit();
@@ -3132,6 +3411,7 @@ pub fn parseScopedVariables(
             var die_name: ?[]const u8 = null;
             var die_location: ?[]const u8 = null;
             var die_type_ref: u64 = 0;
+            var die_type_ref_is_absolute = false;
             var die_low_pc: u64 = 0;
             var die_high_pc: u64 = 0;
             var die_high_pc_is_offset = false;
@@ -3165,6 +3445,40 @@ pub fn parseScopedVariables(
                             const loc_len = readULEB128(debug_info, &pos) catch break;
                             const loc_end = pos + @as(usize, @intCast(loc_len));
                             if (loc_end <= debug_info.len) {
+                                die_location = debug_info[pos..loc_end];
+                            }
+                            pos = loc_end;
+                        } else if (attr.form == DW_FORM_block1) {
+                            // DWARF 4: 1-byte length prefix + expression bytes
+                            if (pos < debug_info.len) {
+                                const loc_len = debug_info[pos];
+                                pos += 1;
+                                const loc_end = pos + loc_len;
+                                if (loc_end <= debug_info.len and loc_len > 0) {
+                                    die_location = debug_info[pos..loc_end];
+                                }
+                                pos = loc_end;
+                            }
+                        } else if (attr.form == DW_FORM_block2) {
+                            const loc_len = readU16(debug_info, &pos) catch break;
+                            const loc_end = pos + loc_len;
+                            if (loc_end <= debug_info.len and loc_len > 0) {
+                                die_location = debug_info[pos..loc_end];
+                            }
+                            pos = loc_end;
+                        } else if (attr.form == DW_FORM_block4) {
+                            const loc_len_u32 = readU32(debug_info, &pos) catch break;
+                            const loc_len: usize = @intCast(loc_len_u32);
+                            const loc_end = pos + loc_len;
+                            if (loc_end <= debug_info.len and loc_len > 0) {
+                                die_location = debug_info[pos..loc_end];
+                            }
+                            pos = loc_end;
+                        } else if (attr.form == DW_FORM_block) {
+                            const loc_len_uleb = readULEB128(debug_info, &pos) catch break;
+                            const loc_len: usize = @intCast(loc_len_uleb);
+                            const loc_end = pos + loc_len;
+                            if (loc_end <= debug_info.len and loc_len > 0) {
                                 die_location = debug_info[pos..loc_end];
                             }
                             pos = loc_end;
@@ -3218,6 +3532,40 @@ pub fn parseScopedVariables(
                                 die_frame_base = debug_info[pos..fb_end];
                             }
                             pos = fb_end;
+                        } else if (attr.form == DW_FORM_block1) {
+                            // DWARF 4: 1-byte length prefix + expression bytes (Go uses this)
+                            if (pos < debug_info.len) {
+                                const fb_len = debug_info[pos];
+                                pos += 1;
+                                const fb_end = pos + fb_len;
+                                if (fb_end <= debug_info.len and fb_len > 0) {
+                                    die_frame_base = debug_info[pos..fb_end];
+                                }
+                                pos = fb_end;
+                            }
+                        } else if (attr.form == DW_FORM_block2) {
+                            const fb_len = readU16(debug_info, &pos) catch break;
+                            const fb_end = pos + fb_len;
+                            if (fb_end <= debug_info.len and fb_len > 0) {
+                                die_frame_base = debug_info[pos..fb_end];
+                            }
+                            pos = fb_end;
+                        } else if (attr.form == DW_FORM_block4) {
+                            const fb_len_u32 = readU32(debug_info, &pos) catch break;
+                            const fb_len: usize = @intCast(fb_len_u32);
+                            const fb_end = pos + fb_len;
+                            if (fb_end <= debug_info.len and fb_len > 0) {
+                                die_frame_base = debug_info[pos..fb_end];
+                            }
+                            pos = fb_end;
+                        } else if (attr.form == DW_FORM_block) {
+                            const fb_len_uleb = readULEB128(debug_info, &pos) catch break;
+                            const fb_len: usize = @intCast(fb_len_uleb);
+                            const fb_end = pos + fb_len;
+                            if (fb_end <= debug_info.len and fb_len > 0) {
+                                die_frame_base = debug_info[pos..fb_end];
+                            }
+                            pos = fb_end;
                         } else {
                             skipForm(debug_info, &pos, attr.form, is_64bit, 8) catch break;
                         }
@@ -3225,6 +3573,13 @@ pub fn parseScopedVariables(
                     DW_AT_type => {
                         if (attr.form == DW_FORM_ref_sig8) {
                             pos += 8; // Type signature — skip for now
+                        } else if (attr.form == DW_FORM_ref_addr) {
+                            // Absolute offset into .debug_info (used by Go for cross-CU type refs)
+                            die_type_ref = if (is_64bit)
+                                readU64(debug_info, &pos) catch break
+                            else
+                                readU32(debug_info, &pos) catch break;
+                            die_type_ref_is_absolute = true;
                         } else if (attr.form == DW_FORM_ref4) {
                             die_type_ref = readU32(debug_info, &pos) catch break;
                         } else if (attr.form == DW_FORM_ref1 and pos < debug_info.len) {
@@ -3323,6 +3678,17 @@ pub fn parseScopedVariables(
                 else
                     false;
 
+                if (die_low_pc > 0 and die_low_pc <= target_pc + 0x100 and target_pc < die_low_pc + 0x1000) {
+                    const df = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
+                    if (df) |dfile| {
+                        defer dfile.close();
+                        dfile.seekFromEnd(0) catch {};
+                        var dbuf: [512]u8 = undefined;
+                        const dmsg = std.fmt.bufPrint(&dbuf, "parseScopedVars: subprog low=0x{x} high=0x{x} target_pc=0x{x} match={}\n", .{ die_low_pc, die_high_pc, target_pc, pc_in_func }) catch "parseScopedVars: fmt error\n";
+                        dfile.writeAll(dmsg) catch {};
+                    }
+                }
+
                 if (pc_in_func) {
                     in_target_func = true;
                     target_func_depth = depth;
@@ -3342,14 +3708,26 @@ pub fn parseScopedVariables(
                     var type_desc: ?TypeDescription = null;
 
                     if (die_type_ref != 0) {
-                        if (type_map_ptr.get(die_type_ref)) |type_die| {
+                        // DW_FORM_ref_addr gives absolute offsets; other DW_FORM_ref*
+                        // give CU-relative offsets that need conversion to absolute.
+                        const abs_type_ref = if (die_type_ref_is_absolute)
+                            die_type_ref
+                        else
+                            cu_header_start + die_type_ref;
+                        const cross_cu_ctx = CrossCuContext{
+                            .debug_info = debug_info,
+                            .debug_abbrev = debug_abbrev,
+                            .debug_str = debug_str,
+                            .extra = extra,
+                        };
+                        if (type_map_ptr.get(abs_type_ref)) |type_die| {
                             encoding = type_die.encoding;
                             byte_size = type_die.byte_size;
                             type_name = type_die.name orelse "";
 
                             // Build rich type description for composite types
                             if (type_die.tag != DW_TAG_base_type) {
-                                type_desc = resolveTypeDescription(type_map_ptr, die_type_ref, allocator) catch null;
+                                type_desc = resolveTypeDescriptionCrossCu(type_map_ptr, abs_type_ref, allocator, cross_cu_ctx) catch null;
                                 if (type_desc) |td| {
                                     // Use resolved info for display
                                     if (td.byte_size > 0) byte_size = td.byte_size;
@@ -3357,6 +3735,10 @@ pub fn parseScopedVariables(
                                     if (td.encoding > 0) encoding = td.encoding;
                                 }
                             }
+                        } else if (die_type_ref_is_absolute) {
+                            // Cross-CU reference (DW_FORM_ref_addr): type is in a different
+                            // CU than the one we scanned. Parse the type DIE directly.
+                            resolveTypeAtOffset(debug_info, debug_abbrev, debug_str, extra, abs_type_ref, &encoding, &byte_size, &type_name, allocator);
                         }
                     }
 
@@ -3364,6 +3746,17 @@ pub fn parseScopedVariables(
                         try allocator.dupe(u8, loc)
                     else
                         try allocator.alloc(u8, 0);
+
+                    {
+                        const df2 = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
+                        if (df2) |dfile2| {
+                            defer dfile2.close();
+                            dfile2.seekFromEnd(0) catch {};
+                            var dbuf2: [512]u8 = undefined;
+                            const dmsg2 = std.fmt.bufPrint(&dbuf2, "parseScopedVars: var name={s} loc_expr_len={} die_location_len={} cu_low_pc=0x{x}\n", .{ name, loc_expr.len, if (die_location) |l| l.len else @as(usize, 0), cu_low_pc }) catch "parseScopedVars var: fmt error\n";
+                            dfile2.writeAll(dmsg2) catch {};
+                        }
+                    }
 
                     try variables.append(allocator, .{
                         .name = name,
@@ -4445,9 +4838,9 @@ test "resolveAddress returns null for unknown address" {
 
 test "resolveAddress returns source location for known address" {
     const entries = [_]LineEntry{
-        .{ .address = 0x1000, .file_index = 1, .line = 5, .column = 3, .is_stmt = true, .end_sequence = false },
-        .{ .address = 0x1010, .file_index = 1, .line = 6, .column = 0, .is_stmt = true, .end_sequence = false },
-        .{ .address = 0x1020, .file_index = 1, .line = 7, .column = 0, .is_stmt = true, .end_sequence = true },
+        .{ .address = 0x1000, .file_index = 0, .line = 5, .column = 3, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1010, .file_index = 0, .line = 6, .column = 0, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1020, .file_index = 0, .line = 7, .column = 0, .is_stmt = true, .end_sequence = true },
     };
     const files = [_]FileEntry{
         .{ .name = "test.c", .dir_index = 0 },
@@ -4460,8 +4853,8 @@ test "resolveAddress returns source location for known address" {
 
 test "resolveAddress maps address between entries" {
     const entries = [_]LineEntry{
-        .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
-        .{ .address = 0x1020, .file_index = 1, .line = 15, .column = 0, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1000, .file_index = 0, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x1020, .file_index = 0, .line = 15, .column = 0, .is_stmt = true, .end_sequence = false },
     };
     const files = [_]FileEntry{
         .{ .name = "main.c", .dir_index = 0 },
@@ -4837,6 +5230,7 @@ test "collectTypeDies collects class_type and union_type" {
         11, // start after CU header
         ipos,
         std.testing.allocator,
+        0, // CU header starts at offset 0 in this test
     );
     defer type_map.deinit();
 

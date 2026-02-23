@@ -329,6 +329,16 @@ pub const DapProxy = struct {
             self.allocator.free(entry.body);
         }
         self.buffered_events.deinit(self.allocator);
+        // Clean up saved launch state
+        if (self.saved_launch_program) |p| self.allocator.free(p);
+        if (self.saved_launch_args) |args| {
+            for (args) |a| self.allocator.free(a);
+            self.allocator.free(args);
+        }
+        if (self.saved_adapter_argv) |argv| {
+            for (argv) |a| self.allocator.free(a);
+            self.allocator.free(argv);
+        }
         if (self.process) |*proc| {
             // Kill the entire process group (adapter + launcher + debuggee).
             // setsid() makes the adapter the session+group leader, so
@@ -391,6 +401,7 @@ pub const DapProxy = struct {
         .findSymbolFn = proxyFindSymbol,
         .drainNotificationsFn = proxyDrainNotifications,
         .rawRequestFn = proxyRawRequest,
+        .getPidFn = proxyGetPid,
     };
 
     fn nextSeq(self: *DapProxy) i64 {
@@ -1690,6 +1701,12 @@ pub const DapProxy = struct {
         }
 
         return .{ .result = result_str, .@"type" = type_str, .result_allocated = true };
+    }
+
+    fn proxyGetPid(ctx: *anyopaque) ?std.posix.pid_t {
+        const self: *DapProxy = @ptrCast(@alignCast(ctx));
+        if (self.process) |proc| return proc.id;
+        return null;
     }
 
     fn proxyStop(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!void {

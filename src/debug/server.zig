@@ -514,6 +514,18 @@ pub const DebugServer = struct {
         }
     }
 
+    // ── Helpers ────────────────────────────────────────────────────────
+
+    const RUNNING_ERROR = "Session is running. Use debug_poll_events to check status or debug_stop to cancel.";
+
+    /// Return an error result if the session is currently executing (has a pending async run).
+    fn requireStopped(session: *session_mod.Session) ?ToolResult {
+        if (session.pending_run != null or session.status == .running) {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = RUNNING_ERROR } };
+        }
+        return null;
+    }
+
     // ── Tool Implementations ────────────────────────────────────────────
 
     fn toolLaunch(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
@@ -539,14 +551,12 @@ pub const DebugServer = struct {
             if (config.language) |lang| {
                 if (std.mem.eql(u8, lang, "python") or
                     std.mem.eql(u8, lang, "javascript") or
-                    std.mem.eql(u8, lang, "go") or
                     std.mem.eql(u8, lang, "java")) break :blk true;
             }
             // Check file extension
             const ext = std.fs.path.extension(config.program);
             if (std.mem.eql(u8, ext, ".py") or
                 std.mem.eql(u8, ext, ".js") or
-                std.mem.eql(u8, ext, ".go") or
                 std.mem.eql(u8, ext, ".java")) break :blk true;
             break :blk false;
         };
@@ -808,22 +818,85 @@ pub const DebugServer = struct {
             .thread_id = if (a.object.get("thread_id")) |v| (if (v == .integer) @as(u32, @intCast(v.integer)) else null) else null,
         };
 
+        // Pause and restart are non-blocking — keep synchronous
+        if (action == .pause or action == .restart) {
+            session.status = .running;
+            const state = session.driver.runEx(allocator, action, run_options) catch |err| {
+                self.dashboard.onError("cog_debug_run", @errorName(err));
+                return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
+            };
+
+            session.status = if (state.exit_code != null) .terminated else .stopped;
+            self.dashboard.onRun(session_id_val.string, action_val.string, state);
+            self.emitStopEvent(session_id_val.string, action_val.string, state);
+
+            var aw: Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var jw: Stringify = .{ .writer = &aw.writer };
+            try state.jsonStringify(&jw);
+            const result = try aw.toOwnedSlice();
+            return .{ .ok = result };
+        }
+
+        // Async execution control: continue, step_into, step_over, step_out,
+        // reverse_continue, step_back — spawn background thread, return immediately.
+        if (session.pending_run != null) {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Session is already running. Use debug_poll_events to check status or debug_stop to cancel." } };
+        }
+
         session.status = .running;
-        const state = session.driver.runEx(allocator, action, run_options) catch |err| {
-            self.dashboard.onError("cog_debug_run", @errorName(err));
-            return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
+        self.emitRunEvent(session_id_val.string, action_val.string);
+
+        // Dupe session_id and action_name so they outlive the parsed JSON request.
+        const owned_session_id = self.allocator.dupe(u8, session_id_val.string) catch
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to allocate session_id" } };
+        const owned_action_name = self.allocator.dupe(u8, action_val.string) catch {
+            self.allocator.free(owned_session_id);
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to allocate action_name" } };
         };
 
-        session.status = if (state.exit_code != null) .terminated else .stopped;
-        self.dashboard.onRun(session_id_val.string, action_val.string, state);
-        self.emitStopEvent(session_id_val.string, action_val.string, state);
+        session.pending_run = .{
+            .thread = std.Thread.spawn(.{}, runBackground, .{ session, self.allocator, action, run_options }) catch |err| {
+                session.status = .stopped;
+                self.allocator.free(owned_session_id);
+                self.allocator.free(owned_action_name);
+                session.pending_run = null;
+                self.dashboard.onError("cog_debug_run", @errorName(err));
+                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to spawn run thread" } };
+            },
+            .session_id = owned_session_id,
+            .action_name = owned_action_name,
+            .allocator = self.allocator,
+        };
 
         var aw: Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        var s: Stringify = .{ .writer = &aw.writer };
-        try state.jsonStringify(&s);
+        var jw: Stringify = .{ .writer = &aw.writer };
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write("running");
+        try jw.objectField("session_id");
+        try jw.write(session_id_val.string);
+        try jw.endObject();
         const result = try aw.toOwnedSlice();
         return .{ .ok = result };
+    }
+
+    /// Background thread function for async execution control.
+    /// Calls driver.runEx() which blocks until the debuggee stops.
+    /// Writes result to session.pending_run using release/acquire ordering.
+    fn runBackground(session: *session_mod.Session, alloc: std.mem.Allocator, action: types.RunAction, opts: types.RunOptions) void {
+        const state = session.driver.runEx(alloc, action, opts) catch |err| {
+            if (session.pending_run) |*pr| {
+                pr.error_msg = @errorName(err);
+                pr.result.store(2, .release);
+            }
+            return;
+        };
+        if (session.pending_run) |*pr| {
+            pr.stop_state = state;
+            pr.result.store(1, .release);
+        }
     }
 
     fn toolInspect(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
@@ -835,6 +908,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const request = types.InspectRequest{
             .expression = if (a.object.get("expression")) |v| (if (v == .string) v.string else null) else null,
@@ -882,7 +957,17 @@ pub const DebugServer = struct {
         const detach = if (a.object.get("detach")) |v| (v == .bool and v.bool) else false;
 
         if (self.session_manager.getSession(session_id)) |session| {
-            if (terminate_only) {
+            if (session.pending_run != null) {
+                // Background thread is blocking on waitpid/read.
+                // Kill the process directly via SIGKILL — this is safe from any
+                // thread (unlike ptrace) and unblocks the background thread.
+                // Do NOT call driver.stop() which would race on waitpid.
+                if (session.driver.getPid()) |pid| {
+                    posix.kill(pid, posix.SIG.KILL) catch {};
+                }
+                // The background thread will detect the kill and set result to
+                // completed/error. destroySession joins the thread.
+            } else if (terminate_only) {
                 // Terminate the debuggee and clean up session
                 session.driver.terminate(allocator) catch {
                     // Fall back to full stop if terminate not supported
@@ -959,6 +1044,8 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
+        if (requireStopped(session)) |err_result| return err_result;
+
         const thread_id: u32 = if (a.object.get("thread_id")) |v| (if (v == .integer) @intCast(v.integer) else 1) else 1;
         const start_frame: u32 = if (a.object.get("start_frame")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
         const levels: u32 = if (a.object.get("levels")) |v| (if (v == .integer) @intCast(v.integer) else 20) else 20;
@@ -998,6 +1085,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const action_val = a.object.get("action") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing action" } };
         if (action_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "action must be string" } };
@@ -1081,6 +1170,8 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
+        if (requireStopped(session)) |err_result| return err_result;
+
         const address: u64 = if (a.object.get("address")) |addr_val| blk: {
             if (addr_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "address must be string" } };
             const addr_str = addr_val.string;
@@ -1149,7 +1240,6 @@ pub const DebugServer = struct {
                 const lang = lang_val.string;
                 if (std.mem.eql(u8, lang, "python") or
                     std.mem.eql(u8, lang, "javascript") or
-                    std.mem.eql(u8, lang, "go") or
                     std.mem.eql(u8, lang, "java")) break :blk true;
             }
             break :blk false;
@@ -1221,6 +1311,8 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
+        if (requireStopped(session)) |err_result| return err_result;
+
         const var_val = a.object.get("variable") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing variable" } };
         if (var_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "variable must be string" } };
 
@@ -1255,6 +1347,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const frame_id: u32 = if (a.object.get("frame_id")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
 
@@ -1488,6 +1582,8 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
+        if (requireStopped(session)) |err_result| return err_result;
+
         const expr_val = a.object.get("expression") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing expression" } };
         if (expr_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "expression must be string" } };
 
@@ -1522,6 +1618,8 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
+        if (requireStopped(session)) |err_result| return err_result;
+
         const frame_id_val = a.object.get("frame_id") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing frame_id" } };
         if (frame_id_val != .integer) return .{ .err = .{ .code = INVALID_PARAMS, .message = "frame_id must be integer" } };
 
@@ -1545,6 +1643,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const thread_id: u32 = if (a.object.get("thread_id")) |v| (if (v == .integer) @intCast(v.integer) else 1) else 1;
 
@@ -1571,6 +1671,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const thread_id: u32 = if (a.object.get("thread_id")) |v| (if (v == .integer) @intCast(v.integer) else 1) else 1;
 
@@ -1672,6 +1774,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const frame_id_val = a.object.get("frame_id") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing frame_id" } };
         if (frame_id_val != .integer) return .{ .err = .{ .code = INVALID_PARAMS, .message = "frame_id must be integer" } };
@@ -1909,6 +2013,8 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
+        if (requireStopped(session)) |err_result| return err_result;
+
         const name_val = a.object.get("name") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing name" } };
         if (name_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "name must be string" } };
 
@@ -1934,6 +2040,8 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        if (requireStopped(session)) |err_result| return err_result;
 
         const name_val = a.object.get("name") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing name" } };
         if (name_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "name must be string" } };
@@ -1979,7 +2087,57 @@ pub const DebugServer = struct {
             if (session_id_filter) |filter| {
                 if (!std.mem.eql(u8, entry.key_ptr.*, filter)) continue;
             }
-            const notifications = entry.value_ptr.*.driver.drainNotifications(allocator);
+
+            const session = entry.value_ptr;
+
+            // Check for completed async run
+            if (session.pending_run) |*pr| {
+                const status = pr.result.load(.acquire);
+                if (status == 1) {
+                    // Completed successfully — emit stopped event
+                    if (pr.stop_state) |state| {
+                        session.status = if (state.exit_code != null) .terminated else .stopped;
+                        self.dashboard.onRun(entry.key_ptr.*, pr.action_name, state);
+                        self.emitStopEvent(entry.key_ptr.*, pr.action_name, state);
+
+                        try jw.beginObject();
+                        try jw.objectField("session_id");
+                        try jw.write(entry.key_ptr.*);
+                        try jw.objectField("method");
+                        try jw.write("stopped");
+                        try jw.objectField("params");
+                        try state.jsonStringify(&jw);
+                        try jw.endObject();
+                    }
+                    pr.thread.join();
+                    pr.deinit();
+                    session.pending_run = null;
+                } else if (status == 2) {
+                    // Error — emit error event
+                    const err_msg = pr.error_msg orelse "unknown error";
+                    session.status = .stopped;
+
+                    try jw.beginObject();
+                    try jw.objectField("session_id");
+                    try jw.write(entry.key_ptr.*);
+                    try jw.objectField("method");
+                    try jw.write("error");
+                    try jw.objectField("params");
+                    try jw.beginObject();
+                    try jw.objectField("error");
+                    try jw.write(err_msg);
+                    try jw.endObject();
+                    try jw.endObject();
+
+                    pr.thread.join();
+                    pr.deinit();
+                    session.pending_run = null;
+                }
+                // status == 0: still running, skip
+            }
+
+            // Drain driver notifications (DAP events, etc.)
+            const notifications = session.driver.drainNotifications(allocator);
             defer {
                 for (notifications) |n| {
                     allocator.free(n.method);
@@ -1994,8 +2152,11 @@ pub const DebugServer = struct {
                 try jw.objectField("method");
                 try jw.write(n.method);
                 try jw.objectField("params");
-                // Write raw JSON params
+                // Write raw pre-serialized JSON params using the raw streaming API
+                // to keep the Stringify state machine consistent.
+                try jw.beginWriteRaw();
                 try jw.writer.writeAll(n.params_json);
+                jw.endWriteRaw();
                 try jw.endObject();
             }
         }

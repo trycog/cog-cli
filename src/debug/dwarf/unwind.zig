@@ -128,6 +128,7 @@ pub const UnwindFrame = struct {
     line: u32,
     frame_index: u32,
     fp: u64 = 0,
+    sp: u64 = 0,
 };
 
 pub const CieEntry = struct {
@@ -188,7 +189,7 @@ pub const EhFrameIndex = struct {
 
 /// Build an FDE index from eh_frame data for fast PC lookups.
 /// Single pass through eh_frame parsing only headers (length, CIE_id, initial_location, range).
-pub fn buildEhFrameIndex(data: []const u8, allocator: std.mem.Allocator) !EhFrameIndex {
+pub fn buildEhFrameIndex(data: []const u8, is_debug_frame: bool, allocator: std.mem.Allocator) !EhFrameIndex {
     var entries: std.ArrayListUnmanaged(EhFrameIndex.FdeIndexEntry) = .empty;
     errdefer entries.deinit(allocator);
 
@@ -216,13 +217,13 @@ pub fn buildEhFrameIndex(data: []const u8, allocator: std.mem.Allocator) !EhFram
         const cie_id = std.mem.readInt(u32, data[pos..][0..4], .little);
         pos += 4;
 
-        if (cie_id == 0) {
+        if (if (is_debug_frame) cie_id == 0xFFFFFFFF else cie_id == 0) {
             pos = entry_end;
             continue;
         }
 
         // FDE — extract header info for index
-        const cie_offset = entry_data_start - @as(usize, cie_id);
+        const cie_offset = if (is_debug_frame) @as(usize, cie_id) else entry_data_start - @as(usize, cie_id);
         const cie = parseCie(data, cie_offset);
         const fde_enc: u8 = if (cie) |c| c.fde_encoding else 0xFF;
 
@@ -433,13 +434,23 @@ pub fn parseCie(data: []const u8, cie_start: usize) ?CieEntry {
     if (pos >= data.len) return null;
     const version = data[pos];
     pos += 1;
-    _ = version;
 
     // Augmentation string (null-terminated)
     const aug_start = pos;
     while (pos < data.len and data[pos] != 0) pos += 1;
     const augmentation = data[aug_start..pos];
     if (pos < data.len) pos += 1; // Skip null terminator
+
+    // DWARF v4+ .debug_frame CIEs have address_size and segment_selector_size
+    // after the augmentation string (not present in .eh_frame or DWARF v1-v3)
+    var cie_address_size: u8 = 0;
+    if (version >= 4) {
+        if (pos + 2 > data.len) return null;
+        cie_address_size = data[pos]; // address_size
+        pos += 1;
+        _ = data[pos]; // segment_selector_size
+        pos += 1;
+    }
 
     // Code alignment factor
     const code_alignment = parser.readULEB128(data, &pos) catch return null;
@@ -483,9 +494,9 @@ pub fn parseCie(data: []const u8, cie_start: usize) ?CieEntry {
 
     const initial_instructions = if (pos < entry_end) data[pos..entry_end] else &[_]u8{};
 
-    // For .eh_frame, address_size is determined by the target architecture.
-    // For .debug_frame v4+, it would be parsed from the CIE header (not yet supported).
-    const address_size: u8 = switch (builtin.cpu.arch) {
+    // For .debug_frame v4+, use the address_size from the CIE header.
+    // For .eh_frame (or older .debug_frame), fall back to target architecture.
+    const address_size: u8 = if (cie_address_size != 0) cie_address_size else switch (builtin.cpu.arch) {
         .x86, .arm, .riscv32, .powerpc => 4,
         else => 8,
     };
@@ -734,6 +745,7 @@ pub fn unwindCfa(
     index: ?*const EhFrameIndex,
     cie_cache: ?*CieCache,
     allocator: std.mem.Allocator,
+    is_debug_frame: bool,
 ) ?CfaUnwindResult {
     // Fast path: use pre-built index for O(log n) FDE lookup
     if (index) |idx| {
@@ -769,12 +781,12 @@ pub fn unwindCfa(
         const cie_id = std.mem.readInt(u32, eh_frame_data[pos..][0..4], .little);
         pos += 4;
 
-        if (cie_id == 0) {
+        if (if (is_debug_frame) cie_id == 0xFFFFFFFF else cie_id == 0) {
             pos = entry_end;
             continue;
         }
 
-        const cie_offset = entry_data_start - @as(usize, cie_id);
+        const cie_offset = if (is_debug_frame) @as(usize, cie_id) else entry_data_start - @as(usize, cie_id);
         const cie = if (cie_cache) |cc| cc.getOrParse(eh_frame_data, cie_offset, allocator) orelse {
             pos = entry_end;
             continue;
@@ -999,6 +1011,7 @@ pub fn unwindStackCfa(
     max_depth: u32,
     fde_index: ?*const EhFrameIndex,
     cie_cache: ?*CieCache,
+    is_debug_frame: bool,
 ) ![]UnwindFrame {
     var frames: std.ArrayListUnmanaged(UnwindFrame) = .empty;
     errdefer frames.deinit(allocator);
@@ -1050,6 +1063,7 @@ pub fn unwindStackCfa(
             fde_index,
             cie_cache,
             allocator,
+            is_debug_frame,
         ) orelse break;
         if (result.return_address == 0) break;
 
@@ -1335,7 +1349,7 @@ test "unwindStack includes source locations" {
         .{ .name = "bar", .low_pc = 0x3000, .high_pc = 0x3050 },
     };
     const line_entries = [_]parser.LineEntry{
-        .{ .address = 0x3000, .file_index = 1, .line = 42, .column = 5, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x3000, .file_index = 0, .line = 42, .column = 5, .is_stmt = true, .end_sequence = false },
     };
     const file_entries = [_]parser.FileEntry{
         .{ .name = "bar.c", .dir_index = 0 },
@@ -1581,7 +1595,7 @@ test "unwindCfa returns null for empty eh_frame" {
     };
     var dummy: u8 = 0;
     const ctx: *anyopaque = @ptrCast(&dummy);
-    const result = unwindCfa(&[_]u8{}, 0x1000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator);
+    const result = unwindCfa(&[_]u8{}, 0x1000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator, false);
     try std.testing.expect(result == null);
 }
 
@@ -1619,6 +1633,6 @@ test "unwindCfa returns null when no FDE covers target PC" {
     // Terminator
     std.mem.writeInt(u32, frame_data[36..40], 0, .little);
 
-    const result = unwindCfa(&frame_data, 0x2000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator);
+    const result = unwindCfa(&frame_data, 0x2000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator, false);
     try std.testing.expect(result == null);
 }

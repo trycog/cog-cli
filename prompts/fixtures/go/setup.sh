@@ -5,16 +5,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Copy source files to /tmp (overwrites any modified versions)
-cp "$SCRIPT_DIR/debug_test.go"  /tmp/debug_test.go
-cp "$SCRIPT_DIR/debug_crash.go" /tmp/debug_crash.go
-cp "$SCRIPT_DIR/debug_sleep.go" /tmp/debug_sleep.go
-cp "$SCRIPT_DIR/debug_vars.go"  /tmp/debug_vars.go
+# Build a Go fixture in a stable directory under /tmp.
+# Uses a persistent build directory so DWARF source paths remain valid
+# (the debugger needs the source file to exist at the path recorded in DWARF).
+build_go_fixture() {
+    local src="$1" target_name="$2" builddir="$3" output="$4"
+    rm -rf "$builddir"
+    mkdir -p "$builddir"
+    cp "$src" "$builddir/$target_name"
+    (cd "$builddir" && go mod init fixture && go build -gcflags="all=-N -l" -ldflags="-compressdwarf=false" -o "$output" .)
+}
 
-# Compile all four programs with debug info and no optimization
-go build -gcflags="all=-N -l" -o /tmp/debug_test_go  /tmp/debug_test.go
-go build -gcflags="all=-N -l" -o /tmp/debug_crash_go /tmp/debug_crash.go
-go build -gcflags="all=-N -l" -o /tmp/debug_sleep_go /tmp/debug_sleep.go
-go build -gcflags="all=-N -l" -o /tmp/debug_vars_go  /tmp/debug_vars.go
+# Build all fixtures
+# Note: debug_test.go is renamed to debug_basic.go to avoid Go's _test.go convention
+build_go_fixture "$SCRIPT_DIR/debug_test.go"  "debug_basic.go" "/tmp/debug_basic" "/tmp/debug_test_go"
+build_go_fixture "$SCRIPT_DIR/debug_crash.go" "debug_crash.go" "/tmp/debug_crash" "/tmp/debug_crash_go"
+build_go_fixture "$SCRIPT_DIR/debug_sleep.go" "debug_sleep.go" "/tmp/debug_sleep" "/tmp/debug_sleep_go"
+build_go_fixture "$SCRIPT_DIR/debug_vars.go"  "debug_vars.go"  "/tmp/debug_vars"  "/tmp/debug_vars_go"
 
 echo "All Go test fixtures compiled in /tmp/"

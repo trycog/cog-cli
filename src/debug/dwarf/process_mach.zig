@@ -14,6 +14,18 @@ const ARM_THREAD_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(ArmThread
 const x86_THREAD_STATE64: std.c.thread_flavor_t = 4;
 const x86_THREAD_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(X86ThreadState64) / @sizeOf(std.c.natural_t);
 
+// ARM64 debug state for hardware watchpoints
+const ARM_DEBUG_STATE64: std.c.thread_flavor_t = 15;
+const ARM_DEBUG_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(ArmDebugState64) / @sizeOf(std.c.natural_t);
+
+const ArmDebugState64 = extern struct {
+    bvr: [16]u64, // Breakpoint Value Registers
+    bcr: [16]u64, // Breakpoint Control Registers
+    wvr: [16]u64, // Watchpoint Value Registers
+    wcr: [16]u64, // Watchpoint Control Registers
+    mdscr_el1: u64,
+};
+
 // ARM64 NEON (FP/SIMD) thread state
 const ARM_NEON_STATE64: std.c.thread_flavor_t = 17;
 const ARM_NEON_STATE64_COUNT: std.c.mach_msg_type_number_t = @sizeOf(ArmNeonState64) / @sizeOf(std.c.natural_t);
@@ -513,16 +525,40 @@ pub const MachProcessControl = struct {
         // W^X policy: don't set EXECUTE when setting WRITE
         const VM_PROT_READ: std.c.vm_prot_t = 0x01;
         const VM_PROT_WRITE: std.c.vm_prot_t = 0x02;
-        const VM_PROT_EXECUTE: std.c.vm_prot_t = 0x04;
         const VM_PROT_COPY: std.c.vm_prot_t = 0x10;
         const page_size: u64 = if (comptime @import("builtin").cpu.arch == .aarch64) 0x4000 else 0x1000;
         const page_addr = address & ~(page_size - 1);
+
+        // Query original page protection so we can restore it after writing.
+        // Without this, stack/heap pages lose write permission (causing SIGBUS)
+        // and code pages lose execute permission.
+        var original_prot: std.c.vm_prot_t = VM_PROT_READ | 0x04; // default: R|X (code page)
+        {
+            var region_addr: std.c.mach_vm_address_t = page_addr;
+            var region_size: std.c.mach_vm_size_t = 0;
+            var info: std.c.vm_region_basic_info_64 = undefined;
+            var info_cnt: std.c.mach_msg_type_number_t = std.c.VM.REGION.BASIC_INFO_COUNT;
+            var object_name: std.c.mach_port_t = 0;
+            const qkr = std.c.mach_vm_region(
+                task,
+                &region_addr,
+                &region_size,
+                std.c.VM.REGION.BASIC_INFO_64,
+                @ptrCast(&info),
+                &info_cnt,
+                &object_name,
+            );
+            if (qkr == 0) {
+                original_prot = info.protection;
+            }
+        }
+
         _ = std.c.mach_vm_protect(task, page_addr, page_size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 
         const kr = std.c.mach_vm_write(task, address, @intFromPtr(data.ptr), @intCast(data.len));
 
-        // Restore read+execute protection
-        _ = std.c.mach_vm_protect(task, page_addr, page_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+        // Restore original page protection
+        _ = std.c.mach_vm_protect(task, page_addr, page_size, 0, original_prot);
 
         if (kr != 0) return error.WriteFailed;
     }
@@ -677,6 +713,88 @@ pub const MachProcessControl = struct {
                 self.stderr_pipe_read = null;
             }
         }
+    }
+
+    /// Set a hardware watchpoint at the given address.
+    /// access_type: 1 = read, 2 = write, 3 = read+write
+    /// Returns the watchpoint slot index (0-based).
+    pub fn setHardwareWatchpoint(self: *MachProcessControl, address: u64, size: u8, access_type: u8) !u32 {
+        if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.NotSupported;
+
+        const thread = try self.getThread();
+
+        // Read current debug state
+        var state: ArmDebugState64 = std.mem.zeroes(ArmDebugState64);
+        var count: std.c.mach_msg_type_number_t = ARM_DEBUG_STATE64_COUNT;
+        var kr = std.c.thread_get_state(thread, ARM_DEBUG_STATE64, @ptrCast(&state), &count);
+        if (kr != 0) return error.ReadDebugStateFailed;
+
+        // Find a free watchpoint slot (ARM64 has up to 16, typically 4 on Apple Silicon)
+        const max_wp: usize = 4; // Apple Silicon typically supports 4 watchpoints
+        var slot: ?usize = null;
+        for (0..max_wp) |i| {
+            if (state.wcr[i] & 1 == 0) { // Check enable bit
+                slot = i;
+                break;
+            }
+        }
+        const wp_slot = slot orelse return error.NoFreeWatchpoint;
+
+        // Set Watchpoint Value Register (address, must be aligned to size)
+        const aligned_addr = address & ~@as(u64, @intCast(@as(u64, size) - 1));
+        state.wvr[wp_slot] = aligned_addr;
+
+        // Build Watchpoint Control Register value:
+        // Bits [0]: Enable (1)
+        // Bits [2:1]: PAC (privileged access control): 0b10 = EL0 only (user mode)
+        // Bits [4:3]: LSC (load/store control): access type
+        //   0b01 = load (read), 0b10 = store (write), 0b11 = both
+        // Bits [12:5]: BAS (byte address select): which bytes to watch
+        // Bits [15:13]: Reserved
+        const lsc: u64 = switch (access_type) {
+            1 => 0b01, // read
+            2 => 0b10, // write
+            3 => 0b11, // read+write
+            else => 0b10, // default to write
+        };
+        // BAS: set bits for the watched bytes
+        const bas: u64 = switch (size) {
+            1 => 0x01,
+            2 => 0x03,
+            4 => 0x0F,
+            8 => 0xFF,
+            else => 0x0F, // default to 4 bytes
+        };
+        state.wcr[wp_slot] = 1 | // Enable
+            (0b10 << 1) | // PAC: EL0 (user mode)
+            (lsc << 3) | // Load/Store Control
+            (bas << 5); // Byte Address Select
+
+        // Write updated debug state
+        kr = std.c.thread_set_state(thread, ARM_DEBUG_STATE64, @ptrCast(&state), ARM_DEBUG_STATE64_COUNT);
+        if (kr != 0) return error.WriteDebugStateFailed;
+
+        return @intCast(wp_slot);
+    }
+
+    /// Clear a hardware watchpoint by slot index.
+    pub fn clearHardwareWatchpoint(self: *MachProcessControl, slot: u32) !void {
+        if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.NotSupported;
+
+        const thread = try self.getThread();
+
+        var state: ArmDebugState64 = std.mem.zeroes(ArmDebugState64);
+        var count: std.c.mach_msg_type_number_t = ARM_DEBUG_STATE64_COUNT;
+        var kr = std.c.thread_get_state(thread, ARM_DEBUG_STATE64, @ptrCast(&state), &count);
+        if (kr != 0) return error.ReadDebugStateFailed;
+
+        if (slot < 16) {
+            state.wvr[slot] = 0;
+            state.wcr[slot] = 0;
+        }
+
+        kr = std.c.thread_set_state(thread, ARM_DEBUG_STATE64, @ptrCast(&state), ARM_DEBUG_STATE64_COUNT);
+        if (kr != 0) return error.WriteDebugStateFailed;
     }
 };
 

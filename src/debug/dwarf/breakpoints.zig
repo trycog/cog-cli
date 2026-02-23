@@ -55,9 +55,10 @@ pub const BreakpointManager = struct {
         file: []const u8,
         line: u32,
         line_entries: []const parser.LineEntry,
+        file_entries: []const parser.FileEntry,
         condition: ?[]const u8,
     ) !Breakpoint {
-        return self.resolveAndSetEx(file, line, line_entries, condition, null, null);
+        return self.resolveAndSetEx(file, line, line_entries, file_entries, condition, null, null);
     }
 
     /// Resolve a file:line:column to an address using DWARF line entries and set a breakpoint.
@@ -67,11 +68,12 @@ pub const BreakpointManager = struct {
         line: u32,
         column: ?u32,
         line_entries: []const parser.LineEntry,
+        file_entries: []const parser.FileEntry,
         condition: ?[]const u8,
         hit_condition: ?[]const u8,
         log_message: ?[]const u8,
     ) !Breakpoint {
-        return self.resolveAndSetExInternal(file, line, column, line_entries, condition, hit_condition, log_message);
+        return self.resolveAndSetExInternal(file, line, column, line_entries, file_entries, condition, hit_condition, log_message);
     }
 
     /// Resolve a file:line to an address with extended options.
@@ -80,11 +82,12 @@ pub const BreakpointManager = struct {
         file: []const u8,
         line: u32,
         line_entries: []const parser.LineEntry,
+        file_entries: []const parser.FileEntry,
         condition: ?[]const u8,
         hit_condition: ?[]const u8,
         log_message: ?[]const u8,
     ) !Breakpoint {
-        return self.resolveAndSetExInternal(file, line, null, line_entries, condition, hit_condition, log_message);
+        return self.resolveAndSetExInternal(file, line, null, line_entries, file_entries, condition, hit_condition, log_message);
     }
 
     /// Internal resolver that handles both line-only and line+column matching.
@@ -94,6 +97,7 @@ pub const BreakpointManager = struct {
         line: u32,
         column: ?u32,
         line_entries: []const parser.LineEntry,
+        file_entries: []const parser.FileEntry,
         condition: ?[]const u8,
         hit_condition: ?[]const u8,
         log_message: ?[]const u8,
@@ -106,6 +110,12 @@ pub const BreakpointManager = struct {
         for (line_entries) |entry| {
             if (entry.end_sequence) continue;
             if (!entry.is_stmt) continue;
+
+            // File matching: skip entries that don't match the requested file
+            if (file_entries.len > 0 and file.len > 0) {
+                const entry_file = getEntryFileName(file_entries, entry.file_index);
+                if (!filePathsMatch(file, entry_file)) continue;
+            }
 
             if (entry.line == line) {
                 if (column) |requested_col| {
@@ -412,6 +422,33 @@ pub const BreakpointManager = struct {
     }
 };
 
+/// Look up a file name from file entries by 0-based index.
+fn getEntryFileName(files: []const parser.FileEntry, index: u32) []const u8 {
+    if (index < files.len) return files[index].name;
+    return "<unknown>";
+}
+
+/// Flexible file path matching that handles common path variations.
+/// Matches if: exact match, basename match, or one path is a suffix of the other.
+pub fn filePathsMatch(requested: []const u8, entry_path: []const u8) bool {
+    return fileMatchQuality(requested, entry_path) > 0;
+}
+
+/// Returns match quality: 3=exact, 2=suffix, 1=basename, 0=no match.
+/// Higher quality means a more specific match. Use this to prefer exact/suffix
+/// matches over basename-only matches when multiple entries match.
+pub fn fileMatchQuality(requested: []const u8, entry_path: []const u8) u8 {
+    // Exact match
+    if (std.mem.eql(u8, requested, entry_path)) return 3;
+    // Suffix match: requested ends with entry or vice versa
+    if (std.mem.endsWith(u8, requested, entry_path) or std.mem.endsWith(u8, entry_path, requested)) return 2;
+    // Basename match: "foo.go" matches "/some/path/foo.go"
+    const req_base = std.fs.path.basename(requested);
+    const entry_base = std.fs.path.basename(entry_path);
+    if (std.mem.eql(u8, req_base, entry_base)) return 1;
+    return 0;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "BreakpointManager initial state" {
@@ -431,7 +468,7 @@ test "resolveBreakpoint maps file:line to address via debug_line" {
         .{ .address = 0x1020, .file_index = 1, .line = 15, .column = 0, .is_stmt = true, .end_sequence = false },
     };
 
-    const bp = try mgr.resolveAndSet("test.c", 10, &entries, null);
+    const bp = try mgr.resolveAndSet("test.c", 10, &entries, &.{}, null);
     try std.testing.expectEqual(@as(u64, 0x1010), bp.address);
     try std.testing.expectEqual(@as(u32, 10), bp.line);
 }
@@ -446,7 +483,7 @@ test "resolveBreakpoint finds nearest line when exact not available" {
     };
 
     // Request line 10 but only 5 and 15 exist — should get 15 (nearest >= requested)
-    const bp = try mgr.resolveAndSet("test.c", 10, &entries, null);
+    const bp = try mgr.resolveAndSet("test.c", 10, &entries, &.{}, null);
     try std.testing.expectEqual(@as(u32, 15), bp.line);
     try std.testing.expectEqual(@as(u64, 0x1020), bp.address);
 }
@@ -540,7 +577,7 @@ test "breakpoint at invalid location returns error" {
         .{ .address = 0x1000, .file_index = 1, .line = 5, .column = 0, .is_stmt = true, .end_sequence = true },
     };
 
-    const result = mgr.resolveAndSet("test.c", 5, &entries, null);
+    const result = mgr.resolveAndSet("test.c", 5, &entries, &.{}, null);
     try std.testing.expectError(error.NoAddressForLine, result);
 }
 
@@ -552,7 +589,7 @@ test "conditional breakpoint stores condition" {
         .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
     };
 
-    const bp = try mgr.resolveAndSet("test.c", 10, &entries, "x > 5");
+    const bp = try mgr.resolveAndSet("test.c", 10, &entries, &.{}, "x > 5");
     try std.testing.expect(bp.condition != null);
     try std.testing.expectEqualStrings("x > 5", bp.condition.?);
 }
@@ -565,7 +602,7 @@ test "conditional breakpoint evaluates expression" {
         .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
     };
 
-    _ = try mgr.resolveAndSet("test.c", 10, &entries, "x > 5");
+    _ = try mgr.resolveAndSet("test.c", 10, &entries, &.{}, "x > 5");
 
     const bp = mgr.findByAddress(0x1000).?;
 
@@ -696,7 +733,7 @@ test "hit_condition breakpoint stops on correct hit" {
         .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
     };
 
-    _ = try mgr.resolveAndSetEx("test.c", 10, &entries, null, ">= 3", null);
+    _ = try mgr.resolveAndSetEx("test.c", 10, &entries, &.{}, null, ">= 3", null);
     const bp = mgr.findByAddress(0x1000).?;
 
     // Hits 1 and 2 should not stop
@@ -716,7 +753,7 @@ test "log point breakpoint never stops" {
         .{ .address = 0x1000, .file_index = 1, .line = 10, .column = 0, .is_stmt = true, .end_sequence = false },
     };
 
-    _ = try mgr.resolveAndSetEx("test.c", 10, &entries, null, null, "x = {x}");
+    _ = try mgr.resolveAndSetEx("test.c", 10, &entries, &.{}, null, null, "x = {x}");
     const bp = mgr.findByAddress(0x1000).?;
 
     // Log points should never stop
@@ -735,13 +772,13 @@ test "column field is stored correctly on breakpoints" {
     };
 
     // Set a breakpoint with column specified
-    const bp = try mgr.resolveAndSetColumn("test.c", 10, 5, &entries, null, null, null);
+    const bp = try mgr.resolveAndSetColumn("test.c", 10, 5, &entries, &.{}, null, null, null);
     try std.testing.expectEqual(@as(?u32, 5), bp.column);
     try std.testing.expectEqual(@as(u64, 0x1000), bp.address);
     try std.testing.expectEqual(@as(u32, 10), bp.line);
 
     // Set a breakpoint without column — column should be null
-    const bp2 = try mgr.resolveAndSetEx("test.c", 10, &entries, null, null, null);
+    const bp2 = try mgr.resolveAndSetEx("test.c", 10, &entries, &.{}, null, null, null);
     try std.testing.expect(bp2.column == null);
 }
 
@@ -756,19 +793,19 @@ test "column matching prefers more specific matches" {
     };
 
     // Request column 20 — should match exactly at 0x1008
-    const bp1 = try mgr.resolveAndSetColumn("test.c", 10, 20, &entries, null, null, null);
+    const bp1 = try mgr.resolveAndSetColumn("test.c", 10, 20, &entries, &.{}, null, null, null);
     try std.testing.expectEqual(@as(u64, 0x1008), bp1.address);
 
     // Request column 22 — should match closest at column 20 (distance 2) vs 35 (distance 13) vs 5 (distance 17)
-    const bp2 = try mgr.resolveAndSetColumn("test.c", 10, 22, &entries, null, null, null);
+    const bp2 = try mgr.resolveAndSetColumn("test.c", 10, 22, &entries, &.{}, null, null, null);
     try std.testing.expectEqual(@as(u64, 0x1008), bp2.address);
 
     // Request column 30 — should match closest at column 35 (distance 5) vs 20 (distance 10) vs 5 (distance 25)
-    const bp3 = try mgr.resolveAndSetColumn("test.c", 10, 30, &entries, null, null, null);
+    const bp3 = try mgr.resolveAndSetColumn("test.c", 10, 30, &entries, &.{}, null, null, null);
     try std.testing.expectEqual(@as(u64, 0x1010), bp3.address);
 
     // Request column 1 — should match closest at column 5 (distance 4)
-    const bp4 = try mgr.resolveAndSetColumn("test.c", 10, 1, &entries, null, null, null);
+    const bp4 = try mgr.resolveAndSetColumn("test.c", 10, 1, &entries, &.{}, null, null, null);
     try std.testing.expectEqual(@as(u64, 0x1000), bp4.address);
 }
 

@@ -132,6 +132,8 @@ pub const LocationContext = struct {
     address_size: u8 = 8,
     /// Whether the compilation unit uses DWARF-64 format (affects DW_OP_call_ref, DW_OP_implicit_pointer)
     is_dwarf64: bool = false,
+    /// Canonical Frame Address from .eh_frame/.debug_frame (for DW_OP_call_frame_cfa)
+    cfa: ?u64 = null,
 };
 
 pub const VariableValue = struct {
@@ -734,9 +736,15 @@ fn evalLocationImpl(
                 }
             },
             DW_OP_call_frame_cfa => {
-                // CFA is typically FP+16 on x86_64 or frame_base
-                // Use frame_base as approximation
-                const cfa = frame_base orelse return .empty;
+                // CFA (Canonical Frame Address) resolution priority:
+                // 1. Real CFA from .eh_frame/.debug_frame (spec-compliant)
+                // 2. frame_base if already evaluated (avoids circular dependency)
+                // 3. FP+16 heuristic as last resort
+                const cfa = context.cfa orelse frame_base orelse blk: {
+                    const fp_reg: u64 = if (builtin.cpu.arch == .aarch64) 29 else 6;
+                    const fp_val = regs.read(fp_reg) orelse break :blk @as(?u64, null);
+                    break :blk fp_val + 16;
+                } orelse return .empty;
                 if (sp >= stack.len) return .empty;
                 stack[sp] = cfa;
                 sp += 1;
@@ -1480,6 +1488,46 @@ pub fn inspectLocals(
         if (v.location_expr.len == 0) continue;
 
         const loc = evalLocationWithMemory(v.location_expr, regs, frame_base, mem_reader);
+
+        {
+            const df = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
+            if (df) |dfile| {
+                defer dfile.close();
+                dfile.seekFromEnd(0) catch {};
+                var lbuf: [1024]u8 = undefined;
+                var pos: usize = 0;
+                const loc_type: []const u8 = switch (loc) {
+                    .address => "address",
+                    .register => "register",
+                    .value => "value",
+                    .empty => "empty",
+                    .implicit_pointer => "implicit_pointer",
+                    .composite => "composite",
+                };
+                pos += (std.fmt.bufPrint(lbuf[pos..], "inspectVars: name={s} loc_expr_len={} loc_type={s}", .{
+                    v.name, v.location_expr.len, loc_type,
+                }) catch "").len;
+                pos += (switch (loc) {
+                    .address => |a| std.fmt.bufPrint(lbuf[pos..], " addr=0x{x}", .{a}) catch "",
+                    .register => |r| std.fmt.bufPrint(lbuf[pos..], " reg={}", .{r}) catch "",
+                    .value => |val| std.fmt.bufPrint(lbuf[pos..], " val={}", .{val}) catch "",
+                    else => @as([]const u8, ""),
+                }).len;
+                if (frame_base) |fb| {
+                    pos += (std.fmt.bufPrint(lbuf[pos..], " frame_base=0x{x} loc_bytes=", .{fb}) catch "").len;
+                } else {
+                    pos += (std.fmt.bufPrint(lbuf[pos..], " frame_base=null loc_bytes=", .{}) catch "").len;
+                }
+                for (v.location_expr) |b| {
+                    pos += (std.fmt.bufPrint(lbuf[pos..], "{x:0>2}", .{b}) catch "").len;
+                }
+                if (pos < lbuf.len) {
+                    lbuf[pos] = '\n';
+                    pos += 1;
+                }
+                dfile.writeAll(lbuf[0..pos]) catch {};
+            }
+        }
 
         var value_str: []const u8 = "";
         switch (loc) {

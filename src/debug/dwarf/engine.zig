@@ -34,6 +34,7 @@ pub const DwarfEngine = struct {
     bp_manager: BreakpointManager,
     line_entries: []parser.LineEntry = &.{},
     file_entries: []parser.FileEntry = &.{},
+    allocated_paths: [][]const u8 = &.{},
     functions: []parser.FunctionInfo = &.{},
     inlined_subs: []parser.InlinedSubroutineInfo = &.{},
     binary: ?binary_macho.MachoBinary = null,
@@ -44,6 +45,8 @@ pub const DwarfEngine = struct {
     stepping_past_bp: ?u64 = null,
     /// Track whether a step operation is in progress (for stop_reason reporting)
     step_in_progress: bool = false,
+    /// Track whether a single-step operation is in progress (for SIGURG re-step)
+    is_single_stepping: bool = false,
     /// Exception breakpoint signal filters (e.g. SIGSEGV=11, SIGFPE=8)
     exception_signals: [32]bool = [_]bool{false} ** 32,
     /// Cached stack trace from last stop (for per-frame inspection)
@@ -61,8 +64,10 @@ pub const DwarfEngine = struct {
     type_units: []parser.TypeUnitEntry = &.{},
     /// Split DWARF: skeleton CU info for matching DWO binaries
     skeleton_cus: []const parser.SkeletonCuInfo = &.{},
-    /// Pre-built FDE index for fast PC-to-FDE lookup in eh_frame
+    /// Pre-built FDE index for fast PC-to-FDE lookup in eh_frame/debug_frame
     eh_frame_index: ?unwind.EhFrameIndex = null,
+    /// Whether the frame data comes from .debug_frame (vs .eh_frame)
+    is_debug_frame: bool = false,
     /// CIE cache to avoid re-parsing CIEs during CFA unwinding
     cie_cache: ?unwind.CieCache = null,
     /// Abbreviation table cache to avoid re-parsing on every parseScopedVariables call
@@ -87,6 +92,8 @@ pub const DwarfEngine = struct {
         if (self.program_path) |p| self.allocator.free(p);
         self.bp_manager.deinit();
         if (self.line_entries.len > 0) self.allocator.free(self.line_entries);
+        for (self.allocated_paths) |p| self.allocator.free(@constCast(p));
+        if (self.allocated_paths.len > 0) self.allocator.free(self.allocated_paths);
         if (self.file_entries.len > 0) self.allocator.free(self.file_entries);
         if (self.functions.len > 0) self.allocator.free(self.functions);
         if (self.inlined_subs.len > 0) self.allocator.free(self.inlined_subs);
@@ -165,6 +172,10 @@ pub const DwarfEngine = struct {
         .variableLocationFn = engineVariableLocation,
         .drainNotificationsFn = engineDrainNotifications,
         .loadCoreFn = engineLoadCore,
+        .stepInTargetsFn = engineStepInTargets,
+        .getPidFn = engineGetPid,
+        .cancelFn = engineCancel,
+        .terminateThreadsFn = engineTerminateThreads,
     };
 
     // ── Launch ──────────────────────────────────────────────────────
@@ -222,6 +233,7 @@ pub const DwarfEngine = struct {
                 if (isub.high_pc > 0) isub.high_pc -%= @intCast(@as(u64, @intCast(-slide)));
             }
         }
+
     }
 
     fn loadDebugInfo(self: *DwarfEngine, program: []const u8) !void {
@@ -232,8 +244,8 @@ pub const DwarfEngine = struct {
         }
 
         // Build FDE index for fast CFA unwinding
-        if (self.resolveEhFrameData()) |eh_frame_data| {
-            self.eh_frame_index = unwind.buildEhFrameIndex(eh_frame_data, self.allocator) catch null;
+        if (self.resolveFrameData()) |eh_frame_data| {
+            self.eh_frame_index = unwind.buildEhFrameIndex(eh_frame_data, self.is_debug_frame, self.allocator) catch null;
             if (self.eh_frame_index != null) {
                 self.cie_cache = .{};
             }
@@ -271,13 +283,17 @@ pub const DwarfEngine = struct {
         var binary = binary_macho.MachoBinary.loadFile(self.allocator, program) catch return;
         errdefer binary.deinit(self.allocator);
 
-        // Try loading debug_line from the binary itself
+        // Try loading debug_line from the binary itself (with transparent decompression)
         if (binary.sections.debug_line) |line_section| {
-            if (binary.getSectionData(line_section)) |line_data| {
-                const line_str_data = if (binary.sections.debug_line_str) |ls| binary.getSectionData(ls) else null;
-                const result = parser.parseLineProgramWithFilesEx(line_data, self.allocator, line_str_data) catch {
+            const line_data = (binary.getSectionDataAlloc(self.allocator, line_section) catch null) orelse binary.getSectionData(line_section);
+            if (line_data) |ld| {
+                const line_str_data = if (binary.sections.debug_line_str) |ls|
+                    (binary.getSectionDataAlloc(self.allocator, ls) catch null) orelse binary.getSectionData(ls)
+                else
+                    null;
+                const result = parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data) catch {
                     // Fallback to old method
-                    const entries = parser.parseLineProgram(line_data, self.allocator) catch return;
+                    const entries = parser.parseLineProgram(ld, self.allocator) catch return;
                     if (entries.len > 0) {
                         self.line_entries = entries;
                     }
@@ -287,6 +303,9 @@ pub const DwarfEngine = struct {
                     self.line_entries = result.line_entries;
                     if (result.file_entries.len > 0) {
                         self.file_entries = result.file_entries;
+                    }
+                    if (result.allocated_paths.len > 0) {
+                        self.allocated_paths = result.allocated_paths;
                     }
                 }
             }
@@ -307,12 +326,16 @@ pub const DwarfEngine = struct {
         var elf = binary_elf.ElfBinary.loadFile(self.allocator, program) catch return;
         errdefer elf.deinit(self.allocator);
 
-        // Load debug_line
+        // Load debug_line (with transparent decompression)
         if (elf.sections.debug_line) |line_section| {
-            if (elf.getSectionData(line_section)) |line_data| {
-                const line_str_data = if (elf.sections.debug_line_str) |ls| elf.getSectionData(ls) else null;
-                const result = parser.parseLineProgramWithFilesEx(line_data, self.allocator, line_str_data) catch {
-                    const entries = parser.parseLineProgram(line_data, self.allocator) catch return;
+            const line_data = (elf.getSectionDataAlloc(self.allocator, line_section) catch null) orelse elf.getSectionData(line_section);
+            if (line_data) |ld| {
+                const line_str_data = if (elf.sections.debug_line_str) |ls|
+                    (elf.getSectionDataAlloc(self.allocator, ls) catch null) orelse elf.getSectionData(ls)
+                else
+                    null;
+                const result = parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data) catch {
+                    const entries = parser.parseLineProgram(ld, self.allocator) catch return;
                     if (entries.len > 0) {
                         self.line_entries = entries;
                     }
@@ -323,6 +346,9 @@ pub const DwarfEngine = struct {
                     if (result.file_entries.len > 0) {
                         self.file_entries = result.file_entries;
                     }
+                    if (result.allocated_paths.len > 0) {
+                        self.allocated_paths = result.allocated_paths;
+                    }
                 }
             }
         }
@@ -331,11 +357,12 @@ pub const DwarfEngine = struct {
         self.loadFunctionInfoElf(&elf);
 
         self.elf_binary = elf;
+
     }
 
-    fn loadFunctionInfo(self: *DwarfEngine, binary: *const binary_macho.MachoBinary) void {
+    fn loadFunctionInfo(self: *DwarfEngine, binary: *binary_macho.MachoBinary) void {
         // Try dSYM first, then main binary
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
+        const debug_binary: *binary_macho.MachoBinary = blk: {
             if (self.dsym_binary) |*dsym| {
                 if (dsym.sections.debug_info != null) break :blk dsym;
             }
@@ -345,11 +372,11 @@ pub const DwarfEngine = struct {
 
         const info_section = debug_binary.sections.debug_info orelse return;
         const abbrev_section = debug_binary.sections.debug_abbrev orelse return;
-        const info_data = debug_binary.getSectionData(info_section) orelse return;
-        const abbrev_data = debug_binary.getSectionData(abbrev_section) orelse return;
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
+        const info_data = (debug_binary.getSectionDataAlloc(self.allocator, info_section) catch null) orelse debug_binary.getSectionData(info_section) orelse return;
+        const abbrev_data = (debug_binary.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse debug_binary.getSectionData(abbrev_section) orelse return;
+        const str_data = if (debug_binary.sections.debug_str) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null;
+        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null;
+        const addr_data = if (debug_binary.sections.debug_addr) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null;
 
         const functions = parser.parseCompilationUnitEx(
             info_data,
@@ -358,8 +385,8 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
+                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
             },
             self.allocator,
         ) catch return;
@@ -372,8 +399,8 @@ pub const DwarfEngine = struct {
         const extra_sections = parser.ExtraSections{
             .debug_str_offsets = str_offsets_data,
             .debug_addr = addr_data,
-            .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-            .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
+            .debug_ranges = if (debug_binary.sections.debug_ranges) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
+            .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
         };
         const inlined = parser.parseInlinedSubroutines(
             info_data,
@@ -388,14 +415,14 @@ pub const DwarfEngine = struct {
 
         // Load .debug_names index for accelerated symbol lookup
         if (debug_binary.sections.debug_names) |names_section| {
-            if (debug_binary.getSectionData(names_section)) |names_data| {
+            if ((debug_binary.getSectionDataAlloc(self.allocator, names_section) catch null) orelse debug_binary.getSectionData(names_section)) |names_data| {
                 self.debug_names_index = parser.parseDebugNames(names_data, str_data, self.allocator) catch null;
             }
         }
 
         // Load .debug_macro for macro expansion
         if (debug_binary.sections.debug_macro) |macro_section| {
-            if (debug_binary.getSectionData(macro_section)) |macro_data| {
+            if ((debug_binary.getSectionDataAlloc(self.allocator, macro_section) catch null) orelse debug_binary.getSectionData(macro_section)) |macro_data| {
                 self.macro_defs = parser.parseDebugMacro(
                     macro_data,
                     str_data,
@@ -468,14 +495,14 @@ pub const DwarfEngine = struct {
         }
     }
 
-    fn loadFunctionInfoElf(self: *DwarfEngine, elf: *const binary_elf.ElfBinary) void {
+    fn loadFunctionInfoElf(self: *DwarfEngine, elf: *binary_elf.ElfBinary) void {
         const info_section = elf.sections.debug_info orelse return;
         const abbrev_section = elf.sections.debug_abbrev orelse return;
-        const info_data = elf.getSectionData(info_section) orelse return;
-        const abbrev_data = elf.getSectionData(abbrev_section) orelse return;
-        const str_data = if (elf.sections.debug_str) |s| elf.getSectionData(s) else null;
-        const str_offsets_data = if (elf.sections.debug_str_offsets) |s| elf.getSectionData(s) else null;
-        const addr_data = if (elf.sections.debug_addr) |s| elf.getSectionData(s) else null;
+        const info_data = (elf.getSectionDataAlloc(self.allocator, info_section) catch null) orelse elf.getSectionData(info_section) orelse return;
+        const abbrev_data = (elf.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse elf.getSectionData(abbrev_section) orelse return;
+        const str_data = if (elf.sections.debug_str) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null;
+        const str_offsets_data = if (elf.sections.debug_str_offsets) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null;
+        const addr_data = if (elf.sections.debug_addr) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null;
 
         const functions = parser.parseCompilationUnitEx(
             info_data,
@@ -484,8 +511,8 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (elf.sections.debug_ranges) |s| elf.getSectionData(s) else null,
-                .debug_rnglists = if (elf.sections.debug_rnglists) |s| elf.getSectionData(s) else null,
+                .debug_ranges = if (elf.sections.debug_ranges) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+                .debug_rnglists = if (elf.sections.debug_rnglists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
             },
             self.allocator,
         ) catch return;
@@ -498,8 +525,8 @@ pub const DwarfEngine = struct {
         const elf_extra = parser.ExtraSections{
             .debug_str_offsets = str_offsets_data,
             .debug_addr = addr_data,
-            .debug_ranges = if (elf.sections.debug_ranges) |s| elf.getSectionData(s) else null,
-            .debug_rnglists = if (elf.sections.debug_rnglists) |s| elf.getSectionData(s) else null,
+            .debug_ranges = if (elf.sections.debug_ranges) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .debug_rnglists = if (elf.sections.debug_rnglists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
         };
         const inlined = parser.parseInlinedSubroutines(
             info_data,
@@ -514,14 +541,14 @@ pub const DwarfEngine = struct {
 
         // Load .debug_names index for accelerated symbol lookup
         if (elf.sections.debug_names) |names_section| {
-            if (elf.getSectionData(names_section)) |names_data| {
+            if ((elf.getSectionDataAlloc(self.allocator, names_section) catch null) orelse elf.getSectionData(names_section)) |names_data| {
                 self.debug_names_index = parser.parseDebugNames(names_data, str_data, self.allocator) catch null;
             }
         }
 
         // Load .debug_macro for macro expansion
         if (elf.sections.debug_macro) |macro_section| {
-            if (elf.getSectionData(macro_section)) |macro_data| {
+            if ((elf.getSectionDataAlloc(self.allocator, macro_section) catch null) orelse elf.getSectionData(macro_section)) |macro_data| {
                 self.macro_defs = parser.parseDebugMacro(
                     macro_data,
                     str_data,
@@ -612,10 +639,14 @@ pub const DwarfEngine = struct {
         errdefer dsym_binary.deinit(self.allocator);
 
         if (dsym_binary.sections.debug_line) |line_section| {
-            if (dsym_binary.getSectionData(line_section)) |line_data| {
-                const line_str_data = if (dsym_binary.sections.debug_line_str) |ls| dsym_binary.getSectionData(ls) else null;
-                const result = parser.parseLineProgramWithFilesEx(line_data, self.allocator, line_str_data) catch {
-                    const entries = parser.parseLineProgram(line_data, self.allocator) catch return;
+            const line_data = (dsym_binary.getSectionDataAlloc(self.allocator, line_section) catch null) orelse dsym_binary.getSectionData(line_section);
+            if (line_data) |ld| {
+                const line_str_data = if (dsym_binary.sections.debug_line_str) |ls|
+                    (dsym_binary.getSectionDataAlloc(self.allocator, ls) catch null) orelse dsym_binary.getSectionData(ls)
+                else
+                    null;
+                const result = parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data) catch {
+                    const entries = parser.parseLineProgram(ld, self.allocator) catch return;
                     if (entries.len > 0) {
                         self.line_entries = entries;
                     }
@@ -625,6 +656,9 @@ pub const DwarfEngine = struct {
                     self.line_entries = result.line_entries;
                     if (result.file_entries.len > 0) {
                         self.file_entries = result.file_entries;
+                    }
+                    if (result.allocated_paths.len > 0) {
+                        self.allocated_paths = result.allocated_paths;
                     }
                 }
             }
@@ -660,8 +694,11 @@ pub const DwarfEngine = struct {
                 // Instruction-level granularity: just single step
                 if (options.granularity) |g| {
                     if (g == .instruction) {
+                        self.is_single_stepping = true;
                         try self.process.singleStep();
-                        return self.waitAndHandleStop();
+                        const result = try self.waitAndHandleStop();
+                        self.is_single_stepping = false;
+                        return result;
                     }
                 }
                 // Line-level step_into: single-step instruction by instruction until
@@ -669,7 +706,7 @@ pub const DwarfEngine = struct {
                 const pre_regs = try self.process.readRegisters();
                 const pre_func = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, pre_regs.pc) else "";
                 const pre_line = self.getLineForPC(pre_regs.pc);
-                const max_steps: u32 = 500;
+                const max_steps: u32 = 2000;
                 var step_count: u32 = 0;
 
                 while (step_count < max_steps) {
@@ -679,6 +716,14 @@ pub const DwarfEngine = struct {
                     switch (step_result.status) {
                         .exited => return .{ .stop_reason = .exited, .exit_code = step_result.exit_code },
                         .stopped => {
+                            // Handle non-fatal signals (e.g. SIGURG from Go runtime) by re-stepping
+                            const SIGTRAP_INNER = 5;
+                            if (step_result.signal != SIGTRAP_INNER and step_result.signal > 0 and step_result.signal < 32) {
+                                if (!self.exception_signals[@intCast(step_result.signal)] and !isFatalSignal(@intCast(step_result.signal))) {
+                                    // Non-fatal signal — re-step without counting
+                                    continue;
+                                }
+                            }
                             const post_regs = self.process.readRegisters() catch return self.handleStop(step_result.signal);
                             const post_func = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, post_regs.pc) else "";
 
@@ -688,6 +733,13 @@ pub const DwarfEngine = struct {
                                 !std.mem.eql(u8, post_func, pre_func);
 
                             if (entered_new_func) {
+                                // Skip Go runtime trampolines (morestack, gogo, etc.)
+                                // These sit between user function calls during stack growth.
+                                // Continue single-stepping — morestack will eventually jump
+                                // back to the target function's entry point.
+                                if (isRuntimeTrampoline(post_func)) {
+                                    continue;
+                                }
                                 // Find the prologue end address for the new function
                                 if (self.findPrologueEndAddress(post_regs.pc)) |prologue_addr| {
                                     if (prologue_addr != post_regs.pc) {
@@ -728,6 +780,12 @@ pub const DwarfEngine = struct {
                 return self.handleStop(final_result.signal);
             },
             .step_over => {
+                // Read registers BEFORE stepping past breakpoint to capture
+                // the original function/line context. This is critical because
+                // stepPastBreakpoint single-steps the instruction, and if it's
+                // a call, the PC will move into the callee.
+                const original_regs = try self.process.readRegisters();
+
                 // Step past breakpoint if needed
                 if (self.stepping_past_bp) |bp_addr| {
                     try self.stepPastBreakpoint(bp_addr);
@@ -736,68 +794,173 @@ pub const DwarfEngine = struct {
                 // Instruction-level granularity: just single step
                 if (options.granularity) |g| {
                     if (g == .instruction) {
+                        self.is_single_stepping = true;
                         try self.process.singleStep();
-                        return self.waitAndHandleStop();
-                    }
-                }
-                // Read current PC and find current line
-                const regs = try self.process.readRegisters();
-                const current_line = self.getLineForPC(regs.pc);
-                if (current_line != null and self.line_entries.len > 0) {
-                    // Find the next line entry after current line
-                    if (self.findNextLineAddress(regs.pc)) |next_addr| {
-                        // Set temporary breakpoint at the next line, then continue
-                        const tmp_id = try self.bp_manager.setTemporary(next_addr);
-                        self.bp_manager.writeBreakpoint(tmp_id, &self.process) catch {
-                            // If can't write, fall back to single step
-                            try self.process.singleStep();
-                            return self.waitAndHandleStop();
-                        };
-                        // Also set a safety-net breakpoint at the return address.
-                        // If the current line calls a function, execution enters the callee
-                        // and misses the next-line BP. The return-address BP catches it
-                        // when the callee returns.
-                        var has_ret_bp = false;
-                        const ret_addr = self.getReturnAddress(regs) catch null;
-                        if (ret_addr) |ra| {
-                            if (ra != next_addr) {
-                                const ret_id = self.bp_manager.setTemporary(ra) catch null;
-                                if (ret_id) |rid| {
-                                    self.bp_manager.writeBreakpoint(rid, &self.process) catch {};
-                                    has_ret_bp = true;
-                                }
-                            }
-                        }
-                        try self.process.continueExecution();
                         const result = try self.waitAndHandleStop();
-                        self.bp_manager.cleanupTemporary(&self.process);
-                        // If we stopped at the return address (not the next line),
-                        // advance past the return value store to the next source line
-                        // (Phase 2, same pattern as step_out).
-                        if (has_ret_bp) {
-                            const stop_reason = result.stop_reason;
-                            if (stop_reason == .breakpoint or stop_reason == .step) {
-                                const post_regs = self.process.readRegisters() catch return result;
-                                const post_line = self.getLineForPC(post_regs.pc);
-                                const next_line = self.getLineForPC(next_addr);
-                                // If we didn't land on the expected next line, we hit the return BP
-                                if (post_line == null or next_line == null or post_line.? != next_line.?) {
-                                    self.stepping_past_bp = null;
-                                    if (self.findNextLineAddress(post_regs.pc)) |phase2_addr| {
-                                        const tmp2_id = self.bp_manager.setTemporary(phase2_addr) catch return result;
-                                        self.bp_manager.writeBreakpoint(tmp2_id, &self.process) catch return result;
-                                        self.process.continueExecution() catch return result;
-                                        const phase2_result = self.waitAndHandleStop() catch return result;
-                                        self.bp_manager.cleanupTemporary(&self.process);
-                                        return phase2_result;
-                                    }
-                                }
-                            }
-                        }
+                        self.is_single_stepping = false;
                         return result;
                     }
                 }
+                // Frame-aware step_over: record frame identity before stepping,
+                // then verify we're still in the same frame after each stop.
+                // Uses function address range as primary check (always works),
+                // with CFA or SP as secondary frame identity (handles same-function recursion).
+                // This prevents entering callees when Go's SIGURG causes a resume
+                // after the process has already entered a callee.
+                const current_line = self.getLineForPC(original_regs.pc);
+
+                // Frame identity: use CFA if available, else SP (always available from registers)
+                const pre_cfa = self.computeCfa(original_regs);
+                const pre_frame_id = pre_cfa orelse original_regs.sp;
+
+                if (current_line != null and self.line_entries.len > 0) {
+                    // Find current function range using original PC (before stepPastBreakpoint)
+                    const func_info = self.findFunctionInfoForPC(original_regs.pc);
+                    const func_low = if (func_info) |fi| fi.low_pc else 0;
+                    const func_high = if (func_info) |fi| fi.high_pc else 0;
+
+                    // Multi-BP strategy (like Delve): set breakpoints on ALL subsequent
+                    // statement lines in the current function, not just the next line.
+                    // This ensures we catch the correct stop point even if morestack
+                    // or other runtime trampolines intervene.
+                    var bp_targets: [32]u64 = undefined;
+                    var bp_count: usize = 0;
+                    if (func_low != 0 and func_high != 0) {
+                        bp_count = self.findAllLineAddressesInRange(
+                            original_regs.pc,
+                            func_low,
+                            func_high,
+                            current_line.?,
+                            &bp_targets,
+                        );
+                    }
+                    // Fallback: if no multi-BP targets, use single next-line
+                    if (bp_count == 0) {
+                        if (self.findNextLineAddress(original_regs.pc)) |addr| {
+                            bp_targets[0] = addr;
+                            bp_count = 1;
+                        }
+                    }
+
+                    if (bp_count > 0) {
+                        // Set temp BPs at all target addresses
+                        var any_bp_set = false;
+                        for (bp_targets[0..bp_count]) |target_addr| {
+                            const tmp_id = self.bp_manager.setTemporary(target_addr) catch continue;
+                            self.bp_manager.writeBreakpoint(tmp_id, &self.process) catch continue;
+                            any_bp_set = true;
+                        }
+                        if (!any_bp_set) {
+                            // Can't set any breakpoints — fall back to single step
+                            try self.process.singleStep();
+                            return self.waitAndHandleStop();
+                        }
+                        // Safety-net BP at return address (use original regs for correct frame)
+                        const ret_addr = self.getReturnAddress(original_regs) catch null;
+                        if (ret_addr) |ra| {
+                            const ret_id = self.bp_manager.setTemporary(ra) catch null;
+                            if (ret_id) |rid| {
+                                self.bp_manager.writeBreakpoint(rid, &self.process) catch {};
+                            }
+                        }
+
+                        // Frame-checked stepping loop
+                        var step_attempts: u32 = 0;
+                        const max_step_attempts: u32 = 50;
+                        while (step_attempts < max_step_attempts) : (step_attempts += 1) {
+                            try self.process.continueExecution();
+                            const result = try self.waitAndHandleStop();
+                            self.bp_manager.cleanupTemporary(&self.process);
+
+                            // If process exited or hit exception, return immediately
+                            if (result.stop_reason == .exited or result.stop_reason == .exception) {
+                                return result;
+                            }
+
+                            const post_regs = self.process.readRegisters() catch return result;
+                            const post_line = self.getLineForPC(post_regs.pc);
+
+                            // PRIMARY CHECK: Is PC within the original function?
+                            const in_original_func = if (func_low != 0 and func_high != 0)
+                                (post_regs.pc >= func_low and post_regs.pc < func_high)
+                            else
+                                true;
+
+                            if (in_original_func) {
+                                if (post_line != null and post_line.? != current_line.?) {
+                                    // Verify frame identity (handles recursion)
+                                    const post_cfa = self.computeCfa(post_regs);
+                                    const post_frame_id = post_cfa orelse post_regs.sp;
+                                    if (post_frame_id == pre_frame_id) {
+                                        return result; // Same frame, different line — success!
+                                    }
+                                } else {
+                                    // Same line — re-set all BPs and continue
+                                    for (bp_targets[0..bp_count]) |target_addr| {
+                                        const re_id = self.bp_manager.setTemporary(target_addr) catch continue;
+                                        self.bp_manager.writeBreakpoint(re_id, &self.process) catch continue;
+                                    }
+                                    if (ret_addr) |ra| {
+                                        const re_ret = self.bp_manager.setTemporary(ra) catch null;
+                                        if (re_ret) |rid| {
+                                            self.bp_manager.writeBreakpoint(rid, &self.process) catch {};
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // We left the original function. Check if it's a runtime trampoline.
+                            const post_func_name = if (self.functions.len > 0)
+                                unwind.findFunctionForPC(self.functions, post_regs.pc)
+                            else
+                                "";
+                            if (isRuntimeTrampoline(post_func_name)) {
+                                // In morestack/gogo/etc — re-set all BPs and continue.
+                                // After stack growth completes, execution will return to
+                                // our function (or its callee), hitting one of our BPs.
+                                for (bp_targets[0..bp_count]) |target_addr| {
+                                    const re_id = self.bp_manager.setTemporary(target_addr) catch continue;
+                                    self.bp_manager.writeBreakpoint(re_id, &self.process) catch continue;
+                                }
+                                if (ret_addr) |ra| {
+                                    const re_ret = self.bp_manager.setTemporary(ra) catch null;
+                                    if (re_ret) |rid| {
+                                        self.bp_manager.writeBreakpoint(rid, &self.process) catch {};
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Not a trampoline — we're in a real callee or returned to caller.
+                            const post_cfa = self.computeCfa(post_regs);
+                            const post_frame_id = post_cfa orelse post_regs.sp;
+
+                            if (post_frame_id > pre_frame_id) {
+                                // Returned to caller — acceptable
+                                return result;
+                            }
+
+                            // Entered a callee — set BP at return address and continue
+                            const callee_ret = self.getReturnAddress(post_regs) catch null;
+                            if (callee_ret) |cr| {
+                                const cr_id = self.bp_manager.setTemporary(cr) catch return result;
+                                self.bp_manager.writeBreakpoint(cr_id, &self.process) catch return result;
+                                // Also re-set our function BPs in case we return through morestack
+                                for (bp_targets[0..bp_count]) |target_addr| {
+                                    const re_id = self.bp_manager.setTemporary(target_addr) catch continue;
+                                    self.bp_manager.writeBreakpoint(re_id, &self.process) catch continue;
+                                }
+                                continue;
+                            }
+                            return result;
+                        }
+                        // Exhausted attempts
+                        return .{ .stop_reason = .step };
+                    }
+                }
                 // Fallback: single step
+                self.is_single_stepping = true;
                 try self.process.singleStep();
             },
             .step_out => {
@@ -895,7 +1058,9 @@ pub const DwarfEngine = struct {
         }
 
         // Wait and handle stop — with transparent resume for conditional breakpoints
-        return self.waitAndHandleStop();
+        const stop_state = try self.waitAndHandleStop();
+        self.is_single_stepping = false;
+        return stop_state;
     }
 
     /// Wait for the process to stop, then evaluate breakpoint conditions.
@@ -918,7 +1083,7 @@ pub const DwarfEngine = struct {
             switch (result.status) {
                 .stopped => {
                     var state = self.handleStop(result.signal);
-                    if (state.stop_reason == .breakpoint and state.should_resume) {
+                    if (state.should_resume) {
                         // Collect any log point messages before resuming
                         for (state.log_messages) |msg| {
                             collected_logs.append(self.allocator, msg) catch {};
@@ -928,12 +1093,17 @@ pub const DwarfEngine = struct {
                             self.allocator.free(state.log_messages);
                         }
 
-                        // Condition not met or log point — transparently resume
+                        // Condition not met, log point, or non-fatal signal — transparently resume
                         if (self.stepping_past_bp) |bp_addr| {
                             self.stepPastBreakpoint(bp_addr) catch {};
                             self.stepping_past_bp = null;
                         }
-                        self.process.continueExecution() catch {};
+                        // Re-issue the appropriate operation: single-step or continue
+                        if (self.is_single_stepping) {
+                            self.process.singleStep() catch {};
+                        } else {
+                            self.process.continueExecution() catch {};
+                        }
                         resume_count += 1;
                         continue;
                     }
@@ -1009,6 +1179,97 @@ pub const DwarfEngine = struct {
             if (entry.line != current_line) {
                 return entry.address;
             }
+        }
+        return null;
+    }
+
+    /// Like findNextLineAddress but constrained to a function's address range.
+    /// Returns the address of the next source line after `pc` that is within [func_low, func_high).
+    fn findNextLineAddressInRange(self: *DwarfEngine, pc: u64, func_low: u64, func_high: u64) ?u64 {
+        if (self.line_entries.len == 0) return null;
+        const current_line = self.getLineForPC(pc) orelse return null;
+        // Binary search: find first entry with address > pc
+        var lo: usize = 0;
+        var hi: usize = self.line_entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.line_entries[mid].address <= pc) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // Scan forward from lo for next statement with a different line, within function range
+        for (self.line_entries[lo..]) |entry| {
+            if (func_high > 0 and entry.address >= func_high) break;
+            if (entry.end_sequence) continue;
+            if (!entry.is_stmt) continue;
+            if (entry.address < func_low) continue;
+            if (entry.line != current_line) {
+                return entry.address;
+            }
+        }
+        return null;
+    }
+
+    /// Find ALL statement line addresses within a function range that are on lines
+    /// different from `current_line`. Used for multi-BP step_over (like Delve's strategy).
+    /// Returns the number of addresses written into `buf`.
+    fn findAllLineAddressesInRange(
+        self: *DwarfEngine,
+        pc: u64,
+        func_low: u64,
+        func_high: u64,
+        current_line: u32,
+        buf: []u64,
+    ) usize {
+        if (self.line_entries.len == 0) return 0;
+        // Binary search: find first entry with address > pc
+        var lo: usize = 0;
+        var hi: usize = self.line_entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.line_entries[mid].address <= pc) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        var count: usize = 0;
+        var last_line: u32 = current_line;
+        for (self.line_entries[lo..]) |entry| {
+            if (func_high > 0 and entry.address >= func_high) break;
+            if (entry.end_sequence) continue;
+            if (!entry.is_stmt) continue;
+            if (entry.address < func_low) continue;
+            if (entry.line != current_line and entry.line != last_line) {
+                if (count >= buf.len) break;
+                buf[count] = entry.address;
+                count += 1;
+                last_line = entry.line;
+            }
+        }
+        return count;
+    }
+
+    /// Find the FunctionInfo (with address range) for a PC. Returns null if no function contains pc.
+    fn findFunctionInfoForPC(self: *DwarfEngine, pc: u64) ?parser.FunctionInfo {
+        if (self.functions.len == 0) return null;
+        // Binary search: find rightmost function with low_pc <= pc
+        var lo: usize = 0;
+        var hi: usize = self.functions.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.functions[mid].low_pc <= pc) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo == 0) return null;
+        const f = self.functions[lo - 1];
+        if (pc >= f.low_pc and (f.high_pc == 0 or pc < f.high_pc)) {
+            return f;
         }
         return null;
     }
@@ -1142,7 +1403,18 @@ pub const DwarfEngine = struct {
                     },
                 };
             }
-            return .{ .stop_reason = .step };
+            // Fatal signals always stop (SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV)
+            if (signal > 0 and signal < 32 and isFatalSignal(@intCast(signal))) {
+                return .{
+                    .stop_reason = .exception,
+                    .exception = .{
+                        .@"type" = signalName(@intCast(signal)),
+                        .message = "Fatal signal received",
+                    },
+                };
+            }
+            // Non-fatal, non-configured signal (e.g. SIGURG from Go runtime) — resume
+            return .{ .stop_reason = .step, .should_resume = true };
         }
 
         // Read PC to check if we hit a breakpoint
@@ -1299,7 +1571,7 @@ pub const DwarfEngine = struct {
             break :blk std.mem.eql(u8, last_name, "main") or std.mem.eql(u8, last_name, "_start");
         };
         if (!fp_complete) {
-            if (self.resolveEhFrameData()) |eh_frame_data| {
+            if (self.resolveFrameData()) |eh_frame_data| {
                 var cfa_ctx = CfaReaderCtx{
                     .regs = regs,
                     .process = &self.process,
@@ -1319,6 +1591,7 @@ pub const DwarfEngine = struct {
                     50,
                     if (self.eh_frame_index) |*idx| idx else null,
                     if (self.cie_cache) |*cc| cc else null,
+                    self.is_debug_frame,
                 ) catch fp_frames;
 
                 // Use CFA result only if it's better than FP result
@@ -1368,7 +1641,7 @@ pub const DwarfEngine = struct {
                 }
             }
 
-            // Add the physical frame
+            // Add the physical frame (SP is set to 0 initially; corrected below via CFA chain)
             try frame_list.append(self.allocator, .{
                 .id = next_id,
                 .name = uf.function_name,
@@ -1376,18 +1649,53 @@ pub const DwarfEngine = struct {
                 .line = uf.line,
                 .address = uf.address,
                 .fp = uf.fp,
+                .sp = if (uf.sp != 0) uf.sp else 0,
             });
             next_id += 1;
+        }
+
+        // Compute correct SP for each physical frame using CFA chain.
+        // Frame 0's SP comes from actual registers. Frame N's SP = CFA of frame N-1,
+        // because on ARM64 the caller's SP at the call site equals the callee's CFA.
+        {
+            var prev_cfa: ?u64 = null;
+            var is_first_physical = true;
+            for (frame_list.items) |*frame| {
+                if (frame.fp == 0 and frame.address == 0) continue; // skip inlined/virtual frames
+
+                if (is_first_physical) {
+                    frame.sp = regs.sp;
+                    prev_cfa = self.computeCfa(regs);
+                    is_first_physical = false;
+                } else {
+                    // SP for this frame = CFA of the previous (callee) frame
+                    if (prev_cfa) |sp| {
+                        frame.sp = sp;
+                    } else if (frame.fp != 0) {
+                        frame.sp = frame.fp; // last resort fallback
+                    }
+                    // Compute CFA for this frame to propagate to the next
+                    var frame_regs = regs;
+                    frame_regs.fp = frame.fp;
+                    frame_regs.pc = frame.address;
+                    frame_regs.sp = frame.sp;
+                    if (builtin.cpu.arch == .aarch64) {
+                        frame_regs.gprs[29] = frame.fp;
+                        frame_regs.gprs[31] = frame.sp;
+                    } else if (builtin.cpu.arch == .x86_64) {
+                        frame_regs.gprs[6] = frame.fp;
+                        frame_regs.gprs[7] = frame.sp;
+                    }
+                    prev_cfa = self.computeCfa(frame_regs);
+                }
+            }
         }
 
         return try frame_list.toOwnedSlice(self.allocator);
     }
 
-    /// Get a file name from file entries by index (mirrors parser.getFileName).
+    /// Get a file name from file entries by 0-based index.
     fn getFileName(files: []const parser.FileEntry, index: u32) []const u8 {
-        if (index > 0 and index - 1 < files.len) {
-            return files[index - 1].name;
-        }
         if (index < files.len) {
             return files[index].name;
         }
@@ -1412,7 +1720,7 @@ pub const DwarfEngine = struct {
         return parser.findCuForPC(self.cu_index, dwarf_pc);
     }
 
-    fn resolveDebugData(self: *const DwarfEngine) ?DebugData {
+    fn resolveDebugData(self: *DwarfEngine) ?DebugData {
         // Try Mach-O binaries (dSYM first, then main)
         if (self.dsym_binary) |*dsym| {
             if (self.resolveDebugDataFromMacho(dsym)) |d| return d;
@@ -1427,57 +1735,94 @@ pub const DwarfEngine = struct {
         return null;
     }
 
-    fn resolveDebugDataFromMacho(_: *const DwarfEngine, bin: *const binary_macho.MachoBinary) ?DebugData {
+    fn resolveDebugDataFromMacho(self: *DwarfEngine, bin: *binary_macho.MachoBinary) ?DebugData {
         const info_section = bin.sections.debug_info orelse return null;
         const abbrev_section = bin.sections.debug_abbrev orelse return null;
-        const info_data = bin.getSectionData(info_section) orelse return null;
-        const abbrev_data = bin.getSectionData(abbrev_section) orelse return null;
+        const info_data = (bin.getSectionDataAlloc(self.allocator, info_section) catch null) orelse bin.getSectionData(info_section) orelse return null;
+        const abbrev_data = (bin.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse bin.getSectionData(abbrev_section) orelse return null;
         return .{
             .info_data = info_data,
             .abbrev_data = abbrev_data,
-            .str_data = if (bin.sections.debug_str) |s| bin.getSectionData(s) else null,
-            .str_offsets_data = if (bin.sections.debug_str_offsets) |s| bin.getSectionData(s) else null,
-            .addr_data = if (bin.sections.debug_addr) |s| bin.getSectionData(s) else null,
-            .ranges_data = if (bin.sections.debug_ranges) |s| bin.getSectionData(s) else null,
-            .rnglists_data = if (bin.sections.debug_rnglists) |s| bin.getSectionData(s) else null,
-            .loc_data = if (bin.sections.debug_loc) |s| bin.getSectionData(s) else null,
-            .loclists_data = if (bin.sections.debug_loclists) |s| bin.getSectionData(s) else null,
+            .str_data = if (bin.sections.debug_str) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
+            .str_offsets_data = if (bin.sections.debug_str_offsets) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
+            .addr_data = if (bin.sections.debug_addr) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
+            .ranges_data = if (bin.sections.debug_ranges) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
+            .rnglists_data = if (bin.sections.debug_rnglists) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
+            .loc_data = if (bin.sections.debug_loc) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
+            .loclists_data = if (bin.sections.debug_loclists) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
         };
     }
 
-    fn resolveDebugDataFromElf(_: *const DwarfEngine, elf: *const binary_elf.ElfBinary) ?DebugData {
+    fn resolveDebugDataFromElf(self: *DwarfEngine, elf: *binary_elf.ElfBinary) ?DebugData {
         const info_section = elf.sections.debug_info orelse return null;
         const abbrev_section = elf.sections.debug_abbrev orelse return null;
-        const info_data = elf.getSectionData(info_section) orelse return null;
-        const abbrev_data = elf.getSectionData(abbrev_section) orelse return null;
+        const info_data = (elf.getSectionDataAlloc(self.allocator, info_section) catch null) orelse elf.getSectionData(info_section) orelse return null;
+        const abbrev_data = (elf.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse elf.getSectionData(abbrev_section) orelse return null;
         return .{
             .info_data = info_data,
             .abbrev_data = abbrev_data,
-            .str_data = if (elf.sections.debug_str) |s| elf.getSectionData(s) else null,
-            .str_offsets_data = if (elf.sections.debug_str_offsets) |s| elf.getSectionData(s) else null,
-            .addr_data = if (elf.sections.debug_addr) |s| elf.getSectionData(s) else null,
-            .ranges_data = if (elf.sections.debug_ranges) |s| elf.getSectionData(s) else null,
-            .rnglists_data = if (elf.sections.debug_rnglists) |s| elf.getSectionData(s) else null,
-            .loc_data = if (elf.sections.debug_loc) |s| elf.getSectionData(s) else null,
-            .loclists_data = if (elf.sections.debug_loclists) |s| elf.getSectionData(s) else null,
+            .str_data = if (elf.sections.debug_str) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .str_offsets_data = if (elf.sections.debug_str_offsets) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .addr_data = if (elf.sections.debug_addr) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .ranges_data = if (elf.sections.debug_ranges) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .rnglists_data = if (elf.sections.debug_rnglists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .loc_data = if (elf.sections.debug_loc) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .loclists_data = if (elf.sections.debug_loclists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
         };
     }
 
-    /// Resolve .eh_frame section data from available binaries.
-    fn resolveEhFrameData(self: *const DwarfEngine) ?[]const u8 {
+    /// Resolve .eh_frame or .debug_frame section data from available binaries.
+    /// Tries .eh_frame first, then falls back to .debug_frame (used by Go binaries).
+    /// Sets self.is_debug_frame accordingly.
+    fn resolveFrameData(self: *DwarfEngine) ?[]const u8 {
+        // Try .eh_frame first
         if (self.dsym_binary) |*dsym| {
             if (dsym.sections.eh_frame) |s| {
-                if (dsym.getSectionData(s)) |d| return d;
+                if ((dsym.getSectionDataAlloc(self.allocator, s) catch null) orelse dsym.getSectionData(s)) |d| {
+                    self.is_debug_frame = false;
+                    return d;
+                }
             }
         }
         if (self.binary) |*bin| {
             if (bin.sections.eh_frame) |s| {
-                if (bin.getSectionData(s)) |d| return d;
+                if ((bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s)) |d| {
+                    self.is_debug_frame = false;
+                    return d;
+                }
             }
         }
         if (self.elf_binary) |*elf| {
             if (elf.sections.eh_frame) |s| {
-                if (elf.getSectionData(s)) |d| return d;
+                if ((elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s)) |d| {
+                    self.is_debug_frame = false;
+                    return d;
+                }
+            }
+        }
+        // Fall back to .debug_frame
+        if (self.dsym_binary) |*dsym| {
+            if (dsym.sections.debug_frame) |s| {
+                if ((dsym.getSectionDataAlloc(self.allocator, s) catch null) orelse dsym.getSectionData(s)) |d| {
+                    self.is_debug_frame = true;
+                    return d;
+                }
+            }
+        }
+        if (self.binary) |*bin| {
+            if (bin.sections.debug_frame) |s| {
+                if ((bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s)) |d| {
+                    self.is_debug_frame = true;
+                    return d;
+                }
+            }
+        }
+        if (self.elf_binary) |*elf| {
+            if (elf.sections.debug_frame) |s| {
+                if ((elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s)) |d| {
+                    self.is_debug_frame = true;
+                    return d;
+                }
             }
         }
         return null;
@@ -1526,6 +1871,37 @@ pub const DwarfEngine = struct {
         }
     };
 
+    /// Compute the Canonical Frame Address from .eh_frame/.debug_frame.
+    /// Uses the existing unwind infrastructure (EhFrameIndex, CieCache) for O(log n) lookup.
+    fn computeCfa(self: *DwarfEngine, regs: process_mod.RegisterState) ?u64 {
+        const eh_frame_data = self.resolveFrameData() orelse return null;
+        // For .debug_frame, FDE addresses are absolute DWARF addresses.
+        // Convert runtime PC to DWARF space for correct FDE lookup and CFA execution.
+        const target_pc: u64 = if (self.is_debug_frame and self.aslr_slide != 0) blk: {
+            break :blk if (self.aslr_slide >= 0)
+                regs.pc -% @as(u64, @intCast(self.aslr_slide))
+            else
+                regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+        } else regs.pc;
+        var cfa_ctx = CfaReaderCtx{
+            .regs = regs,
+            .process = &self.process,
+            .allocator = self.allocator,
+        };
+        const result = unwind.unwindCfa(
+            eh_frame_data,
+            target_pc,
+            @ptrCast(&cfa_ctx),
+            &CfaReaderCtx.regReader,
+            &CfaReaderCtx.memReader,
+            if (self.eh_frame_index) |*idx| idx else null,
+            if (self.cie_cache) |*cc| cc else null,
+            self.allocator,
+            self.is_debug_frame,
+        ) orelse return null;
+        return result.cfa;
+    }
+
     fn buildLocals(self: *DwarfEngine, regs: process_mod.RegisterState) ![]const types.Variable {
         const dd = self.resolveDebugData() orelse return &.{};
 
@@ -1534,6 +1910,23 @@ pub const DwarfEngine = struct {
             regs.pc -% @as(u64, @intCast(self.aslr_slide))
         else
             regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+
+        {
+            const f = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
+            if (f) |file| {
+                defer file.close();
+                file.seekFromEnd(0) catch {};
+                var buf: [512]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "buildLocals: regs.pc=0x{x}, aslr_slide={d}, dwarf_pc=0x{x}, has_loc={}, has_loclists={}\n", .{
+                    regs.pc,
+                    self.aslr_slide,
+                    dwarf_pc,
+                    dd.loc_data != null,
+                    dd.loclists_data != null,
+                }) catch "buildLocals: fmt error\n";
+                file.writeAll(msg) catch {};
+            }
+        }
 
         var scoped = parser.parseScopedVariables(
             dd.info_data,
@@ -1594,9 +1987,9 @@ pub const DwarfEngine = struct {
         var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = self.allocator };
         const mem_reader = mem_adapter.reader();
 
-        // Evaluate frame base
+        // Evaluate frame base (pass real CFA from .eh_frame for DW_OP_call_frame_cfa)
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
-            const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(regs) });
             break :blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -1609,10 +2002,61 @@ pub const DwarfEngine = struct {
         var locals = std.ArrayListUnmanaged(types.Variable).empty;
         errdefer locals.deinit(self.allocator);
 
+        {
+            const f2 = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
+            if (f2) |file2| {
+                defer file2.close();
+                file2.seekFromEnd(0) catch {};
+                var buf2: [512]u8 = undefined;
+                const msg2 = std.fmt.bufPrint(&buf2, "buildLocals: frame_base={?}, cfa={?}, sp=0x{x}, fp=0x{x}, num_vars={}\n", .{
+                    frame_base,
+                    self.computeCfa(regs),
+                    regs.sp,
+                    regs.fp,
+                    scoped.variables.len,
+                }) catch "buildLocals frame_base: fmt error\n";
+                file2.writeAll(msg2) catch {};
+            }
+        }
+
         for (scoped.variables) |v| {
             if (v.location_expr.len == 0) continue;
 
             const loc = location.evalLocationWithMemory(v.location_expr, reg_provider, frame_base, mem_reader);
+
+            {
+                const f3 = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
+                if (f3) |file3| {
+                    defer file3.close();
+                    file3.seekFromEnd(0) catch {};
+                    var buf3: [512]u8 = undefined;
+                    var p3: usize = 0;
+                    p3 += (std.fmt.bufPrint(buf3[p3..], "  var {s}: loc_type={s}", .{
+                        v.name,
+                        switch (loc) {
+                            .address => "address",
+                            .register => "register",
+                            .value => "value",
+                            .empty => "empty",
+                            .implicit_pointer => "implicit_pointer",
+                            .composite => "composite",
+                        },
+                    }) catch "").len;
+                    p3 += (switch (loc) {
+                        .address => |a| std.fmt.bufPrint(buf3[p3..], " addr=0x{x}", .{a}),
+                        .register => |r| std.fmt.bufPrint(buf3[p3..], " reg={}", .{r}),
+                        .value => |val| std.fmt.bufPrint(buf3[p3..], " val=0x{x}", .{val}),
+                        else => std.fmt.bufPrint(buf3[p3..], "", .{}),
+                    } catch "").len;
+                    p3 += (std.fmt.bufPrint(buf3[p3..], " expr_bytes=", .{}) catch "").len;
+                    for (v.location_expr) |b| {
+                        p3 += (std.fmt.bufPrint(buf3[p3..], "{x:0>2}", .{b}) catch "").len;
+                    }
+                    if (p3 < buf3.len) { buf3[p3] = '\n'; p3 += 1; }
+                    file3.writeAll(buf3[0..p3]) catch {};
+                }
+            }
+
             var fmt_buf: [64]u8 = undefined;
             const value_str = switch (loc) {
                 .value => |val| blk: {
@@ -1696,7 +2140,7 @@ pub const DwarfEngine = struct {
 
         if (self.line_entries.len > 0) {
             // Resolve file:line to address via DWARF line table
-            const bp = try self.bp_manager.resolveAndSetEx(file, line, self.line_entries, condition, hit_condition, log_message);
+            const bp = try self.bp_manager.resolveAndSetEx(file, line, self.line_entries, self.file_entries, condition, hit_condition, log_message);
 
             // Write INT3 into the process
             self.bp_manager.writeBreakpoint(bp.id, &self.process) catch |err| {
@@ -1926,13 +2370,31 @@ pub const DwarfEngine = struct {
             filtered_vars = filtered_buf.items;
         }
 
-        // 7. Adjust registers for target frame — use frame's FP for parent frame inspection
+        // 7. Adjust registers for target frame — use frame's FP, PC, SP for parent frame inspection.
+        //    Also sync GPR array entries so RegisterAdapter reads the same values as CfaReaderCtx.
         var frame_regs = regs;
         if (request.frame_id) |frame_id| {
             if (frame_id > 0) {
                 for (self.cached_stack_trace) |frame| {
-                    if (frame.id == frame_id and frame.fp != 0) {
-                        frame_regs.fp = frame.fp;
+                    if (frame.id == frame_id) {
+                        if (frame.fp != 0) {
+                            frame_regs.fp = frame.fp;
+                            // Sync GPR array so RegisterAdapter reads correct FP
+                            if (builtin.cpu.arch == .aarch64) {
+                                frame_regs.gprs[29] = frame.fp; // x29 = FP
+                            } else if (builtin.cpu.arch == .x86_64) {
+                                frame_regs.gprs[6] = frame.fp; // RBP
+                            }
+                        }
+                        if (frame.address != 0) frame_regs.pc = frame.address;
+                        if (frame.sp != 0) {
+                            frame_regs.sp = frame.sp;
+                            if (builtin.cpu.arch == .aarch64) {
+                                frame_regs.gprs[31] = frame.sp; // x31 = SP
+                            } else if (builtin.cpu.arch == .x86_64) {
+                                frame_regs.gprs[7] = frame.sp; // RSP
+                            }
+                        }
                         break;
                     }
                 }
@@ -1962,9 +2424,9 @@ pub const DwarfEngine = struct {
         var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
-        // 11. Evaluate frame base expression
+        // 11. Evaluate frame base expression (pass real CFA for DW_OP_call_frame_cfa)
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
-            const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(frame_regs) });
             break :blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -1996,9 +2458,9 @@ pub const DwarfEngine = struct {
         var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
-        // Evaluate frame base
+        // Evaluate frame base (pass real CFA for DW_OP_call_frame_cfa)
         const frame_base: ?u64 = if (frame_base_expr.len > 0) blk: {
-            const fb_result = location.evalLocation(frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(regs) });
             break :blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -2400,9 +2862,9 @@ pub const DwarfEngine = struct {
         var reg_adapter = RegisterAdapter{ .regs = regs };
         const reg_provider = reg_adapter.provider();
 
-        // Evaluate frame base
+        // Evaluate frame base (pass real CFA for DW_OP_call_frame_cfa)
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) fb_blk: {
-            const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(regs) });
             break :fb_blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -2480,7 +2942,7 @@ pub const DwarfEngine = struct {
         const mem_reader = mem_adapter.reader();
 
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) fb_blk: {
-            const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(regs) });
             break :fb_blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -2924,10 +3386,37 @@ pub const DwarfEngine = struct {
 
     // ── Set Variable ─────────────────────────────────────────────────
 
-    fn engineSetVariable(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, value: []const u8, _: u32) anyerror!InspectResult {
+    fn engineSetVariable(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, value: []const u8, frame_id: u32) anyerror!InspectResult {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         if (self.core_dump != null) return error.NotSupported; // core dumps are read-only
         const regs = try self.process.readRegisters();
+
+        // Adjust registers for target frame if needed (sync GPR array for RegisterAdapter)
+        var frame_regs = regs;
+        if (frame_id > 0) {
+            for (self.cached_stack_trace) |frame| {
+                if (frame.id == frame_id) {
+                    if (frame.fp != 0) {
+                        frame_regs.fp = frame.fp;
+                        if (builtin.cpu.arch == .aarch64) {
+                            frame_regs.gprs[29] = frame.fp;
+                        } else if (builtin.cpu.arch == .x86_64) {
+                            frame_regs.gprs[6] = frame.fp;
+                        }
+                    }
+                    if (frame.address != 0) frame_regs.pc = frame.address;
+                    if (frame.sp != 0) {
+                        frame_regs.sp = frame.sp;
+                        if (builtin.cpu.arch == .aarch64) {
+                            frame_regs.gprs[31] = frame.sp;
+                        } else if (builtin.cpu.arch == .x86_64) {
+                            frame_regs.gprs[7] = frame.sp;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
 
         // Find debug binary
         const debug_binary: *const binary_macho.MachoBinary = blk: {
@@ -2946,10 +3435,11 @@ pub const DwarfEngine = struct {
         const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
         const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
 
+        // Use target frame's PC for variable lookup
         const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            regs.pc -% @as(u64, @intCast(self.aslr_slide))
+            frame_regs.pc -% @as(u64, @intCast(self.aslr_slide))
         else
-            regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+            frame_regs.pc +% @as(u64, @intCast(-self.aslr_slide));
 
         const extra_sections = parser.ExtraSections{
             .debug_str_offsets = str_offsets_data,
@@ -2973,14 +3463,14 @@ pub const DwarfEngine = struct {
         );
         defer parser.freeScopedVariables(scoped, allocator);
 
-        // Build adapters
-        var reg_adapter = RegisterAdapter{ .regs = regs };
+        // Build adapters using target frame registers
+        var reg_adapter = RegisterAdapter{ .regs = frame_regs };
         const reg_provider = reg_adapter.provider();
         var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
-            const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(frame_regs) });
             break :blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -3061,15 +3551,31 @@ pub const DwarfEngine = struct {
 
     // ── Goto ────────────────────────────────────────────────────────
 
-    fn engineGoto(ctx: *anyopaque, _: std.mem.Allocator, _: []const u8, line: u32) anyerror!StopState {
+    fn engineGoto(ctx: *anyopaque, _: std.mem.Allocator, file: []const u8, line: u32) anyerror!StopState {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         if (self.line_entries.len == 0) return error.NoDebugInfo;
 
-        // Find address for target line
+        // Find address for target line, filtering by file if provided.
+        // When a file is specified, prefer exact/suffix matches over basename-only
+        // matches to avoid resolving to wrong files (e.g. Go runtime files).
         var target_addr: ?u64 = null;
+        var best_match_quality: u8 = 0;
         for (self.line_entries) |entry| {
             if (entry.end_sequence) continue;
-            if (entry.line == line and entry.is_stmt) {
+            if (entry.line != line or !entry.is_stmt) continue;
+            if (file.len > 0 and self.file_entries.len > 0) {
+                const entry_file = if (entry.file_index < self.file_entries.len)
+                    self.file_entries[entry.file_index].name
+                else
+                    "";
+                const quality = breakpoint_mod.fileMatchQuality(file, entry_file);
+                if (quality == 0) continue;
+                if (quality > best_match_quality) {
+                    best_match_quality = quality;
+                    target_addr = entry.address;
+                    if (quality == 3) break; // exact match, can't do better
+                }
+            } else {
                 target_addr = entry.address;
                 break;
             }
@@ -3109,6 +3615,26 @@ pub const DwarfEngine = struct {
                 self.exception_signals[sig] = true;
             }
         }
+    }
+
+    fn isFatalSignal(sig: u8) bool {
+        return switch (sig) {
+            4, 6, 8, 10, 11 => true, // SIGILL, SIGABRT, SIGFPE, SIGBUS, SIGSEGV
+            else => false,
+        };
+    }
+
+    /// Returns true if the function name is a Go runtime trampoline that should
+    /// be stepped through transparently. These include morestack (stack growth),
+    /// gogo (goroutine resume), and other runtime internals that sit between
+    /// user function calls.
+    fn isRuntimeTrampoline(name: []const u8) bool {
+        if (std.mem.startsWith(u8, name, "runtime.morestack")) return true;
+        if (std.mem.startsWith(u8, name, "runtime.newstack")) return true;
+        if (std.mem.startsWith(u8, name, "runtime.gogo")) return true;
+        if (std.mem.startsWith(u8, name, "runtime.systemstack")) return true;
+        if (std.mem.startsWith(u8, name, "runtime.mcall")) return true;
+        return false;
     }
 
     fn signalName(sig: u8) []const u8 {
@@ -3245,7 +3771,7 @@ pub const DwarfEngine = struct {
             .supports_hit_conditional_breakpoints = true,
             .supports_log_points = true,
             .supports_function_breakpoints = true,
-            .supports_data_breakpoints = false,
+            .supports_data_breakpoints = (builtin.cpu.arch == .aarch64),
             .supports_step_back = false,
             .supports_restart_frame = false,
             .supports_goto_targets = true,
@@ -3417,16 +3943,268 @@ pub const DwarfEngine = struct {
         return try sources.toOwnedSlice(allocator);
     }
 
-    // ── Data Breakpoints ────────────────────────────────────────────
+    // ── Step In Targets ──────────────────────────────────────────────
 
-    fn engineDataBreakpointInfo(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?u32) anyerror!types.DataBreakpointInfo {
-        // Native hardware watchpoints not yet implemented
-        return error.NotSupported;
+    fn engineStepInTargets(ctx: *anyopaque, allocator: std.mem.Allocator, _: u32) anyerror![]const types.StepInTarget {
+        const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        const regs = try self.process.readRegisters();
+        const pc = regs.pc;
+
+        // Find current line's address range from line_entries
+        const current_line = self.getLineForPC(pc) orelse return &.{};
+        var line_start: u64 = pc;
+        var line_end: u64 = pc;
+
+        // Find all addresses that belong to the current line
+        for (self.line_entries) |entry| {
+            if (entry.end_sequence) continue;
+            if (entry.line == current_line and entry.address >= pc) {
+                if (entry.address < line_start or line_start == pc) line_start = entry.address;
+            }
+        }
+        line_start = pc; // Always start from current PC
+
+        // Find the next line's first address as the end
+        if (self.findNextLineAddress(pc)) |next_addr| {
+            line_end = next_addr;
+        } else {
+            // If no next line, scan a small range
+            line_end = pc + 64;
+        }
+
+        if (line_end <= line_start) return &.{};
+
+        var targets = std.ArrayListUnmanaged(types.StepInTarget).empty;
+        errdefer targets.deinit(allocator);
+
+        const is_arm = builtin.cpu.arch == .aarch64;
+        var next_id: u32 = 1;
+        var addr = line_start;
+
+        while (addr < line_end) {
+            if (is_arm) {
+                const bytes = self.process.readMemory(addr, 4, allocator) catch break;
+                defer allocator.free(bytes);
+                if (bytes.len < 4) break;
+
+                // Substitute original bytes if breakpoint patched at this address
+                if (self.bp_manager.findByAddress(addr)) |bp| {
+                    if (bp.enabled and bytes.len >= breakpoint_mod.bp_size) {
+                        @memcpy(bytes[0..breakpoint_mod.bp_size], &bp.original_bytes);
+                    }
+                }
+
+                const word = std.mem.readInt(u32, bytes[0..4], .little);
+
+                // BL (branch with link) — opcode: top 6 bits = 100101
+                if (word >> 26 == 0x25) {
+                    // Extract signed 26-bit immediate, shifted left by 2 to form byte offset
+                    const raw_imm: u32 = word & 0x03FFFFFF;
+                    // Sign-extend: shift left 6 to put sign bit at bit 31, then arithmetic shift right 4
+                    const sign_extended: i32 = @as(i32, @bitCast(raw_imm << 6)) >> 4;
+                    const target_addr: u64 = @bitCast(@as(i64, @bitCast(addr)) +% @as(i64, sign_extended));
+                    const func_name = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, target_addr) else "<unknown>";
+                    if (!std.mem.eql(u8, func_name, "<unknown>")) {
+                        try targets.append(allocator, .{
+                            .id = next_id,
+                            .label = try allocator.dupe(u8, func_name),
+                        });
+                        next_id += 1;
+                    }
+                }
+                // BLR (branch with link to register) — opcode: 1101011000111111xxxxxxx00000xxxxx
+                // Encoding: 1101 0110 0011 1111 0000 00xx xxx0 0000
+                if ((word & 0xFFFFFC1F) == 0xD63F0000) {
+                    // Target is in a register — we can try to read it
+                    const rn = (word >> 5) & 0x1F;
+                    const reg_val = regs.gprs[rn];
+                    if (reg_val != 0) {
+                        const func_name = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, reg_val) else "<unknown>";
+                        if (!std.mem.eql(u8, func_name, "<unknown>")) {
+                            try targets.append(allocator, .{
+                                .id = next_id,
+                                .label = try allocator.dupe(u8, func_name),
+                            });
+                            next_id += 1;
+                        }
+                    }
+                }
+                addr += 4;
+            } else {
+                // x86_64: read up to 16 bytes for instruction decoding
+                const bytes = self.process.readMemory(addr, 16, allocator) catch break;
+                defer allocator.free(bytes);
+                if (bytes.len == 0) break;
+
+                // Substitute original bytes if breakpoint patched
+                if (self.bp_manager.findByAddress(addr)) |bp| {
+                    if (bp.enabled and bytes.len >= breakpoint_mod.bp_size) {
+                        @memcpy(bytes[0..breakpoint_mod.bp_size], &bp.original_bytes);
+                    }
+                }
+
+                // Check for CALL instructions (E8 rel32 or FF /2 indirect)
+                if (bytes[0] == 0xE8 and bytes.len >= 5) {
+                    // Direct CALL rel32
+                    const rel: i32 = @bitCast(std.mem.readInt(u32, bytes[1..5], .little));
+                    const target_addr: u64 = @bitCast(@as(i64, @intCast(@as(i64, @bitCast(addr)))) + @as(i64, rel) + 5);
+                    const func_name = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, target_addr) else "<unknown>";
+                    if (!std.mem.eql(u8, func_name, "<unknown>")) {
+                        try targets.append(allocator, .{
+                            .id = next_id,
+                            .label = try allocator.dupe(u8, func_name),
+                        });
+                        next_id += 1;
+                    }
+                    addr += 5;
+                    continue;
+                }
+                // Skip other instructions — advance by 1 byte (basic heuristic)
+                addr += 1;
+            }
+        }
+
+        return try targets.toOwnedSlice(allocator);
     }
 
-    fn engineSetDataBreakpoint(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: types.DataBreakpointAccessType) anyerror!types.BreakpointInfo {
-        // Native hardware watchpoints not yet implemented
-        return error.NotSupported;
+    // ── Data Breakpoints ────────────────────────────────────────────
+
+    fn engineDataBreakpointInfo(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, frame_id: ?u32) anyerror!types.DataBreakpointInfo {
+        const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        if (builtin.cpu.arch != .aarch64) return error.NotSupported;
+
+        const regs = try self.process.readRegisters();
+
+        // Adjust registers for target frame
+        var frame_regs = regs;
+        if (frame_id) |fid| {
+            if (fid > 0) {
+                for (self.cached_stack_trace) |frame| {
+                    if (frame.id == fid) {
+                        if (frame.fp != 0) frame_regs.fp = frame.fp;
+                        if (frame.address != 0) frame_regs.pc = frame.address;
+                        if (frame.sp != 0) frame_regs.sp = frame.sp;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Find the variable using DWARF info
+        const debug_binary: *const binary_macho.MachoBinary = blk: {
+            if (self.dsym_binary) |*dsym| {
+                if (dsym.sections.debug_info != null) break :blk dsym;
+            }
+            if (self.binary) |*bin| {
+                if (bin.sections.debug_info != null) break :blk bin;
+            }
+            return error.NoDebugInfo;
+        };
+
+        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
+            frame_regs.pc -% @as(u64, @intCast(self.aslr_slide))
+        else
+            frame_regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+
+        const info_data = debug_binary.getSectionData(debug_binary.sections.debug_info orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
+        const abbrev_data = debug_binary.getSectionData(debug_binary.sections.debug_abbrev orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
+        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
+
+        const scoped = try parser.parseScopedVariables(
+            info_data,
+            abbrev_data,
+            str_data,
+            .{
+                .debug_str_offsets = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null,
+                .debug_addr = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
+                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
+                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
+                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+            },
+            dwarf_pc,
+            allocator,
+            if (self.abbrev_cache) |*ac| ac else null,
+            self.cuHintForPC(dwarf_pc),
+            if (self.type_die_cache) |*tdc| tdc else null,
+        );
+        defer parser.freeScopedVariables(scoped, allocator);
+
+        var reg_adapter = RegisterAdapter{ .regs = frame_regs };
+        const reg_provider = reg_adapter.provider();
+        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
+        const mem_reader = mem_adapter.reader();
+
+        const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(frame_regs) });
+            break :blk switch (fb_result) {
+                .address => |addr| addr,
+                .value => |val| val,
+                .register => |reg| reg_provider.read(reg),
+                .empty, .implicit_pointer, .composite => null,
+            };
+        } else null;
+
+        // Find the variable's memory address
+        for (scoped.variables) |v| {
+            if (!std.mem.eql(u8, v.name, name)) continue;
+            if (v.location_expr.len == 0) continue;
+
+            const loc = location.evalLocationWithMemory(v.location_expr, reg_provider, frame_base, mem_reader);
+            switch (loc) {
+                .address => |addr| {
+                    const size: u8 = if (v.type_byte_size > 0) @intCast(@min(v.type_byte_size, 8)) else 4;
+                    // Build data_id as "address:size" string
+                    const data_id = try std.fmt.allocPrint(allocator, "0x{x}:{d}", .{ addr, size });
+                    const desc = try std.fmt.allocPrint(allocator, "{s} at 0x{x}", .{ name, addr });
+                    const access_types = try allocator.alloc(types.DataBreakpointAccessType, 3);
+                    access_types[0] = .read;
+                    access_types[1] = .write;
+                    access_types[2] = .readWrite;
+                    return .{
+                        .data_id = data_id,
+                        .description = desc,
+                        .access_types = access_types,
+                    };
+                },
+                else => return error.VariableNotInMemory,
+            }
+        }
+
+        return error.VariableNotFound;
+    }
+
+    fn engineSetDataBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, data_id: []const u8, access_type: types.DataBreakpointAccessType) anyerror!types.BreakpointInfo {
+        const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        if (builtin.cpu.arch != .aarch64) return error.NotSupported;
+
+        // Parse data_id format: "0xADDRESS:SIZE"
+        const colon_pos = std.mem.indexOf(u8, data_id, ":") orelse return error.InvalidDataId;
+        const addr_str = data_id[0..colon_pos];
+        const size_str = data_id[colon_pos + 1 ..];
+
+        // Parse address (skip "0x" prefix)
+        const addr_start: usize = if (std.mem.startsWith(u8, addr_str, "0x")) 2 else 0;
+        const address = std.fmt.parseInt(u64, addr_str[addr_start..], 16) catch return error.InvalidDataId;
+        const size = std.fmt.parseInt(u8, size_str, 10) catch return error.InvalidDataId;
+
+        // Convert access type to hardware encoding
+        const hw_access: u8 = switch (access_type) {
+            .read => 1,
+            .write => 2,
+            .readWrite => 3,
+        };
+
+        // Set hardware watchpoint
+        const slot = try self.process.setHardwareWatchpoint(address, size, hw_access);
+        _ = allocator;
+
+        return .{
+            .id = slot + 1000, // Offset to distinguish from software breakpoints
+            .verified = true,
+            .file = "",
+            .line = 0,
+        };
     }
 
     // ── Restart Frame ──────────────────────────────────────────────
@@ -3434,6 +4212,19 @@ pub const DwarfEngine = struct {
     fn engineRestartFrame(_: *anyopaque, _: std.mem.Allocator, _: u32) anyerror!void {
         // Frame restart is not supported for native DWARF debugging
         return error.NotSupported;
+    }
+
+    // ── Cancel ──────────────────────────────────────────────────────
+
+    fn engineCancel(_: *anyopaque, _: std.mem.Allocator, _: ?u32, _: ?[]const u8) anyerror!void {
+        // No-op: the native engine has no async operations to cancel.
+    }
+
+    // ── Terminate Threads ───────────────────────────────────────────
+
+    fn engineTerminateThreads(_: *anyopaque, _: std.mem.Allocator, _: []const u32) anyerror!void {
+        // No-op: the native engine manages threads via ptrace; individual
+        // thread termination is not meaningful in this context.
     }
 
     // ── Source ───────────────────────────────────────────────────────
@@ -3584,9 +4375,14 @@ pub const DwarfEngine = struct {
         self.launched = false;
     }
 
+    fn engineGetPid(ctx: *anyopaque) ?std.posix.pid_t {
+        const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        return self.process.pid;
+    }
+
     // ── Goto Targets ──────────────────────────────────────────────
 
-    fn engineGotoTargets(ctx: *anyopaque, allocator: std.mem.Allocator, _: []const u8, line: u32) anyerror![]const types.GotoTarget {
+    fn engineGotoTargets(ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32) anyerror![]const types.GotoTarget {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         if (self.line_entries.len == 0) return &.{};
 
@@ -3597,6 +4393,14 @@ pub const DwarfEngine = struct {
         for (self.line_entries) |entry| {
             if (entry.end_sequence) continue;
             if (entry.line == line and entry.is_stmt) {
+                // Filter by file if provided
+                if (file.len > 0 and self.file_entries.len > 0) {
+                    const entry_file = if (entry.file_index < self.file_entries.len)
+                        self.file_entries[entry.file_index].name
+                    else
+                        "";
+                    if (!breakpoint_mod.filePathsMatch(file, entry_file)) continue;
+                }
                 const label = try std.fmt.allocPrint(allocator, "Line {d}", .{entry.line});
                 try targets.append(allocator, .{
                     .id = next_id,
@@ -3932,9 +4736,9 @@ pub const DwarfEngine = struct {
         var reg_adapter = RegisterAdapter{ .regs = regs };
         const reg_provider = reg_adapter.provider();
 
-        // Evaluate frame base
+        // Evaluate frame base (pass real CFA for DW_OP_call_frame_cfa)
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
-            const fb_result = location.evalLocation(scoped.frame_base_expr, reg_provider, null);
+            const fb_result = location.evalLocationEx(scoped.frame_base_expr, reg_provider, null, null, .{ .cfa = self.computeCfa(regs) });
             break :blk switch (fb_result) {
                 .address => |addr| addr,
                 .value => |val| val,
@@ -4004,25 +4808,53 @@ pub const DwarfEngine = struct {
         // Read captured stdout
         const maybe_stdout = self.process.readCapturedOutput(allocator) catch null;
         if (maybe_stdout) |stdout_data| {
-            // Build JSON params for output event
-            var aw: std.io.Writer.Allocating = .init(allocator);
-            var jw: std.json.Stringify = .{ .writer = &aw.writer };
-            jw.beginObject() catch {};
-            jw.objectField("category") catch {};
-            jw.write("stdout") catch {};
-            jw.objectField("output") catch {};
-            jw.write(stdout_data) catch {};
-            jw.endObject() catch {};
-            const params_json = aw.toOwnedSlice() catch {
-                aw.deinit();
-                allocator.free(stdout_data);
-                return notifications.toOwnedSlice(allocator) catch &.{};
+            defer allocator.free(stdout_data);
+            // Build JSON params for output event — skip notification if any JSON op fails
+            const params_json: ?[]const u8 = blk: {
+                var aw: std.io.Writer.Allocating = .init(allocator);
+                var jw: std.json.Stringify = .{ .writer = &aw.writer };
+                jw.beginObject() catch {
+                    aw.deinit();
+                    break :blk null;
+                };
+                jw.objectField("category") catch {
+                    aw.deinit();
+                    break :blk null;
+                };
+                jw.write("stdout") catch {
+                    aw.deinit();
+                    break :blk null;
+                };
+                jw.objectField("output") catch {
+                    aw.deinit();
+                    break :blk null;
+                };
+                jw.write(stdout_data) catch {
+                    aw.deinit();
+                    break :blk null;
+                };
+                jw.endObject() catch {
+                    aw.deinit();
+                    break :blk null;
+                };
+                break :blk aw.toOwnedSlice() catch {
+                    aw.deinit();
+                    break :blk null;
+                };
             };
-            notifications.append(allocator, .{
-                .method = allocator.dupe(u8, "output") catch "",
-                .params_json = params_json,
-            }) catch {};
-            allocator.free(stdout_data);
+            if (params_json) |pj| {
+                const method = allocator.dupe(u8, "output") catch {
+                    allocator.free(pj);
+                    return notifications.toOwnedSlice(allocator) catch &.{};
+                };
+                notifications.append(allocator, .{
+                    .method = method,
+                    .params_json = pj,
+                }) catch {
+                    allocator.free(method);
+                    allocator.free(pj);
+                };
+            }
         }
 
         return notifications.toOwnedSlice(allocator) catch &.{};
@@ -4131,18 +4963,15 @@ test "DwarfEngine stores inlined subroutine info" {
     try std.testing.expectEqualStrings("inlined_mul", engine.inlined_subs[1].name.?);
 }
 
-test "getFileName resolves file entries by index" {
+test "getFileName resolves file entries by 0-based index" {
     const files = [_]parser.FileEntry{
         .{ .name = "main.c", .dir_index = 0 },
         .{ .name = "utils.h", .dir_index = 0 },
     };
 
-    // 1-based index (DWARF 4 style)
-    try std.testing.expectEqualStrings("main.c", DwarfEngine.getFileName(&files, 1));
-    try std.testing.expectEqualStrings("utils.h", DwarfEngine.getFileName(&files, 2));
-
-    // 0-based index (DWARF 5 style)
+    // 0-based indices (normalized by parser)
     try std.testing.expectEqualStrings("main.c", DwarfEngine.getFileName(&files, 0));
+    try std.testing.expectEqualStrings("utils.h", DwarfEngine.getFileName(&files, 1));
 
     // Out of range
     try std.testing.expectEqualStrings("<unknown>", DwarfEngine.getFileName(&files, 10));

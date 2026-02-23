@@ -48,9 +48,17 @@ const Section64 = extern struct {
     reserved3: u32,
 };
 
+pub const CompressionKind = enum {
+    none,
+    zdebug, // GNU __zdebug_* / .zdebug_* with 12-byte header (4-byte "ZLIB" + 8-byte BE size)
+    shf_compressed_32, // ELF SHF_COMPRESSED with Elf32_Chdr (12 bytes)
+    shf_compressed_64, // ELF SHF_COMPRESSED with Elf64_Chdr (24 bytes)
+};
+
 pub const SectionInfo = struct {
     offset: u64,
     size: u64,
+    compression: CompressionKind = .none,
 };
 
 pub const DebugSections = struct {
@@ -84,6 +92,7 @@ pub const MachoBinary = struct {
     owned: bool,
     sections: DebugSections,
     text_vmaddr: u64 = 0,
+    decompressed_buffers: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !MachoBinary {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -109,6 +118,10 @@ pub const MachoBinary = struct {
     }
 
     pub fn deinit(self: *MachoBinary, allocator: std.mem.Allocator) void {
+        for (self.decompressed_buffers.items) |buf| {
+            allocator.free(buf);
+        }
+        self.decompressed_buffers.deinit(allocator);
         if (self.owned) {
             allocator.free(@constCast(self.data));
         }
@@ -119,6 +132,45 @@ pub const MachoBinary = struct {
         const end = start + @as(usize, @intCast(info.size));
         if (end > self.data.len) return null;
         return self.data[start..end];
+    }
+
+    /// Get section data, transparently decompressing if needed.
+    /// Decompressed buffers are owned by the binary and freed on deinit.
+    pub fn getSectionDataAlloc(self: *MachoBinary, allocator: std.mem.Allocator, info: SectionInfo) !?[]const u8 {
+        if (info.compression == .none) return self.getSectionData(info);
+        const decompressed = try self.decompressSection(allocator, info);
+        try self.decompressed_buffers.append(allocator, decompressed);
+        return decompressed;
+    }
+
+    /// Decompress a compressed debug section.
+    /// For zdebug: strips 12-byte GNU header (4-byte "ZLIB" magic + 8-byte BE uncompressed size).
+    fn decompressSection(self: *const MachoBinary, allocator: std.mem.Allocator, info: SectionInfo) ![]u8 {
+        const raw = self.getSectionData(.{ .offset = info.offset, .size = info.size }) orelse return error.NoSectionData;
+
+        const header_size: usize = switch (info.compression) {
+            .zdebug => 12, // "ZLIB" + 8-byte BE size
+            .shf_compressed_64 => 24, // Elf64_Chdr
+            .shf_compressed_32 => 12, // Elf32_Chdr
+            .none => return error.NotCompressed,
+        };
+
+        if (raw.len < header_size) return error.InvalidCompressedSection;
+
+        // Validate header
+        if (info.compression == .zdebug) {
+            if (!std.mem.eql(u8, raw[0..4], "ZLIB")) return error.InvalidCompressedSection;
+        }
+
+        const compressed = raw[header_size..];
+
+        // Decompress zlib stream using std.compress.flate
+        var reader = std.Io.Reader.fixed(compressed);
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var decompress = std.compress.flate.Decompress.init(&reader, .zlib, &.{});
+        _ = decompress.reader.streamRemaining(&aw.writer) catch return error.DecompressFailed;
+        return aw.toOwnedSlice();
     }
 };
 
@@ -161,45 +213,7 @@ fn parseMachO(data: []const u8) !MachoBinary {
                     .size = sect.size,
                 };
 
-                if (std.mem.eql(u8, name, "__debug_info")) {
-                    sections.debug_info = info;
-                } else if (std.mem.eql(u8, name, "__debug_abbrev")) {
-                    sections.debug_abbrev = info;
-                } else if (std.mem.eql(u8, name, "__debug_line")) {
-                    sections.debug_line = info;
-                } else if (std.mem.eql(u8, name, "__debug_str")) {
-                    sections.debug_str = info;
-                } else if (std.mem.eql(u8, name, "__debug_str_offs")) {
-                    sections.debug_str_offsets = info;
-                } else if (std.mem.eql(u8, name, "__debug_addr")) {
-                    sections.debug_addr = info;
-                } else if (std.mem.eql(u8, name, "__debug_ranges")) {
-                    sections.debug_ranges = info;
-                } else if (std.mem.eql(u8, name, "__debug_aranges")) {
-                    sections.debug_aranges = info;
-                } else if (std.mem.eql(u8, name, "__debug_line_str")) {
-                    sections.debug_line_str = info;
-                } else if (std.mem.eql(u8, name, "__debug_frame")) {
-                    sections.debug_frame = info;
-                } else if (std.mem.eql(u8, name, "__debug_loc")) {
-                    sections.debug_loc = info;
-                } else if (std.mem.eql(u8, name, "__debug_loclists")) {
-                    sections.debug_loclists = info;
-                } else if (std.mem.eql(u8, name, "__debug_rnglists")) {
-                    sections.debug_rnglists = info;
-                } else if (std.mem.eql(u8, name, "__eh_frame")) {
-                    sections.eh_frame = info;
-                } else if (std.mem.eql(u8, name, "__debug_macro")) {
-                    sections.debug_macro = info;
-                } else if (std.mem.eql(u8, name, "__debug_names")) {
-                    sections.debug_names = info;
-                } else if (std.mem.eql(u8, name, "__debug_types")) {
-                    sections.debug_types = info;
-                } else if (std.mem.eql(u8, name, "__debug_pubnames")) {
-                    sections.debug_pubnames = info;
-                } else if (std.mem.eql(u8, name, "__debug_pubtypes")) {
-                    sections.debug_pubtypes = info;
-                }
+                matchMachoDebugSection(name, info, &sections);
 
                 sect_offset += @sizeOf(Section64);
             }
@@ -214,6 +228,88 @@ fn parseMachO(data: []const u8) !MachoBinary {
         .sections = sections,
         .text_vmaddr = text_vmaddr,
     };
+}
+
+fn matchMachoDebugSection(name: []const u8, info: SectionInfo, sections: *DebugSections) void {
+    // Uncompressed __debug_* sections
+    if (std.mem.eql(u8, name, "__debug_info")) {
+        sections.debug_info = info;
+    } else if (std.mem.eql(u8, name, "__debug_abbrev")) {
+        sections.debug_abbrev = info;
+    } else if (std.mem.eql(u8, name, "__debug_line")) {
+        sections.debug_line = info;
+    } else if (std.mem.eql(u8, name, "__debug_str")) {
+        sections.debug_str = info;
+    } else if (std.mem.eql(u8, name, "__debug_str_offs")) {
+        sections.debug_str_offsets = info;
+    } else if (std.mem.eql(u8, name, "__debug_addr")) {
+        sections.debug_addr = info;
+    } else if (std.mem.eql(u8, name, "__debug_ranges")) {
+        sections.debug_ranges = info;
+    } else if (std.mem.eql(u8, name, "__debug_aranges")) {
+        sections.debug_aranges = info;
+    } else if (std.mem.eql(u8, name, "__debug_line_str")) {
+        sections.debug_line_str = info;
+    } else if (std.mem.eql(u8, name, "__debug_frame")) {
+        sections.debug_frame = info;
+    } else if (std.mem.eql(u8, name, "__debug_loc")) {
+        sections.debug_loc = info;
+    } else if (std.mem.eql(u8, name, "__debug_loclists")) {
+        sections.debug_loclists = info;
+    } else if (std.mem.eql(u8, name, "__debug_rnglists")) {
+        sections.debug_rnglists = info;
+    } else if (std.mem.eql(u8, name, "__eh_frame")) {
+        sections.eh_frame = info;
+    } else if (std.mem.eql(u8, name, "__debug_macro")) {
+        sections.debug_macro = info;
+    } else if (std.mem.eql(u8, name, "__debug_names")) {
+        sections.debug_names = info;
+    } else if (std.mem.eql(u8, name, "__debug_types")) {
+        sections.debug_types = info;
+    } else if (std.mem.eql(u8, name, "__debug_pubnames")) {
+        sections.debug_pubnames = info;
+    } else if (std.mem.eql(u8, name, "__debug_pubtypes")) {
+        sections.debug_pubtypes = info;
+    }
+    // Compressed __zdebug_* sections (GNU zdebug format)
+    // Mach-O section names are limited to 16 chars, so some are truncated
+    else if (std.mem.eql(u8, name, "__zdebug_info")) {
+        sections.debug_info = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_abbrev") or std.mem.eql(u8, name, "__zdebug_abbre")) {
+        sections.debug_abbrev = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_line")) {
+        sections.debug_line = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_str")) {
+        sections.debug_str = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_str_of")) {
+        sections.debug_str_offsets = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_addr")) {
+        sections.debug_addr = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_ranges")) {
+        sections.debug_ranges = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_arange")) {
+        sections.debug_aranges = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_line_s")) {
+        sections.debug_line_str = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_frame")) {
+        sections.debug_frame = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_loc")) {
+        sections.debug_loc = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_loclis")) {
+        sections.debug_loclists = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_rnglis")) {
+        sections.debug_rnglists = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_macro")) {
+        sections.debug_macro = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_names")) {
+        sections.debug_names = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.eql(u8, name, "__zdebug_types")) {
+        sections.debug_types = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_pubnam")) {
+        sections.debug_pubnames = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    } else if (std.mem.startsWith(u8, name, "__zdebug_pubtyp")) {
+        sections.debug_pubtypes = .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    }
 }
 
 fn readStruct(comptime T: type, data: []const u8, offset: usize) !T {

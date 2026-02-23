@@ -79,6 +79,8 @@ pub const DriverVTable = struct {
     // Core dump loading and DAP passthrough
     loadCoreFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, core_path: []const u8, executable_path: ?[]const u8) anyerror!void = null,
     rawRequestFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, command: []const u8, arguments: ?[]const u8) anyerror![]const u8 = null,
+    // Process identification for async safety (kill from main thread)
+    getPidFn: ?*const fn (ctx: *anyopaque) ?std.posix.pid_t = null,
 };
 
 /// Runtime-polymorphic debug driver.
@@ -323,6 +325,13 @@ pub const ActiveDriver = struct {
         return f(self.ptr, allocator, command, arguments);
     }
 
+    /// Get the PID of the debuggee (native) or adapter (DAP) process.
+    /// Used by toolStop to safely kill the process when a background
+    /// run thread is blocking on waitpid/read.
+    pub fn getPid(self: *ActiveDriver) ?std.posix.pid_t {
+        const f = self.vtable.getPidFn orelse return null;
+        return f(self.ptr);
+    }
 };
 
 // ── Mock Driver for Testing ─────────────────────────────────────────────

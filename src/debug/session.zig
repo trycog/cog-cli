@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const driver_mod = @import("driver.zig");
+const types = @import("types.zig");
 const ActiveDriver = driver_mod.ActiveDriver;
 
 pub const Session = struct {
@@ -10,12 +11,36 @@ pub const Session = struct {
     owner_pid: ?posix.pid_t = null,
     orphan_action: OrphanAction = .none,
     last_activity: i64 = 0,
+    pending_run: ?PendingRun = null,
 
     pub const Status = enum {
         launching,
         running,
         stopped,
         terminated,
+    };
+
+    /// Tracks a background execution control operation (continue, step, etc.).
+    /// The background thread writes stop_state/error_msg then does
+    /// result.store(.release). The main thread checks result.load(.acquire)
+    /// before reading fields — release/acquire ordering guarantees visibility.
+    pub const PendingRun = struct {
+        thread: std.Thread,
+        /// 0 = running, 1 = completed, 2 = error
+        result: std.atomic.Value(u8) = .init(0),
+        stop_state: ?types.StopState = null,
+        error_msg: ?[]const u8 = null,
+        session_id: []const u8 = "",
+        action_name: []const u8 = "",
+        allocator: ?std.mem.Allocator = null,
+
+        /// Free owned copies of session_id and action_name.
+        pub fn deinit(self: *PendingRun) void {
+            if (self.allocator) |a| {
+                if (self.session_id.len > 0) a.free(self.session_id);
+                if (self.action_name.len > 0) a.free(self.action_name);
+            }
+        }
     };
 
     pub const OrphanAction = enum {
@@ -40,6 +65,12 @@ pub const SessionManager = struct {
     pub fn deinit(self: *SessionManager) void {
         var iter = self.sessions.iterator();
         while (iter.next()) |entry| {
+            // Join any pending background run thread before destroying
+            if (entry.value_ptr.pending_run) |*pr| {
+                pr.thread.join();
+                pr.deinit();
+                entry.value_ptr.pending_run = null;
+            }
             entry.value_ptr.driver.deinit();
             self.allocator.free(entry.key_ptr.*);
         }
@@ -74,6 +105,12 @@ pub const SessionManager = struct {
     pub fn destroySession(self: *SessionManager, id: []const u8) bool {
         if (self.sessions.fetchRemove(id)) |kv| {
             var session = kv.value;
+            // Join any pending background run thread before destroying
+            if (session.pending_run) |*pr| {
+                pr.thread.join();
+                pr.deinit();
+                session.pending_run = null;
+            }
             session.driver.deinit();
             self.allocator.free(kv.key);
             return true;
