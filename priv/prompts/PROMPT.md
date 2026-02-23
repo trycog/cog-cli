@@ -1,6 +1,6 @@
 # Cog
 
-You have code intelligence via Cog.
+Code intelligence, persistent memory, and interactive debugging via Cog.
 
 ## Announce Cog Operations
 
@@ -13,274 +13,125 @@ Print an emoji before Cog tool calls to indicate the category:
 <cog:code>
 ## Code Intelligence
 
-The code index updates automatically when files change. A file watcher detects edits, creates, deletes, and renames — no manual re-indexing needed.
-
-### Code Query First
-
-**`cog_code_query` is your primary code exploration tool.** Before using Grep, Glob, file search agents, or explore agents to understand code structure — query the index first. The index knows every symbol, definition, and reference in the project. It answers in milliseconds what file-scanning tools take seconds to find.
-
-**Do NOT** bypass the code index by delegating to subagents that use Grep, Glob, or file search for symbol lookups. If a subagent needs code structure information, it should use `cog_code_query`, not file-scanning tools. Subagents are appropriate for: tasks beyond the index (reading file contents, analyzing logic, cross-referencing documentation), and broad index queries that return many results (see **Subagent Pattern** below).
-
-**Do NOT** use Grep or Glob to find symbol definitions, function locations, or file structure when `cog_code_query` covers it. Fall back to Grep/Glob only when the index doesn't have what you need (e.g., searching for string literals, comments, or content that isn't a symbol).
+Prefer `cog_code_query` over Grep/Glob for symbol lookups — the index resolves definitions, references, and file symbols in milliseconds. Fall back to Grep/Glob only for string literals, comments, or non-symbol content.
 
 ### Query Modes
 
-| Mode | Use for | Required params |
-|------|---------|-----------------|
+| Mode | Use for | Required |
+|------|---------|----------|
 | `find` | Locate where a symbol is defined | `name` |
 | `refs` | Find all references to a symbol | `name` |
 | `symbols` | List all symbols in a specific file | `file` |
 
-**`find` is always your first code query.** It takes a symbol name and returns the file and line where it's defined. Never guess filenames — let `find` tell you. Only use `symbols` mode after `find` has given you the file path. Only use `refs` after you understand the definition.
-
-**Pattern matching:** The `name` parameter supports glob patterns — `*` (zero or more chars) and `?` (one char). Examples: `*init*` finds all symbols containing "init", `get*` finds all symbols starting with "get". Matching is case-insensitive.
-
-**`kind` filter:** Use the `kind` parameter to filter by symbol type (function, class, method, variable, etc.). This is a structural advantage over grep — `name=*init*, kind=function` is a one-shot precise query that grep can only approximate with regex hacks.
-
-**File scoping:** The `file` parameter can be used with `find` and `refs` modes to scope results to a specific file. For `find`, only symbols defined in the matching file are returned. For `refs`, only references located in the matching file are shown.
+Start with `find` — don't guess filenames. `name` supports globs (`*init*`, `get*`, case-insensitive). Use `kind` to filter by type (function, class, method, variable). Use `file` to scope results to a specific file.
 
 ### Exploration Sequence
 
-**This sequence is mandatory. Do not skip or reorder steps.**
+Default: `find` → `symbols` → `refs` → `Read` (with `offset`/`limit`, 20-30 lines around the symbol). Skip steps when prior context makes them unnecessary.
 
-When you need to understand unfamiliar code:
+### Batch Exploration
 
-1. **`cog_code_query` with `find`** — locate the symbol definition by name. This tells you the file and line. **Never skip this step.**
-2. **`cog_code_query` with `symbols`** — understand the file that `find` pointed you to
-3. **`cog_code_query` with `refs`** — see how it's used across the project
-4. **Read** only the lines you need — use the line numbers from `find`/`symbols`/`refs` with `Read`'s `offset` and `limit` parameters to read a targeted window (20-30 lines) around the symbol. **Never read an entire file when the index has already told you the exact line.**
-
-**NEVER do any of the following:**
-- Guess a filename and use `symbols` mode without first using `find` to confirm the file exists
-- Use Glob or file search to locate a symbol that `find` can resolve
-- Jump to `Read` before the index has told you where to look
-- Use `symbols` on a file path you assumed rather than one `find` returned
-- Read an entire file when you only need to see a specific symbol — use `offset` and `limit`
-
-This sequence replaces broad file searches. You should arrive at a `Read` call knowing the exact file and line — reading only the relevant section, not the whole file.
-
-### Batch Exploration with `cog_code_explore`
-
-**`cog_code_explore`** combines find + read into a single call. Pass an array of symbol queries and get back the source code snippet around each definition — no multi-step find→read loop needed.
+`cog_code_explore` combines find + read in one call:
 
 ```json
 cog_code_explore({ queries: [{ name: "init", kind: "function" }, { name: "Settings" }], context_lines: 15 })
 ```
 
-Each result returns the **top match** (highest relevance score) with the code snippet. Use this when you need to see the actual source of multiple symbols. Fall back to `cog_code_query` when you need all matches, references, or file symbol listings.
+### Subagents
 
-### Subagent Pattern
+- **Inline:** ≤3 symbols via `find` or `cog_code_explore`
+- **Subagent:** 4+ symbols or broad searches — query the index, return a summary
 
-For multi-symbol exploration, **launch a subagent** instead of dumping all results into the main context.
-
-- **Direct inline calls:** Single-symbol lookups with `find` or up to ~3 symbols with `cog_code_explore` — small, focused results go straight into your context
-- **Subagent calls:** Broad searches (glob patterns, 4+ symbols, or any query where you expect many results). The subagent uses `cog_code_explore` for batch find+read, then `cog_code_query` for refs/symbols as needed, and returns only a summary
-
-This keeps the main context clean. The SCIP index returns results in milliseconds — the subagent can make many queries cheaply without flooding the caller.
-
-### Other Tools
-
-- **`cog_code_status`** — reports the current index state (files indexed, languages, etc.)
-- **Do not** try to index or remove files — the watcher handles all index maintenance automatically
+Subagents should use `cog_code_query`/`cog_code_explore` for symbol lookups, not Grep/Glob.
 </cog:code>
 
 <cog:mem>
 ## Memory
 
-You also have persistent associative memory. Checking memory before work and recording after work is how you avoid repeating mistakes, surface known gotchas, and build institutional knowledge.
+Persistent associative memory. **Truth hierarchy:** Current code > User statements > Cog knowledge
 
-**Truth hierarchy:** Current code > User statements > Cog knowledge
+`cog_mem_*` tools are MCP tools — call them directly, never via the Skill tool.
 
-### Announce Memory Operations
+Subagents do not perform memory operations — only the primary agent owns the lifecycle.
 
-- 🧠 Read: `cog_mem_recall`, `cog_mem_list_short_term`
-- 🧠 Write: `cog_mem_learn`, `cog_mem_reinforce`, `cog_mem_update`, `cog_mem_flush`
+### Lifecycle
 
-### The Memory Lifecycle
+| Phase | When | Action |
+|-------|------|--------|
+| **Recall** | Before exploring unfamiliar code | `cog_mem_recall` with reformulated query. Report results to user. |
+| **Record** | When you learn something Cog doesn't know | `cog_mem_learn` — term (2-5 specific words), definition (1-3 sentences + keywords) |
+| **Reinforce** | After completing a unit of work | Synthesize a higher-level lesson via `cog_mem_learn`, then validate short-term memories |
+| **Consolidate** | Before final response | `cog_mem_list_short_term` → `cog_mem_reinforce` or `cog_mem_flush` each entry |
 
-The primary agent follows four steps for every task. This is your operating procedure, not a guideline. **Subagents do not follow this lifecycle** — see the Subagents section below.
+### Short-Term Memory Model
 
-### Active Policy Digest
+All new memories are created as **short-term**. Short-term memories decay and are garbage-collected within 24 hours. To preserve what you learned:
 
-- Recall before exploration.
-- Record net-new knowledge when learned.
-- Reinforce only high-confidence memories.
-- Consolidate before final response.
-- If memory tools are unavailable, continue without memory and state that clearly.
+- **Reinforce** — after a unit of work, synthesize a higher-level insight via `cog_mem_learn` (with `associations` linking back to specific memories). Then `cog_mem_reinforce` memories validated by the work.
+- **Consolidate** — before your final response, `cog_mem_list_short_term` to review all pending memories. `cog_mem_reinforce` if validated, `cog_mem_flush` if wrong or no longer relevant. Unreinforced memories will be lost.
 
-#### 1. RECALL — before reading code
+### Recall
 
-**CRITICAL: `cog_mem_recall` is an MCP tool. Call it directly — NEVER use the Skill tool to load `cog` for recall.** The `cog` skill only loads reference documentation. All memory MCP tools (`cog_mem_recall`, `cog_mem_learn`, etc.) are available directly when memory is configured.
-
-If `cog_mem_*` tools are missing, memory is not configured in this workspace (no brain URL in `.cog/settings.json`). In that case, run `cog init` and choose `Memory + Tools`. Do not use deprecated `cog mem:*` CLI commands.
-
-Your first action for any task is querying Cog. Before reading source files, before exploring, before planning — check what you already know. Do not formulate an approach before recalling. Plans made without Cog context miss known solutions and repeat past mistakes.
-
-The recall sequence has three visible steps:
-
-1. Print `🧠 Querying Cog...` as text to the user
-2. Call the `cog_mem_recall` MCP tool with a reformulated query (not the Skill tool, not Bash — the MCP tool directly)
-3. Report results: briefly tell the user what engrams Cog returned, or state "no relevant memories found"
-
-All three steps are mandatory. The user must see step 1 and step 3 as visible text in your response.
-
-**Reformulate your query.** Don't pass the user's words verbatim. Think: what would an engram about this be *titled*? What words would its *definition* contain? Expand with synonyms and related concepts.
+Reformulate queries — expand with synonyms and related concepts:
 
 | Instead of | Query with |
 |------------|------------|
 | `"fix auth timeout"` | `"authentication session token expiration JWT refresh lifecycle race condition"` |
-| `"add validation"` | `"input validation boundary sanitization schema constraint defense in depth"` |
 
-If Cog returns results, follow the paths it reveals and read referenced components first. If Cog is wrong, correct it with `cog_mem_update`.
+Follow paths Cog reveals. Correct wrong memories with `cog_mem_update`.
 
-#### 2. WORK + RECORD — learn, recall, and record continuously
+### Record
 
-Work normally, guided by what Cog returned. **Recall during work, not just at the start.** When you encounter an unfamiliar concept, module, or pattern — query Cog before exploring the codebase. If you're about to read files to figure out how something works, `cog_mem_recall` first. Cog may already have the answer. Only explore code if Cog doesn't know.
-
-**Record any concept-shaped knowledge that Cog doesn't have.** If you produce, receive, or synthesize knowledge that has a nameable term, a definition, and potential relationships to other concepts — and recall didn't return it — record it immediately via `cog_mem_learn`. The source doesn't matter: code exploration, user explanation, answering a question, diagnosing a bug, or reasoning from context all qualify equally. The test is simple: *is this a concept Cog should know but doesn't?* If yes, record it now. After each learn call, briefly tell the user what concept was stored (e.g., "🧠 Stored: Session Expiry Clock Skew").
-
-**Choose the right structure:**
-- Sequential knowledge (A enables B enables C) → use `chain_to`
-- Hub knowledge (A connects to B, C, D) → use `associations`
-
-Default to chains for dependencies, causation, and reasoning paths. Include all relationships in the single `cog_mem_learn` call.
-
-**Predicates:**
+- Sequential knowledge (A → B → C) → `chain_to`
+- Hub knowledge (A connects to B, C, D) → `associations`
 
 | Predicate | Use for |
 |-----------|---------|
 | `leads_to` | Causal chains, sequential dependencies |
-| `generalizes` | Higher-level abstractions of specific findings |
+| `generalizes` | Higher-level abstractions |
 | `requires` | Hard dependencies |
-| `contradicts` | Conflicting information that needs resolution |
+| `contradicts` | Conflicting information |
 | `related_to` | Loose conceptual association |
 
-Prefer `chain_to` with `leads_to`/`requires` for dependencies and reasoning paths. Use `associations` with `related_to`/`generalizes` for hub concepts that connect multiple topics.
-
 ```
-🧠 Recording to Cog...
 cog_mem_learn({
   "term": "Auth Timeout Root Cause",
-  "definition": "Refresh token checked after expiry window. Fix: add 30s buffer before window closes. Keywords: session, timeout, race condition.",
+  "definition": "Refresh token checked after expiry window. Fix: add 30s buffer. Keywords: session, timeout, race condition.",
   "chain_to": [
-    {"term": "Token Refresh Buffer Pattern", "definition": "30-second safety margin before token expiry prevents race conditions", "predicate": "leads_to"}
+    {"term": "Token Refresh Buffer Pattern", "definition": "30s safety margin before token expiry prevents race conditions", "predicate": "leads_to"}
   ]
 })
 ```
 
-**Engram quality:** Terms are 2-5 specific words ("Auth Token Refresh Timing" not "Architecture"). Definitions are 1-3 sentences covering what it is, why it matters, and keywords for search. Broad terms like "Overview" or "Architecture" pollute search results — be specific.
+### End of Session
 
-#### 3. REINFORCE — after completing work, reflect
-
-When a unit of work is done, step back and reflect. Ask: *what's the higher-level lesson from this work?* Record a synthesis that captures the overall insight, not just the individual details you recorded during work. Then reinforce the memories you're confident in.
-
-```
-🧠 Recording to Cog...
-cog_mem_learn({
-  "term": "Clock Skew Session Management",
-  "definition": "Never calculate token expiry locally. Always use server-issued timestamps. Local clocks drift across services.",
-  "associations": [{"target": "Auth Timeout Root Cause", "predicate": "generalizes"}]
-})
-
-🧠 Reinforcing memory...
-cog_mem_reinforce({"engram_id": "..."})
-```
-
-#### 4. CONSOLIDATE — before your final response
-
-Short-term memories decay in 24 hours. Before ending, review and preserve what you learned.
-
-1. Call `cog_mem_list_short_term` MCP tool to see pending short-term memories
-2. For each entry: call `cog_mem_reinforce` if valid and useful, `cog_mem_flush` if wrong or worthless
-3. **Print a visible summary** at the end of your response with these two lines:
-   - `🧠 Cog recall:` what recall surfaced that was useful (or "nothing relevant" if it didn't help)
-   - `🧠 Stored to Cog:` list the concept names you stored during this session (or "nothing new" if none)
-
-**This summary is mandatory.** It closes the memory lifecycle and shows the user Cog is working.
-
-**Triggers:** The user says work is done, you're about to send your final response, or you've completed a sequence of commits on a topic.
-
-### Example (abbreviated)
-
-In the example below: `[print]` = visible text you output, `[call]` = real MCP tool call.
-
-```
-User: "Fix login sessions expiring early"
-
-1. [print] 🧠 Querying Cog...
-   [call]  cog_mem_recall({...})
-2. [print] 🧠 Recording to Cog...
-   [call]  cog_mem_learn({...})
-3. Implement fix using code tools, then test.
-4. [call]  cog_mem_list_short_term({...}) and reinforce/flush as needed.
-5. Final response includes:
-   [print] 🧠 Cog recall: ...
-   [print] 🧠 Stored to Cog: ...
-```
-
-### Subagents
-
-**Subagents do not perform memory operations.** The primary agent owns the memory lifecycle — it recalls before delegating work and records after receiving results. Subagents focus exclusively on their delegated task (code exploration, testing, analysis, etc.) and return results to the primary agent, which decides what to store.
-
-This keeps subagents lean and fast. Memory recall and recording happen at the orchestration layer, not in every worker.
+End your response with:
+- `🧠 Cog recall:` what was useful (or "nothing relevant")
+- `🧠 Stored to Cog:` concepts stored (or "nothing new")
 
 ### Never Store
 
-Passwords, API keys, tokens, secrets, SSH/PGP keys, certificates, connection strings with credentials, PII. Server auto-rejects sensitive content.
-
----
-
-**RECALL → WORK+RECORD → REINFORCE → CONSOLIDATE.** Skipping recall wastes time rediscovering known solutions. Deferring recording loses details while they're fresh. Skipping reinforcement loses the higher-level lesson. Skipping consolidation lets memories decay within 24 hours. Every step exists because the alternative is measurably worse.
+Passwords, API keys, tokens, secrets, SSH/PGP keys, certificates, connection strings with credentials, PII.
 </cog:mem>
 
 <cog:debug>
 ## Debugger
 
-Print 🐞 before all debug tool calls.
+When you need to inspect runtime state to diagnose a bug, use the debugger instead of print/log statements.
 
-You have a full interactive debugger via Cog. **Use it instead of adding print, console.log, logging, or any IO statements to inspect runtime state.** The debugger replaces print debugging entirely. Only fall back to IO-based inspection if the debugger is unavailable for the target language or runtime.
+### Strategies
 
-### When to use the debugger
+**Exception-first** — for crashes. Set exception breakpoint → run → inspect stack trace and variables at crash site.
 
-Use the debugger whenever you would otherwise inject logging or print statements to understand runtime behavior. This includes:
+**Hypothesis-first** — for wrong output. Formulate hypothesis → set targeted breakpoints → run → inspect to confirm or refute.
 
-- A program crashes or throws an exception and the error message alone doesn't explain why
-- A program produces wrong output and you need to trace how values flow through the code
-- You need to inspect variable state at a specific point in execution
-- You need to understand which code path is actually taken at runtime
-- A test fails and the assertion message doesn't reveal the root cause
+### Loop
 
-Do NOT use the debugger for problems that don't require runtime inspection: compile errors, type errors, syntax errors, missing imports, configuration issues, or bugs that are obvious from reading the code.
+Launch → Set breakpoints → Run → Inspect (stack, scopes, expressions) → Decide (diagnose or continue) → Stop → Fix source
 
-### Two strategies
+### Notes
 
-**Exception-first** — for crashes and runtime errors. Set an exception breakpoint, run the program, and let the runtime find the crash site. Then inspect the stack trace, exception info, and variable state at that point. This requires zero prior knowledge of where the bug is.
-
-**Hypothesis-first** — for logic bugs where the program doesn't crash but produces wrong output. Formulate what you think is wrong ("I believe `total` is being calculated before `discount` is applied"), set targeted breakpoints at the relevant locations, run, and inspect state to confirm or refute the hypothesis.
-
-### The debugging loop
-
-1. **Launch** a debug session for the program or test
-2. **Set breakpoints** — exception breakpoints for crashes, line/function breakpoints for logic bugs
-3. **Run** and wait for the program to hit a breakpoint
-4. **Inspect** — examine the stack trace, variable scopes, and evaluate expressions to understand the state
-5. **Decide** — either you have enough information to diagnose the bug, or set new breakpoints and continue
-6. **Stop** the debug session
-7. **Fix the source code** based on what you learned
-
-### Runtime mutation
-
-Some languages and runtimes support modifying variables and re-executing frames at runtime. Others do not — compiled languages like Zig, Rust, and Go may not support meaningful runtime mutation. Call `cog_debug_capabilities` after launching a session to determine what the debug driver supports.
-
-If runtime mutation is supported, you may use it to test hypotheses — "if I change this value, does the bug disappear?" — but always fix the source code for the actual resolution. Runtime mutation is for diagnosis, not for fixes.
-
-If runtime mutation is not supported, the debugger is observation-only: inspect state, diagnose the problem, stop the session, then fix the source code.
-
-### Session recovery
-
-Debug sessions may terminate due to idle timeout. If a debug tool call fails because the session is no longer available, relaunch the session and restore your previous state — re-set all breakpoints, exception filters, and watchpoints that were active before the session was lost.
-
-### Cleanup
-
-Always call `cog_debug_stop` when you are done investigating. Never leave debug sessions running.
+- `cog_debug_capabilities` after launch checks mutation support. Mutation is for diagnosis only — always fix source code.
+- Session timeout: relaunch and restore breakpoints/watchpoints.
+- Always `cog_debug_stop` when done.
 </cog:debug>
