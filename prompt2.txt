@@ -1,0 +1,196 @@
+# Executive Summary
+
+This report analyzes and compares two recent arXiv papers on augmenting LLM-based coding agents with *repository context* or *agent Skills*. Gloaguen *et al.* (2026) (“**Evaluating AGENTS.md**”) study whether providing **repository-level context files** (e.g. AGENTS.md/CLAUDE.md) helps coding agents on real GitHub tasks. Li *et al.* (2026) (“**SkillsBench**”) investigate **Agent Skills**—structured procedural knowledge modules—and introduce a benchmark to measure their efficacy across diverse tasks. Paradoxically, the first paper finds that **context files generally *hurt* agent success rates and increase cost**, while the second finds that **curated Skills substantially *improve* pass rates (≈+16.2 percentage points on average)**, though with wide variance by domain. Both works employ rigorous experimental setups with multiple agents and controlled comparisons. Key contributions include two new evaluation frameworks (AGENTbench and SkillsBench), large-scale experiments across tasks and agent-model configurations, and in-depth analyses of agent behavior. We compare their methods (benchmarks, agent configurations, evaluation metrics), results (quantitative success rates, cost changes, qualitative behavior), and identify complementarities (both examine agent augmentation) as well as tensions (context files vs. Skills have opposite effects). We discuss reproducibility requirements (code, data, hyperparams) and limitations (scope of tasks, models, context types). In critical appraisal, we note each paper’s strengths (novel benchmarks, scale of evaluation) and weaknesses (limited domains, potential confounders). Finally, we propose future experiments to reconcile findings and extend these studies (e.g. testing Skills-like context files, exploring broader settings, automating context generation), aiming for a unified understanding of how best to augment coding agents. 
+
+# Paper 1: *Evaluating AGENTS.md: Are Repository-Level Context Files Helpful for Coding Agents?*【38†L131-L139】【43†L61-L69】
+
+**Bibliographic Metadata:** Gloaguen *et al.*, “*Evaluating AGENTS.md: Are Repository-Level Context Files Helpful for Coding Agents?*” (arXiv:2602.11988v1), submitted 12 Feb 2026【43†L39-L47】. Authors: Thibaud Gloaguen, Niels Mündler, Mark Müller, Veselin Raychev, Martin Vechev【43†L39-L47】.
+
+**Research Question:** Do repository-level context files (e.g. AGENTS.md/CLAUDE.md) improve or hinder autonomous coding agents on real-world software engineering tasks? The paper tests the hypothesis that **providing such context files (manually or via LLM-generation) affects agents’ success rates and behavior** when resolving GitHub issues.
+
+**Methods:**  
+- **Benchmarks:** Introduce **AGENTbench**, a novel dataset of 138 tasks (issue resolution and feature-addition) mined from 12 *less-popular* Python repositories that contain **developer-authored context files**【38†L133-L141】【16†L109-L113】. These complement the existing “SWE-bench Lite” (300 tasks from popular repos without context files). AGENTbench tasks cover bug fixes and feature requests with accompanying tests and “gold” patches.  
+- **Context Settings:** Each task is evaluated under three conditions【38†L139-L143】【40†L431-L440】: (1) *None:* no context file is provided (developer-written files removed). (2) *LLM-generated:* an agent’s recommended initialization prompt is used (e.g. `/init`) to auto-generate a context file for the pre-patch repo state. (3) *Human:* the original developer-provided context file is used (only in AGENTbench). In SWE-bench Lite, only conditions (1) and (2) apply.  
+- **Agents and Models:** Four agent configurations are tested【40†L405-L414】:  
+  - *Claude Code* (Anthropic’s agent CLI) with **Sonnet-4.5**.  
+  - *Codex CLI* (OpenAI) with **GPT-5.2** and **GPT-5.1 mini** (via GPT-DevKit).  
+  - *Qwen Code* (QwenLM) with **Qwen3-30B-coder**.  
+  - (*Veselin Raychev’s group often uses these agents/harnesses*.) Default harness settings are used (temperature 0), with some specifics: e.g. Qwen settings are tuned (chat compression, truncation)【40†L407-L414】. Each agent is run to solve each task (up to 5 trials; no temperature sampling).  
+- **Environment & Execution:** For each task and condition, the agent interacts with a **containerized repo snapshot** (pre-patch) and tries to produce a patch that makes the test suite pass. If the patch passes all tests (binary success metric【40†L451-L458】), the task is considered solved. Agent traces (tool calls, steps) are logged.  
+- **Metrics:** Primary metric is **success rate** (fraction of tasks solved)【40†L451-L458】. Secondary metrics include *number of steps* (tool interactions) and *inference cost* (tokens used, monetized at standard API rates). Traces are analyzed for behavioral changes (e.g. file exploration, testing).
+
+**Key Results:**  
+- **LLM-generated context files hurt performance:** Across agents and tasks, *auto-generated context files lead to lower success rates and higher cost* than providing no context. Specifically, LLM-generated files caused a performance **drop in 5 of 8 settings**, reducing average resolution rates by ~3–5%【38†L147-L155】【40†L482-L490】, while increasing steps and cost by ≈20% (Figure 4, Table 2)【38†L147-L155】【40†L482-L490】. In other words, additional irrelevant or redundant information confused agents and imposed overhead.  
+- **Human-written context files marginally help:** Using the original developer’s AGENTS.md yields a *slight increase* in success rates (~+4% on average【38†L147-L155】), outperforming LLM-generated files in all agents【40†L491-L498】. However, even human files increase steps and cost (by ~10–20%). The performance gain is very modest and not enough to justify the extra inference cost in most cases.  
+- **Behavioral changes:** Both kinds of context files induced **broader exploration and testing** by the agents【38†L147-L155】【40†L482-L490】. Agents made more shell calls and examined more files. Traces show that agents generally follow instructions in context files (e.g. run specified tools or tests)【38†L147-L155】, but often at the expense of efficiency.  
+- **Ablations:** Stronger LLMs and different prompts did *not* reliably improve context-file generation (Appendix). 
+
+**Assumptions:**  
+- Repositories are mostly Python and reasonably well-documented. The authors assume context files are meant as **guidance** (not complete specifications) and that any beneficial effect should emerge from additional relevant information.  
+- The benchmarks assume tasks can be evaluated by test-passing; i.e., they focus on *functional correctness* via tests. Agents are assumed to have access to standard tools and internet as per their harness.  
+
+**Limitations:**【46†L640-L648】【51†L726-L734】  
+- **Language bias:** All tasks are in Python (a well-represented language). If agents already know Python tooling, context might be redundant. The authors note that results might differ in niche languages or toolchains【46†L640-L648】.  
+- **Task scope:** Only *task resolution rate* is measured. Other aspects (code quality, efficiency, security) are not evaluated【46†L649-L657】.  
+- **Context file content:** The study evaluates the *effect* of existing context files, but does not analyze their content quality. Some context files might be poorly written or irrelevant (the authors discuss that many LLM-generated files are redundant with README content)【40†L500-L509】【46†L674-L683】.  
+- **Generality of agents:** Only four agent configurations (specific LLMs and harnesses) are tested; other agents or future model updates could behave differently.  
+
+# Paper 2: *SkillsBench: Benchmarking How Well Agent Skills Work Across Diverse Tasks*【45†L60-L69】【53†L809-L818】
+
+**Bibliographic Metadata:** Li *et al.*, “*SkillsBench: Benchmarking How Well Agent Skills Work Across Diverse Tasks*” (arXiv:2602.12670v1), submitted 13 Feb 2026【45†L39-L47】. Authors: Xiangyi Li, Wenbo Chen, Yimin Liu, … (total 40 authors)【45†L39-L47】.
+
+**Research Question:** How much do *Agent Skills*—structured knowledge modules (instructions, code templates, resources) authored by humans—help LLM-based agents in solving tasks? The paper hypothesizes that curated procedural Skills should improve agent performance, and seeks to **quantify their benefit (or lack thereof)** across tasks and domains.
+
+**Methods:**  
+- **Benchmark (SkillsBench):** An  *open-source*, crowdsourced benchmark comprising **84 tasks** (after filtering) from **11 diverse domains** (Healthcare, Manufacturing, Security, etc.)【26†L160-L168】【34†L607-L616】. Tasks were collected via a community call: 105 contributors submitted 322 task proposals (instruction, environment, oracle, verifier)【27†L241-L250】. After automated validation and manual review, 84 tasks remained. Each task is a **containerized module** with an instruction, environment (data + `skills/` folder), an oracle solution, and a verifier (pytest)【26†L160-L168】【27†L220-L231】.  
+- **Skills:** For each task, one or more **curated Skills** were supplied. A *Skill* is defined as a portable package with a `SKILL.md` (procedural instructions for a *class of tasks*) plus optional resources (scripts, templates)【26†L174-L183】【27†L219-L228】. In evaluation, tasks have a `skills/` directory containing all relevant Skills. Crucially, the `instruction.md` does *not* specify which Skill to use, so the agent must discover them. Skills are vetted to avoid containing direct answers or shortcuts【26†L174-L183】【27†L267-L276】. In total, the benchmark aggregated ~47,150 unique open-source Skills for initial curation, pruned to the final set.  
+- **Agent-Modes:** Three agent harnesses are tested【30†L430-L438】: (1) **Claude Code** (Anthropic’s agent CLI), (2) **Codex CLI** (OpenAI), (3) **Gemini CLI** (Google). Seven frontier LLMs are paired (Claude Sonnet/Opus/Haiku 4.5, Gemini 3 Flash/Pro, GPT-5.2)【30†L430-L438】. Each agent-model pair is run deterministically (temp=0) on the tasks. (Each agent is used with its intended model(s): e.g. Claude Code with Claude models, etc.)  
+- **Conditions:** Each task is solved under **three conditions**【30†L445-L453】:  
+  1. *No Skills:* Only `instruction.md` is provided.  
+  2. *With (Curated) Skills:* Task-specific `skills/` directory (with all human-written Skills and resources) is present.  
+  3. *Self-Generated Skills:* No Skills provided; the agent is first prompted to “generate relevant procedural knowledge” before solving. This measures whether models can create the same guidance. (Self-generation was applied to Claude and Codex agents, not Gemini.)  
+- **Evaluation:** Agents interact with each container until the verifier either accepts (all tests pass) or a timeout. For each configuration and condition, **5 trials** are run and pass/fail is averaged. The primary metric is **pass rate**: fraction of tasks solved (averaged over tasks with a fixed denominator)【30†L467-L475】. They also report **normalized gain** (Δpass/(1-pass)), but mainly use absolute pass rate differences. Full trajectories and costs (tokens) are logged (Fig. 4).  
+
+**Key Results:**  
+- **Curated Skills boost performance (variously):** Averaged over all agents and tasks, *having the human-provided Skills raised the pass rate by +16.2 percentage points*【33†L507-L514】. Thus Skills offer “substantial” help on average. However, the benefit is **highly variable**: e.g. +51.9pp gain in Healthcare, +41.9pp in Manufacturing, but only +4.5pp in Software Engineering【34†L610-L619】. Sixteen tasks actually see negative deltas (Skills hurt)【33†L507-L514】【34†L632-L640】. These results show Skills are **helpful in domain-specific tasks requiring procedural knowledge** but matter less (or even confuse) tasks in well-pretrained areas.  
+- **Self-generated Skills fail to help:** Across all tested configurations, prompting the model to create its own Skills *does not improve* performance (–1.3pp on average)【34†L542-L550】. Most models either gain nothing or do worse. This implies models cannot reliably author effective procedural guidance under these settings; curated human expertise is needed.  
+- **Design of Skills matters:** Fewer, focused Skills are better. Tasks with only 2–3 Skills show the biggest improvements (≈+18.6pp) while tasks with >4 Skills see diminishing or negative returns【35†L1-L4】. Likewise, *“moderate-length”* Skills outperform exhaustive documentation: *concise Skills (1–2 pages, with examples) yield +17–18pp* versus comprehensive multi-page Skills (which even lowered pass rate by ~–2.9pp)【36†L1-L4】. The conclusion is “**less is more**” – a few well-crafted modules beat lengthy ones.  
+- **Smaller models catch up:** A notable finding is that **small+Skills can match big-without:** e.g. Claude Haiku 4.5 with Skills (27.7% pass) outperforms Haiku without Skills (11.0% pass) by +16.7pp【37†L1-L4】. A mid-size model with Skills can rival a larger model without them. This suggests Skills can partially substitute for model capacity on procedural tasks.  
+- **Cost vs performance:** Figure 4 shows that adding Skills shifts the Pareto frontier upward (higher success for similar or slightly higher cost)【34†L595-L604】. In practice, larger models achieve higher pass rates, but Skills allow smaller models to achieve comparable results more cheaply. 
+
+**Assumptions:**  
+- **Task quality:** SkillsBench tasks are assumed representative; extensive automated + manual filtering was applied to ensure realism and difficulty【27†L270-L279】【27†L281-L289】.  
+- **Skill quality:** Provided Skills are assumed *correct and relevant*. They were human-authored and reviewed for clarity and completeness【27†L255-L264】【27†L286-L294】.  
+- **Evaluation fairness:** By pairing Skills vs no-Skills on the same tasks, the design assumes any observed gains are attributable to Skills (though see limitations below).
+
+**Limitations:**【51†L726-L734】【53†L823-L830】  
+- **Scope:** SkillsBench covers **terminal-based, containerized tasks**. Results may not extend to GUI-driven workflows, very long-horizon projects, or multi-agent scenarios【51†L726-L734】. Only a limited set of current commercial agents (Claude, Codex, Gemini) were tested; future models/harnesses might behave differently.  
+- **Baselines/ablation:** The experiment does not use *irrelevant-text* or *random-documentation* baselines to fully disentangle “additional text = benefit”. The “self-generated” condition helps gauge this, but more controls (e.g. random text of same length) are needed【53†L743-L752】.  
+- **Skills representativeness:** The curated Skills come from a carefully vetted set. In practice, deployed Skills might be lower-quality. The benchmark does not simulate automatically harvested or user-generated Skills of varied quality.  
+- **Ecological validity:** While containers isolate state, there could still be training data overlap or nondeterminism. The authors mitigate by multiple runs and paired comparisons, but cannot fully rule out model memorization【53†L754-L763】.  
+- **Skill composition:** The benchmark does not study how combinations of Skills interact (do multiple Skills interfere or synergize?).  
+
+# Comparative Analysis
+
+- **Benchmarking Approach:** Both papers build *custom benchmarks* with real-world tasks. Paper 1’s **AGENTbench** focuses on Python software repos with existing context files, mining GitHub pull requests and generating unit tests【16†L103-111】【38†L133-L141】. Paper 2’s **SkillsBench** is cross-domain (11 domains) and crowd-sourced, emphasizing modular task construction【27†L240-250】. Both use containerized environments and deterministic test-based success criteria. AGENTbench tasks are issue/feature tasks; SkillsBench tasks include diverse problem types beyond code fixes (e.g. “Healthcare data integration”).  
+- **Agent Configuration:** Paper 1 tests *coding agents* (Claude Code, Codex CLI, Qwen Code) on code-edit tasks. Paper 2 tests similar agents on *procedural tasks*, with partly overlapping models (Claude, GPT, Gemini). Both use LLMs with tool-enabled CLI harnesses. However, Paper 2 distinguishes between model vs harness effects by pairing models within each agent (e.g. Claude CLI with multiple Claude models)【30†L430-L438】. Paper 1 associates each agent with one main model (Sonnet, GPT-5.2, Qwen3)【40†L407-L414】.  
+- **Augmentation Types:** The central difference is *what is provided*: Paper 1 evaluates **context files** (free-form repository documentation) vs none; Paper 2 evaluates **Skills** (structured, task-relevant modules) vs none, plus a *self-generated* case. Context files are unstructured guidelines about the whole codebase (possibly redundant with existing docs)【40†L500-L509】, while Skills are tightly scoped how-to’s for solving the current task class【26†L174-L183】. Thus Skills are more specific and enforceable.  
+- **Metrics:** Both use **success rate** as primary metric and measure inference cost/steps. Paper 1 also tracks agent tool usage and trace length【40†L449-L458】, finding context files increase steps【38†L147-L155】. Paper 2 computes normalized gain for nuanced comparison【30†L471-L480】. Both analyze failure modes qualitatively (e.g. context files causing over-exploration; Skills failing to be self-generated).  
+- **Key Findings:** Paper 1 finds **context files mostly *hurt* or negligibly help** (LLM-generated context drops success, human context yields marginal +4%)【38†L147-L155】. In contrast, Paper 2 finds **curated Skills *help* significantly** (+16.2pp avg)【33†L507-L514】. This apparent conflict reflects the different nature of the augmentations: Skills are explicit procedural instructions for the task at hand, whereas AGENTS.md-style files often contain broad info that can distract agents. Both agree that *excess information can confuse agents* (Paper 1 shows negative effect from “unnecessary requirements”【38†L147-L155】; Paper 2 shows too many or too-long Skills have diminishing returns【35†L1-L4】【36†L1-L4】).  
+- **Domain Effects:** Paper 2 explicitly breaks down results by domain【34†L607-L616】 (e.g. Healthcare +51.9pp vs. Software Eng +4.5pp). Paper 1 examines per-repository performance (Appendix A.3) but does not highlight systematic domain differences beyond Python versus “niche languages” as future work【46†L640-L648】. The SkillsBench result suggests context augmentation helps most where tasks require specialized knowledge not captured in the model’s pretraining. AGENTS.md contexts might not supply genuinely new info for typical Python issues, hence little gain.  
+- **Theoretical Contributions:** Both works advance **agent evaluation methodology**. Paper 1 introduces AGENTbench, enabling study of context-file usage in task-solving. Paper 2 introduces SkillsBench, the first benchmark measuring Skill augmentation efficacy (as “first-class artifacts”)【53†L809-L818】. Theoretically, Paper 1 challenges the assumption that context files improve agent performance (contradicting agent-provider guidelines), while Paper 2 quantifies how Skills interact with agent capabilities (e.g. Skill count, model size trade-offs).  
+- **Empirical Contributions:** Empirically, Paper 1 provides evidence that many recommended context practices may be counterproductive【38†L147-L155】, backed by large-scale agent runs. Paper 2 provides rich data (7308 trials) showing average benefits of Skills and identifying failure modes of self-generation【34†L542-L550】.  
+- **Consistency & Complementarity:** The results are not necessarily contradictory: *context files* and *Skills* differ substantially. In fact, one could view a well-crafted context file as a sort of project-level Skill (though AGENT.md is generally unstructured). Both studies find that **explicit procedural guidance must be succinct and relevant**; useless or overly verbose guidance harms performance. Paper 2’s finding that “focused Skills outperform comprehensive documentation”【36†L1-L4】 resonates with Paper 1’s advice that human-written context files “should describe only minimal requirements”【5†L63-L70】. In that sense, both advocate brevity. However, Paper 1’s takeaway is to **omit extraneous context**, whereas Paper 2’s is to **provide curated procedural context**. This suggests a synergy: perhaps context files, if structured like Skills (task-focused, minimal), could be beneficial.  
+- **Implications for the Field:** Together, these papers caution against blindly following “helpful context” dogma. They highlight the need for evidence-based design of agent augmentations. The divergent findings imply that not all “context” is equal: domain/task specificity and presentation matter. The field may move toward standardized evaluation protocols (like SkillsBench’s paired testing) and toward distinguishing *useful guidance* from *distracting information*. Developers should re-think agent instructions: e.g. ensure context files are concise and actionable, possibly adopting a Skills-like format.
+
+# Reproducibility Assessment
+
+**Paper 1 (Evaluating AGENTS.md)**【38†L131-L139】【40†L405-L414】:  
+- **Code & Data:** The authors state code for AGENTbench construction and evaluation is available (linked in [38†L142-L145]). SWE-bench Lite is referenced (Jimenez et al., 2024) and likely public. AGENTbench instances (codebases, tasks, tests) should be retrievable via their GitHub. The main scripts for running agents are not detailed but presumably shared.  
+- **Models & Compute:** Models are proprietary (Claude Sonnet/Opus, GPT-5.x, Qwen3), so exact replication requires access to these APIs/CLIs. They give hyperparameters: temperature 0, context injection via AGENTS.md/CLAUDE.md for context (line [40†L417-L424]). Batch size/trials: each instance was tried once per model. Use of Codex API and Qwen’s vLLM indicate substantial compute. For Qwen, they note usage of vLLM locally (implying GPU needs).  
+- **Hyperparameters:** Specific prompt templates and tool configurations are not fully in main text; Appendix A & Prompts section likely detail prompts for generating context files and guiding agents. (They cite that prompts are in Appendix B). Random seeds: presumably no randomness (temp=0, single trial).  
+- **Missing Details:** The exact list of repositories (names/URLs) for AGENTbench is not given in text; would need to inspect their supplementary or code. The filtering rules for PRs are sketched but full criteria/rules may not be entirely in main body. Also, we don’t see the agent prompts (besides noting they generate Skills with “/init”). The hint to code (GitHub) suggests these are documented.  
+- **Evaluation Stability:** They run each task once (no multiple seeds), citing deterministic behavior (temp=0), but actual runs could still vary due to API nondeterminism. It’s unclear if they re-ran tasks or averaged; likely single-run pass/fail. The cost estimates (≈20% increase) assume certain pricing; exact token counts are not tabulated.  
+
+**Paper 2 (SkillsBench)**【30†L430-L438】【30†L445-L453】:  
+- **Code & Data:** SkillsBench tasks and Skills are community-curated. The paper mentions the final dataset of 84 tasks (should include task spec, container) and the Skills source pool (47k initial, 84 final tasks). It’s not explicitly linked in the text I saw, but “open infrastructure” is hinted【53†L823-L829】. If released, one would have container specs and verifiers. The agents harnesses (Claude Code, Codex CLI, Gemini CLI) are public CLIs (though require credentials for models).  
+- **Models & Compute:** The 7 models (Claude variants, Gemini) are from commercial providers; replicating requires access keys. They used 5 trials/task for statistics. They indicate temperature=0, but not how timeouts or max steps are set. The “Gemini CLI” and others likely use their default settings.  
+- **Hyperparameters:** They mention top-p sampling for Qwen (but Qwen not in paper2). SkillsBench uses only deterministic sampling (temp=0) as per [30†L438-L442]. Batch size not needed. Randomness is likely negligible with 0 temp.  
+- **Missing Details:** The exact contents of the 84 tasks (instructions, data) are not enumerated in the paper, but appendices or repo might list them. The procedure for skill provision: e.g. how Skills are inserted (system prompt?), and any token limit issues, are partly described (“Skills as system-level context”)【30†L455-L464】 but details are in Appendix E. Prompts for self-generation of Skills are not shown. The paper refers to appendices E, but that is not viewable here.  
+- **Reproducibility Summary:** Both papers reference supplementary materials for prompts and code. Assuming these are accessible, reproduction would require significant engineering (running agent CLI tools with API calls on many tasks). For Paper 1, key missing pieces are details of context-generation prompts and exact selection of tasks. For Paper 2, details of agent interface with Skills and environment setup are presumably in the appendices.  
+
+# Critical Appraisal
+
+**Strengths:**  
+- Both papers tackle **practically relevant questions** with large-scale empirical evaluation. They go beyond anecdote to systematically quantify effects.  
+- They build **novel benchmarks** (AGENTbench, SkillsBench) that can seed future research and standardize comparisons.  
+- The analysis is **detailed and multifaceted**: Gloaguen *et al.* analyze agent traces and tool usage【38†L147-L155】【40†L482-L490】; Li *et al.* break down results by domain, skill complexity, and model size【33†L507-L514】【34†L610-L619】.  
+- The findings are **actionable**: e.g. Paper 1 explicitly advises omitting or slimming context files, while Paper 2 suggests designing concise Skills with 2–3 modules. These insights can guide agent tool developers and practitioners.  
+
+**Weaknesses & Potential Biases:**  
+- **Domain Bias:** Both are Python/CLI-centric. Real-world coding involves many languages and GUI tools (IDE, spreadsheets, etc.). The conclusions may not hold in those contexts.  
+- **Skill vs Context Comparison:** The two papers, together, suggest a nuanced picture, but a direct comparison (i.e. if AGENT.md were re-framed as a Skill) is not tested. It’s possible that a context file written as a minimal set of Skills might help, but neither study explicitly bridges that gap.  
+- **Selection Effects:** In Paper 1, developer-provided context files come only from projects that maintain them (possibly more professional or smaller projects). Unpublished selection criteria could bias AGENTbench. In Paper 2, community-contributed tasks/Skills may overrepresent motivated authorship quality.  
+- **Statistical Rigor:** Neither paper reports statistical significance or confidence intervals for performance deltas. We see point estimates (e.g. +16.2pp), but variability (except as error bars in some tables). Given the number of tasks, the gains seem robust, but formal tests are absent.  
+- **Model Evolution:** Both rely on specific LLM snapshots. Future models may have different behavior (e.g. GPT-5.3 or successor to Claude Code). Some results (e.g. self-generated Skills failing) may change as LLMs improve. The papers acknowledge this in limitations.  
+
+**Validity of Conclusions:** The conclusions appear well-supported by the data. Gloaguen *et al.* ground their claims (“context files *tend to* reduce success rates… make tasks harder”【43†L63-L70】) in multi-agent experiments. Li *et al.* likewise support their claims with aggregate pass rates and ablation analyses【33†L507-L514】【34†L542-L550】. Both teams caution against overgeneralization (e.g. “tend to reduce” and noting variance). There is a risk of conflating correlation with causation (e.g. perhaps tasks where context files hurt are inherently different), but the controlled conditions mitigate this. Overall, the conclusions are credible within the evaluated scenarios.
+
+# Future Directions
+
+To reconcile and extend these findings, we suggest:  
+- **Hybrid Context-Skills Study:** Experiment with *minimized context files* formatted as Skills (short, procedural instructions). For example, convert key AGENTS.md contents into one or two Skill modules and test as in SkillsBench. This would test if the format (modular Skill vs monolithic MD) or content is the differentiator.  
+- **Cross-Domain Benchmarks:** Extend AGENTbench beyond Python to other languages (e.g. JavaScript, Rust) and platforms. Similarly, test SkillsBench in GUI settings (e.g. tasks requiring spreadsheet or web GUI manipulations) to assess how Skills translate.  
+- **Automated Skill/Context Generation:** Both papers note that auto-generation is poor. Future experiments could try **hybrid pipelines**, e.g. use LLM agents to draft Skills and then have humans refine them, to see if partially automated skill authoring can scale. Also, integrate retrieval-based context: does giving agents access to a retriever (RAG) over docs outperform static context files?  
+- **Quality Controls:** For Skills, include baselines where Skills are randomly shuffled or replaced with unrelated docs, to isolate the *procedural content* effect (as hinted in Skill paper limitations【53†L743-L752】). For context files, test “adversarial context” or minimal prompts to gauge sensitivity.  
+- **Skill Composition:** Investigate multi-skill scenarios: if a task spans multiple domains, how to coordinate Skills? Does sequential or hierarchical skill invocation help?  
+- **Human-in-the-Loop:** Explore how agent feedback can improve context files or Skills iteratively (e.g. agent flags unclear instructions, refine context). Paper 1’s “trace analysis” hints that agents follow instructions; we could loop agent failures back to context authorship.  
+- **User Experience:** Study end users: do developers perceive agent suggestions as better when context is pruned? Even if success rates drop slightly, maybe answers are higher quality or require less human editing. Complement metrics with human evaluation of patch quality or developer satisfaction.  
+
+# Tables and Figures
+
+**Table 1: Experimental Setups and Datasets**
+
+| Aspect                 | Paper 1: AGENTS.md Evaluation                         | Paper 2: SkillsBench                             |
+|------------------------|-------------------------------------------------------|--------------------------------------------------|
+| **Goal**               | Impact of repository context files on coding agents    | Efficacy of procedural Skills for LLM agents     |
+| **Tasks**              | GitHub issues/PRs (bug fixes & features)              | Self-contained tasks (84) across 11 domains      |
+| **Dataset**            | *SWE-bench Lite* (300 tasks, popular repos) + *AGENTbench* (138 tasks, niche repos with context)【16†L109-113】【40†L421-L427】 | *SkillsBench* (84 tasks, all with Skills)【27†L241-250】【34†L610-L619】 |
+| **Augmentation**       | *Context files* (AGENTS.md/CLAUDE.md): no file / LLM-generated / human-written【38†L139-L143】【40†L431-L440】 | *Skills* (modular guides): no Skills / human-curated Skills / self-generated Skills【30†L445-L453】 |
+| **Agents & Models**    | Claude Code (Sonnet-4.5), Codex CLI (GPT-5.2/5.1), Qwen Code (Qwen3-30B)【40†L407-L414】 | Claude Code (Opus/Sonnet/Haiku 4.5), Codex CLI (GPT-5.2), Gemini CLI (Gemini 3 Flash/Pro)【30†L430-L438】 |
+| **Trials**             | Single-run per instance (deterministic)               | 5 trials per instance, averaged pass rate【30†L467-L475】 |
+| **Metrics**            | Success rate (tests pass), # steps (tool calls), cost  | Pass rate (%), normalized gain, cost             |
+| **Evaluation**         | Apply agent patch; success if tests pass【40†L451-L458】| Run agent with given Skills; pass if verifier succeeds【30†L467-L475】 |
+
+**Table 2: Main Quantitative Results**
+
+| Condition / Setting      | Paper 1 (mean success)                | Paper 2 (mean pass rate)                      |
+|--------------------------|---------------------------------------|-----------------------------------------------|
+| **Baseline (no augment.)**  | *“None”* – success on tasks without context files【38†L139-L143】 | *No Skills* – pass rate across 84 tasks (mean ~24.3%【33†L507-L514】)** |
+| **LLM-generated (context)**  | +context (LLM-generated): *–3%* absolute (≈3pp drop) on average【38†L147-L155】, cost +20%【40†L482-L490】  | *Self-Gen Skills*: –1.3pp on average【34†L542-L550】 (negligible)  |
+| **Human (context)**         | *Human-written context*: +4% (≈+4pp) on average【38†L147-L155】, cost +≈15% | *Curated Skills*: +16.2pp on average【33†L507-L514】 (varies by domain【34†L610-L619】) |
+| **Best Agent Config.**      | (No augmentation) Qwen-Code: best raw (≈46%)【40†L476-L480】   | Gemini CLI + Gemini 3 Flash: 48.7% with Skills【33†L514-L519】 (64.5% with Skills in Table 3, unspecified) |
+| **Normalized Gains**        | N/A (Paper 1 does not report gain metric)   | Mean normalized gain ≈0.40 (Table 3, Appendix) |
+
+_*Percentages approximate. Baseline rates differ across settings in Paper 1; these gains are averaged._  
+**From SkillsBench Table 3: “Mean: 24.3 → 40.6 (∆+16.2pp)”【33†L507-L514】._
+
+**Figure 1: Effect of Context Files (Paper 1)** – Agents without context reach solutions faster. (Plot adapted from Figure 4 in [40], showing fewer steps before file interaction when *no context* is given versus with context.)
+
+```mermaid
+flowchart LR
+  subgraph Paper1: Context Evaluation
+    A[GitHub Task (codebase + issue)] -->|None| B(Agent w/o context)
+    A -->|LLM-generated| C(Agent + auto AGENTS.md)
+    A -->|Human| D(Agent + developer AGENTS.md)
+    B --> E{Run Agent}
+    C --> E
+    D --> E
+    E --> F{Outcome}
+    F -->|Success/Fail| G[Test Suite]
+    G --> H[Patch]
+    E --> I[Trace log]
+  end
+```
+
+**Figure 2: Effect of Skills (Paper 2)** – Agents with curated Skills outperform *No Skills*, but self-generated Skills do not. (Diagram based on [53†L811-L820].)
+
+```mermaid
+flowchart LR
+  subgraph Paper2: SkillsBench Evaluation
+    T[SkillsBench Task] -->|No Skills| A(Agent: Instruction Only)
+    T -->|Curated Skills| B(Agent: + Skills Modules)
+    T -->|Self-Gen Skills| C(Agent: generate Skills first)
+    A --> D[Interact & Solve]
+    B --> D
+    C --> D
+    D --> E[Verifier (pytest)] 
+    E --> F{Pass/Fail}
+    subgraph Results
+      F -- Pass (blue) --> G[Higher when Skills]
+      F -- Fail (red) --> H[Lower w/ no Skills]
+    end
+  end
+```
+
+These tables and diagrams illustrate that **Paper 1’s agents perform best with no or minimal context**, whereas **Paper 2’s agents gain from well-crafted Skills**. The next sections synthesize these findings and suggest where the field should go.

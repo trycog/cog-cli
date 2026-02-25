@@ -26,6 +26,14 @@ const InstructionBreakpoint = types.InstructionBreakpoint;
 
 // ── DWARF Debug Engine ──────────────────────────────────────────────────
 
+const HardwareWatchpoint = struct {
+    active: bool = false,
+    id: u32 = 0, // breakpoint ID (slot + 1000)
+    address: u64 = 0, // watched memory address
+    size: u64 = 0, // watch region size in bytes
+    access_type: u3 = 0, // WCR access bits (1=load, 2=store, 3=both)
+};
+
 pub const DwarfEngine = struct {
     process: ProcessControl = .{},
     allocator: std.mem.Allocator,
@@ -43,6 +51,10 @@ pub const DwarfEngine = struct {
     aslr_slide: i64 = 0,
     /// Track whether we just hit a breakpoint and need to step past it
     stepping_past_bp: ?u64 = null,
+    /// Hardware watchpoint tracking (ARM64 supports up to 4 slots on Apple Silicon)
+    hw_watchpoints: [4]HardwareWatchpoint = [_]HardwareWatchpoint{.{}} ** 4,
+    /// Track whether we need to step past a watchpoint on next resume (slot index)
+    stepping_past_wp: ?u32 = null,
     /// Track whether a step operation is in progress (for stop_reason reporting)
     step_in_progress: bool = false,
     /// Track whether a single-step operation is in progress (for SIGURG re-step)
@@ -87,6 +99,14 @@ pub const DwarfEngine = struct {
     }
 
     pub fn deinit(self: *DwarfEngine) void {
+        // Clear hardware watchpoints before killing to leave clean state
+        if (self.core_dump == null) {
+            for (self.hw_watchpoints, 0..) |wp, slot| {
+                if (wp.active) {
+                    self.process.clearHardwareWatchpoint(@intCast(slot)) catch {};
+                }
+            }
+        }
         if (self.core_dump) |*cd| cd.deinit();
         if (self.core_dump == null) self.process.kill() catch {};
         if (self.program_path) |p| self.allocator.free(p);
@@ -679,6 +699,11 @@ pub const DwarfEngine = struct {
         };
         switch (action) {
             .@"continue" => {
+                // If we're stopped at a watchpoint, step past it first
+                if (self.stepping_past_wp) |wp_slot| {
+                    try self.stepPastWatchpoint(wp_slot);
+                    self.stepping_past_wp = null;
+                }
                 // If we're stopped at a breakpoint, step past it first
                 if (self.stepping_past_bp) |bp_addr| {
                     try self.stepPastBreakpoint(bp_addr);
@@ -687,6 +712,10 @@ pub const DwarfEngine = struct {
                 try self.process.continueExecution();
             },
             .step_into => {
+                if (self.stepping_past_wp) |wp_slot| {
+                    try self.stepPastWatchpoint(wp_slot);
+                    self.stepping_past_wp = null;
+                }
                 if (self.stepping_past_bp) |bp_addr| {
                     try self.stepPastBreakpoint(bp_addr);
                     self.stepping_past_bp = null;
@@ -786,6 +815,11 @@ pub const DwarfEngine = struct {
                 // a call, the PC will move into the callee.
                 const original_regs = try self.process.readRegisters();
 
+                // Step past watchpoint if needed
+                if (self.stepping_past_wp) |wp_slot| {
+                    try self.stepPastWatchpoint(wp_slot);
+                    self.stepping_past_wp = null;
+                }
                 // Step past breakpoint if needed
                 if (self.stepping_past_bp) |bp_addr| {
                     try self.stepPastBreakpoint(bp_addr);
@@ -964,6 +998,10 @@ pub const DwarfEngine = struct {
                 try self.process.singleStep();
             },
             .step_out => {
+                if (self.stepping_past_wp) |wp_slot| {
+                    try self.stepPastWatchpoint(wp_slot);
+                    self.stepping_past_wp = null;
+                }
                 if (self.stepping_past_bp) |bp_addr| {
                     try self.stepPastBreakpoint(bp_addr);
                     self.stepping_past_bp = null;
@@ -1034,6 +1072,8 @@ pub const DwarfEngine = struct {
                     }
                     self.rearmAllBreakpoints();
                     self.stepping_past_bp = null;
+                    self.stepping_past_wp = null;
+                    self.hw_watchpoints = [_]HardwareWatchpoint{.{}} ** 4;
                     return .{ .stop_reason = .entry };
                 }
                 return .{ .stop_reason = .exception };
@@ -1094,6 +1134,10 @@ pub const DwarfEngine = struct {
                         }
 
                         // Condition not met, log point, or non-fatal signal — transparently resume
+                        if (self.stepping_past_wp) |wp_slot| {
+                            self.stepPastWatchpoint(wp_slot) catch {};
+                            self.stepping_past_wp = null;
+                        }
                         if (self.stepping_past_bp) |bp_addr| {
                             self.stepPastBreakpoint(bp_addr) catch {};
                             self.stepping_past_bp = null;
@@ -1510,6 +1554,46 @@ pub const DwarfEngine = struct {
                 .stack_trace = stack_trace,
                 .locals = locals,
             };
+        }
+
+        // Check for hardware watchpoint hit:
+        // If we got SIGTRAP, no software breakpoint at this address, and we're
+        // not in a single-step operation, check if any hardware watchpoints are active.
+        // On ARM64, watchpoint traps halt BEFORE the faulting instruction executes.
+        if (!self.is_single_stepping) {
+            for (&self.hw_watchpoints, 0..) |*wp, slot_idx| {
+                if (!wp.active) continue;
+
+                // Set step-past state so next resume will step past the watchpoint
+                self.stepping_past_wp = @intCast(slot_idx);
+
+                // Build stack trace and locals for the stop
+                const wp_stack_trace = self.buildStackTrace(regs) catch &.{};
+                self.cacheStackTrace(wp_stack_trace);
+                const wp_locals = self.buildLocals(regs) catch &.{};
+                const wp_func_name = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, regs.pc) else "";
+                const wp_loc = if (self.line_entries.len > 0 and self.file_entries.len > 0)
+                    parser.resolveAddress(self.line_entries, self.file_entries, regs.pc)
+                else
+                    null;
+
+                const wp_bp_ids: []const u32 = if (self.allocator.alloc(u32, 1)) |ids| blk: {
+                    ids[0] = wp.id;
+                    break :blk ids;
+                } else |_| &.{};
+
+                return .{
+                    .stop_reason = .data_breakpoint,
+                    .hit_breakpoint_ids = wp_bp_ids,
+                    .location = if (wp_loc) |l| .{
+                        .file = l.file,
+                        .line = l.line,
+                        .function = wp_func_name,
+                    } else null,
+                    .stack_trace = wp_stack_trace,
+                    .locals = wp_locals,
+                };
+            }
         }
 
         // For step stops, also provide stack trace and locals
@@ -2124,6 +2208,24 @@ pub const DwarfEngine = struct {
         }
     }
 
+    /// Step past a hardware watchpoint: temporarily disable it, single-step the
+    /// faulting instruction, then re-enable. On ARM64, watchpoints fire BEFORE the
+    /// instruction executes, so without this the watchpoint re-fires immediately.
+    fn stepPastWatchpoint(self: *DwarfEngine, slot: u32) !void {
+        // 1. Temporarily disable the watchpoint in hardware
+        try self.process.clearHardwareWatchpoint(slot);
+
+        // 2. Single-step past the faulting instruction
+        try self.process.singleStep();
+        _ = try self.process.waitForStop();
+
+        // 3. Re-enable the watchpoint if still tracked as active
+        if (self.hw_watchpoints[slot].active) {
+            const wp = self.hw_watchpoints[slot];
+            _ = try self.process.setHardwareWatchpoint(wp.address, @intCast(wp.size), @intCast(wp.access_type));
+        }
+    }
+
     fn rearmAllBreakpoints(self: *DwarfEngine) void {
         for (self.bp_manager.breakpoints.items) |*bp| {
             if (bp.enabled) {
@@ -2165,6 +2267,22 @@ pub const DwarfEngine = struct {
 
     fn engineRemoveBreakpoint(ctx: *anyopaque, _: std.mem.Allocator, id: u32) anyerror!void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+
+        // Hardware watchpoint IDs are slot + 1000
+        if (id >= 1000 and id < 1004) {
+            const slot: u32 = id - 1000;
+            if (self.hw_watchpoints[slot].active) {
+                try self.process.clearHardwareWatchpoint(slot);
+                self.hw_watchpoints[slot] = .{};
+                // Clear step-past state if we were about to step past this one
+                if (self.stepping_past_wp) |wp_slot| {
+                    if (wp_slot == slot) self.stepping_past_wp = null;
+                }
+            }
+            return;
+        }
+
+        // Existing software breakpoint removal
         self.bp_manager.removeBreakpoint(id, &self.process) catch {
             // If process write fails, at least remove from list
             self.bp_manager.remove(id) catch {};
@@ -2174,9 +2292,16 @@ pub const DwarfEngine = struct {
     fn engineListBreakpoints(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const BreakpointInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         const bps = self.bp_manager.list();
-        if (bps.len == 0) return &.{};
 
-        const result = try allocator.alloc(BreakpointInfo, bps.len);
+        // Count active hardware watchpoints
+        var wp_count: usize = 0;
+        for (self.hw_watchpoints) |wp| {
+            if (wp.active) wp_count += 1;
+        }
+
+        if (bps.len == 0 and wp_count == 0) return &.{};
+
+        const result = try allocator.alloc(BreakpointInfo, bps.len + wp_count);
         for (bps, 0..) |bp, i| {
             result[i] = .{
                 .id = bp.id,
@@ -2186,6 +2311,19 @@ pub const DwarfEngine = struct {
                 .condition = bp.condition,
                 .hit_condition = bp.hit_condition,
             };
+        }
+
+        // Append active hardware watchpoints
+        var wp_idx: usize = 0;
+        for (self.hw_watchpoints) |wp| {
+            if (!wp.active) continue;
+            result[bps.len + wp_idx] = .{
+                .id = wp.id,
+                .verified = true,
+                .file = "",
+                .line = 0,
+            };
+            wp_idx += 1;
         }
         return result;
     }
@@ -4199,6 +4337,15 @@ pub const DwarfEngine = struct {
         const slot = try self.process.setHardwareWatchpoint(address, size, hw_access);
         _ = allocator;
 
+        // Track watchpoint state for hit detection, step-past, and removal
+        self.hw_watchpoints[slot] = .{
+            .active = true,
+            .id = slot + 1000,
+            .address = address,
+            .size = size,
+            .access_type = @intCast(hw_access),
+        };
+
         return .{
             .id = slot + 1000, // Offset to distinguish from software breakpoints
             .verified = true,
@@ -4626,6 +4773,8 @@ pub const DwarfEngine = struct {
         }
         self.rearmAllBreakpoints();
         self.stepping_past_bp = null;
+        self.stepping_past_wp = null;
+        self.hw_watchpoints = [_]HardwareWatchpoint{.{}} ** 4;
     }
 
     // ── Write Registers ──────────────────────────────────────────────

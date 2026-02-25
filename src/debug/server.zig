@@ -50,6 +50,14 @@ pub fn errorMessage(err: anyerror) []const u8 {
     if (err == error.DebugpyNotInstalled) return "debugpy module not found for python3";
     if (err == error.DelveNotFound) return "dlv (Delve) not found on PATH";
     if (err == error.NodeNotFound) return "node not found on PATH";
+    if (err == error.DownloadFailed) return "Failed to download vscode-js-debug DAP server";
+    if (err == error.ExtractFailed) return "Failed to extract vscode-js-debug archive";
+    if (err == error.InstallFailed) return "vscode-js-debug installation failed";
+    if (err == error.PortParseFailed) return "Failed to parse DAP server listening port";
+    if (err == error.ConnectionFailed) return "Failed to connect to DAP server";
+    if (err == error.JavaNotFound) return "java not found on PATH";
+    if (err == error.JavacNotFound) return "javac not found on PATH";
+    if (err == error.JdiCompileFailed) return "Failed to compile JDI debug adapter";
     if (err == error.UnsupportedLanguage) return "Unsupported language for debugging";
     return @errorName(err);
 }
@@ -551,12 +559,16 @@ pub const DebugServer = struct {
             if (config.language) |lang| {
                 if (std.mem.eql(u8, lang, "python") or
                     std.mem.eql(u8, lang, "javascript") or
+                    std.mem.eql(u8, lang, "typescript") or
                     std.mem.eql(u8, lang, "java")) break :blk true;
             }
             // Check file extension
             const ext = std.fs.path.extension(config.program);
             if (std.mem.eql(u8, ext, ".py") or
                 std.mem.eql(u8, ext, ".js") or
+                std.mem.eql(u8, ext, ".ts") or
+                std.mem.eql(u8, ext, ".mjs") or
+                std.mem.eql(u8, ext, ".mts") or
                 std.mem.eql(u8, ext, ".java")) break :blk true;
             break :blk false;
         };
@@ -818,8 +830,43 @@ pub const DebugServer = struct {
             .thread_id = if (a.object.get("thread_id")) |v| (if (v == .integer) @as(u32, @intCast(v.integer)) else null) else null,
         };
 
-        // Pause and restart are non-blocking — keep synchronous
-        if (action == .pause or action == .restart) {
+        // When pause is requested and a background run is active, use
+        // write-only sendPause to avoid a data race (two threads reading
+        // from the same socket).  The background thread will pick up the
+        // stopped event; the caller should use debug_poll_events to see it.
+        if (action == .pause and session.pending_run != null) {
+            const thread_id: ?u32 = if (run_options.thread_id) |t| t else null;
+            session.driver.sendPause(allocator, thread_id) catch |err| {
+                self.dashboard.onError("cog_debug_run", @errorName(err));
+                return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
+            };
+
+            var aw: Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var jw: Stringify = .{ .writer = &aw.writer };
+            try jw.beginObject();
+            try jw.objectField("status");
+            try jw.write("pausing");
+            try jw.objectField("session_id");
+            try jw.write(session_id_val.string);
+            try jw.endObject();
+            const result = try aw.toOwnedSlice();
+            return .{ .ok = result };
+        }
+
+        // Restart delegates to driver.restart() which handles the full
+        // restart flow (re-arm breakpoints, re-initialize, etc.).
+        if (action == .restart) {
+            session.driver.restart(allocator) catch |err| {
+                self.dashboard.onError("cog_debug_run", @errorName(err));
+                return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
+            };
+            session.status = .stopped;
+            return .{ .ok_static = "{\"stop_reason\":\"restart\"}" };
+        }
+
+        // Pause is non-blocking — keep synchronous
+        if (action == .pause) {
             session.status = .running;
             const state = session.driver.runEx(allocator, action, run_options) catch |err| {
                 self.dashboard.onError("cog_debug_run", @errorName(err));
@@ -1240,6 +1287,7 @@ pub const DebugServer = struct {
                 const lang = lang_val.string;
                 if (std.mem.eql(u8, lang, "python") or
                     std.mem.eql(u8, lang, "javascript") or
+                    std.mem.eql(u8, lang, "typescript") or
                     std.mem.eql(u8, lang, "java")) break :blk true;
             }
             break :blk false;
@@ -1901,6 +1949,20 @@ pub const DebugServer = struct {
 
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+
+        // Cancel any running background thread first (same pattern as toolStop).
+        // The background thread blocks in waitForEvent reading the TCP socket;
+        // killing the process closes the connection and unblocks it.
+        if (session.pending_run != null) {
+            if (session.driver.getPid()) |pid| {
+                posix.kill(pid, posix.SIG.KILL) catch {};
+            }
+            if (session.pending_run) |*pr| {
+                pr.thread.join();
+                pr.deinit();
+            }
+            session.pending_run = null;
+        }
 
         session.driver.restart(allocator) catch |err| {
             self.dashboard.onError("cog_debug_restart", @errorName(err));

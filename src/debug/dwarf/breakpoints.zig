@@ -106,15 +106,19 @@ pub const BreakpointManager = struct {
         var best_addr: ?u64 = null;
         var best_line: u32 = 0;
         var best_col_distance: u32 = std.math.maxInt(u32);
+        var best_match_quality: u8 = 0;
 
         for (line_entries) |entry| {
             if (entry.end_sequence) continue;
             if (!entry.is_stmt) continue;
 
-            // File matching: skip entries that don't match the requested file
+            // File matching: compute quality and skip non-matches.
+            // Prefer higher quality matches (3=exact, 2=suffix, 1=basename).
+            var quality: u8 = 1; // default when no file entries to check
             if (file_entries.len > 0 and file.len > 0) {
                 const entry_file = getEntryFileName(file_entries, entry.file_index);
-                if (!filePathsMatch(file, entry_file)) continue;
+                quality = fileMatchQuality(file, entry_file);
+                if (quality == 0) continue;
             }
 
             if (entry.line == line) {
@@ -125,23 +129,30 @@ pub const BreakpointManager = struct {
                     else
                         requested_col - entry.column;
 
-                    if (best_addr == null or best_line != line or col_distance < best_col_distance) {
+                    if (quality > best_match_quality or best_addr == null or best_line != line or (quality == best_match_quality and col_distance < best_col_distance)) {
                         best_addr = entry.address;
                         best_line = entry.line;
                         best_col_distance = col_distance;
+                        best_match_quality = quality;
                     }
                 } else {
-                    // No column requested: take first exact line match
-                    best_addr = entry.address;
-                    best_line = entry.line;
-                    break;
+                    // No column requested: take best quality exact line match.
+                    // Also prefer an exact line match over a previous fallback (nearest line >= requested).
+                    if (quality > best_match_quality or best_addr == null or best_line != line) {
+                        best_addr = entry.address;
+                        best_line = entry.line;
+                        best_match_quality = quality;
+                    }
+                    // Only break early on exact path match (quality 3)
+                    if (quality == 3) break;
                 }
             } else if (entry.line >= line) {
                 // Also accept the nearest line at or after the requested line
-                // but only if we haven't found an exact line match
-                if (best_line != line and (best_addr == null or entry.line < best_line)) {
+                // but only if we haven't found an exact line match with equal or better quality
+                if (quality >= best_match_quality and best_line != line and (best_addr == null or entry.line < best_line)) {
                     best_addr = entry.address;
                     best_line = entry.line;
+                    best_match_quality = quality;
                 }
             }
         }
@@ -881,4 +892,58 @@ test "instruction breakpoint with invalid reference returns error" {
         .instruction_reference = "not_hex",
     };
     try std.testing.expectError(error.InvalidInstructionReference, mgr.setInstructionBreakpoint(ibp));
+}
+
+test "breakpoint prefers exact path over basename-only match" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Simulate Rust DWARF: stdlib file with same basename appears first at line 547,
+    // user's actual file appears later at line 2.
+    const file_entries = [_]parser.FileEntry{
+        .{ .name = "/rustc/abc123/library/std/src/debug_test.rs", .dir_index = 0 },
+        .{ .name = "/tmp/debug_test.rs", .dir_index = 0 },
+    };
+
+    const line_entries = [_]parser.LineEntry{
+        // stdlib entry: basename matches but path doesn't — quality 1
+        .{ .address = 0xBAD, .file_index = 0, .line = 2, .column = 0, .is_stmt = true, .end_sequence = false },
+        // user entry: suffix matches "/tmp/debug_test.rs" — quality 2
+        .{ .address = 0x2000, .file_index = 1, .line = 2, .column = 0, .is_stmt = true, .end_sequence = false },
+    };
+
+    const bp = try mgr.resolveAndSet("/tmp/debug_test.rs", 2, &line_entries, &file_entries, null);
+    // Should resolve to user's file (0x2000), NOT stdlib (0xBAD)
+    try std.testing.expectEqual(@as(u64, 0x2000), bp.address);
+    try std.testing.expectEqual(@as(u32, 2), bp.line);
+}
+
+test "exact line match preferred over earlier fallback in address order" {
+    var mgr = BreakpointManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Simulates Rust codegen unit layout where functions are NOT in source order.
+    // Memory layout: add() at 0x1000 → main() at 0x2000 → multiply() at 0x3000
+    // Source lines: add=line 2, main=line 33, multiply=line 7
+    // When searching for line 7 (in multiply), the resolver iterates by address
+    // and hits main's line 33 (a fallback >= 7) before reaching multiply's exact line 7.
+    const file_entries = [_]parser.FileEntry{
+        .{ .name = "/tmp/test.rs", .dir_index = 0 },
+    };
+
+    const line_entries = [_]parser.LineEntry{
+        // add() function: line 2
+        .{ .address = 0x1000, .file_index = 0, .line = 2, .column = 0, .is_stmt = true, .end_sequence = false },
+        // main() function: line 33 — appears BEFORE multiply in address order
+        .{ .address = 0x2000, .file_index = 0, .line = 33, .column = 0, .is_stmt = true, .end_sequence = false },
+        .{ .address = 0x2010, .file_index = 0, .line = 34, .column = 0, .is_stmt = true, .end_sequence = false },
+        // multiply() function: line 7 — the exact match, but later in address order
+        .{ .address = 0x3000, .file_index = 0, .line = 7, .column = 0, .is_stmt = true, .end_sequence = false },
+    };
+
+    // Searching for line 7 should find the exact match at 0x3000,
+    // NOT the fallback at 0x2000 (line 33 >= 7).
+    const bp = try mgr.resolveAndSet("/tmp/test.rs", 7, &line_entries, &file_entries, null);
+    try std.testing.expectEqual(@as(u64, 0x3000), bp.address);
+    try std.testing.expectEqual(@as(u32, 7), bp.line);
 }

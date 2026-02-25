@@ -1,4 +1,4 @@
-# Cog Debug Server — End-to-End Test Prompt (JavaScript / DAP)
+# Cog Debug Server — End-to-End Test Prompt (C / Native DWARF Engine)
 
 ## CRITICAL EXECUTION RULES
 
@@ -28,11 +28,11 @@ AI Agent --MCP tools/call--> debug_* tool in Cog MCP runtime
 - Parse JSON from the returned `content[0].text` payload.
 
 ```json
-{"name":"debug_launch","arguments":{"program":"/tmp/debug_test.js","stop_on_entry":true}}
+{"name":"debug_launch","arguments":{"program":"/tmp/debug_test","stop_on_entry":true,"language":"c"}}
 ```
 
 ```json
-{"name":"debug_breakpoint","arguments":{"session_id":"session-1","action":"set","file":"/tmp/debug_test.js","line":4}}
+{"name":"debug_breakpoint","arguments":{"session_id":"session-1","action":"set","file":"/tmp/debug_test.c","line":4}}
 ```
 
 ```json
@@ -104,19 +104,20 @@ Cog exposes 36 debug MCP tools. Prefer runtime discovery (`tools/list`) for exac
 
 Use the scenarios below to validate common and advanced flows across these tools.
 
-### DAP Backend Notes (JavaScript)
+### Native DWARF Engine Notes (C)
 
-JavaScript debugging uses the **DAP (Debug Adapter Protocol)** transport via `vscode-js-debug`
-(`dapDebugServer.js`). The DAP server is auto-downloaded to `~/.config/cog/js-debug/` on first use
-and communicates over TCP on a dynamically assigned port. This means:
+C debugging uses the native DWARF engine directly. C binaries compiled with `cc -g -O0`
+produce standard Mach-O/ELF binaries with DWARF debug info that the native engine reads
+directly.
 
-- Programs are **not compiled** — they are launched directly as `.js` files.
-- The DAP adapter type is `"pwa-node"` (Node.js debugging via Chrome DevTools).
-- **Native-only tools are NOT available** and must return `NOT_SUPPORTED` (-32001):
-  `debug_memory`, `debug_disassemble`, `debug_registers`, `debug_write_register`,
-  `debug_instruction_breakpoint`, `debug_find_symbol`, `debug_variable_location`.
-- Division is **floating-point** by default: `10 / 20 = 0.5`, not `0`.
-  Use `Math.floor(a / b)` for integer truncation.
+**All 36 debug tools are available**, including memory, disassembly, registers, instruction
+breakpoints, symbol lookup, and variable location — these are tested in Part 3.
+
+**Known considerations:**
+- C function names are unmangled and match source directly (e.g., `add`, `multiply`)
+- Integer division truncates toward zero: `10 / 20 = 0`, `20 / 10 = 2`
+- Signals (SIGSEGV, SIGFPE, SIGABRT) are used for crash/exception scenarios
+- No runtime frames — stack traces show only user frames and libc entry point
 
 ---
 
@@ -124,53 +125,52 @@ and communicates over TCP on a dynamically assigned port. This means:
 
 ### Setup
 
-Before running any scenarios, copy all JavaScript test fixtures to `/tmp/`:
+Before running any scenarios, reset and compile all test fixtures:
 
 ```bash
-bash prompts/fixtures/js/setup.sh
+bash prompts/fixtures/setup.sh
 ```
 
-This copies the `.js` source files from `prompts/fixtures/js/` to `/tmp/`. No compilation
-is needed — JavaScript programs are executed directly by Node.js. Run the setup script at
-the start of every session to ensure clean state.
+This copies the source files from `prompts/fixtures/` to `/tmp/` and compiles them with
+`cc -g -O0`. Run the setup script at the start of every session to ensure clean state.
 
 **Do NOT kill any running processes.** The daemon auto-starts on first `debug_*` tool use.
 Killing processes (e.g., `pkill`) can destroy the user's running dashboard or other sessions.
 
-**Do NOT use sleep-based programs in this E2E.** Never launch `/tmp/debug_sleep.js`, never run `/usr/bin/sleep`, and never add waits via sleep commands.
+**Do NOT use sleep-based programs in this E2E.** Never launch `/tmp/debug_sleep`, never run `/usr/bin/sleep`, and never add waits via sleep commands.
 
 ### Programs
 
-| Program | Source | Used by |
-|---------|--------|---------|
-| A: Basic | `/tmp/debug_test.js` | Scenarios 1-11, 14-18, 20-28, 30-33 |
-| B: Crasher | `/tmp/debug_crash.js` | Scenario 19 |
-| D: Multi-variable | `/tmp/debug_vars.js` | Scenarios 12-13, 29 |
+| Program | Source | Binary | Used by |
+|---------|--------|--------|---------|
+| A: Basic | `/tmp/debug_test.c` | `/tmp/debug_test` | Scenarios 1-11, 14-18, 20-28, 30-33 |
+| B: Crasher | `/tmp/debug_crash.c` | `/tmp/debug_crash` | Scenario 19 |
+| D: Multi-variable | `/tmp/debug_vars.c` | `/tmp/debug_vars` | Scenarios 12-13, 29 |
 
 ### Key Line References
 
-**Program A** (`debug_test.js`):
-- Line 4: `const result = a + b;` (inside `add()`)
+**Program A** (`debug_test.c`):
+- Line 4: `int result = a + b;` (inside `add()`)
 - Line 5: `return result;` (inside `add()`)
-- Line 9: `const result = a * b;` (inside `multiply()`)
-- Line 14: `const sum = add(x, y);` (inside `compute()`)
-- Line 15: `const product = multiply(x, y);` (inside `compute()`)
-- Line 16: `const final_ = sum + product;` (inside `compute()`)
-- Line 21: `let total = 0;` (inside `loopSum()`)
-- Line 23: `total = add(total, i);` (loop body in `loopSum()`)
+- Line 9: `int result = a * b;` (inside `multiply()`)
+- Line 14: `int sum = add(x, y);` (inside `compute()`)
+- Line 15: `int product = multiply(x, y);` (inside `compute()`)
+- Line 16: `int final = sum + product;` (inside `compute()`)
+- Line 21: `int total = 0;` (inside `loop_sum()`)
+- Line 23: `total = add(total, i);` (loop body in `loop_sum()`)
 - Line 29: `if (n <= 1) return 1;` (inside `factorial()`)
-- Line 34: `const x = 10;` (inside `main()`)
-- Line 36: `const result1 = compute(x, y);` (inside `main()`)
-- Line 37: `console.log(\`compute = ${result1}\`);` (inside `main()`)
+- Line 34: `int x = 10;` (inside `main()`)
+- Line 36: `int result1 = compute(x, y);` (inside `main()`)
+- Line 37: `printf("compute = %d\n", result1);` (inside `main()`)
 
-**Program B** (`debug_crash.js`):
-- Line 4: `if (b === 0) throw new Error("Division by zero");` (thrown Error)
-- Line 10: `console.log(obj.value);` (TypeError, null dereference)
-- Line 14: `process.abort();` (SIGABRT)
+**Program B** (`debug_crash.c`):
+- Line 6: `return a / b;` (divide by zero)
+- Line 11: `printf("%d\n", *p);` (null deref, SIGSEGV)
+- Line 15: `abort();` (SIGABRT)
 
-**Program D** (`debug_vars.js`):
-- Line 20: `const local3 = local1 * local2;` (inside `process()`)
-- Line 29: `x = modify(x, 3);` (inside `main()`)
+**Program D** (`debug_vars.c`):
+- Line 19: `int local3 = local1 * local2;` (inside `process()`)
+- Line 31: `modify(&x, 3);` (inside `main()`)
 
 ---
 
@@ -192,8 +192,8 @@ These test the fundamental debug loop using Program A.
 
 This is the baseline test. Verify the fundamental debug loop works.
 
-1. `debug_launch` with `program: "/tmp/debug_test.js"`, `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"`, `session_id`, `file: "/tmp/debug_test.js"`, `line: 4`
+1. `debug_launch` with `program: "/tmp/debug_test"`, `stop_on_entry: true`, `language: "c"`
+2. `debug_breakpoint` with `action: "set"`, `session_id`, `file: "/tmp/debug_test.c"`, `line: 4`
 3. `debug_run` with `action: "continue"` — should hit the breakpoint
 4. `debug_inspect` with `expression: "a"` — should be 10
 5. `debug_inspect` with `expression: "b"` — should be 20
@@ -207,7 +207,7 @@ This is the baseline test. Verify the fundamental debug loop works.
 Test function call boundary navigation.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 36 (`const result1 = compute(x, y);` in `main()`)
+2. `debug_breakpoint` with `action: "set"` at line 36 (`int result1 = compute(x, y);` in `main()`)
 3. `debug_run` with `action: "continue"` to hit line 36
 4. `debug_inspect` with `expression: "x"` and `expression: "y"` to confirm `main()` context
 5. `debug_run` with `action: "step_into"` — should enter `compute()`, landing at line 14
@@ -228,7 +228,7 @@ Test hitting multiple breakpoints in sequence using continue.
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
 3. `debug_breakpoint` with `action: "set"` at line 9 (inside `multiply()`)
-4. `debug_breakpoint` with `action: "set"` at line 16 (`const final_ = sum + product;` in `compute()`)
+4. `debug_breakpoint` with `action: "set"` at line 16 (`int final = sum + product;` in `compute()`)
 5. `debug_breakpoint` with `action: "list"` — verify all 3 are set and verified
 6. `debug_run` with `action: "continue"` — should hit line 4
 7. `debug_inspect` for `a` and `b`
@@ -246,7 +246,7 @@ order. Each continue resumes and stops at the next breakpoint.
 Test that a breakpoint inside a loop is hit on each iteration.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 23 (`total = add(total, i);` in `loopSum()`)
+2. `debug_breakpoint` with `action: "set"` at line 23 (`total = add(total, i);` in `loop_sum()`)
 3. `debug_run` with `action: "continue"` — should hit line 23 (i=1)
 4. `debug_inspect` for `i` and `total`
 5. `debug_run` with `action: "continue"` — should hit line 23 again (i=2)
@@ -258,7 +258,7 @@ Test that a breakpoint inside a loop is hit on each iteration.
 11. `debug_stop`
 
 **What this tests:** Breakpoints inside loops fire on every iteration. The breakpoint
-re-arming logic works correctly across multiple hits.
+re-arming logic (step past INT3, re-insert trap) works correctly across multiple hits.
 
 **Expected values per iteration:**
 | Hit | i | total (before add) |
@@ -274,7 +274,7 @@ re-arming logic works correctly across multiple hits.
 Test that step_over executes a function call without entering it.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 14 (`const sum = add(x, y);` in `compute()`)
+2. `debug_breakpoint` with `action: "set"` at line 14 (`int sum = add(x, y);` in `compute()`)
 3. `debug_run` with `action: "continue"` to hit line 14
 4. `debug_run` with `action: "step_over"` — should execute `add()` entirely, stop at line 15
 5. `debug_inspect` with `expression: "sum"` — should be 30
@@ -301,7 +301,7 @@ Test breakpoint lifecycle management.
 9. `debug_run` with `action: "continue"` — should hit line 9 (multiply), confirming line 4 was skipped
 10. `debug_stop`
 
-**What this tests:** Breakpoint removal actually disarms the breakpoint. The removed
+**What this tests:** Breakpoint removal actually disarms the trap instruction. The removed
 breakpoint is no longer hit during execution.
 
 ### Scenario 7: Recursive Function Debugging
@@ -337,20 +337,19 @@ Test the expression evaluator with various operators.
    - `debug_inspect` with `expression: "a + b"` — should be 30
    - `debug_inspect` with `expression: "a - b"` — should be -10
    - `debug_inspect` with `expression: "a * b"` — should be 200
-   - `debug_inspect` with `expression: "a / b"` — should be 0.5 (JavaScript uses float division)
+   - `debug_inspect` with `expression: "a / b"` — should be 0 (integer division)
    - `debug_inspect` with `expression: "b / a"` — should be 2
-   - `debug_inspect` with `expression: "Math.floor(a / b)"` — should be 0 (integer division via Math.floor)
 5. `debug_stop`
 
-**What this tests:** All four arithmetic operators in the expression evaluator. JavaScript
-float division behavior (`10 / 20 = 0.5`), and `Math.floor()` for integer truncation.
+**What this tests:** All four arithmetic operators in the expression evaluator. Integer
+division truncation behavior.
 
 ### Scenario 9: Restart
 
 Test restarting a debug session without re-launching.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 34 (`const x = 10;` in `main()`)
+2. `debug_breakpoint` with `action: "set"` at line 34 (`int x = 10;` in `main()`)
 3. `debug_run` with `action: "continue"` to hit line 34
 4. `debug_run` with `action: "continue"` to let the program run to completion
 5. `debug_restart` — should restart the session
@@ -366,7 +365,7 @@ breakpoints. The session ID remains the same.
 
 Test the server's response to invalid inputs.
 
-1. `debug_launch` with `program: "/tmp/debug_test.js"`, `stop_on_entry: true`
+1. `debug_launch` with `program: "/tmp/debug_test"`, `language: "c"`
 2. `debug_run` with an invalid `session_id: "nonexistent"` — should return an error
 3. `debug_breakpoint` with `action: "set"`, `session_id`, but missing `file` — should return an error
 4. `debug_run` with `action: "invalid_action"` — should return an error
@@ -385,7 +384,7 @@ Test thread enumeration and stack trace retrieval with pagination.
 
 Uses Program A.
 
-1. `debug_launch` with `/tmp/debug_test.js`, `stop_on_entry: true`
+1. `debug_launch` with `/tmp/debug_test`, `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
 4. `debug_threads` — should return at least one thread (the main thread)
@@ -402,14 +401,14 @@ parameters (`start_frame`, `levels`) correctly limit the returned frames.
 
 Test variable scope enumeration for a stack frame.
 
-Uses Program D (`/tmp/debug_vars.js`).
+Uses Program D (`/tmp/debug_vars`).
 
-1. `debug_launch` with `/tmp/debug_vars.js`, `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 20 (`const local3 = local1 * local2;` inside `process()`)
+1. `debug_launch` with `/tmp/debug_vars`, `stop_on_entry: true`
+2. `debug_breakpoint` with `action: "set"` at line 19 (`int local3 = local1 * local2;` inside `process()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
 4. `debug_scopes` with `frame_id: 0` — should return scope objects
 5. Each scope should have `name`, `variablesReference` (integer), and `expensive` (boolean)
-6. Use the `variablesReference` from the "Local" scope to call `debug_inspect` with `variable_ref` — should return `local1` and `local2` variables
+6. Use the `variablesReference` from the "Locals" scope to call `debug_inspect` with `variable_ref` — should return `local1` and `local2` variables
 7. `debug_stop`
 
 **What this tests:** Scope hierarchy is exposed correctly. Variable references can be used
@@ -419,10 +418,10 @@ to drill into scope contents.
 
 Test modifying variable values during debugging.
 
-Uses Program D (`/tmp/debug_vars.js`).
+Uses Program D (`/tmp/debug_vars`).
 
-1. `debug_launch` with `/tmp/debug_vars.js`, `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 29 (`x = modify(x, 3);` in `main()`)
+1. `debug_launch` with `/tmp/debug_vars`, `stop_on_entry: true`
+2. `debug_breakpoint` with `action: "set"` at line 31 (`modify(&x, 3);` in `main()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
 4. `debug_inspect` with `expression: "x"` — should be 5
 5. `debug_set_variable` with `variable: "x"`, `value: "42"`
@@ -438,86 +437,87 @@ Uses Program D (`/tmp/debug_vars.js`).
 
 ---
 
-### Part 3: Native-Only Tools — NOT_SUPPORTED Verification (Scenarios 14-16)
+### Part 3: Memory and Low-Level (Scenarios 14-16)
 
-These scenarios verify that native-only tools correctly return `NOT_SUPPORTED` (-32001)
-when used with the DAP/vscode-js-debug backend. JavaScript debugging runs through DAP,
-which does not expose memory, registers, or instruction-level features.
+### Scenario 14: Memory Read and Disassembly
 
-### Scenario 14: Memory and Disassembly — NOT_SUPPORTED
-
-Verify that `debug_memory` and `debug_disassemble` return NOT_SUPPORTED via DAP.
+Test reading memory and disassembling instructions at the current PC.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_memory` with `action: "read"`, `address: "0x1000"`, `size: 32`
-   — should return error with code `-32001` (NOT_SUPPORTED)
-5. Verify the error response contains code `-32001`
-6. `debug_disassemble` with `address: "0x1000"`, `instruction_count: 5`
-   — should return error with code `-32001` (NOT_SUPPORTED)
-7. Verify the error response contains code `-32001`
-8. `debug_stop`
+4. Get the current PC from the stop state's `location` (or from `debug_registers`)
+5. `debug_memory` with `action: "read"`, PC address, `size: 32` — should return hex bytes
+6. Verify the response has `data` (hex string), `address`, and `size` fields
+7. `debug_disassemble` with the PC address, `instruction_count: 5` — should return disassembled instructions
+8. Verify each instruction has `address`, `instruction` (mnemonic), and optionally `instructionBytes`
+9. `debug_memory` with `action: "read"`, `address: "0x0"`, `size: 1` — should fail (invalid address)
+10. `debug_stop`
 
-**What this tests:** Native-only memory and disassembly tools are correctly rejected
-with NOT_SUPPORTED when the backend is DAP/vscode-js-debug.
+**What this tests:** Memory reads at valid addresses return hex data. Disassembly produces
+instruction mnemonics. Invalid memory addresses produce errors rather than crashes.
 
-### Scenario 15: Instruction Breakpoints — NOT_SUPPORTED
+### Scenario 15: Instruction Breakpoints
 
-Verify that `debug_instruction_breakpoint` returns NOT_SUPPORTED via DAP.
+Test setting breakpoints by memory address rather than source line.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_instruction_breakpoint` with `instruction_reference: "0x1000"`
-   — should return error with code `-32001` (NOT_SUPPORTED)
-3. Verify the error response contains code `-32001`
-4. `debug_stop`
+2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
+3. `debug_run` with `action: "continue"` to hit line 4
+4. `debug_disassemble` at the current PC to get instruction addresses
+5. `debug_breakpoint` with `action: "remove"` for the source breakpoint
+6. `debug_run` with `action: "continue"` to proceed past `add()`
+7. `debug_instruction_breakpoint` with an address from step 4
+8. `debug_run` with `action: "continue"` — should hit the instruction breakpoint on next `add()` call
+9. Verify the stop reason indicates an instruction breakpoint
+10. `debug_stop`
 
-**What this tests:** Instruction-level breakpoints are correctly rejected with
-NOT_SUPPORTED when the backend is DAP/vscode-js-debug.
+**What this tests:** Instruction-level breakpoints can be set by address and fire correctly.
+This exercises a different breakpoint path than source-line breakpoints.
 
-### Scenario 16: CPU Registers and Native Introspection — NOT_SUPPORTED
+### Scenario 16: CPU Registers (Native Engine)
 
-Verify that register and native introspection tools return NOT_SUPPORTED via DAP.
+Test reading and writing CPU registers.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_registers` — should return error with code `-32001` (NOT_SUPPORTED)
-5. `debug_variable_location` with `name: "a"` — should return error with code `-32001` (NOT_SUPPORTED)
-6. `debug_find_symbol` with `name: "add"` — should return error with code `-32001` (NOT_SUPPORTED)
-7. `debug_write_register` with `name: "rax"`, `value: 0` — should return error with code `-32001` (NOT_SUPPORTED)
-8. Verify all four responses contain error code `-32001`
+4. `debug_registers` — should return register name/value pairs
+5. Verify key registers are present (e.g., `rip`/`pc`, `rsp`/`sp`, `rbp`/`fp`)
+6. Note the value of `rip` — it should match the address in the stop location
+7. `debug_variable_location` with `name: "a"` — should indicate register or stack location
+8. `debug_find_symbol` with `name: "add"` — should return symbol information
 9. `debug_stop`
 
-**What this tests:** All native-engine-only tools (`debug_registers`,
-`debug_variable_location`, `debug_find_symbol`, `debug_write_register`) are correctly
-rejected with NOT_SUPPORTED when the backend is DAP/vscode-js-debug.
+**What this tests:** Register reads return valid data. Variable location tracking works.
+Symbol lookup resolves function names to addresses.
 
 ---
 
 ### Part 4: Advanced Breakpoints (Scenarios 17-19)
 
-### Scenario 17: Function Breakpoints — NOT_SUPPORTED
+### Scenario 17: Function Breakpoints
 
-Verify that function breakpoints return NOT_SUPPORTED via vscode-js-debug (which advertises
-`supportsFunctionBreakpoints: false`).
+Test setting breakpoints by function name instead of file:line.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set_function"`, `function: "multiply"`
-   — should return error with code `-32001` (NOT_SUPPORTED)
-3. Verify the error response contains code `-32001`
-4. `debug_stop`
+3. `debug_run` with `action: "continue"` — should hit when `multiply()` is called
+4. `debug_inspect` for `a` and `b` — should be 10 and 20
+5. Verify the stop location references the `multiply` function
+6. `debug_breakpoint` with `action: "list"` — the function breakpoint should be listed
+7. `debug_stop`
 
-**What this tests:** Function breakpoints are correctly rejected with NOT_SUPPORTED
-when the DAP adapter does not advertise `supportsFunctionBreakpoints`.
+**What this tests:** Function breakpoints resolve the function name to an address and fire
+when execution enters the function.
 
 ### Scenario 18: Breakpoint Locations
 
@@ -526,61 +526,54 @@ Test querying valid breakpoint positions in a source file.
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
-3. `debug_run` with `action: "continue"` to hit line 4 — ensures the script is fully loaded
-4. `debug_breakpoint_locations` with `source: "/tmp/debug_test.js"`, `line: 3`, `end_line: 6`
+2. `debug_breakpoint_locations` with `source: "/tmp/debug_test.c"`, `line: 3`, `end_line: 6`
    — should return valid breakpoint positions within `add()` (lines 4 and 5 at minimum)
-5. `debug_breakpoint_locations` with `source: "/tmp/debug_test.js"`, `line: 12`
+3. `debug_breakpoint_locations` with `source: "/tmp/debug_test.c"`, `line: 12`
    — query a single line, may return line 14 as the nearest valid position
-6. Verify each result has `line` and optionally `endLine`, `column`, `endColumn`
-7. `debug_stop`
+4. Verify each result has `line` and optionally `endLine`, `column`, `endColumn`
+5. `debug_stop`
 
 **What this tests:** The debugger can report which source locations are valid breakpoint
 targets. This is critical for IDEs that need to snap breakpoints to valid positions.
-Note: the script must be loaded (hit a breakpoint) before querying locations, as
-vscode-js-debug needs the script to be parsed first.
 
 ### Scenario 19: Exception Breakpoints and Exception Info
 
-Test exception breakpoint configuration and exception information retrieval.
+Test exception/signal breakpoint configuration and exception information retrieval.
 
-Uses Program B (`/tmp/debug_crash.js`).
+Uses Program B (`/tmp/debug_crash`).
 
-1. `debug_launch` with `/tmp/debug_crash.js`, `args: ["null"]`, `stop_on_entry: true`
+1. `debug_launch` with `/tmp/debug_crash`, `args: ["null"]`, `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set_exception"`, `filters: ["uncaught"]`
-3. `debug_run` with `action: "continue"` — should stop on the TypeError at line 10 (null dereference)
-4. The stop reason should indicate an exception
+3. `debug_run` with `action: "continue"` — should crash with SIGSEGV at line 11
+4. The stop reason should indicate an exception or signal
 5. `debug_exception_info` — should return exception details
 6. Verify the response has `exceptionId` (required), `breakMode` (required), and optionally `description` and `details`
-7. The exception should be a `TypeError` related to reading property of null
-8. `debug_stop`
+7. `debug_stop`
 
-**What this tests:** Exception breakpoints cause the debugger to stop on uncaught exceptions.
-Exception info retrieves structured details about the TypeError.
+**What this tests:** Exception breakpoints cause the debugger to stop on signals/exceptions.
+Exception info retrieves structured details about what went wrong.
 
 ---
 
 ### Part 5: Navigation (Scenarios 20-22)
 
-### Scenario 20: Goto Targets and Goto — NOT_SUPPORTED
+### Scenario 20: Goto Targets and Goto Execution
 
-Verify that goto targets and goto return NOT_SUPPORTED via vscode-js-debug (which does not
-advertise `supportsGotoTargetsRequest`).
+Test discovering and jumping to goto targets.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 14 (`const sum = add(x, y);` in `compute()`)
+2. `debug_breakpoint` with `action: "set"` at line 14 (`int sum = add(x, y);` in `compute()`)
 3. `debug_run` with `action: "continue"` to hit line 14
-4. `debug_goto_targets` with `file: "/tmp/debug_test.js"`, `line: 16`
-   — should return error with code `-32001` (NOT_SUPPORTED)
-5. `debug_run` with `action: "goto"`, `file: "/tmp/debug_test.js"`, `line: 16`
-   — should return error with code `-32001` (NOT_SUPPORTED)
-6. Verify both responses contain error code `-32001`
+4. `debug_goto_targets` with `file: "/tmp/debug_test.c"`, `line: 16`
+5. If targets are returned, `debug_run` with `action: "goto"`, `file: "/tmp/debug_test.c"`, `line: 16`
+   — should jump to line 16, skipping `add()` and `multiply()` calls
+6. `debug_inspect` for `sum` and `product` — may be uninitialized/zero
 7. `debug_stop`
 
-**What this tests:** Goto targets and goto execution are correctly rejected with NOT_SUPPORTED
-when the DAP adapter does not advertise `supportsGotoTargetsRequest`.
+**What this tests:** Goto targets can be discovered for a source location. The goto action
+repositions execution to a different line within the same function.
 
 ### Scenario 21: Step-In Targets
 
@@ -589,38 +582,36 @@ Test listing available step-in targets when a line has multiple function calls.
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 14 (`const sum = add(x, y);` in `compute()` — has `add` call)
-3. `debug_run` with `action: "continue"` to hit line 14
-4. `debug_step_in_targets` with `frame_id: 0` — should list `add` as a target (or empty array, which is valid DAP behavior for single-call lines)
-5. Record the target IDs returned (may be empty)
-6. `debug_breakpoint` with `action: "set"` at line 36 (`const result1 = compute(x, y);` in `main()`)
-7. `debug_run` with `action: "continue"` to hit line 36
-8. `debug_step_in_targets` with `frame_id: 0` — should list `compute` as a target (or empty array)
-9. Verify the response has a `targets` array (empty is acceptable — DAP adapters may return empty targets for single-call lines)
-10. `debug_stop`
+2. `debug_breakpoint` with `action: "set"` at line 36 (`int result1 = compute(x, y);` in `main()`)
+3. `debug_run` with `action: "continue"` to hit line 36
+4. `debug_step_in_targets` with `frame_id: 0` — should list `compute` as a target
+5. Record the target IDs returned
+6. `debug_breakpoint` with `action: "set"` at line 14 and continue to hit it
+7. `debug_step_in_targets` with `frame_id: 0` — should list `add` as a target
+8. `debug_stop`
 
 **What this tests:** Step-in targets enumerate the callable functions at the current execution
-point. Empty targets is valid DAP behavior when the adapter chooses not to enumerate targets.
+point.
 
 ### Scenario 22: Stepping Granularity
 
-Test line-level stepping. Instruction-level granularity is not available via DAP/vscode-js-debug.
+Test instruction-level stepping vs line-level stepping.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
 3. `debug_run` with `action: "continue"` to hit line 4
-4. Record the current line number from the stop location
-5. `debug_run` with `action: "step_over"`, `granularity: "line"` — advance to next source line
-6. Verify the location changed to a different line number (should be line 5)
-7. `debug_run` with `action: "step_over"`, `granularity: "line"` — advance again
-8. Verify line changed again (should return to `compute()`)
-9. `debug_stop`
+4. Record the current PC address from the stop location
+5. `debug_run` with `action: "step_over"`, `granularity: "instruction"` — advance by one instruction
+6. Record the new PC — should have advanced by a small number of bytes
+7. `debug_run` with `action: "step_over"`, `granularity: "instruction"` two more times
+8. `debug_run` with `action: "step_over"`, `granularity: "line"` — advance to next source line
+9. Verify the location changed to a different line number
+10. `debug_stop`
 
-**What this tests:** Line-level granularity stepping moves to the next source line. Note
-that instruction-level granularity (`granularity: "instruction"`) is not available via
-DAP/vscode-js-debug since JavaScript is interpreted, not compiled to machine code.
+**What this tests:** Instruction-level granularity moves by individual machine instructions.
+Line granularity (the default) moves to the next source line.
 
 ---
 
@@ -633,9 +624,9 @@ Test the session management tools.
 Uses Program A.
 
 1. `debug_sessions` — should return an empty array
-2. `debug_launch` with `/tmp/debug_test.js`, `stop_on_entry: true` — note session_id ("session-1")
+2. `debug_launch` with `/tmp/debug_test`, `stop_on_entry: true` — note session_id ("session-1")
 3. `debug_sessions` — should return one session
-4. `debug_launch` with `/tmp/debug_test.js` again — should create "session-2"
+4. `debug_launch` with `/tmp/debug_test` again — should create "session-2"
 5. `debug_sessions` — should return two sessions
 6. `debug_stop` for "session-1"
 7. `debug_sessions` — should return only "session-2"
@@ -655,17 +646,16 @@ Uses Program A.
 2. `debug_capabilities` — should return a JSON object with boolean capability flags
 3. Verify key capabilities are present as camelCase fields:
    - `supportsConfigurationDoneRequest`
-   - `supportsSetVariable`
+   - `supportsReadMemoryRequest`
+   - `supportsDisassembleRequest`
    - `supportsStepInTargetsRequest`
    - `supportsBreakpointLocationsRequest`
-   - `supportsExceptionInfoRequest`
    - `supportsValueFormattingOptions`
 4. All capability values should be booleans
 5. `debug_stop`
 
 **What this tests:** The capabilities response uses correct DAP-spec camelCase field names
-and returns boolean values. Some capabilities may differ from native sessions (e.g.,
-`supportsReadMemoryRequest` and `supportsDisassembleRequest` may be false).
+and returns boolean values.
 
 ### Scenario 25: Restart (Tool) and Stop Variants
 
@@ -691,25 +681,21 @@ Uses Program A.
 
 ### Part 7: Introspection (Scenarios 26-28)
 
-### Scenario 26: Modules (NOT_SUPPORTED) and Loaded Sources
+### Scenario 26: Modules and Loaded Sources
 
-Test module enumeration (NOT_SUPPORTED) and source file enumeration.
+Test module and source file enumeration.
 
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 4 (inside `add()`)
-3. `debug_run` with `action: "continue"` to hit the breakpoint
-4. `debug_modules` — should return error with code `-32001` (NOT_SUPPORTED)
-   vscode-js-debug does not advertise `supportsModulesRequest`
-5. Verify the error response contains code `-32001`
-6. `debug_loaded_sources` — should return source files
-7. `/tmp/debug_test.js` should appear in the sources list
-8. `debug_stop`
+2. `debug_modules` — should return loaded modules/libraries
+3. The main executable (`debug_test`) should appear in the modules list
+4. Verify each module has identifying fields (name, path, or id)
+5. `debug_loaded_sources` — should return source files
+6. `/tmp/debug_test.c` should appear in the sources list
+7. `debug_stop`
 
-**What this tests:** Module enumeration is correctly rejected with NOT_SUPPORTED when the
-DAP adapter does not advertise `supportsModulesRequest`. `debug_loaded_sources` is supported
-by vscode-js-debug and should return the loaded script files.
+**What this tests:** Module enumeration exposes loaded binaries and shared libraries.
 
 ### Scenario 27: Completions
 
@@ -728,7 +714,7 @@ Uses Program A.
 **What this tests:** The completion engine suggests variable names and expressions that match
 partial input.
 
-### Scenario 28: Advanced Inspect (Contexts, Scopes, and Frames)
+### Scenario 28: Advanced Inspect (Contexts and Scopes)
 
 Test inspect with different evaluation contexts, frame IDs, and scope filtering.
 
@@ -758,22 +744,21 @@ frame-relative inspection all work correctly.
 
 Test setting a data breakpoint on a variable.
 
-Uses Program D (`/tmp/debug_vars.js`).
+Uses Program D (`/tmp/debug_vars`).
 
-1. `debug_launch` with `/tmp/debug_vars.js`, `stop_on_entry: true`
-2. `debug_breakpoint` with `action: "set"` at line 29 (`x = modify(x, 3);` in `main()`)
-3. `debug_run` with `action: "continue"` to hit line 29
+1. `debug_launch` with `/tmp/debug_vars`, `stop_on_entry: true`
+2. `debug_breakpoint` with `action: "set"` at line 31 (`modify(&x, 3);` in `main()`)
+3. `debug_run` with `action: "continue"` to hit line 31
 4. `debug_watchpoint` with `variable: "x"`, `access_type: "write"`
-5. Verify the response — it may return a watchpoint confirmation or an error
-6. If successful: `debug_run` with `action: "continue"` — should trigger watchpoint when `x` is written
+5. Verify the response has `breakpoint` and `description` fields
+6. `debug_run` with `action: "continue"` — should trigger watchpoint when `modify()` writes `x`
 7. `debug_inspect` with `expression: "x"` — should show modified value (8 = 5 + 3)
 8. `debug_stop`
 
 **What this tests:** Data breakpoints (watchpoints) fire when a watched variable is written.
 
-**Note:** Watchpoint support via DAP/vscode-js-debug may be limited or unavailable. If the
-debugger returns an error indicating watchpoints are not supported, document the error and
-mark as expected.
+**Note:** Watchpoint support depends on hardware and OS capabilities. If the debugger returns
+an error indicating watchpoints are not supported, document the error and mark as expected.
 
 ### Scenario 30: Event Polling
 
@@ -783,10 +768,10 @@ Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
 2. `debug_poll_events` with no session_id — should return any pending events
-3. `debug_breakpoint` with `action: "set"` at line 37 (`console.log(\`compute = ${result1}\`);`)
+3. `debug_breakpoint` with `action: "set"` at line 37 (`printf("compute = %d\n", result1);`)
 4. `debug_run` with `action: "continue"` to hit line 37
-5. `debug_run` with `action: "step_over"` — `console.log` should execute
-6. `debug_poll_events` with `session_id` — should return pending events
+5. `debug_run` with `action: "step_over"` — `printf` should execute
+6. `debug_poll_events` with `session_id: "session-1"` — should return pending events
 7. Look for output events containing `"compute = 230"`
 8. `debug_poll_events` again — should return empty (events already drained)
 9. `debug_stop`
@@ -835,13 +820,13 @@ Test error differentiation and edge cases.
 Uses Program A.
 
 1. `debug_launch` with `stop_on_entry: true`
-2. `debug_memory` with `action: "read"`, `address: "not_hex"` — should return INVALID_PARAMS (-32602) or NOT_SUPPORTED (-32001)
-3. `debug_memory` with `action: "write"`, `address: "0x1000"`, `data: "GG"` — should return error (NOT_SUPPORTED or INVALID_PARAMS)
+2. `debug_memory` with `action: "read"`, `address: "not_hex"` — should return INVALID_PARAMS (-32602)
+3. `debug_memory` with `action: "write"`, `address: "0x1000"`, `data: "GG"` — should return error
 4. `debug_breakpoint` with `action: "set"` and missing `file` — should return INVALID_PARAMS
 5. `debug_stacktrace` with invalid `session_id` — should return error
-6. `debug_instruction_breakpoint` with missing `instruction_reference` — should return INVALID_PARAMS or NOT_SUPPORTED (-32001)
+6. `debug_instruction_breakpoint` with missing `instruction_reference` — should return INVALID_PARAMS
 7. `debug_source` with `source_reference: 99999` — should return error
-8. `debug_registers` — should return NOT_SUPPORTED (`-32001`) via DAP backend
+8. `debug_registers` — should succeed (native engine supports registers for C)
 9. `debug_stop`
 
 **What this tests:** Different error types return different error codes:
@@ -871,9 +856,9 @@ After completing all 33 scenarios, output this summary table and nothing else:
 | 11 | Threads + stack traces | PASS/FAIL | | |
 | 12 | Scopes | PASS/FAIL | | |
 | 13 | Set variable / set expression | PASS/FAIL | | |
-| 14 | Memory + disassembly (NOT_SUPPORTED) | PASS/FAIL | | |
-| 15 | Instruction breakpoints (NOT_SUPPORTED) | PASS/FAIL | | |
-| 16 | CPU registers + native tools (NOT_SUPPORTED) | PASS/FAIL | | |
+| 14 | Memory + disassembly | PASS/FAIL | | |
+| 15 | Instruction breakpoints | PASS/FAIL | | |
+| 16 | CPU registers + symbol lookup | PASS/FAIL | | |
 | 17 | Function breakpoints | PASS/FAIL | | |
 | 18 | Breakpoint locations | PASS/FAIL | | |
 | 19 | Exception breakpoints + info | PASS/FAIL | | |

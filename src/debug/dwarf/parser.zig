@@ -819,6 +819,9 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
             }
         } else {
             // DWARF 4 directory and file tables
+            // In DWARF 4, dir_index 0 = comp_dir; listed directories start at index 1.
+            // Insert a placeholder at index 0 so dirs[N] maps to include_directories[N].
+            try dirs.append(allocator, "");
             // Directories (null-terminated strings, terminated by empty string)
             while (pos < data.len and data[pos] != 0) {
                 const dir = readNullTermString(data, &pos);
@@ -940,7 +943,7 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
                     DW_LNS_advance_line => {
                         const advance = try readSLEB128(data, &pos);
                         const new_line = @as(i64, line) + advance;
-                        if (new_line > 0) {
+                        if (new_line >= 0) {
                             line = @intCast(new_line);
                         }
                     },
@@ -985,7 +988,7 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
                     const addr_inc = (adjusted / line_range) * min_instruction_length;
                     address += addr_inc;
                     const new_line = @as(i64, line) + line_inc;
-                    if (new_line > 0) {
+                    if (new_line >= 0) {
                         line = @intCast(new_line);
                     }
                     const norm_fi = normalizeFileIndex(file_index, file_base_offset, version);
@@ -2288,10 +2291,10 @@ fn collectTypeDies(
                         die.array_count = v + 1;
                     } else if (attr.form == DW_FORM_udata) {
                         const v = readULEB128(debug_info, &scan_pos) catch break;
-                        die.array_count = @as(u32, @intCast(v)) + 1;
+                        die.array_count = if (v <= std.math.maxInt(u32) - 1) @as(u32, @intCast(v)) + 1 else 0;
                     } else if (attr.form == DW_FORM_sdata) {
                         const v = readSLEB128(debug_info, &scan_pos) catch break;
-                        if (v >= 0) die.array_count = @as(u32, @intCast(v)) + 1;
+                        if (v >= 0 and v <= std.math.maxInt(u32) - 1) die.array_count = @as(u32, @intCast(v)) + 1;
                     } else {
                         skipForm(debug_info, &scan_pos, attr.form, is_64bit, 8) catch break;
                     }
@@ -2302,7 +2305,7 @@ fn collectTypeDies(
                         scan_pos += 1;
                     } else if (attr.form == DW_FORM_udata) {
                         const v = readULEB128(debug_info, &scan_pos) catch break;
-                        die.array_count = @intCast(v);
+                        die.array_count = if (v <= std.math.maxInt(u32)) @intCast(v) else 0;
                     } else {
                         skipForm(debug_info, &scan_pos, attr.form, is_64bit, 8) catch break;
                     }
@@ -2320,7 +2323,8 @@ fn collectTypeDies(
                     } else if (attr.form == DW_FORM_sdata) {
                         die.const_value = readSLEB128(debug_info, &scan_pos) catch break;
                     } else if (attr.form == DW_FORM_udata) {
-                        die.const_value = @intCast(readULEB128(debug_info, &scan_pos) catch break);
+                        const v = readULEB128(debug_info, &scan_pos) catch break;
+                        die.const_value = if (v <= std.math.maxInt(i64)) @intCast(v) else @bitCast(v);
                     } else {
                         skipForm(debug_info, &scan_pos, attr.form, is_64bit, 8) catch break;
                     }
@@ -2379,7 +2383,8 @@ fn collectTypeDies(
                     } else if (attr.form == DW_FORM_sdata) {
                         die.discr_value = readSLEB128(debug_info, &scan_pos) catch break;
                     } else if (attr.form == DW_FORM_udata) {
-                        die.discr_value = @intCast(readULEB128(debug_info, &scan_pos) catch break);
+                        const v = readULEB128(debug_info, &scan_pos) catch break;
+                        die.discr_value = if (v <= std.math.maxInt(i64)) @intCast(v) else @bitCast(v);
                     } else {
                         skipForm(debug_info, &scan_pos, attr.form, is_64bit, 8) catch break;
                     }

@@ -79,6 +79,9 @@ pub const DriverVTable = struct {
     // Core dump loading and DAP passthrough
     loadCoreFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, core_path: []const u8, executable_path: ?[]const u8) anyerror!void = null,
     rawRequestFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, command: []const u8, arguments: ?[]const u8) anyerror![]const u8 = null,
+    // Write-only pause (fire-and-forget, no readResponse) for use when a
+    // background run thread is already reading from the socket.
+    sendPauseFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, thread_id: ?u32) anyerror!void = null,
     // Process identification for async safety (kill from main thread)
     getPidFn: ?*const fn (ctx: *anyopaque) ?std.posix.pid_t = null,
 };
@@ -323,6 +326,14 @@ pub const ActiveDriver = struct {
     pub fn rawRequest(self: *ActiveDriver, allocator: std.mem.Allocator, command: []const u8, arguments: ?[]const u8) ![]const u8 {
         const f = self.vtable.rawRequestFn orelse return error.NotSupported;
         return f(self.ptr, allocator, command, arguments);
+    }
+
+    /// Write-only pause: sends a pause request without reading the response.
+    /// Safe to call while a background run thread is reading from the socket.
+    /// The background thread will pick up the resulting stopped event.
+    pub fn sendPause(self: *ActiveDriver, allocator: std.mem.Allocator, thread_id: ?u32) !void {
+        const f = self.vtable.sendPauseFn orelse return error.NotSupported;
+        return f(self.ptr, allocator, thread_id);
     }
 
     /// Get the PID of the debuggee (native) or adapter (DAP) process.

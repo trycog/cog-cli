@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="trycog/cog-cli"
 APP="cog"
-INSTALL_DIR="$HOME/.cog/bin"
+INSTALL_DIR="$HOME/.config/cog/bin"
 
 # Colors — cyan is the brand accent
 CYAN='\033[0;36m'
@@ -11,6 +11,13 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RED='\033[0;31m'
 NC='\033[0m'
+
+# Migration: warn if old ~/.cog/bin/cog exists
+if [ -f "$HOME/.cog/bin/cog" ]; then
+    echo -e "${CYAN}Note:${NC} cog now installs to ${BOLD}\$HOME/.config/cog/bin${NC}"
+    echo -e "${DIM}You can remove the old location:${NC} rm -rf ~/.cog"
+    echo ""
+fi
 
 usage() {
     cat <<EOF
