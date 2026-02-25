@@ -119,7 +119,7 @@ pub fn builtinDebugExtensionList() []const u8 {
     comptime {
         var out: []const u8 = "";
         for (extensions.builtins) |b| {
-            if (b.debugger == null) continue;
+            if (b.debug == null) continue;
             out = out ++ "    " ++ bold ++ b.name ++ reset ++ dim;
             for (b.file_extensions) |ext| {
                 out = out ++ " " ++ ext;
@@ -837,13 +837,11 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     for (files.items) |file_path| {
         const ext = std.fs.path.extension(file_path);
         if (ext.len == 0) continue;
-        if (tree_sitter_indexer.detectLanguage(ext) != null) {
+        if (extensions.isBuiltinSupported(ext)) {
             indexable_count += 1;
-        } else {
-            if (extensions.resolveByExtension(allocator, ext)) |resolved| {
-                extensions.freeExtension(allocator, &resolved);
-                indexable_count += 1;
-            }
+        } else if (extensions.resolveByExtension(allocator, ext)) |resolved| {
+            extensions.freeExtension(allocator, &resolved);
+            indexable_count += 1;
         }
     }
 
@@ -872,72 +870,85 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const ext = std.fs.path.extension(file_path);
         if (ext.len == 0) continue;
 
-        // Try tree-sitter first
-        if (tree_sitter_indexer.detectLanguage(ext)) |lang| {
-            if (show_progress) {
-                tui.progressUpdate(indexed_count, total_files, total_symbols, file_path);
-            }
+        var resolved = extensions.resolveByExtension(allocator, ext) orelse continue;
+        const idx = resolved.indexer orelse {
+            extensions.freeExtension(allocator, &resolved);
+            continue;
+        };
 
-            // Read source file
-            const source = readFileContents(allocator, file_path) orelse continue;
-            defer allocator.free(source);
+        switch (idx) {
+            .tree_sitter => |ts_config| {
+                defer extensions.freeExtension(allocator, &resolved);
 
-            // Index with tree-sitter
-            if (indexer.indexFile(allocator, source, file_path, lang)) |result| {
-                backing_buffers.append(allocator, result.string_data) catch {};
-                mergeDocument(allocator, &master_index, result.doc);
-                indexed_count += 1;
-                total_symbols += result.doc.symbols.len;
-            } else |_| {
-                // Indexing failed (e.g. Flow-typed JS parsed as plain JS).
-                // Still add a stub document so the file appears in the index
-                // and queries report "no symbols" instead of "file not found".
-                mergeDocument(allocator, &master_index, .{
-                    .language = lang.scipName(),
-                    .relative_path = file_path,
-                    .occurrences = &.{},
-                    .symbols = &.{},
-                });
-                indexed_count += 1;
-            }
-
-            if (show_progress) {
-                tui.progressUpdate(indexed_count, total_files, total_symbols, file_path);
-            }
-        } else {
-            // Track for external indexer fallback
-            var extension = extensions.resolveByExtension(allocator, ext) orelse continue;
-            var found = false;
-            var found_idx: usize = 0;
-            for (seen_names[0..num_unique], 0..) |name, idx| {
-                if (std.mem.eql(u8, name, extension.name)) {
-                    found = true;
-                    found_idx = idx;
-                    break;
+                if (show_progress) {
+                    tui.progressUpdate(indexed_count, total_files, total_symbols, file_path);
                 }
-            }
-            if (!found and num_unique < 16) {
-                seen_names[num_unique] = extension.name;
-                unique_exts[num_unique] = extension;
-                ext_files[num_unique].append(allocator, file_path) catch {};
-                num_unique += 1;
-            } else if (found) {
-                ext_files[found_idx].append(allocator, file_path) catch {};
-                extensions.freeExtension(allocator, &extension);
-            } else {
-                extensions.freeExtension(allocator, &extension);
-            }
+
+                // Read source file
+                const source = readFileContents(allocator, file_path) orelse continue;
+                defer allocator.free(source);
+
+                // Index with tree-sitter
+                if (indexer.indexFile(allocator, source, file_path, ts_config)) |result| {
+                    backing_buffers.append(allocator, result.string_data) catch {};
+                    mergeDocument(allocator, &master_index, result.doc);
+                    indexed_count += 1;
+                    total_symbols += result.doc.symbols.len;
+                } else |_| {
+                    // Indexing failed (e.g. Flow-typed JS parsed as plain JS).
+                    // Still add a stub document so the file appears in the index
+                    // and queries report "no symbols" instead of "file not found".
+                    mergeDocument(allocator, &master_index, .{
+                        .language = ts_config.scip_name,
+                        .relative_path = file_path,
+                        .occurrences = &.{},
+                        .symbols = &.{},
+                    });
+                    indexed_count += 1;
+                }
+
+                if (show_progress) {
+                    tui.progressUpdate(indexed_count, total_files, total_symbols, file_path);
+                }
+            },
+            .scip_binary => {
+                // Collect for batch external indexing
+                var found = false;
+                var found_idx: usize = 0;
+                for (seen_names[0..num_unique], 0..) |name, i| {
+                    if (std.mem.eql(u8, name, resolved.name)) {
+                        found = true;
+                        found_idx = i;
+                        break;
+                    }
+                }
+                if (!found and num_unique < 16) {
+                    seen_names[num_unique] = resolved.name;
+                    unique_exts[num_unique] = resolved;
+                    ext_files[num_unique].append(allocator, file_path) catch {};
+                    num_unique += 1;
+                } else if (found) {
+                    ext_files[found_idx].append(allocator, file_path) catch {};
+                    extensions.freeExtension(allocator, &resolved);
+                } else {
+                    extensions.freeExtension(allocator, &resolved);
+                }
+            },
         }
     }
 
     // Invoke external indexers per-file for unsupported languages
     for (0..num_unique) |ext_idx| {
+        const scip_config = switch (unique_exts[ext_idx].indexer orelse continue) {
+            .scip_binary => |sc| sc,
+            .tree_sitter => continue,
+        };
         for (ext_files[ext_idx].items) |ext_file_path| {
             if (show_progress) {
                 tui.progressUpdate(indexed_count, total_files, total_symbols, ext_file_path);
             }
 
-            const result = invokeIndexerForFile(allocator, ext_file_path, &unique_exts[ext_idx]) catch continue;
+            const result = invokeIndexerForFile(allocator, ext_file_path, scip_config) catch continue;
 
             backing_buffers.append(allocator, result.backing_data) catch {};
             mergeDocument(allocator, &master_index, result.doc);
@@ -1305,7 +1316,7 @@ const DocumentResult = struct {
 
 /// Invoke an indexer for a single file, decode the SCIP output, return the document.
 /// Caller must free backing_data after the document is no longer needed.
-fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, ext: *const extensions.Extension) !DocumentResult {
+fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, config: extensions.ScipBinaryConfig) !DocumentResult {
     // Create temp file for SCIP output
     const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/cog-index-{d}.scip", .{std.crypto.random.int(u64)});
     defer allocator.free(tmp_path);
@@ -1316,13 +1327,13 @@ fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, ext
         .{ .key = "{file}", .value = file_path },
         .{ .key = "{output}", .value = tmp_path },
     };
-    const sub_args = try settings_mod.substituteArgs(allocator, ext.args, subs);
+    const sub_args = try settings_mod.substituteArgs(allocator, config.args, subs);
     defer settings_mod.freeSubstitutedArgs(allocator, sub_args);
 
     // Build full command
     const full_args = try allocator.alloc([]const u8, 1 + sub_args.len);
     defer allocator.free(full_args);
-    full_args[0] = ext.command;
+    full_args[0] = config.command;
     @memcpy(full_args[1..], sub_args);
 
     // Run indexer (output goes to temp file, not stdout/stderr)
@@ -1377,7 +1388,7 @@ fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, ext
 
 /// Invoke an indexer for a project directory, decode the SCIP output, return the full index.
 /// Caller must free backing_data after the index is no longer needed.
-fn invokeProjectIndexer(allocator: std.mem.Allocator, target_path: []const u8, ext: *const extensions.Extension) !IndexResult {
+fn invokeProjectIndexer(allocator: std.mem.Allocator, target_path: []const u8, config: extensions.ScipBinaryConfig) !IndexResult {
     // Create temp file for SCIP output
     const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/cog-index-{d}.scip", .{std.crypto.random.int(u64)});
     defer allocator.free(tmp_path);
@@ -1388,13 +1399,13 @@ fn invokeProjectIndexer(allocator: std.mem.Allocator, target_path: []const u8, e
         .{ .key = "{file}", .value = target_path },
         .{ .key = "{output}", .value = tmp_path },
     };
-    const sub_args = try settings_mod.substituteArgs(allocator, ext.args, subs);
+    const sub_args = try settings_mod.substituteArgs(allocator, config.args, subs);
     defer settings_mod.freeSubstitutedArgs(allocator, sub_args);
 
     // Build full command
     const full_args = try allocator.alloc([]const u8, 1 + sub_args.len);
     defer allocator.free(full_args);
-    full_args[0] = ext.command;
+    full_args[0] = config.command;
     @memcpy(full_args[1..], sub_args);
 
     // Run indexer
@@ -1505,43 +1516,45 @@ pub fn reindexFile(allocator: std.mem.Allocator, file_path: []const u8) bool {
     const ext_str = std.fs.path.extension(file_path);
     if (ext_str.len == 0) return false;
 
-    // Try tree-sitter first
-    if (tree_sitter_indexer.detectLanguage(ext_str)) |lang| {
-        const source = readFileContents(allocator, file_path) orelse return false;
-        defer allocator.free(source);
+    const resolved = extensions.resolveByExtension(allocator, ext_str) orelse return false;
+    defer extensions.freeExtension(allocator, &resolved);
 
-        var indexer = tree_sitter_indexer.Indexer.init();
-        defer indexer.deinit();
+    const idx = resolved.indexer orelse return false;
+    switch (idx) {
+        .tree_sitter => |ts_config| {
+            const source = readFileContents(allocator, file_path) orelse return false;
+            defer allocator.free(source);
 
-        const result = indexer.indexFile(allocator, source, file_path, lang) catch return false;
-        mergeDocument(allocator, &master_index, result.doc);
+            var indexer = tree_sitter_indexer.Indexer.init();
+            defer indexer.deinit();
 
-        // Encode and write (must happen before freeing string_data,
-        // since symbol names are slices into it)
-        const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
+            const result = indexer.indexFile(allocator, source, file_path, ts_config) catch return false;
+            mergeDocument(allocator, &master_index, result.doc);
+
+            // Encode and write (must happen before freeing string_data,
+            // since symbol names are slices into it)
+            const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
+                allocator.free(result.string_data);
+                return false;
+            };
             allocator.free(result.string_data);
-            return false;
-        };
-        allocator.free(result.string_data);
-        defer allocator.free(encoded);
+            defer allocator.free(encoded);
 
-        return writeEncodedIndexAtomically(allocator, index_path, encoded);
-    } else {
-        // Fall back to external indexer
-        const extension = extensions.resolveByExtension(allocator, ext_str) orelse return false;
-        defer extensions.freeExtension(allocator, &extension);
+            return writeEncodedIndexAtomically(allocator, index_path, encoded);
+        },
+        .scip_binary => |scip_config| {
+            const file_result = invokeIndexerForFile(allocator, file_path, scip_config) catch return false;
+            mergeDocument(allocator, &master_index, file_result.doc);
 
-        const file_result = invokeIndexerForFile(allocator, file_path, &extension) catch return false;
-        mergeDocument(allocator, &master_index, file_result.doc);
-
-        const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
+            const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
+                allocator.free(file_result.backing_data);
+                return false;
+            };
             allocator.free(file_result.backing_data);
-            return false;
-        };
-        allocator.free(file_result.backing_data);
-        defer allocator.free(encoded);
+            defer allocator.free(encoded);
 
-        return writeEncodedIndexAtomically(allocator, index_path, encoded);
+            return writeEncodedIndexAtomically(allocator, index_path, encoded);
+        },
     }
 }
 
@@ -2217,23 +2230,31 @@ fn codeRename(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer if (reindex_string_data) |data| allocator.free(data);
     const ext_str = std.fs.path.extension(new_path);
     if (ext_str.len > 0) {
-        if (tree_sitter_indexer.detectLanguage(ext_str)) |lang| {
-            if (readFileContents(allocator, new_path)) |source| {
-                defer allocator.free(source);
-                var indexer = tree_sitter_indexer.Indexer.init();
-                defer indexer.deinit();
-                if (indexer.indexFile(allocator, source, new_path, lang)) |result| {
-                    reindex_string_data = result.string_data;
-                    mergeDocument(allocator, &master_index, result.doc);
-                    reindexed = true;
-                } else |_| {}
+        if (extensions.resolveByExtension(allocator, ext_str)) |resolved| {
+            defer extensions.freeExtension(allocator, &resolved);
+            if (resolved.indexer) |idx| {
+                switch (idx) {
+                    .tree_sitter => |ts_config| {
+                        if (readFileContents(allocator, new_path)) |source| {
+                            defer allocator.free(source);
+                            var indexer = tree_sitter_indexer.Indexer.init();
+                            defer indexer.deinit();
+                            if (indexer.indexFile(allocator, source, new_path, ts_config)) |result| {
+                                reindex_string_data = result.string_data;
+                                mergeDocument(allocator, &master_index, result.doc);
+                                reindexed = true;
+                            } else |_| {}
+                        }
+                    },
+                    .scip_binary => |scip_config| {
+                        if (invokeIndexerForFile(allocator, new_path, scip_config)) |file_result| {
+                            reindex_backing = file_result.backing_data;
+                            mergeDocument(allocator, &master_index, file_result.doc);
+                            reindexed = true;
+                        } else |_| {}
+                    },
+                }
             }
-        } else if (extensions.resolveByExtension(allocator, ext_str)) |extension| {
-            if (invokeIndexerForFile(allocator, new_path, &extension)) |file_result| {
-                reindex_backing = file_result.backing_data;
-                mergeDocument(allocator, &master_index, file_result.doc);
-                reindexed = true;
-            } else |_| {}
         }
     }
 
@@ -3074,23 +3095,31 @@ pub fn codeRenameInner(allocator: std.mem.Allocator, old_path: []const u8, new_p
     defer if (reindex_string_data) |data| allocator.free(data);
     const ext_str = std.fs.path.extension(new_path);
     if (ext_str.len > 0) {
-        if (tree_sitter_indexer.detectLanguage(ext_str)) |lang| {
-            if (readFileContents(allocator, new_path)) |source| {
-                defer allocator.free(source);
-                var indexer = tree_sitter_indexer.Indexer.init();
-                defer indexer.deinit();
-                if (indexer.indexFile(allocator, source, new_path, lang)) |result| {
-                    reindex_string_data = result.string_data;
-                    mergeDocument(allocator, &master_index, result.doc);
-                    reindexed = true;
-                } else |_| {}
+        if (extensions.resolveByExtension(allocator, ext_str)) |resolved| {
+            defer extensions.freeExtension(allocator, &resolved);
+            if (resolved.indexer) |idx| {
+                switch (idx) {
+                    .tree_sitter => |ts_config| {
+                        if (readFileContents(allocator, new_path)) |source| {
+                            defer allocator.free(source);
+                            var indexer = tree_sitter_indexer.Indexer.init();
+                            defer indexer.deinit();
+                            if (indexer.indexFile(allocator, source, new_path, ts_config)) |result| {
+                                reindex_string_data = result.string_data;
+                                mergeDocument(allocator, &master_index, result.doc);
+                                reindexed = true;
+                            } else |_| {}
+                        }
+                    },
+                    .scip_binary => |scip_config| {
+                        if (invokeIndexerForFile(allocator, new_path, scip_config)) |file_result| {
+                            reindex_backing = file_result.backing_data;
+                            mergeDocument(allocator, &master_index, file_result.doc);
+                            reindexed = true;
+                        } else |_| {}
+                    },
+                }
             }
-        } else if (extensions.resolveByExtension(allocator, ext_str)) |extension| {
-            if (invokeIndexerForFile(allocator, new_path, &extension)) |file_result| {
-                reindex_backing = file_result.backing_data;
-                mergeDocument(allocator, &master_index, file_result.doc);
-                reindexed = true;
-            } else |_| {}
         }
     }
     _ = saveIndex(allocator, master_index, index_path);
@@ -3268,51 +3297,65 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
     for (files.items) |file_path| {
         const ext = std.fs.path.extension(file_path);
         if (ext.len == 0) continue;
-        if (tree_sitter_indexer.detectLanguage(ext)) |lang| {
-            const source = readFileContents(allocator, file_path) orelse continue;
-            defer allocator.free(source);
-            if (indexer.indexFile(allocator, source, file_path, lang)) |result| {
-                backing_buffers.append(allocator, result.string_data) catch {};
-                mergeDocument(allocator, &master_index, result.doc);
-                indexed_count += 1;
-                total_symbols += result.doc.symbols.len;
-            } else |_| {
-                mergeDocument(allocator, &master_index, .{
-                    .language = lang.scipName(),
-                    .relative_path = file_path,
-                    .occurrences = &.{},
-                    .symbols = &.{},
-                });
-                indexed_count += 1;
-            }
-        } else {
-            var extension = extensions.resolveByExtension(allocator, ext) orelse continue;
-            var found = false;
-            var found_idx: usize = 0;
-            for (seen_names[0..num_unique], 0..) |name, idx| {
-                if (std.mem.eql(u8, name, extension.name)) {
-                    found = true;
-                    found_idx = idx;
-                    break;
+
+        var resolved = extensions.resolveByExtension(allocator, ext) orelse continue;
+        const idx_config = resolved.indexer orelse {
+            extensions.freeExtension(allocator, &resolved);
+            continue;
+        };
+
+        switch (idx_config) {
+            .tree_sitter => |ts_config| {
+                defer extensions.freeExtension(allocator, &resolved);
+                const source = readFileContents(allocator, file_path) orelse continue;
+                defer allocator.free(source);
+                if (indexer.indexFile(allocator, source, file_path, ts_config)) |result| {
+                    backing_buffers.append(allocator, result.string_data) catch {};
+                    mergeDocument(allocator, &master_index, result.doc);
+                    indexed_count += 1;
+                    total_symbols += result.doc.symbols.len;
+                } else |_| {
+                    mergeDocument(allocator, &master_index, .{
+                        .language = ts_config.scip_name,
+                        .relative_path = file_path,
+                        .occurrences = &.{},
+                        .symbols = &.{},
+                    });
+                    indexed_count += 1;
                 }
-            }
-            if (!found and num_unique < 16) {
-                seen_names[num_unique] = extension.name;
-                unique_exts[num_unique] = extension;
-                ext_files[num_unique].append(allocator, file_path) catch {};
-                num_unique += 1;
-            } else if (found) {
-                ext_files[found_idx].append(allocator, file_path) catch {};
-                extensions.freeExtension(allocator, &extension);
-            } else {
-                extensions.freeExtension(allocator, &extension);
-            }
+            },
+            .scip_binary => {
+                var found = false;
+                var found_idx: usize = 0;
+                for (seen_names[0..num_unique], 0..) |name, i| {
+                    if (std.mem.eql(u8, name, resolved.name)) {
+                        found = true;
+                        found_idx = i;
+                        break;
+                    }
+                }
+                if (!found and num_unique < 16) {
+                    seen_names[num_unique] = resolved.name;
+                    unique_exts[num_unique] = resolved;
+                    ext_files[num_unique].append(allocator, file_path) catch {};
+                    num_unique += 1;
+                } else if (found) {
+                    ext_files[found_idx].append(allocator, file_path) catch {};
+                    extensions.freeExtension(allocator, &resolved);
+                } else {
+                    extensions.freeExtension(allocator, &resolved);
+                }
+            },
         }
     }
 
     for (0..num_unique) |ext_idx| {
+        const scip_config = switch (unique_exts[ext_idx].indexer orelse continue) {
+            .scip_binary => |sc| sc,
+            .tree_sitter => continue,
+        };
         for (ext_files[ext_idx].items) |ext_file_path| {
-            const result = invokeIndexerForFile(allocator, ext_file_path, &unique_exts[ext_idx]) catch continue;
+            const result = invokeIndexerForFile(allocator, ext_file_path, scip_config) catch continue;
             backing_buffers.append(allocator, result.backing_data) catch {};
             mergeDocument(allocator, &master_index, result.doc);
             indexed_count += 1;

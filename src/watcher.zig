@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const paths = @import("paths.zig");
-const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
+const extensions = @import("extensions.zig");
 
 // ── Public API ──────────────────────────────────────────────────────────
 
@@ -150,10 +150,10 @@ fn shouldWatchPath(rel_path: []const u8) bool {
     }
     if (last_component.len == 0) return false;
 
-    // Check file extension — only watch files tree-sitter can index
+    // Check file extension — only watch files with a recognized extension
     const ext = std.fs.path.extension(last_component);
     if (ext.len == 0) return false;
-    return tree_sitter_indexer.detectLanguage(ext) != null;
+    return extensions.isBuiltinSupported(ext);
 }
 
 fn isExcludedDir(name: []const u8) bool {

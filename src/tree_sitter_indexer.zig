@@ -1,5 +1,6 @@
 const std = @import("std");
 const scip = @import("scip.zig");
+const extensions = @import("extensions.zig");
 
 // ── Tree-sitter C API ───────────────────────────────────────────────────
 
@@ -19,87 +20,20 @@ extern fn tree_sitter_rust() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_c() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_cpp() callconv(.c) *c.TSLanguage;
 
-// ── Language enum ───────────────────────────────────────────────────────
+// ── Grammar lookup ──────────────────────────────────────────────────────
 
-pub const Language = enum {
-    go,
-    typescript,
-    tsx,
-    javascript,
-    python,
-    java,
-    rust,
-    c_lang,
-    cpp,
-
-    pub fn tsLanguage(self: Language) *c.TSLanguage {
-        return switch (self) {
-            .go => tree_sitter_go(),
-            .typescript => tree_sitter_typescript(),
-            .tsx => tree_sitter_tsx(),
-            .javascript => tree_sitter_javascript(),
-            .python => tree_sitter_python(),
-            .java => tree_sitter_java(),
-            .rust => tree_sitter_rust(),
-            .c_lang => tree_sitter_c(),
-            .cpp => tree_sitter_cpp(),
-        };
-    }
-
-    pub fn querySource(self: Language) []const u8 {
-        return switch (self) {
-            .go => @embedFile("queries/go.scm"),
-            .typescript => @embedFile("queries/typescript.scm"),
-            .tsx => @embedFile("queries/tsx.scm"),
-            .javascript => @embedFile("queries/javascript.scm"),
-            .python => @embedFile("queries/python.scm"),
-            .java => @embedFile("queries/java.scm"),
-            .rust => @embedFile("queries/rust.scm"),
-            .c_lang => @embedFile("queries/c.scm"),
-            .cpp => @embedFile("queries/cpp.scm"),
-        };
-    }
-
-    pub fn scipName(self: Language) []const u8 {
-        return switch (self) {
-            .go => "go",
-            .typescript => "typescript",
-            .tsx => "tsx",
-            .javascript => "javascript",
-            .python => "python",
-            .java => "java",
-            .rust => "rust",
-            .c_lang => "c",
-            .cpp => "cpp",
-        };
-    }
-};
-
-/// Detect language from file extension. Returns null for unsupported extensions.
-pub fn detectLanguage(ext: []const u8) ?Language {
-    if (ext.len == 0) return null;
-    // Strip leading dot if present
-    const e = if (ext[0] == '.') ext[1..] else ext;
-
-    if (std.mem.eql(u8, e, "go")) return .go;
-    if (std.mem.eql(u8, e, "ts")) return .typescript;
-    if (std.mem.eql(u8, e, "tsx")) return .tsx;
-    if (std.mem.eql(u8, e, "js")) return .javascript;
-    if (std.mem.eql(u8, e, "jsx")) return .javascript;
-    if (std.mem.eql(u8, e, "mjs")) return .javascript;
-    if (std.mem.eql(u8, e, "cjs")) return .javascript;
-    if (std.mem.eql(u8, e, "py")) return .python;
-    if (std.mem.eql(u8, e, "pyi")) return .python;
-    if (std.mem.eql(u8, e, "java")) return .java;
-    if (std.mem.eql(u8, e, "rs")) return .rust;
-    if (std.mem.eql(u8, e, "c")) return .c_lang;
-    if (std.mem.eql(u8, e, "h")) return .c_lang;
-    if (std.mem.eql(u8, e, "cpp")) return .cpp;
-    if (std.mem.eql(u8, e, "cc")) return .cpp;
-    if (std.mem.eql(u8, e, "cxx")) return .cpp;
-    if (std.mem.eql(u8, e, "hpp")) return .cpp;
-    if (std.mem.eql(u8, e, "hxx")) return .cpp;
-    if (std.mem.eql(u8, e, "hh")) return .cpp;
+/// Look up a compiled tree-sitter grammar by name.
+/// Returns null for unknown grammar names.
+pub fn getGrammar(name: []const u8) ?*c.TSLanguage {
+    if (std.mem.eql(u8, name, "go")) return tree_sitter_go();
+    if (std.mem.eql(u8, name, "typescript")) return tree_sitter_typescript();
+    if (std.mem.eql(u8, name, "tsx")) return tree_sitter_tsx();
+    if (std.mem.eql(u8, name, "javascript")) return tree_sitter_javascript();
+    if (std.mem.eql(u8, name, "python")) return tree_sitter_python();
+    if (std.mem.eql(u8, name, "java")) return tree_sitter_java();
+    if (std.mem.eql(u8, name, "rust")) return tree_sitter_rust();
+    if (std.mem.eql(u8, name, "c")) return tree_sitter_c();
+    if (std.mem.eql(u8, name, "cpp")) return tree_sitter_cpp();
     return null;
 }
 
@@ -205,16 +139,16 @@ pub const Indexer = struct {
         allocator: std.mem.Allocator,
         source: []const u8,
         relative_path: []const u8,
-        language: Language,
+        config: extensions.TreeSitterConfig,
     ) !IndexFileResult {
         // Detect Flow-typed JS files and use TypeScript parser instead.
         // Flow's generic syntax (<T>) is invalid JS but valid TS, so the
         // TypeScript parser handles these files correctly. We keep the JS
         // query patterns since TS grammar produces the same base node types.
-        const is_flow = language == .javascript and isFlowFile(source);
-        const parser_lang: Language = if (is_flow) .typescript else language;
+        const is_flow = std.mem.eql(u8, config.grammar_name, "javascript") and isFlowFile(source);
+        const parser_grammar = if (is_flow) "typescript" else config.grammar_name;
 
-        const ts_lang = parser_lang.tsLanguage();
+        const ts_lang = getGrammar(parser_grammar) orelse return error.UnknownGrammar;
 
         // Set parser language
         if (!c.ts_parser_set_language(self.parser, ts_lang)) {
@@ -232,9 +166,9 @@ pub const Indexer = struct {
 
         const root_node = c.ts_tree_root_node(tree);
 
-        // Compile the query — use JS patterns even for Flow files since
-        // the TS grammar produces compatible node types
-        const query_src = language.querySource();
+        // Compile the query — use the config's query source even for Flow files
+        // since the TS grammar produces compatible node types
+        const query_src = config.query_source;
         var error_offset: u32 = 0;
         var error_type: c.TSQueryError = c.TSQueryErrorNone;
         const query = c.ts_query_new(
@@ -257,7 +191,7 @@ pub const Indexer = struct {
             const err_msg = std.fmt.bufPrint(&err_buf, "query compile error ({s}) at offset {d} in {s} query\n", .{
                 err_kind,
                 error_offset,
-                language.scipName(),
+                config.scip_name,
             }) catch "query compile error\n";
             var buf: [4096]u8 = undefined;
             var w = std.fs.File.stderr().writer(&buf);
@@ -440,7 +374,7 @@ pub const Indexer = struct {
 
         return .{
             .doc = .{
-                .language = language.scipName(),
+                .language = config.scip_name,
                 .relative_path = relative_path,
                 .occurrences = occurrences,
                 .symbols = symbols,
@@ -452,29 +386,31 @@ pub const Indexer = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-test "detectLanguage" {
-    try std.testing.expectEqual(Language.go, detectLanguage(".go").?);
-    try std.testing.expectEqual(Language.typescript, detectLanguage(".ts").?);
-    try std.testing.expectEqual(Language.tsx, detectLanguage(".tsx").?);
-    try std.testing.expectEqual(Language.javascript, detectLanguage(".js").?);
-    try std.testing.expectEqual(Language.javascript, detectLanguage(".jsx").?);
-    try std.testing.expectEqual(Language.javascript, detectLanguage(".mjs").?);
-    try std.testing.expectEqual(Language.python, detectLanguage(".py").?);
-    try std.testing.expectEqual(Language.java, detectLanguage(".java").?);
-    try std.testing.expectEqual(Language.rust, detectLanguage(".rs").?);
-    try std.testing.expectEqual(Language.c_lang, detectLanguage(".c").?);
-    try std.testing.expectEqual(Language.c_lang, detectLanguage(".h").?);
-    try std.testing.expectEqual(Language.cpp, detectLanguage(".cpp").?);
-    try std.testing.expectEqual(Language.cpp, detectLanguage(".cc").?);
-    try std.testing.expectEqual(Language.cpp, detectLanguage(".hpp").?);
-    try std.testing.expect(detectLanguage(".zig") == null);
-    try std.testing.expect(detectLanguage(".rb") == null);
-    try std.testing.expect(detectLanguage("") == null);
+/// Helper to find a builtin tree-sitter config by extension name.
+fn findBuiltinConfig(name: []const u8) ?extensions.TreeSitterConfig {
+    for (&extensions.builtins) |*b| {
+        if (std.mem.eql(u8, b.name, name)) {
+            if (b.indexer) |idx| return switch (idx) {
+                .tree_sitter => |ts| ts,
+                else => null,
+            };
+        }
+    }
+    return null;
 }
 
-test "detectLanguage without dot" {
-    try std.testing.expectEqual(Language.go, detectLanguage("go").?);
-    try std.testing.expectEqual(Language.python, detectLanguage("py").?);
+test "getGrammar" {
+    try std.testing.expect(getGrammar("go") != null);
+    try std.testing.expect(getGrammar("typescript") != null);
+    try std.testing.expect(getGrammar("tsx") != null);
+    try std.testing.expect(getGrammar("javascript") != null);
+    try std.testing.expect(getGrammar("python") != null);
+    try std.testing.expect(getGrammar("java") != null);
+    try std.testing.expect(getGrammar("rust") != null);
+    try std.testing.expect(getGrammar("c") != null);
+    try std.testing.expect(getGrammar("cpp") != null);
+    try std.testing.expect(getGrammar("zig") == null);
+    try std.testing.expect(getGrammar("ruby") == null);
 }
 
 test "captureToScipKind" {
@@ -503,7 +439,8 @@ test "indexFile Go" {
         \\}
     ;
 
-    const result = try indexer.indexFile(allocator, source, "main.go", .go);
+    const config = findBuiltinConfig("go") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "main.go", config);
     const doc = result.doc;
     defer {
         for (doc.symbols) |sym| {
@@ -550,7 +487,8 @@ test "indexFile Python" {
         \\    pass
     ;
 
-    const result = try indexer.indexFile(allocator, source, "test.py", .python);
+    const config = findBuiltinConfig("python") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "test.py", config);
     const doc = result.doc;
     defer {
         for (doc.symbols) |sym| {
@@ -597,7 +535,8 @@ test "indexFile JavaScript" {
         \\}
     ;
 
-    const result = try indexer.indexFile(allocator, source, "test.js", .javascript);
+    const config = findBuiltinConfig("javascript") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "test.js", config);
     const doc = result.doc;
     defer {
         for (doc.symbols) |sym| {
@@ -626,7 +565,8 @@ test "indexFile empty source" {
     var indexer = Indexer.init();
     defer indexer.deinit();
 
-    const result = try indexer.indexFile(allocator, "", "empty.go", .go);
+    const config = findBuiltinConfig("go") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, "", "empty.go", config);
     const doc = result.doc;
     defer {
         for (doc.symbols) |sym| {

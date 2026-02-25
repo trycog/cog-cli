@@ -174,6 +174,10 @@ pub const DapEvent = struct {
 // ── Request Builders ────────────────────────────────────────────────────
 
 pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
+    return initializeRequestParams(allocator, seq, "cog", false);
+}
+
+pub fn initializeRequestParams(allocator: std.mem.Allocator, seq: i64, adapter_id: []const u8, supports_start_debugging: bool) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -190,7 +194,7 @@ pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
     try s.objectField("clientID");
     try s.write("cog-debug");
     try s.objectField("adapterID");
-    try s.write("cog");
+    try s.write(adapter_id);
     try s.objectField("clientName");
     try s.write("Cog Debug");
     try s.objectField("locale");
@@ -201,13 +205,10 @@ pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
     try s.write(true);
     try s.objectField("columnsStartAt1");
     try s.write(true);
-    // Do NOT advertise runInTerminal or startDebugging — we run headless
-    // and cannot provide a terminal or manage sub-sessions. Setting these
-    // to false forces the adapter to launch the debuggee internally.
     try s.objectField("supportsRunInTerminalRequest");
     try s.write(false);
     try s.objectField("supportsStartDebuggingRequest");
-    try s.write(false);
+    try s.write(supports_start_debugging);
     // Advertise client capabilities
     try s.objectField("supportsVariableType");
     try s.write(true);
@@ -232,6 +233,12 @@ pub fn initializeRequest(allocator: std.mem.Allocator, seq: i64) ![]const u8 {
 }
 
 pub fn launchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8, args: []const []const u8, stop_on_entry: bool) ![]const u8 {
+    return launchRequestEx(allocator, seq, program, args, stop_on_entry, null, null);
+}
+
+/// Build a launch request with optional extra arguments merged from JSON and optional cwd.
+/// extra_args_json, when non-null, is parsed and each field is written into the arguments object.
+pub fn launchRequestEx(allocator: std.mem.Allocator, seq: i64, program: []const u8, args: []const []const u8, stop_on_entry: bool, extra_args_json: ?[]const u8, cwd: ?[]const u8) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -245,6 +252,22 @@ pub fn launchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8
     try s.write("launch");
     try s.objectField("arguments");
     try s.beginObject();
+
+    // Write extra fields from JSON first (e.g. type, sourceMaps for JS)
+    if (extra_args_json) |extra| {
+        const parsed = json.parseFromSlice(json.Value, allocator, extra, .{}) catch null;
+        if (parsed) |p| {
+            defer p.deinit();
+            if (p.value == .object) {
+                var it = p.value.object.iterator();
+                while (it.next()) |entry| {
+                    try s.objectField(entry.key_ptr.*);
+                    try s.write(entry.value_ptr.*);
+                }
+            }
+        }
+    }
+
     try s.objectField("program");
     try s.write(program);
     if (args.len > 0) {
@@ -255,10 +278,14 @@ pub fn launchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8
     }
     try s.objectField("stopOnEntry");
     try s.write(stop_on_entry);
-    // Use internalConsole to prevent debugpy from spawning a terminal
+    // Use internalConsole to prevent adapters from spawning a terminal
     // (integratedTerminal is the default and causes SIGTTIN when running headless)
     try s.objectField("console");
     try s.write("internalConsole");
+    if (cwd) |d| {
+        try s.objectField("cwd");
+        try s.write(d);
+    }
     try s.endObject();
     try s.endObject();
 
@@ -1597,62 +1624,6 @@ pub fn restartRequest(allocator: std.mem.Allocator, seq: i64, arguments: ?[]cons
     return try aw.toOwnedSlice();
 }
 
-// ── JavaScript/TypeScript Protocol Builders ─────────────────────────────
-
-pub fn initializeRequestEx(allocator: std.mem.Allocator, seq: i64, adapter_id: []const u8) ![]const u8 {
-    var aw: Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-
-    try s.beginObject();
-    try s.objectField("seq");
-    try s.write(seq);
-    try s.objectField("type");
-    try s.write("request");
-    try s.objectField("command");
-    try s.write("initialize");
-    try s.objectField("arguments");
-    try s.beginObject();
-    try s.objectField("clientID");
-    try s.write("cog-debug");
-    try s.objectField("adapterID");
-    try s.write(adapter_id);
-    try s.objectField("clientName");
-    try s.write("Cog Debug");
-    try s.objectField("locale");
-    try s.write("en-US");
-    try s.objectField("pathFormat");
-    try s.write("path");
-    try s.objectField("linesStartAt1");
-    try s.write(true);
-    try s.objectField("columnsStartAt1");
-    try s.write(true);
-    try s.objectField("supportsRunInTerminalRequest");
-    try s.write(false);
-    try s.objectField("supportsStartDebuggingRequest");
-    try s.write(true);
-    try s.objectField("supportsVariableType");
-    try s.write(true);
-    try s.objectField("supportsVariablePaging");
-    try s.write(true);
-    try s.objectField("supportsMemoryReferences");
-    try s.write(true);
-    try s.objectField("supportsProgressReporting");
-    try s.write(true);
-    try s.objectField("supportsInvalidatedEvent");
-    try s.write(true);
-    try s.objectField("supportsMemoryEvent");
-    try s.write(true);
-    try s.objectField("supportsANSIStyling");
-    try s.write(true);
-    try s.objectField("supportsArgsCanBeInterpretedByShell");
-    try s.write(true);
-    try s.endObject();
-    try s.endObject();
-
-    return try aw.toOwnedSlice();
-}
-
 /// Build a launch request with raw JSON arguments for child session handshake.
 /// Used when connecting to a vscode-js-debug child session — the configuration
 /// object comes from the startDebugging reverse request and must be forwarded as-is.
@@ -1667,46 +1638,6 @@ pub fn childLaunchRequest(allocator: std.mem.Allocator, seq: i64, config_json: [
         .arguments = parsed.value,
     };
     return try req.serialize(allocator);
-}
-
-pub fn jsLaunchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8, args: []const []const u8, stop_on_entry: bool, cwd: ?[]const u8) ![]const u8 {
-    var aw: Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-
-    try s.beginObject();
-    try s.objectField("seq");
-    try s.write(seq);
-    try s.objectField("type");
-    try s.write("request");
-    try s.objectField("command");
-    try s.write("launch");
-    try s.objectField("arguments");
-    try s.beginObject();
-    try s.objectField("type");
-    try s.write("pwa-node");
-    try s.objectField("program");
-    try s.write(program);
-    if (args.len > 0) {
-        try s.objectField("args");
-        try s.beginArray();
-        for (args) |arg| try s.write(arg);
-        try s.endArray();
-    }
-    try s.objectField("stopOnEntry");
-    try s.write(stop_on_entry);
-    try s.objectField("console");
-    try s.write("internalConsole");
-    try s.objectField("sourceMaps");
-    try s.write(true);
-    if (cwd) |d| {
-        try s.objectField("cwd");
-        try s.write(d);
-    }
-    try s.endObject();
-    try s.endObject();
-
-    return try aw.toOwnedSlice();
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

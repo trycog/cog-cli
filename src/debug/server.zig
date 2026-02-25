@@ -8,6 +8,7 @@ const session_mod = @import("session.zig");
 const driver_mod = @import("driver.zig");
 const dashboard_mod = @import("dashboard.zig");
 const dashboard_tui = @import("dashboard_tui.zig");
+const extensions = @import("../extensions.zig");
 
 // Debug logging to file
 var server_log_file: ?std.fs.File = null;
@@ -554,30 +555,28 @@ pub const DebugServer = struct {
         else
             null;
 
-        // Determine driver type from language hint or file extension
-        const use_dap = blk: {
+        // Resolve extension to determine debug driver
+        const resolved_ext = blk: {
             if (config.language) |lang| {
-                if (std.mem.eql(u8, lang, "python") or
-                    std.mem.eql(u8, lang, "javascript") or
-                    std.mem.eql(u8, lang, "typescript") or
-                    std.mem.eql(u8, lang, "java")) break :blk true;
+                if (extensions.resolveByLanguageHint(allocator, lang)) |ext| break :blk ext;
             }
-            // Check file extension
             const ext = std.fs.path.extension(config.program);
-            if (std.mem.eql(u8, ext, ".py") or
-                std.mem.eql(u8, ext, ".js") or
-                std.mem.eql(u8, ext, ".ts") or
-                std.mem.eql(u8, ext, ".mjs") or
-                std.mem.eql(u8, ext, ".mts") or
-                std.mem.eql(u8, ext, ".java")) break :blk true;
-            break :blk false;
+            break :blk extensions.resolveByExtension(allocator, ext);
         };
+        defer if (resolved_ext) |re| extensions.freeExtension(allocator, &re);
+
+        const debug_config = if (resolved_ext) |re| re.debug else null;
+        const use_dap = if (debug_config) |dc| dc == .dap else false;
 
         if (use_dap) {
             serverLog("[toolLaunch] Using DAP transport, creating proxy...", .{});
             const dap_proxy = @import("dap/proxy.zig");
             var proxy = try allocator.create(dap_proxy.DapProxy);
             proxy.* = dap_proxy.DapProxy.init(allocator);
+            // Pass the DAP config to the proxy
+            if (debug_config) |dc| {
+                proxy.debug_config = dc.dap;
+            }
             errdefer {
                 proxy.deinit();
                 allocator.destroy(proxy);

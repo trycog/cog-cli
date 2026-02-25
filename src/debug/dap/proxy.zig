@@ -167,17 +167,12 @@ pub const TcpTransport = struct {
     server_process: DetachedProcess,
 };
 
-pub const Language = enum {
-    python,
-    go,
-    javascript,
-    java,
-    unknown,
-};
+const extensions = @import("../../extensions.zig");
+const adapter_lifecycle = @import("adapter_lifecycle.zig");
 
 pub const DapProxy = struct {
     transport: Transport = .none,
-    language: Language = .unknown,
+    debug_config: ?extensions.DapConfig = null,
     seq: i64 = 1,
     thread_id: i64 = 1,
     // Topmost frame ID from the most recent stopped event's stack trace.
@@ -226,7 +221,7 @@ pub const DapProxy = struct {
     saved_launch_stop_on_entry: bool = false,
     saved_adapter_argv: ?[]const []const u8 = null,
     // vscode-js-debug child session support
-    js_debug_port: ?u16 = null,
+    adapter_tcp_port: ?u16 = null,
     pending_child_config: ?[]const u8 = null,
     parent_stream: ?std.net.Stream = null,
 
@@ -1140,60 +1135,72 @@ pub const DapProxy = struct {
 
     // ── Driver Interface (vtable functions) ─────────────────────────────
 
-    fn checkDependency(allocator: std.mem.Allocator, argv: []const []const u8, not_found_err: anyerror, not_installed_err: anyerror) anyerror!void {
-        var check = std.process.Child.init(argv, allocator);
-        check.stdin_behavior = .Ignore;
-        check.stdout_behavior = .Ignore;
-        check.stderr_behavior = .Ignore;
-        check.spawn() catch return not_found_err;
-        const term = check.wait() catch return not_found_err;
-        if (term.Exited != 0) return not_installed_err;
-    }
-
     fn proxyLaunch(ctx: *anyopaque, allocator: std.mem.Allocator, config: LaunchConfig) anyerror!void {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
+        const cfg = self.debug_config orelse return error.UnsupportedLanguage;
 
         dapLog("[DAP launch] Starting proxyLaunch for program: {s}", .{config.program});
 
-        // Build adapter command based on file extension or language hint
-        const ext = std.fs.path.extension(config.program);
-        const is_js = std.mem.eql(u8, ext, ".js") or std.mem.eql(u8, ext, ".ts") or
-            std.mem.eql(u8, ext, ".mjs") or std.mem.eql(u8, ext, ".mts");
+        // 1. Check dependencies
+        if (adapter_lifecycle.checkDependencies(allocator, cfg.dependencies)) |err_msg| {
+            dapLog("[DAP launch] Dependency check failed: {s}", .{err_msg});
+            return error.DependencyCheckFailed;
+        }
+        dapLog("[DAP launch] Dependency checks passed", .{});
 
-        if (is_js) {
-            return self.launchJavaScript(allocator, config);
+        // 2. Ensure adapter is installed (download/compile if needed)
+        var adapter_path: ?[]const u8 = null;
+        defer if (adapter_path) |p| allocator.free(p);
+        if (cfg.adapter_install) |install| {
+            adapter_path = adapter_lifecycle.ensureAdapter(allocator, install) catch |err| {
+                dapLog("[DAP launch] Adapter installation failed: {s}", .{@errorName(err)});
+                return err;
+            };
+            dapLog("[DAP launch] Adapter available at: {s}", .{adapter_path orelse ""});
         }
 
+        // 3. Build adapter argv with {adapter_path} substitution
         var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv_list.deinit(allocator);
-
-        if (std.mem.eql(u8, ext, ".py")) {
-            dapLog("[DAP launch] Checking Python/debugpy dependency...", .{});
-            try checkDependency(allocator, &.{ "python3", "-c", "import debugpy" }, error.PythonNotFound, error.DebugpyNotInstalled);
-            dapLog("[DAP launch] Dependency check passed", .{});
-            try argv_list.append(allocator, "python3");
-            try argv_list.append(allocator, "-m");
-            try argv_list.append(allocator, "debugpy.adapter");
-            self.language = .python;
-        } else if (std.mem.eql(u8, ext, ".go")) {
-            try checkDependency(allocator, &.{ "dlv", "version" }, error.DelveNotFound, error.DelveNotFound);
-            try argv_list.append(allocator, "dlv");
-            try argv_list.append(allocator, "dap");
-            self.language = .go;
-        } else if (std.mem.eql(u8, ext, ".java")) {
-            return self.launchJava(allocator, config);
-        } else {
-            return error.UnsupportedLanguage;
+        try argv_list.append(allocator, cfg.adapter_command);
+        for (cfg.adapter_args) |arg| {
+            if (std.mem.eql(u8, arg, "{adapter_path}")) {
+                if (adapter_path) |p| {
+                    // Build entry point path from adapter_install config
+                    if (cfg.adapter_install) |install| {
+                        const entry = std.fs.path.join(allocator, &.{ p, std.fs.path.basename(install.entry_point) }) catch {
+                            try argv_list.append(allocator, p);
+                            continue;
+                        };
+                        // Note: this leaks, but it's a one-time allocation for the adapter path
+                        try argv_list.append(allocator, entry);
+                    } else {
+                        try argv_list.append(allocator, p);
+                    }
+                } else {
+                    try argv_list.append(allocator, arg);
+                }
+            } else {
+                try argv_list.append(allocator, arg);
+            }
         }
 
-        // Save launch state for potential emulated restart (adapters
-        // that lack supportsRestartRequest, e.g. debugpy).
-        self.saveLaunchState(config, argv_list.items);
+        // 4. Transport-specific launch
+        switch (cfg.transport) {
+            .stdio => try self.launchStdio(allocator, config, cfg, argv_list.items),
+            .tcp => try self.launchTcp(allocator, config, cfg, argv_list.items),
+        }
+    }
+
+    /// Launch an adapter over stdio transport (Python, Go, Java, etc.)
+    fn launchStdio(self: *DapProxy, allocator: std.mem.Allocator, config: LaunchConfig, cfg: extensions.DapConfig, argv: []const []const u8) anyerror!void {
+        // Save launch state for potential emulated restart
+        self.saveLaunchState(config, argv);
 
         // Spawn the adapter in a new session (setsid) so it is fully
         // detached from the controlling terminal — prevents SIGTTIN.
-        dapLog("[DAP launch] Spawning adapter process (detached)...", .{});
-        const child = try spawnDetached(allocator, argv_list.items);
+        dapLog("[DAP launch] Spawning adapter process (detached, stdio)...", .{});
+        const child = try spawnDetached(allocator, argv);
         dapLog("[DAP launch] Adapter process spawned (pid={d})", .{child.id});
 
         self.transport = .{ .stdio = .{ .process = child } };
@@ -1201,24 +1208,19 @@ pub const DapProxy = struct {
 
         // 1. Send initialize request and wait for response
         dapLog("[DAP launch] Step 1: Sending initialize request (seq={d})...", .{self.seq});
-        const init_msg = try protocol.initializeRequest(allocator, self.nextSeq());
+        const init_msg = try protocol.initializeRequestParams(allocator, self.nextSeq(), cfg.adapter_id, cfg.supports_start_debugging);
         defer allocator.free(init_msg);
         const init_resp = try self.sendRequest(allocator, init_msg);
         defer allocator.free(init_resp);
         dapLog("[DAP launch] Step 1: Initialize response received ({d} bytes)", .{init_resp.len});
-
-        // Parse capabilities from the initialize response body
         self.parseAdapterCapabilities(allocator, init_resp);
 
         // 2. Send launch request WITHOUT waiting for response.
-        //    Per DAP spec, the adapter sends 'initialized' event after receiving
-        //    launch, then waits for configurationDone before sending the launch
-        //    response. So we must not block here.
         dapLog("[DAP launch] Step 2: Sending launch request (seq={d})...", .{self.seq});
-        const launch_msg = try protocol.launchRequest(allocator, self.nextSeq(), config.program, config.args, config.stop_on_entry);
+        const launch_msg = try protocol.launchRequestEx(allocator, self.nextSeq(), config.program, config.args, config.stop_on_entry, cfg.launch_extra_args_json, null);
         defer allocator.free(launch_msg);
         try self.sendRaw(allocator, launch_msg);
-        dapLog("[DAP launch] Step 2: Launch request sent (not waiting for response)", .{});
+        dapLog("[DAP launch] Step 2: Launch request sent", .{});
 
         // 3. Wait for 'initialized' event from the adapter
         dapLog("[DAP launch] Step 3: Waiting for initialized event...", .{});
@@ -1226,9 +1228,7 @@ pub const DapProxy = struct {
         allocator.free(init_event);
         dapLog("[DAP launch] Step 3: initialized event received", .{});
 
-        // 4. Send configurationDone — the adapter will then send both the
-        //    configurationDone response and the launch response. readResponse
-        //    returns the first response it sees (either one is fine).
+        // 4. Send configurationDone
         dapLog("[DAP launch] Step 4: Sending configurationDone request (seq={d})...", .{self.seq});
         const config_done_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
         defer allocator.free(config_done_msg);
@@ -1240,32 +1240,23 @@ pub const DapProxy = struct {
         dapLog("[DAP launch] Launch complete, session initialized", .{});
     }
 
-    /// Launch JavaScript/TypeScript via vscode-js-debug over TCP.
-    fn launchJavaScript(self: *DapProxy, allocator: std.mem.Allocator, config: LaunchConfig) anyerror!void {
-        const js_debug = @import("js_debug.zig");
+    /// Launch an adapter over TCP transport (vscode-js-debug, etc.)
+    fn launchTcp(self: *DapProxy, allocator: std.mem.Allocator, config: LaunchConfig, cfg: extensions.DapConfig, argv: []const []const u8) anyerror!void {
+        dapLog("[DAP launch] TCP transport launch", .{});
 
-        dapLog("[DAP launch] JavaScript/TypeScript launch", .{});
+        // Save launch state for restart
+        self.saveLaunchState(config, argv);
 
-        // 1. Check node dependency
-        try checkDependency(allocator, &.{ "node", "--version" }, error.NodeNotFound, error.NodeNotFound);
+        // 1. Spawn the adapter process
+        dapLog("[DAP launch] Spawning adapter process (TCP)...", .{});
+        const server_child = try spawnDetached(allocator, argv);
 
-        // 2. Ensure vscode-js-debug is installed
-        dapLog("[DAP launch] Ensuring vscode-js-debug is installed...", .{});
-        const dap_server_path = try js_debug.ensureDapServer(allocator);
-        defer allocator.free(dap_server_path);
-
-        // 3. Spawn dapDebugServer.js with port 0 (auto-assign) on 127.0.0.1
-        dapLog("[DAP launch] Spawning dapDebugServer.js...", .{});
-        const server_child = try spawnDetached(allocator, &.{ "node", dap_server_path, "0", "127.0.0.1" });
-
-        // Save launch state for restart (use node + dapDebugServer args as adapter_argv)
-        self.saveLaunchState(config, &.{ "node", dap_server_path, "0", "127.0.0.1" });
-
-        // 4. Read stdout to get the listening port
+        // 2. Read stdout to get the listening port
+        const port_prefix = cfg.port_stdout_prefix orelse return error.PortParseFailed;
         const server_stdout = server_child.stdout orelse return error.NotInitialized;
         var port_buf: [256]u8 = undefined;
         var port_len: usize = 0;
-        const port_timeout_ms: i32 = 10_000;
+        const port_timeout_ms: i32 = @intCast(cfg.port_detection_timeout_ms);
 
         while (port_len < port_buf.len) {
             var poll_fds = [_]std.posix.pollfd{.{
@@ -1280,65 +1271,62 @@ pub const DapProxy = struct {
             if (n == 0) return error.ConnectionClosed;
             port_len += n;
 
-            // Check if we have the port message yet
-            if (js_debug.parseListeningPort(port_buf[0..port_len])) |_| break;
+            if (adapter_lifecycle.detectPortFromStdout(port_buf[0..port_len], port_prefix)) |_| break;
         }
 
-        const port = js_debug.parseListeningPort(port_buf[0..port_len]) orelse return error.PortParseFailed;
-        self.js_debug_port = port;
-        dapLog("[DAP launch] dapDebugServer listening on port {d}", .{port});
+        const port = adapter_lifecycle.detectPortFromStdout(port_buf[0..port_len], port_prefix) orelse return error.PortParseFailed;
+        self.adapter_tcp_port = port;
+        dapLog("[DAP launch] Adapter listening on port {d}", .{port});
 
-        // 5. Connect TCP to the DAP server
+        // 3. Connect TCP to the adapter
         const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return error.ConnectionFailed;
 
         self.transport = .{ .tcp = .{ .stream = stream, .server_process = server_child } };
-        self.language = .javascript;
         self.initialized = false;
 
-        // 6. DAP initialize handshake
-        dapLog("[DAP launch] Sending initialize request (pwa-node, seq={d})...", .{self.seq});
-        const init_msg = try protocol.initializeRequestEx(allocator, self.nextSeq(), "pwa-node");
+        // 4. DAP initialize handshake
+        dapLog("[DAP launch] Sending initialize request ({s}, seq={d})...", .{ cfg.adapter_id, self.seq });
+        const init_msg = try protocol.initializeRequestParams(allocator, self.nextSeq(), cfg.adapter_id, cfg.supports_start_debugging);
         defer allocator.free(init_msg);
         const init_resp = try self.sendRequest(allocator, init_msg);
         defer allocator.free(init_resp);
         self.parseAdapterCapabilities(allocator, init_resp);
 
-        // 7. Send JS-specific launch request (don't wait — initialized event comes first)
-        //    IMPORTANT: Always send stopOnEntry=false to the parent adapter.
-        //    vscode-js-debug implements stopOnEntry with a persistent internal
-        //    breakpoint that fires on EVERY stop.  We handle entry-stop ourselves
-        //    via DAP "pause" in connectChildSession instead.
-        dapLog("[DAP launch] Sending JS launch request (stopOnEntry=false to parent)...", .{});
+        // 5. Send launch request (don't wait — initialized event comes first)
+        //    For child session adapters: send stopOnEntry=false to parent,
+        //    we handle entry-stop ourselves via DAP "pause" in connectChildSession.
+        const stop_on_entry = if (cfg.child_sessions.enabled) false else config.stop_on_entry;
+        dapLog("[DAP launch] Sending launch request (stopOnEntry={})...", .{stop_on_entry});
         const cwd = std.fs.path.dirname(config.program);
-        const launch_msg = try protocol.jsLaunchRequest(allocator, self.nextSeq(), config.program, config.args, false, cwd);
+        const launch_msg = try protocol.launchRequestEx(allocator, self.nextSeq(), config.program, config.args, stop_on_entry, cfg.launch_extra_args_json, cwd);
         defer allocator.free(launch_msg);
         try self.sendRaw(allocator, launch_msg);
 
-        // 8. Wait for initialized event
+        // 6. Wait for initialized event
         const init_event = try self.waitForEvent(allocator, "initialized");
         allocator.free(init_event);
 
-        // 9. configurationDone
+        // 7. configurationDone
         const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
         defer allocator.free(cd_msg);
         const cd_resp = try self.sendRequest(allocator, cd_msg);
         allocator.free(cd_resp);
 
-        // 10. Wait for the startDebugging reverse request from the parent adapter.
-        // vscode-js-debug sends this asynchronously after configurationDone — it
-        // spawns a child Node process and asks us to open a child debug session.
-        // The reverse request arrives via readResponse side-effects, so we poll
-        // for messages until pending_child_config is populated.
-        dapLog("[DAP launch] Waiting for startDebugging reverse request...", .{});
-        try self.waitForChildConfig(allocator);
+        // 8. Handle child sessions if enabled
+        if (cfg.child_sessions.enabled) {
+            dapLog("[DAP launch] Waiting for startDebugging reverse request...", .{});
+            try self.waitForChildConfig(allocator);
 
-        if (self.pending_child_config != null) {
-            dapLog("[DAP launch] Child session config detected, connecting to child...", .{});
-            try self.connectChildSession(allocator);
+            if (self.pending_child_config != null) {
+                dapLog("[DAP launch] Child session config detected, connecting to child...", .{});
+                try self.connectChildSession(allocator);
+            } else {
+                self.initialized = true;
+            }
         } else {
             self.initialized = true;
         }
-        dapLog("[DAP launch] JavaScript launch complete", .{});
+        dapLog("[DAP launch] TCP launch complete", .{});
     }
 
     /// Wait for the startDebugging reverse request to populate pending_child_config.
@@ -1450,7 +1438,7 @@ pub const DapProxy = struct {
     /// fresh DAP handshake with the child config, and swap the transport so all
     /// subsequent commands go to the child session that actually controls the debuggee.
     fn connectChildSession(self: *DapProxy, allocator: std.mem.Allocator) !void {
-        const port = self.js_debug_port orelse return error.NotInitialized;
+        const port = self.adapter_tcp_port orelse return error.NotInitialized;
         const config_json = self.pending_child_config orelse return error.NotInitialized;
 
         dapLog("[DAP child] Connecting child session to 127.0.0.1:{d}", .{port});
@@ -1481,7 +1469,8 @@ pub const DapProxy = struct {
 
         // 4. DAP initialize handshake on child
         dapLog("[DAP child] Sending initialize request...", .{});
-        const init_msg = try protocol.initializeRequestEx(allocator, self.nextSeq(), "pwa-node");
+        const cfg = self.debug_config orelse return error.NotInitialized;
+        const init_msg = try protocol.initializeRequestParams(allocator, self.nextSeq(), cfg.adapter_id, cfg.supports_start_debugging);
         defer allocator.free(init_msg);
         const init_resp = try self.sendRequest(allocator, init_msg);
         defer allocator.free(init_resp);
@@ -1560,66 +1549,6 @@ pub const DapProxy = struct {
         self.pending_child_config = null;
 
         dapLog("[DAP child] Child session connected and initialized", .{});
-    }
-
-    /// Launch Java via JDI DAP server over stdio.
-    fn launchJava(self: *DapProxy, allocator: std.mem.Allocator, config: LaunchConfig) anyerror!void {
-        const java_debug = @import("java_debug.zig");
-
-        dapLog("[DAP launch] Java launch", .{});
-
-        // 1. Check java and javac dependencies
-        try checkDependency(allocator, &.{ "java", "-version" }, error.JavaNotFound, error.JavaNotFound);
-        try checkDependency(allocator, &.{ "javac", "-version" }, error.JavacNotFound, error.JavacNotFound);
-
-        // 2. Ensure JDI DAP server is compiled and cached
-        dapLog("[DAP launch] Ensuring JDI DAP server is compiled...", .{});
-        const cache_dir = try java_debug.ensureJdiServer(allocator);
-        defer allocator.free(cache_dir);
-
-        // 3. Spawn the Java DAP server as a stdio process
-        dapLog("[DAP launch] Spawning JDI DAP server...", .{});
-        const child = try spawnDetached(allocator, &.{ "java", "-cp", cache_dir, "JdiDapServer" });
-
-        // Save launch state for restart
-        self.saveLaunchState(config, &.{ "java", "-cp", cache_dir, "JdiDapServer" });
-
-        self.transport = .{ .stdio = .{ .process = child } };
-        self.language = .java;
-        self.initialized = false;
-
-        // 4. DAP initialize handshake
-        dapLog("[DAP launch] Sending initialize request (seq={d})...", .{self.seq});
-        const init_msg = try protocol.initializeRequest(allocator, self.nextSeq());
-        defer allocator.free(init_msg);
-        const init_resp = try self.sendRequest(allocator, init_msg);
-        defer allocator.free(init_resp);
-        dapLog("[DAP launch] Initialize response received ({d} bytes)", .{init_resp.len});
-        self.parseAdapterCapabilities(allocator, init_resp);
-
-        // 5. Send launch request (don't wait — adapter sends initialized event first)
-        dapLog("[DAP launch] Sending launch request (seq={d})...", .{self.seq});
-        const launch_msg = try protocol.launchRequest(allocator, self.nextSeq(), config.program, config.args, config.stop_on_entry);
-        defer allocator.free(launch_msg);
-        try self.sendRaw(allocator, launch_msg);
-        dapLog("[DAP launch] Launch request sent", .{});
-
-        // 6. Wait for initialized event
-        dapLog("[DAP launch] Waiting for initialized event...", .{});
-        const init_event = try self.waitForEvent(allocator, "initialized");
-        allocator.free(init_event);
-        dapLog("[DAP launch] initialized event received", .{});
-
-        // 7. Send configurationDone
-        dapLog("[DAP launch] Sending configurationDone request (seq={d})...", .{self.seq});
-        const config_done_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
-        defer allocator.free(config_done_msg);
-        const config_resp = try self.sendRequest(allocator, config_done_msg);
-        allocator.free(config_resp);
-        dapLog("[DAP launch] configurationDone response received", .{});
-
-        self.initialized = true;
-        dapLog("[DAP launch] Java launch complete", .{});
     }
 
     /// Re-serialize child config JSON with stopOnEntry forced to false.
@@ -3172,33 +3101,27 @@ pub const DapProxy = struct {
 
     fn proxyRestart(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!void {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
+        const cfg = self.debug_config orelse return error.NotSupported;
+
+        const use_native_restart = cfg.restart_method == .native;
 
         const native_restart_ok = native_restart: {
-            if (self.adapter_capabilities.supports_restart_request and self.language != .javascript) {
+            if (self.adapter_capabilities.supports_restart_request and use_native_restart) {
                 // Native restart requires an active adapter connection.
                 if (self.transport == .none) break :native_restart false;
-                // ── Native restart ─────────────────────────────────────────
-                // The adapter supports the restart request natively.
-                // Flow: restart → wait initialized → re-arm → configurationDone
                 dapLog("[DAP restart] Adapter supports native restart (seq={d})", .{self.seq});
 
-                // Set initialized=true before sending so that concurrent checks
-                // (e.g. proxyRun) don't fail while the restart is in flight.
-                // This also counteracts the `terminated` event setting initialized=false.
                 self.initialized = true;
 
                 const msg = protocol.restartRequest(allocator, self.nextSeq(), null) catch break :native_restart false;
                 defer allocator.free(msg);
                 const resp = self.sendRequest(allocator, msg) catch |err| {
-                    // If the adapter process has exited (e.g. after terminated event),
-                    // the transport pipe is dead. Fall through to emulated restart.
                     dapLog("[DAP restart] Native restart sendRequest failed: {any}, falling back to emulated", .{err});
                     self.initialized = false;
                     break :native_restart false;
                 };
                 allocator.free(resp);
 
-                // Wait for the `initialized` event (adapter re-enters config phase).
                 const init_event = self.waitForEvent(allocator, "initialized") catch {
                     dapLog("[DAP restart] No initialized event after native restart, re-arming anyway", .{});
                     self.rearmBreakpoints(allocator);
@@ -3225,15 +3148,12 @@ pub const DapProxy = struct {
 
         if (!native_restart_ok) {
             // ── Emulated restart ───────────────────────────────────────
-            // The adapter does NOT support the restart request (e.g.
-            // debugpy).  Emulate by disconnecting, killing the adapter,
-            // spawning a fresh one, and running the full init handshake.
-            dapLog("[DAP restart] Adapter lacks restart support, emulating via disconnect+relaunch", .{});
+            dapLog("[DAP restart] Emulating via disconnect+relaunch", .{});
 
             const program = self.saved_launch_program orelse return error.NotSupported;
             const adapter_argv = self.saved_adapter_argv orelse return error.NotSupported;
 
-            // 1. Disconnect from the current adapter (restart hint = true).
+            // 1. Disconnect from the current adapter.
             {
                 const disc_msg = protocol.disconnectRequestEx(allocator, self.nextSeq(), true, false, true) catch |err| {
                     dapLog("[DAP restart] Failed to build disconnect: {any}", .{err});
@@ -3261,14 +3181,13 @@ pub const DapProxy = struct {
 
             // 4. Spawn a new adapter process and connect.
             dapLog("[DAP restart] Spawning new adapter process...", .{});
-            if (self.language == .javascript) {
-                // JS restart: spawn new DAP server, connect TCP
-                const js_debug = @import("js_debug.zig");
+            if (cfg.transport == .tcp) {
+                // TCP restart: spawn new adapter, detect port, connect
+                const port_prefix = cfg.port_stdout_prefix orelse return error.PortParseFailed;
                 const child = spawnDetached(allocator, adapter_argv) catch |err| {
-                    dapLog("[DAP restart] Failed to spawn JS adapter: {any}", .{err});
+                    dapLog("[DAP restart] Failed to spawn adapter: {any}", .{err});
                     return err;
                 };
-                // Read port from stdout
                 const server_stdout = child.stdout orelse return error.NotInitialized;
                 var port_buf: [256]u8 = undefined;
                 var port_len: usize = 0;
@@ -3278,15 +3197,15 @@ pub const DapProxy = struct {
                         .events = std.posix.POLL.IN,
                         .revents = 0,
                     }};
-                    const pr = std.posix.poll(&poll_fds, 10_000) catch return error.ReadFailed;
+                    const pr = std.posix.poll(&poll_fds, @intCast(cfg.port_detection_timeout_ms)) catch return error.ReadFailed;
                     if (pr == 0) return error.Timeout;
                     const n = server_stdout.read(port_buf[port_len..]) catch return error.ReadFailed;
                     if (n == 0) return error.ConnectionClosed;
                     port_len += n;
-                    if (js_debug.parseListeningPort(port_buf[0..port_len])) |_| break;
+                    if (adapter_lifecycle.detectPortFromStdout(port_buf[0..port_len], port_prefix)) |_| break;
                 }
-                const port = js_debug.parseListeningPort(port_buf[0..port_len]) orelse return error.PortParseFailed;
-                self.js_debug_port = port;
+                const port = adapter_lifecycle.detectPortFromStdout(port_buf[0..port_len], port_prefix) orelse return error.PortParseFailed;
+                self.adapter_tcp_port = port;
                 const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return error.ConnectionFailed;
                 self.transport = .{ .tcp = .{ .stream = stream, .server_process = child } };
             } else {
@@ -3301,36 +3220,24 @@ pub const DapProxy = struct {
             // 5. Full DAP initialization sequence (mirrors proxyLaunch).
 
             // 5a. initialize → get capabilities
-            const init_msg = if (self.language == .javascript)
-                try protocol.initializeRequestEx(allocator, self.nextSeq(), "pwa-node")
-            else
-                try protocol.initializeRequest(allocator, self.nextSeq());
+            const init_msg = try protocol.initializeRequestParams(allocator, self.nextSeq(), cfg.adapter_id, cfg.supports_start_debugging);
             defer allocator.free(init_msg);
             const init_resp = try self.sendRequest(allocator, init_msg);
             defer allocator.free(init_resp);
             self.parseAdapterCapabilities(allocator, init_resp);
 
-            // 5b. Send launch request (don't wait — adapter sends
-            //     initialized event before the launch response).
-            //     For JS: always send stopOnEntry=false to parent (we use
-            //     DAP pause in connectChildSession instead).
-            const launch_msg = if (self.language == .javascript)
-                try protocol.jsLaunchRequest(
-                    allocator,
-                    self.nextSeq(),
-                    program,
-                    self.saved_launch_args orelse &.{},
-                    false,
-                    std.fs.path.dirname(program),
-                )
-            else
-                try protocol.launchRequest(
-                    allocator,
-                    self.nextSeq(),
-                    program,
-                    self.saved_launch_args orelse &.{},
-                    self.saved_launch_stop_on_entry,
-                );
+            // 5b. Send launch request.
+            //     For child session adapters: send stopOnEntry=false to parent.
+            const stop_on_entry = if (cfg.child_sessions.enabled) false else self.saved_launch_stop_on_entry;
+            const launch_msg = try protocol.launchRequestEx(
+                allocator,
+                self.nextSeq(),
+                program,
+                self.saved_launch_args orelse &.{},
+                stop_on_entry,
+                cfg.launch_extra_args_json,
+                std.fs.path.dirname(program),
+            );
             defer allocator.free(launch_msg);
             try self.sendRaw(allocator, launch_msg);
 
@@ -3348,8 +3255,8 @@ pub const DapProxy = struct {
             const cd_resp = try self.sendRequest(allocator, cd_msg);
             allocator.free(cd_resp);
 
-            // Wait for startDebugging reverse request if this is a JS session.
-            if (self.language == .javascript) {
+            // Wait for child session if enabled.
+            if (cfg.child_sessions.enabled) {
                 try self.waitForChildConfig(allocator);
             }
 
