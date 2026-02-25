@@ -253,9 +253,25 @@ pub fn launchRequestEx(allocator: std.mem.Allocator, seq: i64, program: []const 
     try s.objectField("arguments");
     try s.beginObject();
 
-    // Write extra fields from JSON first (e.g. type, sourceMaps for JS)
+    // Write extra fields from JSON first (e.g. type, sourceMaps, outFiles for JS).
+    // Template variables: {cwd} is replaced with the actual working directory so
+    // that outFiles globs point to the program's location at runtime.
     if (extra_args_json) |extra| {
-        const parsed = json.parseFromSlice(json.Value, allocator, extra, .{}) catch null;
+        var effective_extra = extra;
+        var extra_owned: ?[]u8 = null;
+        defer if (extra_owned) |e| allocator.free(e);
+
+        if (cwd) |d| {
+            if (std.mem.indexOf(u8, extra, "{cwd}") != null) {
+                const new_size = std.mem.replacementSize(u8, extra, "{cwd}", d);
+                const buf = try allocator.alloc(u8, new_size);
+                _ = std.mem.replace(u8, extra, "{cwd}", d, buf);
+                extra_owned = buf;
+                effective_extra = buf;
+            }
+        }
+
+        const parsed = json.parseFromSlice(json.Value, allocator, effective_extra, .{}) catch null;
         if (parsed) |p| {
             defer p.deinit();
             if (p.value == .object) {

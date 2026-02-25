@@ -104,13 +104,13 @@ pub const Extension = struct {
 
 const js_dap_config: DapConfig = .{
     .adapter_command = "node",
-    .adapter_args = &.{ "{adapter_path}", "0", "127.0.0.1" },
+    .adapter_args = &.{ "{entry_point}", "0", "127.0.0.1" },
     .transport = .tcp,
     .port_stdout_prefix = "Debug server listening at ",
     .adapter_id = "pwa-node",
     .supports_start_debugging = true,
     .launch_extra_args_json =
-    \\{"type":"pwa-node","console":"internalConsole","sourceMaps":true}
+    \\{"type":"pwa-node","console":"internalConsole","sourceMaps":true,"__workspaceFolder":"{cwd}","outFiles":["{cwd}/**/*.js","!**/node_modules/**"],"resolveSourceMapLocations":["**","!**/node_modules/**"]}
     ,
     .child_sessions = .{ .enabled = true, .stop_on_entry_workaround = true },
     .restart_method = .respawn,

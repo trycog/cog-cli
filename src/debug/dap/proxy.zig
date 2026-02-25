@@ -224,6 +224,12 @@ pub const DapProxy = struct {
     adapter_tcp_port: ?u16 = null,
     pending_child_config: ?[]const u8 = null,
     parent_stream: ?std.net.Stream = null,
+    // Deferred configurationDone: when true, the child session has been
+    // initialized but configurationDone has NOT been sent yet.  Breakpoints
+    // set by the user go into the configuration phase so vscode-js-debug
+    // can resolve source-mapped .ts breakpoints via outFiles pre-scanning.
+    // configurationDone is sent on the first proxyRun call.
+    child_config_deferred: bool = false,
 
     pub const MemoryEvent = struct {
         memory_reference: []const u8,
@@ -614,6 +620,7 @@ pub const DapProxy = struct {
                         // Handle events
                         if (parsed.value.object.get("event")) |evt| {
                             if (evt == .string) {
+                                dapLog("[DAP readResponse] Processing event: {s} (while waiting for seq={d})", .{ evt.string, expected_seq });
                                 if (std.mem.eql(u8, evt.string, "stopped")) {
                                     if (parsed.value.object.get("body")) |body| {
                                         if (body == .object) {
@@ -625,26 +632,28 @@ pub const DapProxy = struct {
                                     // Queue notification
                                     self.queueNotification("debug/stopped", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "output")) {
-                                    // Capture debuggee output
+                                    // Capture debuggee output (skip telemetry — adapter-internal metrics)
                                     if (parsed.value.object.get("body")) |body| {
                                         if (body == .object) {
                                             const category = if (body.object.get("category")) |c|
                                                 (if (c == .string) c.string else "console")
                                             else
                                                 "console";
-                                            const text = if (body.object.get("output")) |o|
-                                                (if (o == .string) o.string else "")
-                                            else
-                                                "";
-                                            if (text.len > 0) {
-                                                self.output_buffer.append(self.allocator, .{
-                                                    .category = self.allocator.dupe(u8, category) catch "",
-                                                    .text = self.allocator.dupe(u8, text) catch "",
-                                                }) catch {};
+                                            if (!std.mem.eql(u8, category, "telemetry")) {
+                                                const text = if (body.object.get("output")) |o|
+                                                    (if (o == .string) o.string else "")
+                                                else
+                                                    "";
+                                                if (text.len > 0) {
+                                                    self.output_buffer.append(self.allocator, .{
+                                                        .category = self.allocator.dupe(u8, category) catch "",
+                                                        .text = self.allocator.dupe(u8, text) catch "",
+                                                    }) catch {};
+                                                }
+                                                self.queueNotification("debug/output", decoded.body);
                                             }
                                         }
                                     }
-                                    self.queueNotification("debug/output", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "breakpoint")) {
                                     // Breakpoint verification event
                                     if (parsed.value.object.get("body")) |body| {
@@ -672,8 +681,7 @@ pub const DapProxy = struct {
                                     // Thread create/exit event
                                     self.queueNotification("debug/thread", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "loadedSource")) {
-                                    // Loaded source event
-                                    self.queueNotification("debug/loaded_source", decoded.body);
+                                    // Suppressed from poll_events — use cog_debug_loaded_sources instead.
                                 } else if (std.mem.eql(u8, evt.string, "process")) {
                                     // Process event
                                     self.queueNotification("debug/process", decoded.body);
@@ -1159,21 +1167,31 @@ pub const DapProxy = struct {
             dapLog("[DAP launch] Adapter available at: {s}", .{adapter_path orelse ""});
         }
 
-        // 3. Build adapter argv with {adapter_path} substitution
+        // 3. Build adapter argv with placeholder substitution
+        //    {adapter_path} → install directory (e.g. for Java -cp)
+        //    {entry_point}  → full path to adapter entry point file (e.g. for node)
         var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv_list.deinit(allocator);
         try argv_list.append(allocator, cfg.adapter_command);
         for (cfg.adapter_args) |arg| {
             if (std.mem.eql(u8, arg, "{adapter_path}")) {
+                try argv_list.append(allocator, adapter_path orelse arg);
+            } else if (std.mem.eql(u8, arg, "{entry_point}")) {
                 if (adapter_path) |p| {
-                    // Build entry point path from adapter_install config
                     if (cfg.adapter_install) |install| {
-                        const entry = std.fs.path.join(allocator, &.{ p, std.fs.path.basename(install.entry_point) }) catch {
+                        // Strip install_dir prefix from entry_point to get the relative path,
+                        // then join with the resolved adapter_path directory.
+                        const ep = install.entry_point;
+                        const rel = if (std.mem.startsWith(u8, ep, install.install_dir)) blk: {
+                            var rest = ep[install.install_dir.len..];
+                            if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
+                            break :blk rest;
+                        } else std.fs.path.basename(ep);
+                        const full = std.fs.path.join(allocator, &.{ p, rel }) catch {
                             try argv_list.append(allocator, p);
                             continue;
                         };
-                        // Note: this leaks, but it's a one-time allocation for the adapter path
-                        try argv_list.append(allocator, entry);
+                        try argv_list.append(allocator, full);
                     } else {
                         try argv_list.append(allocator, p);
                     }
@@ -1477,16 +1495,16 @@ pub const DapProxy = struct {
         self.parseAdapterCapabilities(allocator, init_resp);
 
         // 5. Send launch with child config.
-        //    IMPORTANT: Strip stopOnEntry from the child config.  vscode-js-debug
-        //    implements stopOnEntry with a persistent internal breakpoint (ID 0)
-        //    that fires on EVERY stop — not just the first.  This breaks normal
-        //    breakpoint debugging.  Instead, we use DAP "pause" after configurationDone
-        //    to achieve the same effect without the persistent breakpoint.
-        dapLog("[DAP child] Sending child launch request (stopOnEntry stripped)...", .{});
-        const child_config = if (self.saved_launch_stop_on_entry)
-            try self.stripStopOnEntry(allocator, config_json)
-        else
-            try allocator.dupe(u8, config_json);
+        //    Inject outFiles + resolveSourceMapLocations so vscode-js-debug can
+        //    resolve source-mapped breakpoints (.ts → .js).  The child config
+        //    from startDebugging does NOT inherit these from the parent launch.
+        //
+        //    Strip stopOnEntry to avoid vscode-js-debug's persistent internal
+        //    breakpoint (ID 0) that fires on EVERY stop.
+        dapLog("[DAP child] Sending child launch request...", .{});
+        const enriched_config = try self.injectSourceMapConfig(allocator, config_json);
+        defer allocator.free(enriched_config);
+        const child_config = try self.stripStopOnEntry(allocator, enriched_config);
         defer allocator.free(child_config);
         const launch_msg = try protocol.childLaunchRequest(allocator, self.nextSeq(), child_config);
         defer allocator.free(launch_msg);
@@ -1496,45 +1514,33 @@ pub const DapProxy = struct {
         const init_event = try self.waitForEvent(allocator, "initialized");
         allocator.free(init_event);
 
-        // 7. Re-arm breakpoints on the child session
+        // 7. Mark child as initialized so proxySetBreakpoint can send to it.
         self.initialized = true;
+
+        // 8. Re-arm any existing breakpoints during the configuration phase.
+        // This must happen BEFORE configurationDone — vscode-js-debug only
+        // resolves source-mapped breakpoints (.ts via outFiles) during the
+        // config phase.  After a restart, the new child adapter has no
+        // breakpoints; re-arming sends the tracked set from the previous session.
+        // On initial launch this is a no-op (no breakpoints tracked yet).
         self.rearmBreakpoints(allocator);
 
-        // 8. configurationDone
-        const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
-        defer allocator.free(cd_msg);
-        const cd_resp = try self.sendRequest(allocator, cd_msg);
-        allocator.free(cd_resp);
-
-        // 8b. If user wanted stopOnEntry, send a DAP pause request to stop the
-        //     program.  This achieves the same effect without the persistent
-        //     internal breakpoint that vscode-js-debug uses for stopOnEntry.
+        // 9. Handle configurationDone based on stopOnEntry.
         if (self.saved_launch_stop_on_entry) {
-            dapLog("[DAP child] Sending pause for entry stop...", .{});
-            const pause_msg = protocol.pauseRequest(allocator, self.nextSeq(), self.thread_id) catch null;
-            if (pause_msg) |pm| {
-                defer allocator.free(pm);
-                if (self.sendRequest(allocator, pm)) |pause_resp| {
-                    allocator.free(pause_resp);
-                    // Wait for the stopped event from the pause
-                    if (self.waitForEvent(allocator, "stopped")) |entry_event| {
-                        const evt = protocol.DapEvent.parse(allocator, entry_event) catch null;
-                        if (evt) |e| {
-                            if (e.thread_id) |tid| self.thread_id = tid;
-                            e.deinit(allocator);
-                        }
-                        allocator.free(entry_event);
-                        dapLog("[DAP child] Paused at entry (thread_id={d})", .{self.thread_id});
-                    } else |err| {
-                        dapLog("[DAP child] Failed to wait for pause stop: {}", .{err});
-                    }
-                } else |err| {
-                    dapLog("[DAP child] Pause request failed: {}", .{err});
-                }
-            }
+            // Defer configurationDone.  Breakpoints the user sets between
+            // launch and their first "continue" go into the DAP configuration
+            // phase.  configurationDone is sent in proxyRun on the first continue.
+            dapLog("[DAP child] Deferring configurationDone (stopOnEntry=true)", .{});
+            self.child_config_deferred = true;
+        } else {
+            // No stopOnEntry: send configurationDone to start the program.
+            const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
+            defer allocator.free(cd_msg);
+            const cd_resp = try self.sendRequest(allocator, cd_msg);
+            allocator.free(cd_resp);
         }
 
-        // 9. Drain all launch-time notifications (loadedSource, telemetry output,
+        // 10. Drain all launch-time notifications (loadedSource, telemetry output,
         // process, thread events, etc.) accumulated during the child handshake.
         // These are internal DAP noise, not user-relevant events.
         for (self.pending_notifications.items) |n| {
@@ -1544,7 +1550,7 @@ pub const DapProxy = struct {
         dapLog("[DAP child] Drained {d} launch-time notifications", .{self.pending_notifications.items.len});
         self.pending_notifications.items.len = 0;
 
-        // 10. Consume the child config — it's been used
+        // 11. Consume the child config — it's been used
         self.allocator.free(config_json);
         self.pending_child_config = null;
 
@@ -1573,15 +1579,109 @@ pub const DapProxy = struct {
         return aw.toOwnedSlice() catch return error.OutOfMemory;
     }
 
+    /// Inject outFiles and resolveSourceMapLocations into a child session config
+    /// so that vscode-js-debug can resolve source-mapped breakpoints (.ts files).
+    /// The startDebugging reverse request config does NOT inherit these from the
+    /// parent launch, so we must add them based on the program's directory.
+    fn injectSourceMapConfig(self: *DapProxy, allocator: std.mem.Allocator, config_json: []const u8) ![]const u8 {
+        const cfg = self.debug_config orelse return try allocator.dupe(u8, config_json);
+        const extra = cfg.launch_extra_args_json orelse return try allocator.dupe(u8, config_json);
+        // Only inject if the adapter config has sourceMaps enabled
+        if (std.mem.indexOf(u8, extra, "sourceMaps") == null)
+            return try allocator.dupe(u8, config_json);
+
+        const program_dir = if (self.saved_launch_program) |p| std.fs.path.dirname(p) else null;
+        const dir = program_dir orelse return try allocator.dupe(u8, config_json);
+
+        const parsed = json.parseFromSlice(json.Value, allocator, config_json, .{}) catch
+            return try allocator.dupe(u8, config_json);
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return try allocator.dupe(u8, config_json);
+
+        // Build the outFiles glob: <program_dir>/**/*.js
+        var pattern_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+        const pattern = std.fmt.bufPrint(&pattern_buf, "{s}/**/*.js", .{dir}) catch
+            return try allocator.dupe(u8, config_json);
+
+        dapLog("[DAP child] Injecting outFiles=[{s}] into child config", .{pattern});
+
+        // Manually serialize: copy all existing fields, then append our new ones
+        var aw: Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var s: Stringify = .{ .writer = &aw.writer };
+
+        try s.beginObject();
+
+        // Copy existing fields
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            try s.objectField(entry.key_ptr.*);
+            try s.write(entry.value_ptr.*);
+        }
+
+        // Add sourceMaps: true
+        try s.objectField("sourceMaps");
+        try s.write(true);
+
+        // __workspaceFolder: vscode-js-debug uses this to resolve
+        // ${workspaceFolder} in outFiles, sourceMapPathOverrides, etc.
+        // Critical for standalone DAP (non-VS Code) source map resolution.
+        try s.objectField("__workspaceFolder");
+        try s.write(dir);
+
+        // cwd: used as basePath for source map resolution
+        try s.objectField("cwd");
+        try s.write(dir);
+
+        // outFiles: ["<dir>/**/*.js", "!**/node_modules/**"]
+        try s.objectField("outFiles");
+        try s.beginArray();
+        try s.write(pattern);
+        try s.write("!**/node_modules/**");
+        try s.endArray();
+
+        // resolveSourceMapLocations: ["**", "!**/node_modules/**"]
+        try s.objectField("resolveSourceMapLocations");
+        try s.beginArray();
+        try s.write("**");
+        try s.write("!**/node_modules/**");
+        try s.endArray();
+
+        try s.endObject();
+
+        return aw.toOwnedSlice() catch return error.OutOfMemory;
+    }
+
     fn proxyRun(ctx: *anyopaque, allocator: std.mem.Allocator, action: RunAction, options: types.RunOptions) anyerror!StopState {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized) return error.NotInitialized;
 
-        // Build and send the appropriate DAP run command with options
-        const msg = try self.mapRunActionEx(allocator, action, options);
-        defer allocator.free(msg);
-        const resp = try self.sendRequest(allocator, msg);
-        allocator.free(resp);
+        if (self.child_config_deferred) {
+            // First continue after a deferred child session launch.
+            // Re-arm all tracked breakpoints as a final reconciliation before
+            // ending the configuration phase.  During the config phase, the user
+            // may have set and/or removed breakpoints — each operation sent a
+            // setBreakpoints request.  Re-arming ensures the adapter has the
+            // correct final set, guarding against any adapter-side confusion
+            // from multiple incremental updates during the config phase.
+            dapLog("[DAP proxyRun] Re-arming breakpoints before deferred configurationDone", .{});
+            self.rearmBreakpoints(allocator);
+
+            dapLog("[DAP proxyRun] Sending deferred configurationDone to start program", .{});
+            const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
+            defer allocator.free(cd_msg);
+            const cd_resp = try self.sendRequest(allocator, cd_msg);
+            allocator.free(cd_resp);
+            self.child_config_deferred = false;
+            // Don't send a separate continue — configurationDone starts the program.
+        } else {
+            // Normal case: send the appropriate DAP run command
+            const msg = try self.mapRunActionEx(allocator, action, options);
+            defer allocator.free(msg);
+            const resp = try self.sendRequest(allocator, msg);
+            allocator.free(resp);
+        }
 
         // Wait for a stopped or exited event
         // Try stopped first, fall back to exited
@@ -1863,7 +1963,9 @@ pub const DapProxy = struct {
         // Dupe strings onto self.allocator — the caller's slices point into
         // the JSON parse tree which is freed after this call returns.
         // Resolve symlinks (e.g. /tmp -> /private/tmp on macOS) so that the
-        // key matches what the DAP adapter uses internally.
+        // path matches what the DAP adapter uses internally (Node.js resolves
+        // symlinks when loading scripts, and vscode-js-debug uses the resolved
+        // paths for source map resolution).
         const resolved_file = resolvePath(self.allocator, file);
         const file_owned = if (resolved_file.ptr != file.ptr)
             resolved_file // already allocated by resolvePath
@@ -1892,8 +1994,14 @@ pub const DapProxy = struct {
         // Register for removal lookup (use the key that's in the hash map)
         try self.bp_registry.put(self.allocator, bp_id, .{ .file = gop.key_ptr.*, .line = line });
 
-        // If adapter is connected, send the DAP setBreakpoints request with conditions
-        if (self.initialized and self.transport != .none) {
+        // If adapter is connected and NOT in the deferred config phase, send
+        // the DAP setBreakpoints request immediately.  During the deferred
+        // config phase (child_config_deferred=true), we only update internal
+        // data structures — a single reconciliation setBreakpoints call is
+        // sent via rearmBreakpoints right before configurationDone in proxyRun.
+        // This avoids vscode-js-debug's breakpoint prediction getting confused
+        // by multiple incremental setBreakpoints replacements during config.
+        if (self.initialized and self.transport != .none and !self.child_config_deferred) {
             try self.sendFileBreakpoints(allocator, gop.key_ptr.*, gop.value_ptr.items);
         }
 
@@ -1920,7 +2028,12 @@ pub const DapProxy = struct {
         }
         const msg = try protocol.setBreakpointsRequestEx(allocator, self.nextSeq(), file, lines, options);
         defer allocator.free(msg);
-        const resp = self.sendRequest(allocator, msg) catch return;
+        dapLog("[DAP sendFileBreakpoints] Sending setBreakpoints for file={s} with {d} breakpoints", .{ file, bp_list.len });
+        const resp = try self.sendRequest(allocator, msg);
+        {
+            const log_len = @min(resp.len, 512);
+            dapLog("[DAP sendFileBreakpoints] Response[0..{d}]: {s}", .{ log_len, resp[0..log_len] });
+        }
         allocator.free(resp);
     }
 
@@ -1947,9 +2060,13 @@ pub const DapProxy = struct {
                 i += 1;
             }
 
-            // Re-send all remaining breakpoints for this file (with conditions)
-            if (self.initialized and self.transport != .none) {
-                self.sendFileBreakpoints(allocator, file, bp_list.items) catch {};
+            // Re-send all remaining breakpoints for this file (with conditions).
+            // Skip during deferred config phase — rearmBreakpoints handles it.
+            if (self.initialized and self.transport != .none and !self.child_config_deferred) {
+                dapLog("[DAP removeBreakpoint] Re-sending {d} remaining breakpoints for file={s}", .{ bp_list.items.len, file });
+                self.sendFileBreakpoints(allocator, file, bp_list.items) catch |err| {
+                    dapLog("[DAP removeBreakpoint] Failed to re-send breakpoints for file={s}: {any}", .{ file, err });
+                };
             }
         }
 
@@ -2284,10 +2401,10 @@ pub const DapProxy = struct {
             if (s == .bool and !s.bool) return error.NotSupported;
         }
 
-        const body = parsed.value.object.get("body") orelse return error.InvalidResponse;
-        if (body != .object) return error.InvalidResponse;
-        const data_val = body.object.get("data") orelse return error.InvalidResponse;
-        if (data_val != .string) return error.InvalidResponse;
+        const body = parsed.value.object.get("body") orelse return error.NotSupported;
+        if (body != .object) return error.NotSupported;
+        const data_val = body.object.get("data") orelse return error.NotSupported;
+        if (data_val != .string) return error.NotSupported;
 
         return try allocator.dupe(u8, data_val.string);
     }
@@ -2503,11 +2620,8 @@ pub const DapProxy = struct {
         if (!self.initialized or self.transport == .none) return error.NotSupported;
         if (!self.adapter_capabilities.supports_goto_targets) return error.NotSupported;
 
-        const resolved = resolvePath(allocator, file);
-        defer if (resolved.ptr != file.ptr) allocator.free(resolved);
-
         // 1. Get goto targets for the file:line
-        const targets_msg = try protocol.gotoTargetsRequest(allocator, self.nextSeq(), resolved, @intCast(line), null);
+        const targets_msg = try protocol.gotoTargetsRequest(allocator, self.nextSeq(), file, @intCast(line), null);
         defer allocator.free(targets_msg);
         const targets_resp = try self.sendRequest(allocator, targets_msg);
         defer allocator.free(targets_resp);
@@ -3031,10 +3145,8 @@ pub const DapProxy = struct {
         if (!self.initialized or self.transport == .none) return error.NotSupported;
         if (!self.adapter_capabilities.supports_breakpoint_locations) return error.NotSupported;
 
-        const resolved = resolvePath(allocator, file);
-        defer if (resolved.ptr != file.ptr) allocator.free(resolved);
         const el: ?i64 = if (end_line) |e| @intCast(e) else null;
-        const msg = try protocol.breakpointLocationsRequest(allocator, self.nextSeq(), resolved, @intCast(line), el, null, null);
+        const msg = try protocol.breakpointLocationsRequest(allocator, self.nextSeq(), file, @intCast(line), el, null, null);
         defer allocator.free(msg);
         const resp = try self.sendRequest(allocator, msg);
         defer allocator.free(resp);
@@ -3246,8 +3358,12 @@ pub const DapProxy = struct {
             allocator.free(init_event);
 
             // 5d. Re-arm all breakpoints during the configuration phase.
+            // For child-session adapters, skip — the parent doesn't do the
+            // debugging; connectChildSession() re-arms on the child instead.
             self.initialized = true;
-            self.rearmBreakpoints(allocator);
+            if (!cfg.child_sessions.enabled) {
+                self.rearmBreakpoints(allocator);
+            }
 
             // 5e. Send configurationDone to complete the init handshake.
             const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
@@ -3367,9 +3483,7 @@ pub const DapProxy = struct {
         if (!self.initialized or self.transport == .none) return error.NotSupported;
         if (!self.adapter_capabilities.supports_goto_targets) return error.NotSupported;
 
-        const resolved = resolvePath(allocator, file);
-        defer if (resolved.ptr != file.ptr) allocator.free(resolved);
-        const msg = try protocol.gotoTargetsRequest(allocator, self.nextSeq(), resolved, @intCast(line), null);
+        const msg = try protocol.gotoTargetsRequest(allocator, self.nextSeq(), file, @intCast(line), null);
         defer allocator.free(msg);
         const resp = try self.sendRequest(allocator, msg);
         defer allocator.free(resp);
