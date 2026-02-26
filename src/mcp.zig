@@ -151,6 +151,13 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
 
     const stdin = std.fs.File.stdin();
 
+    // Thread-safe stdout writer shared by all handler threads
+    var stdout_mutex: std.Thread.Mutex = .{};
+    const stdout_writer = StdoutWriter{
+        .file = std.fs.File.stdout(),
+        .mutex = &stdout_mutex,
+    };
+
     var input_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer input_buf.deinit(allocator);
 
@@ -205,14 +212,21 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         try input_buf.appendSlice(allocator, read_buf[0..n]);
 
         while (try nextMessageFromBuffer(allocator, &input_buf)) |msg| {
-            defer allocator.free(msg);
-            processMessage(&runtime, msg) catch |err| {
-                logErr("MCP processMessage error: ", err);
-                if (err == error.WriteFailure) {
-                    shutdown_requested.store(true, .release);
-                    break;
-                }
+            // Spawn a handler thread per message for concurrent processing.
+            // The thread owns `msg` and frees it when done.
+            const thread = std.Thread.spawn(.{}, handleRequest, .{ &runtime, msg, stdout_writer }) catch {
+                // If we can't spawn a thread, process inline as fallback
+                defer allocator.free(msg);
+                processMessage(&runtime, msg, stdout_writer) catch |err| {
+                    logErr("MCP processMessage error: ", err);
+                    if (err == error.WriteFailure) {
+                        shutdown_requested.store(true, .release);
+                        break;
+                    }
+                };
+                continue;
             };
+            thread.detach();
         }
     }
 
@@ -334,9 +348,19 @@ fn nextMessageFromBuffer(allocator: std.mem.Allocator, input: *std.ArrayListUnma
     return null;
 }
 
-fn processMessage(runtime: *Runtime, line: []const u8) !void {
+/// Handler thread entry point. Owns `msg` and frees it when done.
+fn handleRequest(runtime: *Runtime, msg: []const u8, stdout: StdoutWriter) void {
+    defer runtime.allocator.free(msg);
+    processMessage(runtime, msg, stdout) catch |err| {
+        logErr("MCP processMessage error: ", err);
+        if (err == error.WriteFailure) {
+            shutdown_requested.store(true, .release);
+        }
+    };
+}
+
+fn processMessage(runtime: *Runtime, line: []const u8, stdout: StdoutWriter) !void {
     const allocator = runtime.allocator;
-    const stdout = std.fs.File.stdout();
     debugLogBytes(">>> RECV: ", line);
 
     const parsed = json.parseFromSlice(json.Value, allocator, line, .{}) catch {
@@ -428,6 +452,27 @@ fn processMessage(runtime: *Runtime, line: []const u8) !void {
     }
 }
 
+// ── Stdout Writer ───────────────────────────────────────────────────────
+//
+// Thread-safe wrapper around stdout that serializes all JSON-RPC response
+// writes through a mutex. Shared across all handler threads.
+
+const StdoutWriter = struct {
+    file: std.fs.File,
+    mutex: *std.Thread.Mutex,
+
+    fn writeResponse(self: StdoutWriter, data: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        debugLogBytes("<<< SEND: ", data);
+        var buf: [8192]u8 = undefined;
+        var w = self.file.writerStreaming(&buf);
+        w.interface.writeAll(data) catch return error.WriteFailure;
+        w.interface.writeAll("\n") catch return error.WriteFailure;
+        w.interface.flush() catch return error.WriteFailure;
+    }
+};
+
 // ── ReplyOnce Guard ─────────────────────────────────────────────────────
 //
 // Guarantees that every MCP request receives exactly one JSON-RPC response.
@@ -438,11 +483,11 @@ fn processMessage(runtime: *Runtime, line: []const u8) !void {
 const ReplyOnce = struct {
     allocator: std.mem.Allocator,
     id: ?json.Value,
-    stdout: std.fs.File,
+    stdout: StdoutWriter,
     responded: bool = false,
     is_notification: bool = false,
 
-    fn init(allocator: std.mem.Allocator, id: ?json.Value, stdout: std.fs.File) ReplyOnce {
+    fn init(allocator: std.mem.Allocator, id: ?json.Value, stdout: StdoutWriter) ReplyOnce {
         return .{
             .allocator = allocator,
             .id = id,
@@ -480,7 +525,7 @@ const ReplyOnce = struct {
     fn sendRaw(self: *ReplyOnce, data: []const u8) !void {
         if (self.responded) return;
         self.responded = true;
-        try writeResponse(self.stdout, data);
+        try self.stdout.writeResponse(data);
     }
 
     /// Send a -32603 internal error. Used by catch blocks in processMessage.
@@ -1383,7 +1428,7 @@ fn writeId(s: *Stringify, id: ?json.Value) !void {
     }
 }
 
-fn writeToolResult(allocator: std.mem.Allocator, id: ?json.Value, content: []const u8, stdout: std.fs.File) !void {
+fn writeToolResult(allocator: std.mem.Allocator, id: ?json.Value, content: []const u8, stdout: StdoutWriter) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -1408,10 +1453,10 @@ fn writeToolResult(allocator: std.mem.Allocator, id: ?json.Value, content: []con
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try stdout.writeResponse(result);
 }
 
-fn writeToolError(allocator: std.mem.Allocator, id: ?json.Value, message: []const u8, stdout: std.fs.File) !void {
+fn writeToolError(allocator: std.mem.Allocator, id: ?json.Value, message: []const u8, stdout: StdoutWriter) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -1438,10 +1483,10 @@ fn writeToolError(allocator: std.mem.Allocator, id: ?json.Value, message: []cons
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
+    try stdout.writeResponse(result);
 }
 
-fn writeError(allocator: std.mem.Allocator, id: ?json.Value, code: i32, message: []const u8, stdout: std.fs.File) !void {
+fn writeError(allocator: std.mem.Allocator, id: ?json.Value, code: i32, message: []const u8, stdout: StdoutWriter) !void {
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -1461,17 +1506,7 @@ fn writeError(allocator: std.mem.Allocator, id: ?json.Value, code: i32, message:
 
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
-    try writeResponse(stdout, result);
-}
-
-fn writeResponse(stdout: std.fs.File, data: []const u8) !void {
-    debugLogBytes("<<< SEND: ", data);
-    // MCP stdio transport: write bare JSON followed by newline.
-    var buf: [8192]u8 = undefined;
-    var w = stdout.writerStreaming(&buf);
-    w.interface.writeAll(data) catch return error.WriteFailure;
-    w.interface.writeAll("\n") catch return error.WriteFailure;
-    w.interface.flush() catch return error.WriteFailure;
+    try stdout.writeResponse(result);
 }
 
 fn logErr(prefix: []const u8, err: anyerror) void {

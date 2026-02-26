@@ -129,9 +129,10 @@ pub const DaemonServer = struct {
 
         var iter = self.server.session_manager.sessions.iterator();
         while (iter.next()) |entry| {
+            const session = entry.value_ptr.*;
             // Check per-session idle timeout
-            if (entry.value_ptr.last_activity > 0 and
-                now - entry.value_ptr.last_activity > self.session_idle_timeout_ms)
+            if (session.last_activity > 0 and
+                now - session.last_activity > self.session_idle_timeout_ms)
             {
                 const id_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
                 ids.append(self.allocator, id_copy) catch {
@@ -142,8 +143,8 @@ pub const DaemonServer = struct {
             }
 
             // Check orphaned owner process
-            if (entry.value_ptr.orphan_action == .none) continue;
-            const owner_pid = entry.value_ptr.owner_pid orelse continue;
+            if (session.orphan_action == .none) continue;
+            const owner_pid = session.owner_pid orelse continue;
             if (!isProcessAlive(owner_pid)) {
                 const id_copy = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
                 ids.append(self.allocator, id_copy) catch {
@@ -154,8 +155,8 @@ pub const DaemonServer = struct {
         }
 
         for (ids.items) |id| {
-            // Use sessions.getPtr directly to avoid updating last_activity
-            if (self.server.session_manager.sessions.getPtr(id)) |session| {
+            // Use sessions.get directly to avoid updating last_activity
+            if (self.server.session_manager.sessions.get(id)) |session| {
                 switch (session.orphan_action) {
                     .terminate => {
                         session.driver.stop(self.allocator) catch {
