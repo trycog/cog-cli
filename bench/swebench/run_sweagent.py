@@ -42,10 +42,14 @@ def _patched_get_swerex_start_cmd(self, token):
     if self._config.python_standalone_dir:
         # Standalone Python path — use original logic
         return _original_get_swerex_start_cmd(self, token)
-    # Try swerex-remote directly, fall back to pip install + run
+    # Try swerex-remote directly, fall back to pip install + run.
+    # SWE-bench Pro images have pip configured to use a local PyPI mirror
+    # (127.0.0.1:9876) that doesn't exist outside the evaluation harness,
+    # so we must override the index URL to use real PyPI.
     cmd = (
         f"{REMOTE_EXECUTABLE_NAME} {rex_args} || "
-        f"(python3 -m pip install -q {PACKAGE_NAME} && {REMOTE_EXECUTABLE_NAME} {rex_args})"
+        f"(python3 -m pip install --index-url https://pypi.org/simple/ -q {PACKAGE_NAME} "
+        f"&& {REMOTE_EXECUTABLE_NAME} {rex_args})"
     )
     return ["/bin/bash", "-c", cmd]
 
