@@ -131,6 +131,8 @@ instances:
     python_standalone_dir: ""
     # SWE-bench Pro images are amd64; needed for Apple Silicon hosts
     platform: linux/amd64
+    # pip install swe-rex under emulation can take a while
+    startup_timeout: 600
     # Clear the image ENTRYPOINT (/bin/bash) so SWE-ReX's explicit
     # /bin/bash -c '...' command works without double-bash invocation
     docker_args:
