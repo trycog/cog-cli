@@ -117,21 +117,58 @@ Passwords, API keys, tokens, secrets, SSH/PGP keys, certificates, connection str
 <cog:debug>
 ## Debugger
 
-When you need to inspect runtime state to diagnose a bug, use the debugger instead of print/log statements.
+Use the debugger to inspect runtime state instead of print/log statements.
 
-### Strategies
+### When to Use
 
-**Exception-first** — for crashes. Set exception breakpoint → run → inspect stack trace and variables at crash site.
+- **YES:** Wrong output, wrong return value, crash with unclear stack, state mutation bugs, concurrency issues
+- **NO:** Syntax errors, import errors, missing dependencies, config/env issues — read the error message instead
 
-**Hypothesis-first** — for wrong output. Formulate hypothesis → set targeted breakpoints → run → inspect to confirm or refute.
+### Core Tools
 
-### Loop
+These 6 tools cover 95% of debugging workflows:
 
-Launch → Set breakpoints → Run → Inspect (stack, scopes, expressions) → Decide (diagnose or continue) → Stop → Fix source
+| Tool | Purpose |
+|------|---------|
+| `cog_debug_launch` | Start debug session (returns session_id) |
+| `cog_debug_breakpoint` | Set/remove/list breakpoints (line, function, conditional) |
+| `cog_debug_run` | continue, step_over, step_into, step_out |
+| `cog_debug_inspect` | Evaluate expressions, list scope variables |
+| `cog_debug_stacktrace` | View call stack with frame IDs |
+| `cog_debug_stop` | End session (always call when done) |
 
-### Notes
+### Hypothesis-Driven Workflow
 
-- `cog_debug_capabilities` after launch checks mutation support. Mutation is for diagnosis only — always fix source code.
-- Session timeout: relaunch and restore breakpoints/watchpoints.
-- Always `cog_debug_stop` when done.
+You MUST state a hypothesis before using any debug tool.
+
+1. **Observe** — Run the failing test or reproduce the error. Read the traceback and relevant source.
+2. **Hypothesize** — State: "I believe [X] because [Y]. I expect [variable] to be [expected] at [location]." Do this BEFORE calling any `cog_debug_*` tool.
+3. **Design experiment** — Decide where to set breakpoints and what expressions to evaluate. What would confirm vs refute the hypothesis?
+4. **Execute** — `launch` → `breakpoint` → `run` (continue) → `inspect`. Quote the actual values observed.
+5. **Interpret** — Compare observed values to your prediction. Either diagnose the root cause or refine the hypothesis and repeat from step 3.
+6. **Fix** — `stop` the debugger, apply the minimal source fix, verify with the test.
+
+### Conditional Breakpoints
+
+Use the `condition` parameter when a breakpoint is inside a loop or called multiple times. This pauses only when the condition is true, saving massive context vs hitting the same line repeatedly.
+
+```
+cog_debug_breakpoint(session_id, action="set", file="app.py", line=42, condition="user_id is None")
+```
+
+### Anti-Patterns
+
+- Do NOT `step_over` repeatedly without inspecting — always have a reason for each step
+- Do NOT launch a debug session without a hypothesis — aimless stepping wastes tokens
+- Do NOT inspect every variable in scope — target specific expressions tied to your hypothesis
+- Do NOT use exception breakpoints in Python/pytest — pytest catches all exceptions internally
+- Do NOT add print statements when you have the debugger — use `cog_debug_inspect` instead
+
+### Bailout Rule
+
+If 2 debug sessions have not found the root cause, stop. Summarize what you observed and reason from the evidence. Do NOT launch a 3rd session without a genuinely different hypothesis.
+
+### Cleanup
+
+Always `cog_debug_stop` when done. On session timeout, relaunch and restore breakpoints.
 </cog:debug>
