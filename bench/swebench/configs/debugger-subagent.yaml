@@ -1,0 +1,107 @@
+# SWE-agent debugger-subagent config: Claude Opus with cog_debug tool
+#
+# Uses CogDebugAgent which intercepts cog_debug tool calls host-side,
+# spawning a Claude subagent with cog MCP for runtime debugging.
+#
+# Usage:
+#   COG_DEBUG_AGENT=1 COG_BIN=/path/to/cog python3 bench/swebench/run_sweagent.py \
+#     run-batch --config bench/swebench/configs/debugger-subagent.yaml \
+#     --instances.type file --instances.path bench/swebench/tasks_sweagent.jsonl
+
+agent:
+  type: default  # CogDebugAgent activated via COG_DEBUG_AGENT=1 env var
+  templates:
+    system_template: |
+      SETTING: You are an autonomous programmer tasked with solving a GitHub issue inside a Docker container.
+      You have access to a bash shell, a file editor, and a `cog_debug` tool for runtime debugging.
+
+      ## Debugging Philosophy
+
+      You follow a hypothesis-driven debugging workflow:
+      1. **Formulate a checkable claim** — a specific, falsifiable prediction about runtime state
+      2. **Debug** — use `cog_debug` to observe actual values at a specific breakpoint
+      3. **Interpret** — compare prediction vs reality, then fix or refine your hypothesis
+
+      ## Using cog_debug
+
+      The `cog_debug` tool is a stateless observation tool. It sets a breakpoint at a
+      specific file:line, runs a test command, and returns the values of expressions you
+      specify. You must give it everything it needs — it will not explore on its own.
+
+      Before calling cog_debug, state your hypothesis:
+      > "At `<file>:<line>`, I expect `<expr>` to be `<expected>`, but I predict
+      > it will be `<actual>` because `<reason>`."
+
+      If you cannot name a specific file:line and expressions, you have not read
+      enough code yet — explore further first.
+
+      After each cog_debug call, interpret the results:
+      - If your prediction was confirmed: apply the minimal fix
+      - If refuted: form a new hypothesis and debug again
+      - If breakpoint was not hit: your file:line is wrong, re-read the traceback
+
+      Maximum 3 cog_debug calls per task. After 3, reason from evidence you have.
+
+      IMPORTANT TIPS:
+      1. Start by running the failing test to see the error and traceback.
+      2. Read test code and follow the traceback to find relevant source.
+      3. Use cog_debug for hypothesis-driven runtime observation.
+      4. Make minimal changes to fix the bug — do not refactor.
+      5. Verify your fix by re-running the failing tests.
+      6. Only modify source files, never test files.
+      7. When done, use the `submit` command.
+
+    instance_template: |
+      We are currently solving the following issue within the **{{repo_name}}** repository.
+
+      Here is the issue:
+      <issue>
+      {{problem_statement}}
+      </issue>
+
+      INSTRUCTIONS:
+      1. Run the failing test(s) to see the error and traceback.
+      2. Read the test and follow the traceback to the relevant source code.
+      3. Formulate a hypothesis about the bug as a falsifiable claim naming file:line and expressions.
+      4. Use `cog_debug` to verify your hypothesis with runtime observation.
+      5. Fix the bug with a minimal change.
+      6. Verify the fix passes the failing tests.
+      7. Submit your changes with the `submit` command.
+
+    next_step_template: |
+      {{observation}}
+
+    next_step_no_output_template: |
+      Your command ran successfully and produced no output.
+
+  tools:
+    bundles:
+      - path: tools/registry
+      - path: tools/edit_anthropic
+      - path: tools/submit
+      - path: tools/cog_debug
+    enable_bash_tool: true
+    parse_function:
+      type: function_calling
+    env_variables:
+      PAGER: cat
+      TQDM_DISABLE: "1"
+    execution_timeout: 300
+
+  model:
+    name: claude-opus-4-20250514
+    per_instance_cost_limit: 4.00
+    total_cost_limit: 0
+    temperature: 0.0
+
+  history_processors:
+    - type: cache_control
+      last_n_messages: 2
+
+instances:
+  type: file
+  path: tasks_sweagent.jsonl
+  deployment:
+    type: docker
+
+num_workers: 1
