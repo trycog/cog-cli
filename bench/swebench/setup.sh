@@ -183,7 +183,41 @@ for i, task in enumerate(tasks):
                 f.write(new_content)
             print(f"    Sanitized addopts in pyproject.toml")
 
+    # ── Configure .claude/settings.json ──────────────────────────────
+    # Must be created BEFORE the swebench-base commit so git clean -fd
+    # during reset_workspace doesn't wipe it.
+    claude_dir = os.path.join(task_dir, '.claude')
+    os.makedirs(claude_dir, exist_ok=True)
+    with open(os.path.join(claude_dir, 'settings.json'), 'w') as f:
+        f.write(settings_json)
+
+    # ── Install cog-debug agent file ──────────────────────────────────
+    agents_dir = os.path.join(claude_dir, 'agents')
+    os.makedirs(agents_dir, exist_ok=True)
+    debug_agent_header = """\
+---
+name: cog-debug
+description: Stateless debug observation tool — takes exact breakpoint coordinates and returns runtime values
+tools:
+  - mcp__cog__cog_debug_launch
+  - mcp__cog__cog_debug_breakpoint
+  - mcp__cog__cog_debug_run
+  - mcp__cog__cog_debug_inspect
+  - mcp__cog__cog_debug_stacktrace
+  - mcp__cog__cog_debug_stop
+mcpServers:
+  - cog
+maxTurns: 10
+---
+"""
+    debug_agent_body_path = os.path.join(script_dir, '..', '..', 'priv', 'agents', 'cog-debug.md')
+    with open(debug_agent_body_path) as f:
+        debug_agent_body = f.read()
+    with open(os.path.join(agents_dir, 'cog-debug.md'), 'w') as f:
+        f.write(debug_agent_header + debug_agent_body)
+
     # ── Commit to swebench-base branch ───────────────────────────────
+    # Done AFTER .claude/ setup so git clean -fd during reset preserves it.
     print(f"    Creating swebench-base branch...")
     subprocess.run(
         ['git', 'checkout', '-B', 'swebench-base'],
@@ -199,37 +233,6 @@ for i, task in enumerate(tasks):
         env={**os.environ, 'GIT_AUTHOR_NAME': 'swebench', 'GIT_AUTHOR_EMAIL': 'bench@cog',
              'GIT_COMMITTER_NAME': 'swebench', 'GIT_COMMITTER_EMAIL': 'bench@cog'}
     )
-
-    # ── Configure .claude/settings.json ──────────────────────────────
-    claude_dir = os.path.join(task_dir, '.claude')
-    os.makedirs(claude_dir, exist_ok=True)
-    with open(os.path.join(claude_dir, 'settings.json'), 'w') as f:
-        f.write(settings_json)
-
-    # ── Install cog-debug agent file ──────────────────────────────────
-    agents_dir = os.path.join(claude_dir, 'agents')
-    os.makedirs(agents_dir, exist_ok=True)
-    debug_agent_header = """\
----
-name: cog-debug
-description: Debug subagent that inspects runtime state via cog debugger tools
-tools:
-  - mcp__cog__cog_debug_launch
-  - mcp__cog__cog_debug_breakpoint
-  - mcp__cog__cog_debug_run
-  - mcp__cog__cog_debug_inspect
-  - mcp__cog__cog_debug_stacktrace
-  - mcp__cog__cog_debug_stop
-mcpServers:
-  - cog
-maxTurns: 6
----
-"""
-    debug_agent_body_path = os.path.join(script_dir, '..', '..', 'priv', 'agents', 'cog-debug.md')
-    with open(debug_agent_body_path) as f:
-        debug_agent_body = f.read()
-    with open(os.path.join(agents_dir, 'cog-debug.md'), 'w') as f:
-        f.write(debug_agent_header + debug_agent_body)
 
     print(f"    Done")
 
