@@ -22,7 +22,7 @@ Run the failing test(s) to see the error and traceback. Read the test code and f
 ### 2. Formulate a checkable claim
 Before delegating, state your hypothesis as a concrete, falsifiable prediction about runtime state:
 
-> "At `{file}:{line}`, I expect `{expr}` to be `{expected}`, but I predict it will be `{actual}` because `{reason}`."
+> "At `<file>:<line>`, I expect `<expr>` to be `<expected>`, but I predict it will be `<actual>` because `<reason>`."
 
 This claim must name a specific file:line and specific expression(s). If you cannot name both, you have not read enough code yet — go back to step 1.
 
@@ -31,9 +31,9 @@ The `cog-debug` subagent is a stateless observation tool. It takes exact coordin
 
 ```
 Task(
-  prompt="BREAKPOINT: {file}:{line}
-INSPECT: {expr1}, {expr2}
-TEST: {command to run the failing test}",
+  prompt="BREAKPOINT: <file>:<line>
+INSPECT: <expr1>, <expr2>
+TEST: <command to run the failing test>",
   subagent_type="cog-debug"
 )
 ```
@@ -41,9 +41,9 @@ TEST: {command to run the failing test}",
 To add a condition (e.g. to skip loop iterations):
 ```
 Task(
-  prompt="BREAKPOINT: {file}:{line} WHEN {condition}
-INSPECT: {expr1}, {expr2}
-TEST: {command}",
+  prompt="BREAKPOINT: <file>:<line> WHEN <condition>
+INSPECT: <expr1>, <expr2>
+TEST: <command>",
   subagent_type="cog-debug"
 )
 ```
