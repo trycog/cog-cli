@@ -126,5 +126,8 @@ instances:
   path: tasks_sweagent.jsonl
   deployment:
     type: docker
+    # SWE-bench Pro images already have Python; skip standalone install
+    # (the default tries to build a standalone Python which fails on arm64)
+    python_standalone_dir: null
 
 num_workers: 1
