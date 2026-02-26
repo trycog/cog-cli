@@ -22,7 +22,7 @@ fi
 echo "Found $count result files in .bench/"
 
 # Check for SWE-bench evaluation results
-for variant in baseline debugger; do
+for variant in baseline debugger debugger-lite; do
   report="$RESULTS_DIR/$variant/results.json"
   if [[ -f "$report" ]]; then
     echo "Found SWE-bench eval results for $variant"
@@ -36,6 +36,9 @@ import json, glob, os, sys
 bench_dir = '$BENCH_DIR'
 results_dir = '$RESULTS_DIR'
 tasks_json = '$TASKS_JSON'
+
+ALL_VARIANTS = ['baseline', 'debugger', 'debugger-lite']
+DEBUG_VARIANTS = ['debugger', 'debugger-lite']
 
 # Load task definitions
 with open(tasks_json) as f:
@@ -55,7 +58,7 @@ for f_path in sorted(glob.glob(os.path.join(bench_dir, '*.json'))):
 
 # Load SWE-bench evaluation results (resolved instance IDs)
 resolved = {}  # variant -> set of resolved instance_ids
-for variant in ['baseline', 'debugger']:
+for variant in ALL_VARIANTS:
     resolved[variant] = set()
     # Try multiple result file locations
     for fname in ['results.json', 'report.json']:
@@ -71,6 +74,26 @@ for variant in ['baseline', 'debugger']:
             except Exception as e:
                 print(f'  warning: could not parse {report_path}: {e}', file=sys.stderr)
 
+def build_variant_data(m, is_resolved, is_debug=False):
+    \"\"\"Build per-task data for a variant from its metrics dict.\"\"\"
+    d = {
+        'cost_usd': m.get('cost_usd', 0),
+        'duration_ms': m.get('duration_ms', 0),
+        'num_turns': m.get('num_turns', 0),
+        'input_tokens': m.get('input_tokens', 0),
+        'output_tokens': m.get('output_tokens', 0),
+        'has_patch': m.get('has_patch', False),
+        'patch_size': m.get('patch_size', 0),
+        'resolved': is_resolved,
+        'timeout': m.get('timeout', False),
+    }
+    if is_debug:
+        d['debug_tool_calls'] = m.get('debug_tool_calls', 0)
+        d['sessions_launched'] = m.get('sessions_launched', 0)
+        d['breakpoints_set'] = m.get('breakpoints_set', 0)
+        d['conditional_breakpoints'] = m.get('conditional_breakpoints', 0)
+    return d
+
 # Build per-task results
 task_results = []
 for task in tasks:
@@ -79,78 +102,74 @@ for task in tasks:
 
     baseline = metrics.get((iid, 'baseline'), {})
     debugger = metrics.get((iid, 'debugger'), {})
+    debugger_lite = metrics.get((iid, 'debugger-lite'), {})
 
-    b_resolved = iid in resolved.get('baseline', set())
-    d_resolved = iid in resolved.get('debugger', set())
-
-    task_results.append({
+    entry = {
         'instance_id': iid,
         'repo': repo,
-        'baseline': {
-            'cost_usd': baseline.get('cost_usd', 0),
-            'duration_ms': baseline.get('duration_ms', 0),
-            'num_turns': baseline.get('num_turns', 0),
-            'input_tokens': baseline.get('input_tokens', 0),
-            'output_tokens': baseline.get('output_tokens', 0),
-            'has_patch': baseline.get('has_patch', False),
-            'patch_size': baseline.get('patch_size', 0),
-            'resolved': b_resolved,
-            'timeout': baseline.get('timeout', False),
-        },
-        'debugger': {
-            'cost_usd': debugger.get('cost_usd', 0),
-            'duration_ms': debugger.get('duration_ms', 0),
-            'num_turns': debugger.get('num_turns', 0),
-            'input_tokens': debugger.get('input_tokens', 0),
-            'output_tokens': debugger.get('output_tokens', 0),
-            'has_patch': debugger.get('has_patch', False),
-            'patch_size': debugger.get('patch_size', 0),
-            'resolved': d_resolved,
-            'timeout': debugger.get('timeout', False),
-            'debug_tool_calls': debugger.get('debug_tool_calls', 0),
-        },
-    })
+        'baseline': build_variant_data(baseline, iid in resolved['baseline']),
+        'debugger': build_variant_data(debugger, iid in resolved['debugger'], is_debug=True),
+        'debugger_lite': build_variant_data(debugger_lite, iid in resolved['debugger-lite'], is_debug=True),
+    }
+    task_results.append(entry)
 
-# Compute aggregates
-b_resolved_count = sum(1 for t in task_results if t['baseline']['resolved'])
-d_resolved_count = sum(1 for t in task_results if t['debugger']['resolved'])
-b_total_tokens = sum(t['baseline']['input_tokens'] + t['baseline']['output_tokens'] for t in task_results)
-d_total_tokens = sum(t['debugger']['input_tokens'] + t['debugger']['output_tokens'] for t in task_results)
-b_total_cost = sum(t['baseline']['cost_usd'] for t in task_results)
-d_total_cost = sum(t['debugger']['cost_usd'] for t in task_results)
-b_ran = sum(1 for t in task_results if t['baseline']['cost_usd'] > 0 or t['baseline'].get('timeout'))
-d_ran = sum(1 for t in task_results if t['debugger']['cost_usd'] > 0 or t['debugger'].get('timeout'))
+# Compute aggregates per variant
+def aggregate(tasks, key):
+    ran = sum(1 for t in tasks if t[key]['cost_usd'] > 0 or t[key].get('timeout'))
+    resolved_count = sum(1 for t in tasks if t[key]['resolved'])
+    total_tokens = sum(t[key]['input_tokens'] + t[key]['output_tokens'] for t in tasks)
+    total_cost = sum(t[key]['cost_usd'] for t in tasks)
+    return ran, resolved_count, total_tokens, total_cost
+
+b_ran, b_resolved_count, b_total_tokens, b_total_cost = aggregate(task_results, 'baseline')
+d_ran, d_resolved_count, d_total_tokens, d_total_cost = aggregate(task_results, 'debugger')
+dl_ran, dl_resolved_count, dl_total_tokens, dl_total_cost = aggregate(task_results, 'debugger_lite')
 
 # Debugger advantage: tasks resolved by debugger but not baseline
 advantage = sum(1 for t in task_results if t['debugger']['resolved'] and not t['baseline']['resolved'])
 disadvantage = sum(1 for t in task_results if t['baseline']['resolved'] and not t['debugger']['resolved'])
+dl_advantage = sum(1 for t in task_results if t['debugger_lite']['resolved'] and not t['baseline']['resolved'])
+dl_disadvantage = sum(1 for t in task_results if t['baseline']['resolved'] and not t['debugger_lite']['resolved'])
 
 d_used_tools = sum(1 for t in task_results if t['debugger'].get('debug_tool_calls', 0) > 0)
 d_no_tools = sum(1 for t in task_results if t['debugger']['cost_usd'] > 0 and t['debugger'].get('debug_tool_calls', 0) == 0)
+dl_used_tools = sum(1 for t in task_results if t['debugger_lite'].get('debug_tool_calls', 0) > 0)
+dl_no_tools = sum(1 for t in task_results if t['debugger_lite']['cost_usd'] > 0 and t['debugger_lite'].get('debug_tool_calls', 0) == 0)
 
 data = {
     'total_tasks': len(tasks),
     'baseline_ran': b_ran,
     'debugger_ran': d_ran,
+    'debugger_lite_ran': dl_ran,
     'baseline_resolved': b_resolved_count,
     'debugger_resolved': d_resolved_count,
+    'debugger_lite_resolved': dl_resolved_count,
     'debugger_advantage': advantage,
     'debugger_disadvantage': disadvantage,
+    'debugger_lite_advantage': dl_advantage,
+    'debugger_lite_disadvantage': dl_disadvantage,
     'baseline_total_tokens': b_total_tokens,
     'debugger_total_tokens': d_total_tokens,
+    'debugger_lite_total_tokens': dl_total_tokens,
     'baseline_total_cost': round(b_total_cost, 2),
     'debugger_total_cost': round(d_total_cost, 2),
+    'debugger_lite_total_cost': round(dl_total_cost, 2),
     'debugger_used_tools': d_used_tools,
     'debugger_no_tools': d_no_tools,
+    'debugger_lite_used_tools': dl_used_tools,
+    'debugger_lite_no_tools': dl_no_tools,
     'tasks': task_results,
 }
 
 print('const SWEBENCH_DATA = ' + json.dumps(data, indent=2) + ';')
-print(f'Collected {len(task_results)} tasks ({b_ran} baseline, {d_ran} debugger runs)', file=sys.stderr)
-print(f'Resolved: baseline={b_resolved_count}, debugger={d_resolved_count} (advantage: +{advantage}, -{disadvantage})', file=sys.stderr)
-print(f'Debugger tool usage: {d_used_tools} used tools, {d_no_tools} did NOT use tools', file=sys.stderr)
+print(f'Collected {len(task_results)} tasks ({b_ran} baseline, {d_ran} debugger, {dl_ran} debugger-lite runs)', file=sys.stderr)
+print(f'Resolved: baseline={b_resolved_count}, debugger={d_resolved_count}, debugger-lite={dl_resolved_count}', file=sys.stderr)
+print(f'Debugger advantage: +{advantage}/-{disadvantage}  Debugger-lite advantage: +{dl_advantage}/-{dl_disadvantage}', file=sys.stderr)
+print(f'Debugger tool usage: {d_used_tools} used, {d_no_tools} skipped  |  Lite: {dl_used_tools} used, {dl_no_tools} skipped', file=sys.stderr)
 if d_no_tools > 0:
     print(f'WARNING: {d_no_tools} debugger runs completed without using any cog_debug tools', file=sys.stderr)
+if dl_no_tools > 0:
+    print(f'WARNING: {dl_no_tools} debugger-lite runs completed without using any cog_debug tools', file=sys.stderr)
 ")
 
 # Replace the data block between markers in dashboard.html
