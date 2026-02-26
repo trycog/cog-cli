@@ -1,0 +1,69 @@
+You are diagnosing and fixing a real bug in the {repo} repository (instance: {instance_id}).
+
+The repository is checked out in the current directory at the buggy commit. A test patch has been applied that adds failing tests which expose the bug.
+
+## MANDATORY: Use the cog debugger
+
+You MUST use the cog debugger MCP tools to diagnose this bug. Do NOT skip the debugger. Do NOT just read the code and guess the fix. You are required to launch a debug session, set breakpoints, and inspect runtime state before making any code changes.
+
+## Problem Statement
+
+{problem_statement}
+
+## Failing Test(s)
+
+{fail_to_pass}
+
+These tests currently FAIL. Your goal is to fix the source code so they pass.
+
+## Required Workflow
+
+1. Read the failing test to understand what it does and find the relevant source code
+2. Determine how to run the failing test (see "Launching the debugger" below)
+3. Set breakpoints on the SOURCE code (not the test) at the suspected bug location
+4. Run to breakpoint, inspect variables to confirm the root cause
+5. Stop the debugger, apply the fix, verify with Bash
+
+## Tool Reference
+
+| Tool | Purpose | Key args |
+|------|---------|----------|
+| `mcp__cog__cog_debug_launch` | Start debug session | program or module, args, cwd |
+| `mcp__cog__cog_debug_breakpoint` | Set breakpoint | action: "set", file, line |
+| `mcp__cog__cog_debug_run` | Continue/step | action: "continue" / "step_over" / "step_into" / "step_out" |
+| `mcp__cog__cog_debug_inspect` | Evaluate expression | expression: any Python expression |
+| `mcp__cog__cog_debug_stacktrace` | View call stack | (no required args) |
+| `mcp__cog__cog_debug_stop` | End session | (no required args) |
+
+## Launching the debugger
+
+First check how the project runs tests. Look for `runtests.py`, `manage.py`, `tox.ini`, or similar. Different projects need different launch approaches:
+
+**Standard pytest projects** — use `module`:
+```
+cog_debug_launch(module="pytest", args=["tests/test_file.py::test_name", "-xvs"])
+```
+
+**Django** — use the project's test runner script as `program`:
+```
+cog_debug_launch(program="tests/runtests.py", args=["--settings=test_sqlite", "test_module"], cwd="/path/to/repo")
+```
+
+**Custom test scripts** — use the script as `program`:
+```
+cog_debug_launch(program="path/to/test_script.py", args=[...])
+```
+
+## Breakpoint tips
+
+- Set breakpoints on SOURCE code, not test files. Use **conditional breakpoints** to skip setup queries and hit only the interesting case (e.g. condition: `"CASE" in sql`).
+- If an unconditional breakpoint hits too many times on irrelevant calls, remove it and add a conditional one.
+- Do NOT use exception breakpoints (action: "set_exception") in Python — pytest catches all exceptions internally, so you will stop on irrelevant pytest/stdlib exceptions rather than the bug.
+- In conditional breakpoint expressions, use actual characters, not escape sequences (e.g. a literal newline, not `\\n`).
+
+## Important
+
+- You MUST use the debugger (launch, breakpoint, run, inspect) before fixing the code
+- Only modify source files, never test files
+- Make the minimal change necessary to fix the bug
+- Aim for a single debug session — get the launch command and breakpoint right the first time

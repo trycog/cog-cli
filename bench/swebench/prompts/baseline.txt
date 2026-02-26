@@ -1,0 +1,51 @@
+You are diagnosing and fixing a real bug in the {repo} repository (instance: {instance_id}).
+
+The repository is checked out in the current directory at the buggy commit. A test patch has been applied that adds failing tests which expose the bug.
+
+## Problem Statement
+
+{problem_statement}
+
+## Failing Test(s)
+
+{fail_to_pass}
+
+These tests currently FAIL. Your goal is to fix the source code so they pass.
+
+## MANDATORY Debugging Workflow
+
+You MUST follow every step below in order. Do NOT skip steps. Do NOT state any hypothesis or diagnosis until Step 5. You are required to observe runtime state through print-debugging before forming any conclusions about the bug.
+
+### Step 1: Run the failing test
+Run the failing test(s) to see the actual error output and traceback. Do NOT proceed until you have real test output.
+
+### Step 2: Read the test and source code
+Read the failing test to understand expected vs actual behavior. Follow the traceback to the relevant source code. Do NOT say what the bug is. Do NOT describe the root cause. Just identify which code path to instrument.
+
+### Step 3: Add print statements (MANDATORY)
+You MUST add at least 3 print statements to the source code at the suspected bug location to inspect runtime variable state. Print the actual values of variables involved in the failure. For example:
+- Print function arguments on entry
+- Print intermediate values before the failing operation
+- Print branch conditions and which path is taken
+
+Do NOT state any diagnosis or hypothesis yet. Just add the prints.
+
+### Step 4: Re-run the test and read the output (MANDATORY)
+Re-run the failing test and carefully read your print output. Do NOT state any diagnosis yet — just observe.
+
+### Step 5: Diagnose from print output
+NOW you may state your diagnosis. It MUST be grounded in the print output you just observed. Begin your diagnosis by quoting the specific printed values that reveal the bug. Explain what those values tell you and why they are wrong.
+
+### Step 6: Fix the bug
+Remove your print statements and apply the minimal fix to the source code.
+
+### Step 7: Verify
+Re-run the failing test to confirm your fix works.
+
+## Rules
+
+- Do NOT describe the bug, state a hypothesis, or say "the issue is" / "the bug is" / "I can see" until Step 5. If you diagnose before observing print output, your work is invalid.
+- You MUST add print statements and observe their output before writing any fix.
+- Only modify source files, never test files
+- Make the minimal change necessary to fix the bug
+- Do not add new features or refactor existing code

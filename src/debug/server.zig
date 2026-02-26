@@ -255,7 +255,7 @@ const ToolDef = struct {
 };
 
 pub const debug_launch_schema =
-    \\{"type":"object","properties":{"program":{"type":"string","description":"Path to executable or script"},"args":{"type":"array","items":{"type":"string"},"description":"Program arguments"},"env":{"type":"object","description":"Environment variables"},"cwd":{"type":"string","description":"Working directory"},"language":{"type":"string","description":"Language hint (auto-detected from extension)"},"stop_on_entry":{"type":"boolean","default":false}},"required":["program"]}
+    \\{"type":"object","properties":{"program":{"type":"string","description":"Path to the script or executable to debug (e.g. /path/to/script.py)"},"module":{"type":"string","description":"Python module to run (e.g. \"pytest\" for python -m pytest). Use this instead of program for pytest debugging. Pass test files/options in args."},"args":{"type":"array","items":{"type":"string"},"description":"Program arguments (e.g. [\"tests/test_foo.py::test_bar\", \"-xvs\"])"},"env":{"type":"object","description":"Environment variables"},"cwd":{"type":"string","description":"Working directory"},"language":{"type":"string","description":"Language hint (e.g. python, javascript). Auto-detected from file extension or interpreter name."},"stop_on_entry":{"type":"boolean","default":false}}}
 ;
 
 pub const debug_breakpoint_schema =
@@ -548,7 +548,7 @@ pub const DebugServer = struct {
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Invalid launch config: program is required" } };
         };
         defer config.deinit(allocator);
-        serverLog("[toolLaunch] Config parsed: program={s}", .{config.program});
+        serverLog("[toolLaunch] Config parsed: program={s} module={s}", .{ config.program, config.module orelse "(none)" });
 
         const client_pid: ?std.posix.pid_t = if (a.object.get("client_pid")) |v|
             (if (v == .integer) @as(std.posix.pid_t, @intCast(v.integer)) else null)
@@ -560,8 +560,22 @@ pub const DebugServer = struct {
             if (config.language) |lang| {
                 if (extensions.resolveByLanguageHint(allocator, lang)) |ext| break :blk ext;
             }
+            // "module" launch mode implies Python (debugpy)
+            if (config.module != null) {
+                if (extensions.resolveByLanguageHint(allocator, "python")) |e| break :blk e;
+            }
             const ext = std.fs.path.extension(config.program);
-            break :blk extensions.resolveByExtension(allocator, ext);
+            if (ext.len > 0) {
+                if (extensions.resolveByExtension(allocator, ext)) |e| break :blk e;
+            }
+            // No extension or unknown extension — try resolving from the
+            // program basename as an interpreter name (e.g. "python3" → python,
+            // "node" → javascript).
+            const basename = std.fs.path.basename(config.program);
+            if (interpreterToLanguage(basename)) |lang| {
+                if (extensions.resolveByLanguageHint(allocator, lang)) |e| break :blk e;
+            }
+            break :blk null;
         };
         defer if (resolved_ext) |re| extensions.freeExtension(allocator, &re);
 
@@ -596,8 +610,9 @@ pub const DebugServer = struct {
             if (self.session_manager.getSession(session_id)) |s| {
                 s.status = .stopped;
             }
-            self.dashboard.onLaunch(session_id, config.program, "dap");
-            self.emitLaunchEvent(session_id, config.program, "dap");
+            const display_name = if (config.program.len > 0) config.program else config.module orelse "unknown";
+            self.dashboard.onLaunch(session_id, display_name, "dap");
+            self.emitLaunchEvent(session_id, display_name, "dap");
 
             var aw: Writer.Allocating = .init(allocator);
             defer aw.deinit();
@@ -2562,6 +2577,32 @@ pub const DebugServer = struct {
 
 fn truncateStr(s: []const u8, max: usize) []const u8 {
     return if (s.len <= max) s else s[0..max];
+}
+
+/// Map common interpreter basenames to language hints for extension resolution.
+/// Handles versioned names like "python3.11" or "node18" by stripping digits.
+fn interpreterToLanguage(basename: []const u8) ?[]const u8 {
+    // Strip trailing version digits (e.g. "python3.11" → "python", "node18" → "node")
+    var name = basename;
+    while (name.len > 0 and (name[name.len - 1] >= '0' and name[name.len - 1] <= '9' or name[name.len - 1] == '.')) {
+        name = name[0 .. name.len - 1];
+    }
+    if (name.len == 0) name = basename;
+
+    const map = .{
+        .{ "python", "python" },
+        .{ "node", "javascript" },
+        .{ "java", "java" },
+        .{ "go", "go" },
+        .{ "ruby", "ruby" },
+        .{ "perl", "perl" },
+        .{ "cargo", "rust" },
+        .{ "rustc", "rust" },
+    };
+    inline for (map) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return null;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

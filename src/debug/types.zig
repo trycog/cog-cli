@@ -52,11 +52,22 @@ pub const Variable = struct {
     presentation_hint: ?VariablePresentationHint = null,
 
     pub fn jsonStringify(self: *const Variable, jw: anytype) !void {
+        return self.jsonStringifyTruncated(jw, 0);
+    }
+
+    /// Serialize with optional value truncation. max_len=0 means no truncation.
+    pub fn jsonStringifyTruncated(self: *const Variable, jw: anytype, max_len: usize) !void {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
         try jw.objectField("value");
-        try jw.write(self.value);
+        if (max_len > 0 and self.value.len > max_len) {
+            try jw.write(self.value[0..max_len]);
+            try jw.objectField("value_truncated");
+            try jw.write(true);
+        } else {
+            try jw.write(self.value);
+        }
         if (self.@"type".len > 0) {
             try jw.objectField("type");
             try jw.write(self.@"type");
@@ -113,12 +124,21 @@ pub const OutputEntry = struct {
     category: []const u8,
     text: []const u8,
 
+    /// Max output text length per entry in stop responses.
+    const max_output_text = 500;
+
     pub fn jsonStringify(self: *const OutputEntry, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("category");
         try jw.write(self.category);
         try jw.objectField("text");
-        try jw.write(self.text);
+        if (self.text.len > max_output_text) {
+            try jw.write(self.text[0..max_output_text]);
+            try jw.objectField("text_truncated");
+            try jw.write(true);
+        } else {
+            try jw.write(self.text);
+        }
         try jw.endObject();
     }
 };
@@ -460,6 +480,15 @@ pub const StopState = struct {
     /// IDs of breakpoints that were hit (from DAP stopped event hitBreakpointIds)
     hit_breakpoint_ids: []const u32 = &.{},
 
+    /// Max stack frames included in stop responses. Use cog_debug_stacktrace for more.
+    const max_stop_frames = 5;
+    /// Max local variables included in stop responses. Use cog_debug_inspect for more.
+    const max_stop_locals = 10;
+    /// Max output entries included in stop responses.
+    const max_stop_output = 10;
+    /// Max length of variable values in stop responses. Use cog_debug_inspect for full values.
+    const max_value_len = 200;
+
     pub fn jsonStringify(self: *const StopState, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("stop_reason");
@@ -476,20 +505,34 @@ pub const StopState = struct {
             try jw.endObject();
         }
         if (self.stack_trace.len > 0) {
+            const frame_count = @min(self.stack_trace.len, max_stop_frames);
             try jw.objectField("stack_trace");
             try jw.beginArray();
-            for (self.stack_trace) |*frame| {
+            for (self.stack_trace[0..frame_count]) |*frame| {
                 try frame.jsonStringify(jw);
             }
             try jw.endArray();
+            if (self.stack_trace.len > max_stop_frames) {
+                try jw.objectField("stack_trace_truncated");
+                try jw.write(true);
+                try jw.objectField("total_frames");
+                try jw.write(self.stack_trace.len);
+            }
         }
         if (self.locals.len > 0) {
+            const local_count = @min(self.locals.len, max_stop_locals);
             try jw.objectField("locals");
             try jw.beginArray();
-            for (self.locals) |*v| {
-                try v.jsonStringify(jw);
+            for (self.locals[0..local_count]) |*v| {
+                try v.jsonStringifyTruncated(jw, max_value_len);
             }
             try jw.endArray();
+            if (self.locals.len > max_stop_locals) {
+                try jw.objectField("locals_truncated");
+                try jw.write(true);
+                try jw.objectField("total_locals");
+                try jw.write(self.locals.len);
+            }
         }
         if (self.exception) |*exc| {
             try jw.objectField("exception");
@@ -508,12 +551,19 @@ pub const StopState = struct {
             try jw.endArray();
         }
         if (self.output.len > 0) {
+            const out_count = @min(self.output.len, max_stop_output);
             try jw.objectField("output");
             try jw.beginArray();
-            for (self.output) |*entry| {
+            for (self.output[0..out_count]) |*entry| {
                 try entry.jsonStringify(jw);
             }
             try jw.endArray();
+            if (self.output.len > max_stop_output) {
+                try jw.objectField("output_truncated");
+                try jw.write(true);
+                try jw.objectField("total_output");
+                try jw.write(self.output.len);
+            }
         }
         if (self.hit_breakpoint_ids.len > 0) {
             try jw.objectField("hit_breakpoint_ids");
@@ -599,6 +649,7 @@ pub const BreakpointInfo = struct {
 
 pub const LaunchConfig = struct {
     program: []const u8,
+    module: ?[]const u8 = null,
     args: []const []const u8 = &.{},
     env: ?std.json.ObjectMap = null,
     cwd: ?[]const u8 = null,
@@ -609,10 +660,20 @@ pub const LaunchConfig = struct {
         if (value != .object) return error.InvalidParams;
         const obj = value.object;
 
-        const program_val = obj.get("program") orelse return error.InvalidParams;
-        if (program_val != .string) return error.InvalidParams;
-        const program = try allocator.dupe(u8, program_val.string);
-        errdefer allocator.free(program);
+        // Either "program" or "module" is required.
+        const program = if (obj.get("program")) |v| blk: {
+            if (v == .string) break :blk try allocator.dupe(u8, v.string);
+            break :blk null;
+        } else null;
+        errdefer if (program) |p| allocator.free(p);
+
+        const module = if (obj.get("module")) |v| blk: {
+            if (v == .string) break :blk try allocator.dupe(u8, v.string);
+            break :blk null;
+        } else null;
+        errdefer if (module) |m| allocator.free(m);
+
+        if (program == null and module == null) return error.InvalidParams;
 
         var args_list: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
@@ -642,7 +703,8 @@ pub const LaunchConfig = struct {
         } else null;
 
         return .{
-            .program = program,
+            .program = program orelse "",
+            .module = module,
             .args = try args_list.toOwnedSlice(allocator),
             .cwd = cwd,
             .language = language,
@@ -651,7 +713,8 @@ pub const LaunchConfig = struct {
     }
 
     pub fn deinit(self: *const LaunchConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.program);
+        if (self.program.len > 0) allocator.free(self.program);
+        if (self.module) |m| allocator.free(m);
         for (self.args) |a| allocator.free(a);
         allocator.free(self.args);
         if (self.language) |l| allocator.free(l);

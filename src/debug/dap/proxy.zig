@@ -217,6 +217,7 @@ pub const DapProxy = struct {
     request_timeout_ms: i32 = 30_000,
     // Saved launch state for emulated restart (adapters without supportsRestartRequest)
     saved_launch_program: ?[]const u8 = null,
+    saved_launch_module: ?[]const u8 = null,
     saved_launch_args: ?[]const []const u8 = null,
     saved_launch_stop_on_entry: bool = false,
     saved_adapter_argv: ?[]const []const u8 = null,
@@ -224,12 +225,13 @@ pub const DapProxy = struct {
     adapter_tcp_port: ?u16 = null,
     pending_child_config: ?[]const u8 = null,
     parent_stream: ?std.net.Stream = null,
-    // Deferred configurationDone: when true, the child session has been
-    // initialized but configurationDone has NOT been sent yet.  Breakpoints
-    // set by the user go into the configuration phase so vscode-js-debug
-    // can resolve source-mapped .ts breakpoints via outFiles pre-scanning.
+    // Deferred configurationDone: when true, the session has been
+    // initialized but configurationDone has NOT been sent yet.  This allows
+    // the user to set breakpoints during the DAP configuration phase —
+    // before the program starts running — preventing the race where
+    // the program runs past breakpoint locations before they are set.
     // configurationDone is sent on the first proxyRun call.
-    child_config_deferred: bool = false,
+    config_deferred: bool = false,
 
     pub const MemoryEvent = struct {
         memory_reference: []const u8,
@@ -366,6 +368,7 @@ pub const DapProxy = struct {
         self.buffered_events.deinit(self.allocator);
         // Clean up saved launch state
         if (self.saved_launch_program) |p| self.allocator.free(p);
+        if (self.saved_launch_module) |m| self.allocator.free(m);
         if (self.saved_launch_args) |args| {
             for (args) |a| self.allocator.free(a);
             self.allocator.free(args);
@@ -893,6 +896,53 @@ pub const DapProxy = struct {
                                         .event_name = self.allocator.dupe(u8, evt.string) catch "",
                                         .body = self.allocator.dupe(u8, decoded.body) catch "",
                                     }) catch {};
+                                    // Also queue notifications for important events so
+                                    // they are visible via poll_events (mirrors readResponse).
+                                    if (std.mem.eql(u8, evt.string, "output")) {
+                                        if (parsed.value.object.get("body")) |body| {
+                                            if (body == .object) {
+                                                const category = if (body.object.get("category")) |c|
+                                                    (if (c == .string) c.string else "console")
+                                                else
+                                                    "console";
+                                                if (!std.mem.eql(u8, category, "telemetry")) {
+                                                    const text = if (body.object.get("output")) |o|
+                                                        (if (o == .string) o.string else "")
+                                                    else
+                                                        "";
+                                                    if (text.len > 0) {
+                                                        self.output_buffer.append(self.allocator, .{
+                                                            .category = self.allocator.dupe(u8, category) catch "",
+                                                            .text = self.allocator.dupe(u8, text) catch "",
+                                                        }) catch {};
+                                                    }
+                                                    self.queueNotification("debug/output", decoded.body);
+                                                }
+                                            }
+                                        }
+                                    } else if (std.mem.eql(u8, evt.string, "stopped")) {
+                                        if (parsed.value.object.get("body")) |body| {
+                                            if (body == .object) {
+                                                if (body.object.get("threadId")) |tid| {
+                                                    if (tid == .integer) self.thread_id = tid.integer;
+                                                }
+                                            }
+                                        }
+                                        self.queueNotification("debug/stopped", decoded.body);
+                                    } else if (std.mem.eql(u8, evt.string, "continued")) {
+                                        self.queueNotification("debug/continued", decoded.body);
+                                    } else if (std.mem.eql(u8, evt.string, "breakpoint")) {
+                                        if (parsed.value.object.get("body")) |body| {
+                                            if (body == .object) {
+                                                if (body.object.get("breakpoint")) |bp| {
+                                                    if (bp == .object) {
+                                                        self.handleBreakpointEvent(bp.object);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        self.queueNotification("debug/breakpoint_verified", decoded.body);
+                                    }
                                 }
                             }
                         }
@@ -1235,7 +1285,7 @@ pub const DapProxy = struct {
 
         // 2. Send launch request WITHOUT waiting for response.
         dapLog("[DAP launch] Step 2: Sending launch request (seq={d})...", .{self.seq});
-        const launch_msg = try protocol.launchRequestEx(allocator, self.nextSeq(), config.program, config.args, config.stop_on_entry, cfg.launch_extra_args_json, null);
+        const launch_msg = try protocol.launchRequestEx(allocator, self.nextSeq(), config.program, config.args, config.stop_on_entry, cfg.launch_extra_args_json, null, config.module);
         defer allocator.free(launch_msg);
         try self.sendRaw(allocator, launch_msg);
         dapLog("[DAP launch] Step 2: Launch request sent", .{});
@@ -1246,16 +1296,15 @@ pub const DapProxy = struct {
         allocator.free(init_event);
         dapLog("[DAP launch] Step 3: initialized event received", .{});
 
-        // 4. Send configurationDone
-        dapLog("[DAP launch] Step 4: Sending configurationDone request (seq={d})...", .{self.seq});
-        const config_done_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
-        defer allocator.free(config_done_msg);
-        const config_resp = try self.sendRequest(allocator, config_done_msg);
-        allocator.free(config_resp);
-        dapLog("[DAP launch] Step 4: configurationDone/launch response received", .{});
-
+        // 4. Defer configurationDone until the first proxyRun call.
+        // The MCP interface is serial: launch → set breakpoints → run.
+        // If we send configurationDone here, the program starts immediately
+        // and may run past breakpoint locations before the user can set them.
+        // By deferring, breakpoints are stored locally during the config phase
+        // and re-armed right before configurationDone in proxyRun.
         self.initialized = true;
-        dapLog("[DAP launch] Launch complete, session initialized", .{});
+        self.config_deferred = true;
+        dapLog("[DAP launch] Deferring configurationDone (breakpoints can be set before run)", .{});
     }
 
     /// Launch an adapter over TCP transport (vscode-js-debug, etc.)
@@ -1315,8 +1364,8 @@ pub const DapProxy = struct {
         //    we handle entry-stop ourselves via DAP "pause" in connectChildSession.
         const stop_on_entry = if (cfg.child_sessions.enabled) false else config.stop_on_entry;
         dapLog("[DAP launch] Sending launch request (stopOnEntry={})...", .{stop_on_entry});
-        const cwd = std.fs.path.dirname(config.program);
-        const launch_msg = try protocol.launchRequestEx(allocator, self.nextSeq(), config.program, config.args, stop_on_entry, cfg.launch_extra_args_json, cwd);
+        const cwd = if (config.program.len > 0) std.fs.path.dirname(config.program) else null;
+        const launch_msg = try protocol.launchRequestEx(allocator, self.nextSeq(), config.program, config.args, stop_on_entry, cfg.launch_extra_args_json, cwd, config.module);
         defer allocator.free(launch_msg);
         try self.sendRaw(allocator, launch_msg);
 
@@ -1531,7 +1580,7 @@ pub const DapProxy = struct {
             // launch and their first "continue" go into the DAP configuration
             // phase.  configurationDone is sent in proxyRun on the first continue.
             dapLog("[DAP child] Deferring configurationDone (stopOnEntry=true)", .{});
-            self.child_config_deferred = true;
+            self.config_deferred = true;
         } else {
             // No stopOnEntry: send configurationDone to start the program.
             const cd_msg = try protocol.configurationDoneRequest(allocator, self.nextSeq());
@@ -1657,14 +1706,13 @@ pub const DapProxy = struct {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.initialized) return error.NotInitialized;
 
-        if (self.child_config_deferred) {
-            // First continue after a deferred child session launch.
+        if (self.config_deferred) {
+            // First run after a deferred launch (stdio or child session).
             // Re-arm all tracked breakpoints as a final reconciliation before
             // ending the configuration phase.  During the config phase, the user
-            // may have set and/or removed breakpoints — each operation sent a
-            // setBreakpoints request.  Re-arming ensures the adapter has the
-            // correct final set, guarding against any adapter-side confusion
-            // from multiple incremental updates during the config phase.
+            // may have set and/or removed breakpoints — each operation only
+            // updated local state.  Re-arming sends the full breakpoint set
+            // to the adapter before configurationDone starts the program.
             dapLog("[DAP proxyRun] Re-arming breakpoints before deferred configurationDone", .{});
             self.rearmBreakpoints(allocator);
 
@@ -1673,7 +1721,7 @@ pub const DapProxy = struct {
             defer allocator.free(cd_msg);
             const cd_resp = try self.sendRequest(allocator, cd_msg);
             allocator.free(cd_resp);
-            self.child_config_deferred = false;
+            self.config_deferred = false;
             // Don't send a separate continue — configurationDone starts the program.
         } else {
             // Normal case: send the appropriate DAP run command
@@ -1996,12 +2044,12 @@ pub const DapProxy = struct {
 
         // If adapter is connected and NOT in the deferred config phase, send
         // the DAP setBreakpoints request immediately.  During the deferred
-        // config phase (child_config_deferred=true), we only update internal
+        // config phase (config_deferred=true), we only update internal
         // data structures — a single reconciliation setBreakpoints call is
         // sent via rearmBreakpoints right before configurationDone in proxyRun.
         // This avoids vscode-js-debug's breakpoint prediction getting confused
         // by multiple incremental setBreakpoints replacements during config.
-        if (self.initialized and self.transport != .none and !self.child_config_deferred) {
+        if (self.initialized and self.transport != .none and !self.config_deferred) {
             try self.sendFileBreakpoints(allocator, gop.key_ptr.*, gop.value_ptr.items);
         }
 
@@ -2062,7 +2110,7 @@ pub const DapProxy = struct {
 
             // Re-send all remaining breakpoints for this file (with conditions).
             // Skip during deferred config phase — rearmBreakpoints handles it.
-            if (self.initialized and self.transport != .none and !self.child_config_deferred) {
+            if (self.initialized and self.transport != .none and !self.config_deferred) {
                 dapLog("[DAP removeBreakpoint] Re-sending {d} remaining breakpoints for file={s}", .{ bp_list.items.len, file });
                 self.sendFileBreakpoints(allocator, file, bp_list.items) catch |err| {
                     dapLog("[DAP removeBreakpoint] Failed to re-send breakpoints for file={s}: {any}", .{ file, err });
@@ -2182,6 +2230,35 @@ pub const DapProxy = struct {
                                             if (vr == .integer) {
                                                 scope_var_ref = vr.integer;
                                                 break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If "arguments" scope was requested but not found, fall back to
+            // "locals" — debugpy (and some other adapters) merge function
+            // arguments into the locals scope rather than exposing a separate
+            // "arguments" scope.
+            if (scope_var_ref == 0 and std.mem.eql(u8, scope_name, "arguments")) {
+                if (scopes_parsed.value == .object) {
+                    if (scopes_parsed.value.object.get("body")) |body2| {
+                        if (body2 == .object) {
+                            if (body2.object.get("scopes")) |scopes2| {
+                                if (scopes2 == .array) {
+                                    for (scopes2.array.items) |item2| {
+                                        if (item2 != .object) continue;
+                                        const sn = if (item2.object.get("name")) |v| (if (v == .string) v.string else continue) else continue;
+                                        if (std.ascii.startsWithIgnoreCase(sn, "local")) {
+                                            if (item2.object.get("variablesReference")) |vr| {
+                                                if (vr == .integer) {
+                                                    scope_var_ref = vr.integer;
+                                                    break;
+                                                }
                                             }
                                         }
                                     }
@@ -3262,7 +3339,8 @@ pub const DapProxy = struct {
             // ── Emulated restart ───────────────────────────────────────
             dapLog("[DAP restart] Emulating via disconnect+relaunch", .{});
 
-            const program = self.saved_launch_program orelse return error.NotSupported;
+            const program = self.saved_launch_program orelse "";
+            if (program.len == 0 and self.saved_launch_module == null) return error.NotSupported;
             const adapter_argv = self.saved_adapter_argv orelse return error.NotSupported;
 
             // 1. Disconnect from the current adapter.
@@ -3348,7 +3426,8 @@ pub const DapProxy = struct {
                 self.saved_launch_args orelse &.{},
                 stop_on_entry,
                 cfg.launch_extra_args_json,
-                std.fs.path.dirname(program),
+                if (program.len > 0) std.fs.path.dirname(program) else null,
+                self.saved_launch_module,
             );
             defer allocator.free(launch_msg);
             try self.sendRaw(allocator, launch_msg);
@@ -3413,6 +3492,7 @@ pub const DapProxy = struct {
     fn saveLaunchState(self: *DapProxy, config: LaunchConfig, adapter_argv: []const []const u8) void {
         // Free any previously saved state
         if (self.saved_launch_program) |p| self.allocator.free(p);
+        if (self.saved_launch_module) |m| self.allocator.free(m);
         if (self.saved_launch_args) |args| {
             for (args) |a| self.allocator.free(a);
             self.allocator.free(args);
@@ -3422,7 +3502,8 @@ pub const DapProxy = struct {
             self.allocator.free(argv);
         }
 
-        self.saved_launch_program = self.allocator.dupe(u8, config.program) catch null;
+        self.saved_launch_program = if (config.program.len > 0) (self.allocator.dupe(u8, config.program) catch null) else null;
+        self.saved_launch_module = if (config.module) |m| (self.allocator.dupe(u8, m) catch null) else null;
         self.saved_launch_stop_on_entry = config.stop_on_entry;
 
         // Dupe program args

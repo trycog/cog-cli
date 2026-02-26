@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SWE-bench Lite — Cog Debugger Benchmark</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  :root {
+    --green: #22c55e;
+    --bg: #0d1117;
+    --bg-card: #161b22;
+    --bg-hover: #1c2129;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --baseline-color: #f97316;
+    --debugger-color: #22c55e;
+    --resolved-color: #22c55e;
+    --unresolved-color: #f85149;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  .container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 2rem;
+  }
+
+  .header {
+    text-align: center;
+    margin-bottom: 2rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header h1 {
+    font-size: 1.8rem;
+    font-weight: 600;
+    color: var(--green);
+    letter-spacing: -0.02em;
+  }
+
+  .header .subtitle {
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    margin-top: 0.3rem;
+  }
+
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+  }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+    text-align: center;
+  }
+
+  .card .value {
+    font-size: 2rem;
+    font-weight: 700;
+    color: var(--green);
+    line-height: 1.2;
+  }
+
+  .card .value.neutral { color: var(--text); }
+  .card .value.warning { color: var(--unresolved-color); }
+
+  .card .label {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-top: 0.25rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .card .detail {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-top: 0.5rem;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  }
+
+  .legend {
+    display: flex;
+    gap: 1.5rem;
+    justify-content: center;
+    margin-bottom: 1.5rem;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+  }
+
+  .chart-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .chart-section h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    color: var(--text);
+  }
+
+  .chart-section h2 span {
+    color: var(--text-dim);
+    font-weight: 400;
+    font-size: 0.85rem;
+  }
+
+  .charts-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+
+  @media (max-width: 900px) {
+    .charts-row { grid-template-columns: 1fr; }
+  }
+
+  .bar-label {
+    fill: var(--text-dim);
+    font-size: 11px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  }
+
+  .bar-value {
+    fill: var(--text);
+    font-size: 10px;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+  }
+
+  .axis text {
+    fill: var(--text-dim);
+    font-size: 10px;
+  }
+
+  .axis line, .axis path {
+    stroke: var(--border);
+  }
+
+  .grid line {
+    stroke: var(--border);
+    stroke-opacity: 0.3;
+  }
+
+  .grid path {
+    stroke: none;
+  }
+
+  .tooltip {
+    position: absolute;
+    background: #1c2129;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.8rem;
+    color: var(--text);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 100;
+    white-space: nowrap;
+  }
+
+  .tooltip .tt-label {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+  }
+
+  .tooltip .tt-value {
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+    font-weight: 600;
+  }
+
+  .table-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+    overflow-x: auto;
+  }
+
+  .table-section h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  th {
+    text-align: left;
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+    font-weight: 500;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+
+  th:hover { color: var(--text); }
+  th .sort-arrow { font-size: 0.6rem; margin-left: 0.2rem; }
+
+  td {
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid #21262d;
+    font-family: 'SF Mono', SFMono-Regular, Consolas, monospace;
+    font-size: 0.75rem;
+  }
+
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--bg-hover); }
+
+  td.instance-col {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-weight: 500;
+    font-size: 0.8rem;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  td.repo-col {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+  }
+
+  .resolved { color: var(--resolved-color); font-weight: 600; }
+  .unresolved { color: var(--unresolved-color); }
+  .baseline-val { color: var(--baseline-color); }
+  .debugger-val { color: var(--debugger-color); }
+
+  .no-data {
+    text-align: center;
+    padding: 3rem;
+    color: var(--text-dim);
+  }
+
+  .no-data code {
+    background: var(--bg-card);
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.85rem;
+    color: var(--green);
+  }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <h1>SWE-bench Lite — Cog Debugger Benchmark</h1>
+    <div class="subtitle">Baseline (no debugger) vs Debugger (cog MCP) — 100 Real-World Python Bugs</div>
+  </div>
+
+  <div id="no-data" class="no-data" style="display:none;">
+    <p>No results found. Run benchmarks first:</p>
+    <pre style="margin-top: 1rem; text-align: left; display: inline-block; color: var(--text-dim); font-size: 0.8rem;">
+python3 bench/swebench/select_tasks.py
+bash bench/swebench/setup.sh
+bash bench/swebench/run.sh all
+bash bench/swebench/evaluate.sh
+bash bench/swebench/collect.sh</pre>
+  </div>
+
+  <div id="dashboard" style="display:none;">
+    <div class="summary" id="summary"></div>
+
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-dot" style="background: var(--debugger-color);"></div>
+        Debugger (cog MCP)
+      </div>
+      <div class="legend-item">
+        <div class="legend-dot" style="background: var(--baseline-color);"></div>
+        Baseline (no debugger)
+      </div>
+    </div>
+
+    <div class="chart-section" id="resolve-section">
+      <h2>Resolve Rate <span>(higher is better)</span></h2>
+      <div id="chart-resolve"></div>
+    </div>
+
+    <div class="chart-section" id="tokens-section">
+      <h2>Total Tokens per Task <span>(lower is better — measures total LLM usage)</span></h2>
+      <div id="chart-tokens"></div>
+    </div>
+
+    <div class="charts-row">
+      <div class="chart-section" id="cost-section">
+        <h2>Cost per Task <span>(USD)</span></h2>
+        <div id="chart-cost"></div>
+      </div>
+      <div class="chart-section" id="repo-section">
+        <h2>Resolve Rate by Repo <span>(percentage)</span></h2>
+        <div id="chart-repo"></div>
+      </div>
+    </div>
+
+    <div class="charts-row">
+      <div class="chart-section" id="duration-section">
+        <h2>Duration per Task <span>(seconds)</span></h2>
+        <div id="chart-duration"></div>
+      </div>
+      <div class="chart-section" id="token-hist-section">
+        <h2>Token Usage Distribution <span>(histogram)</span></h2>
+        <div id="chart-token-hist"></div>
+      </div>
+    </div>
+
+    <div class="table-section">
+      <h2>Detail Table</h2>
+      <table id="data-table"></table>
+    </div>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<!-- SWEBENCH_DATA_START -->
+<script>
+const SWEBENCH_DATA = {
+  "total_tasks": 0,
+  "baseline_ran": 0,
+  "debugger_ran": 0,
+  "baseline_resolved": 0,
+  "debugger_resolved": 0,
+  "debugger_advantage": 0,
+  "debugger_disadvantage": 0,
+  "baseline_total_tokens": 0,
+  "debugger_total_tokens": 0,
+  "baseline_total_cost": 0,
+  "debugger_total_cost": 0,
+  "tasks": []
+};
+</script>
+<!-- SWEBENCH_DATA_END -->
+
+<script>
+const DEBUGGER_COLOR = '#22c55e';
+const BASELINE_COLOR = '#f97316';
+const RESOLVED_COLOR = '#22c55e';
+const UNRESOLVED_COLOR = '#f85149';
+
+(function() {
+  const data = (typeof SWEBENCH_DATA !== 'undefined') ? SWEBENCH_DATA : null;
+  if (!data || !data.tasks || data.tasks.length === 0) {
+    document.getElementById('no-data').style.display = '';
+    return;
+  }
+  document.getElementById('dashboard').style.display = '';
+  render(data);
+})();
+
+function render(data) {
+  const tasks = data.tasks;
+  const hasRuns = tasks.some(t =>
+    t.baseline.cost_usd > 0 || t.debugger.cost_usd > 0 ||
+    t.baseline.timeout || t.debugger.timeout
+  );
+  if (!hasRuns) {
+    document.getElementById('dashboard').style.display = 'none';
+    document.getElementById('no-data').style.display = '';
+    return;
+  }
+
+  renderSummary(data);
+  renderResolveChart(data);
+  renderTokensChart(data);
+  renderCostChart(data);
+  renderRepoChart(data);
+  renderDurationChart(data);
+  renderTokenHistogram(data);
+  renderTable(data);
+}
+
+/* ── Summary Cards ─────────────────────────────────────────────────── */
+
+function renderSummary(data) {
+  const d = data;
+  const bRate = d.baseline_ran > 0 ? (d.baseline_resolved / d.baseline_ran * 100).toFixed(1) : '0';
+  const dRate = d.debugger_ran > 0 ? (d.debugger_resolved / d.debugger_ran * 100).toFixed(1) : '0';
+  const fmtK = n => n >= 1000000 ? (n/1000000).toFixed(1) + 'M' : n >= 1000 ? (n/1000).toFixed(0) + 'k' : String(n);
+
+  const tokenDiff = d.baseline_total_tokens > 0 && d.debugger_total_tokens > 0
+    ? ((d.baseline_total_tokens - d.debugger_total_tokens) / d.baseline_total_tokens * 100).toFixed(0)
+    : null;
+  const tokenDiffStr = tokenDiff !== null
+    ? (tokenDiff > 0 ? tokenDiff + '% fewer' : Math.abs(tokenDiff) + '% more')
+    : '-';
+  const tokenDiffClass = tokenDiff > 0 ? '' : (tokenDiff < 0 ? 'warning' : 'neutral');
+
+  document.getElementById('summary').innerHTML = `
+    <div class="card">
+      <div class="value">${dRate}%</div>
+      <div class="label">Debugger Resolve Rate</div>
+      <div class="detail">${d.debugger_resolved}/${d.debugger_ran} tasks</div>
+    </div>
+    <div class="card">
+      <div class="value neutral">${bRate}%</div>
+      <div class="label">Baseline Resolve Rate</div>
+      <div class="detail">${d.baseline_resolved}/${d.baseline_ran} tasks</div>
+    </div>
+    <div class="card">
+      <div class="value ${d.debugger_advantage > 0 ? '' : 'neutral'}">+${d.debugger_advantage}</div>
+      <div class="label">Debugger Advantage</div>
+      <div class="detail">${d.debugger_advantage} extra resolved, ${d.debugger_disadvantage} missed</div>
+    </div>
+    <div class="card">
+      <div class="value ${tokenDiffClass}">${tokenDiffStr}</div>
+      <div class="label">Debugger Token Usage</div>
+      <div class="detail">${fmtK(d.debugger_total_tokens)} vs ${fmtK(d.baseline_total_tokens)}</div>
+    </div>
+    <div class="card">
+      <div class="value neutral">$${(d.debugger_total_cost || 0).toFixed(2)}</div>
+      <div class="label">Debugger Total Cost</div>
+      <div class="detail">Baseline: $${(d.baseline_total_cost || 0).toFixed(2)}</div>
+    </div>
+    <div class="card">
+      <div class="value ${(d.debugger_no_tools || 0) > 0 ? 'warning' : ''}">${d.debugger_used_tools || 0}/${d.debugger_ran || 0}</div>
+      <div class="label">Used Debug Tools</div>
+      <div class="detail">${(d.debugger_no_tools || 0) > 0 ? (d.debugger_no_tools + ' runs did NOT use debugger') : 'All runs used debugger'}</div>
+    </div>
+  `;
+}
+
+/* ── Resolve Rate Bar Chart ────────────────────────────────────────── */
+
+function renderResolveChart(data) {
+  const container = d3.select('#chart-resolve');
+  const w = container.node().getBoundingClientRect().width;
+  const margin = { top: 20, right: 40, bottom: 30, left: 80 };
+  const width = w - margin.left - margin.right;
+  const height = 80;
+
+  const svg = container.append('svg')
+    .attr('width', w).attr('height', height + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const categories = ['Debugger', 'Baseline'];
+  const values = [data.debugger_resolved, data.baseline_resolved];
+  const totals = [data.debugger_ran, data.baseline_ran];
+  const colors = [DEBUGGER_COLOR, BASELINE_COLOR];
+
+  const x = d3.scaleLinear().domain([0, Math.max(data.total_tasks, d3.max(values) * 1.2)]).range([0, width]);
+  const y = d3.scaleBand().domain(categories).range([0, height]).padding(0.3);
+
+  g.append('g').attr('class', 'grid').attr('transform', `translate(0,${height})`)
+    .call(d3.axisBottom(x).tickSize(-height).tickFormat('').ticks(5));
+
+  categories.forEach((cat, i) => {
+    g.append('rect')
+      .attr('x', 0).attr('y', y(cat))
+      .attr('width', 0).attr('height', y.bandwidth())
+      .attr('rx', 3).attr('fill', colors[i]).attr('opacity', 0.85)
+      .transition().duration(600)
+      .attr('width', x(values[i]));
+
+    g.append('text')
+      .attr('class', 'bar-label')
+      .attr('x', -8).attr('y', y(cat) + y.bandwidth() / 2)
+      .attr('text-anchor', 'end').attr('dominant-baseline', 'middle')
+      .text(cat);
+
+    g.append('text')
+      .attr('class', 'bar-value')
+      .attr('x', x(values[i]) + 6)
+      .attr('y', y(cat) + y.bandwidth() / 2)
+      .attr('dominant-baseline', 'middle')
+      .text(`${values[i]}/${totals[i]}`);
+  });
+}
+
+/* ── Total Tokens per Task (horizontal grouped bars) ──────────────── */
+
+function renderTokensChart(data) {
+  const tasks = data.tasks.filter(t =>
+    (t.baseline.input_tokens + t.baseline.output_tokens > 0) ||
+    (t.debugger.input_tokens + t.debugger.output_tokens > 0)
+  );
+  if (tasks.length === 0) {
+    document.getElementById('tokens-section').style.display = 'none';
+    return;
+  }
+
+  // Sort by debugger tokens descending for visual impact
+  tasks.sort((a, b) => {
+    const aT = a.debugger.input_tokens + a.debugger.output_tokens;
+    const bT = b.debugger.input_tokens + b.debugger.output_tokens;
+    return bT - aT;
+  });
+
+  // Show top 30 for readability, or all if <= 30
+  const shown = tasks.length > 30 ? tasks.slice(0, 30) : tasks;
+
+  const container = d3.select('#chart-tokens');
+  const containerWidth = container.node().getBoundingClientRect().width;
+  const margin = { top: 8, right: 80, bottom: 20, left: 240 };
+  const width = containerWidth - margin.left - margin.right;
+  const barHeight = 12;
+  const groupPad = 6;
+  const groupHeight = barHeight * 2 + 3;
+  const height = shown.length * (groupHeight + groupPad) - groupPad;
+
+  const svg = container.append('svg')
+    .attr('width', containerWidth)
+    .attr('height', height + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const getTokens = d => (d.input_tokens || 0) + (d.output_tokens || 0);
+  const maxVal = d3.max(shown, t => Math.max(getTokens(t.baseline), getTokens(t.debugger)));
+  const x = d3.scaleLinear().domain([0, (maxVal || 1) * 1.15]).range([0, width]);
+  const fmtK = v => v >= 1000000 ? (v/1000000).toFixed(1) + 'M' : v >= 1000 ? (v/1000).toFixed(0) + 'k' : String(v);
+
+  g.append('g').attr('class', 'grid').attr('transform', `translate(0,${height})`)
+    .call(d3.axisBottom(x).tickSize(-height).tickFormat('').ticks(5));
+
+  shown.forEach((t, i) => {
+    const yOff = i * (groupHeight + groupPad);
+    const label = t.instance_id.length > 35 ? t.instance_id.slice(0, 33) + '...' : t.instance_id;
+
+    g.append('text').attr('class', 'bar-label')
+      .attr('x', -8).attr('y', yOff + groupHeight / 2)
+      .attr('text-anchor', 'end').attr('dominant-baseline', 'middle')
+      .text(label);
+
+    const dVal = getTokens(t.debugger);
+    g.append('rect')
+      .attr('x', 0).attr('y', yOff)
+      .attr('width', 0).attr('height', barHeight)
+      .attr('rx', 2).attr('fill', DEBUGGER_COLOR).attr('opacity', 0.85)
+      .on('mouseover', e => showTooltip(e, 'Debugger', t.instance_id, fmtK(dVal) + ' tokens'))
+      .on('mouseout', hideTooltip)
+      .transition().duration(500).delay(i * 20)
+      .attr('width', x(dVal));
+
+    g.append('text').attr('class', 'bar-value')
+      .attr('x', x(dVal) + 4).attr('y', yOff + barHeight / 2)
+      .attr('dominant-baseline', 'middle').attr('opacity', 0)
+      .text(fmtK(dVal))
+      .transition().duration(500).delay(i * 20).attr('opacity', 1);
+
+    const bVal = getTokens(t.baseline);
+    g.append('rect')
+      .attr('x', 0).attr('y', yOff + barHeight + 3)
+      .attr('width', 0).attr('height', barHeight)
+      .attr('rx', 2).attr('fill', BASELINE_COLOR).attr('opacity', 0.85)
+      .on('mouseover', e => showTooltip(e, 'Baseline', t.instance_id, fmtK(bVal) + ' tokens'))
+      .on('mouseout', hideTooltip)
+      .transition().duration(500).delay(i * 20 + 30)
+      .attr('width', x(bVal));
+
+    g.append('text').attr('class', 'bar-value')
+      .attr('x', x(bVal) + 4).attr('y', yOff + barHeight + 3 + barHeight / 2)
+      .attr('dominant-baseline', 'middle').attr('opacity', 0)
+      .text(fmtK(bVal))
+      .transition().duration(500).delay(i * 20 + 30).attr('opacity', 1);
+  });
+
+  if (tasks.length > 30) {
+    container.append('div')
+      .style('text-align', 'center')
+      .style('color', 'var(--text-dim)')
+      .style('font-size', '0.8rem')
+      .style('margin-top', '0.5rem')
+      .text(`Showing top 30 of ${tasks.length} tasks by debugger token usage`);
+  }
+}
+
+/* ── Cost Scatter Chart ────────────────────────────────────────────── */
+
+function renderCostChart(data) {
+  const tasks = data.tasks.filter(t => t.baseline.cost_usd > 0 || t.debugger.cost_usd > 0);
+  if (tasks.length === 0) {
+    document.getElementById('cost-section').style.display = 'none';
+    return;
+  }
+
+  const container = d3.select('#chart-cost');
+  const w = container.node().getBoundingClientRect().width;
+  const margin = { top: 20, right: 20, bottom: 40, left: 50 };
+  const size = Math.min(w - margin.left - margin.right, 350);
+
+  const svg = container.append('svg')
+    .attr('width', size + margin.left + margin.right)
+    .attr('height', size + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const maxCost = d3.max(tasks, t => Math.max(t.baseline.cost_usd, t.debugger.cost_usd)) || 1;
+  const x = d3.scaleLinear().domain([0, maxCost * 1.1]).range([0, size]);
+  const y = d3.scaleLinear().domain([0, maxCost * 1.1]).range([size, 0]);
+
+  g.append('g').attr('class', 'axis').attr('transform', `translate(0,${size})`)
+    .call(d3.axisBottom(x).ticks(5).tickFormat(v => '$' + v.toFixed(2)));
+  g.append('g').attr('class', 'axis')
+    .call(d3.axisLeft(y).ticks(5).tickFormat(v => '$' + v.toFixed(2)));
+
+  // Diagonal line (equal cost)
+  g.append('line')
+    .attr('x1', 0).attr('y1', size).attr('x2', size).attr('y2', 0)
+    .attr('stroke', 'var(--border)').attr('stroke-dasharray', '4,4');
+
+  // Points
+  tasks.forEach(t => {
+    const resolved = t.debugger.resolved || t.baseline.resolved;
+    g.append('circle')
+      .attr('cx', x(t.baseline.cost_usd))
+      .attr('cy', y(t.debugger.cost_usd))
+      .attr('r', 4)
+      .attr('fill', resolved ? RESOLVED_COLOR : UNRESOLVED_COLOR)
+      .attr('opacity', 0.7)
+      .on('mouseover', e => showTooltip(e, t.instance_id, '',
+        `Baseline: $${t.baseline.cost_usd.toFixed(4)}, Debugger: $${t.debugger.cost_usd.toFixed(4)}`))
+      .on('mouseout', hideTooltip);
+  });
+
+  // Axis labels
+  g.append('text').attr('x', size / 2).attr('y', size + 35)
+    .attr('text-anchor', 'middle').attr('fill', 'var(--text-dim)').attr('font-size', '11px')
+    .text('Baseline cost (USD)');
+  g.append('text').attr('transform', 'rotate(-90)')
+    .attr('x', -size / 2).attr('y', -38)
+    .attr('text-anchor', 'middle').attr('fill', 'var(--text-dim)').attr('font-size', '11px')
+    .text('Debugger cost (USD)');
+}
+
+/* ── Repo Breakdown Chart ──────────────────────────────────────────── */
+
+function renderRepoChart(data) {
+  const repos = {};
+  data.tasks.forEach(t => {
+    if (!repos[t.repo]) repos[t.repo] = { baseline: 0, debugger: 0, total: 0 };
+    repos[t.repo].total++;
+    if (t.baseline.resolved) repos[t.repo].baseline++;
+    if (t.debugger.resolved) repos[t.repo].debugger++;
+  });
+
+  const entries = Object.entries(repos).sort((a, b) => b[1].total - a[1].total);
+  if (entries.length === 0) {
+    document.getElementById('repo-section').style.display = 'none';
+    return;
+  }
+
+  const container = d3.select('#chart-repo');
+  const w = container.node().getBoundingClientRect().width;
+  const margin = { top: 8, right: 60, bottom: 20, left: 180 };
+  const width = w - margin.left - margin.right;
+  const barHeight = 14;
+  const groupPad = 8;
+  const groupHeight = barHeight * 2 + 3;
+  const height = entries.length * (groupHeight + groupPad);
+
+  const svg = container.append('svg')
+    .attr('width', w).attr('height', height + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const x = d3.scaleLinear().domain([0, 100]).range([0, width]);
+
+  entries.forEach(([repo, counts], i) => {
+    const yOff = i * (groupHeight + groupPad);
+    const dPct = counts.total > 0 ? (counts.debugger / counts.total * 100) : 0;
+    const bPct = counts.total > 0 ? (counts.baseline / counts.total * 100) : 0;
+
+    g.append('text').attr('class', 'bar-label')
+      .attr('x', -8).attr('y', yOff + groupHeight / 2)
+      .attr('text-anchor', 'end').attr('dominant-baseline', 'middle')
+      .text(repo);
+
+    g.append('rect').attr('x', 0).attr('y', yOff)
+      .attr('width', x(dPct)).attr('height', barHeight)
+      .attr('rx', 2).attr('fill', DEBUGGER_COLOR).attr('opacity', 0.85);
+    g.append('text').attr('class', 'bar-value')
+      .attr('x', x(dPct) + 4).attr('y', yOff + barHeight / 2)
+      .attr('dominant-baseline', 'middle')
+      .text(`${dPct.toFixed(0)}% (${counts.debugger}/${counts.total})`);
+
+    g.append('rect').attr('x', 0).attr('y', yOff + barHeight + 3)
+      .attr('width', x(bPct)).attr('height', barHeight)
+      .attr('rx', 2).attr('fill', BASELINE_COLOR).attr('opacity', 0.85);
+    g.append('text').attr('class', 'bar-value')
+      .attr('x', x(bPct) + 4).attr('y', yOff + barHeight + 3 + barHeight / 2)
+      .attr('dominant-baseline', 'middle')
+      .text(`${bPct.toFixed(0)}% (${counts.baseline}/${counts.total})`);
+  });
+}
+
+/* ── Duration Chart ────────────────────────────────────────────────── */
+
+function renderDurationChart(data) {
+  const tasks = data.tasks.filter(t => t.baseline.duration_ms > 0 || t.debugger.duration_ms > 0);
+  if (tasks.length === 0) {
+    document.getElementById('duration-section').style.display = 'none';
+    return;
+  }
+
+  const container = d3.select('#chart-duration');
+  const w = container.node().getBoundingClientRect().width;
+  const margin = { top: 20, right: 20, bottom: 40, left: 50 };
+  const size = Math.min(w - margin.left - margin.right, 350);
+
+  const svg = container.append('svg')
+    .attr('width', size + margin.left + margin.right)
+    .attr('height', size + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const maxDur = d3.max(tasks, t => Math.max(t.baseline.duration_ms, t.debugger.duration_ms)) / 1000 || 1;
+  const x = d3.scaleLinear().domain([0, maxDur * 1.1]).range([0, size]);
+  const y = d3.scaleLinear().domain([0, maxDur * 1.1]).range([size, 0]);
+
+  g.append('g').attr('class', 'axis').attr('transform', `translate(0,${size})`)
+    .call(d3.axisBottom(x).ticks(5).tickFormat(v => v.toFixed(0) + 's'));
+  g.append('g').attr('class', 'axis')
+    .call(d3.axisLeft(y).ticks(5).tickFormat(v => v.toFixed(0) + 's'));
+
+  g.append('line')
+    .attr('x1', 0).attr('y1', size).attr('x2', size).attr('y2', 0)
+    .attr('stroke', 'var(--border)').attr('stroke-dasharray', '4,4');
+
+  tasks.forEach(t => {
+    g.append('circle')
+      .attr('cx', x(t.baseline.duration_ms / 1000))
+      .attr('cy', y(t.debugger.duration_ms / 1000))
+      .attr('r', 4)
+      .attr('fill', t.debugger.resolved ? RESOLVED_COLOR : UNRESOLVED_COLOR)
+      .attr('opacity', 0.7)
+      .on('mouseover', e => showTooltip(e, t.instance_id, '',
+        `Baseline: ${(t.baseline.duration_ms/1000).toFixed(0)}s, Debugger: ${(t.debugger.duration_ms/1000).toFixed(0)}s`))
+      .on('mouseout', hideTooltip);
+  });
+
+  g.append('text').attr('x', size / 2).attr('y', size + 35)
+    .attr('text-anchor', 'middle').attr('fill', 'var(--text-dim)').attr('font-size', '11px')
+    .text('Baseline duration (s)');
+  g.append('text').attr('transform', 'rotate(-90)')
+    .attr('x', -size / 2).attr('y', -38)
+    .attr('text-anchor', 'middle').attr('fill', 'var(--text-dim)').attr('font-size', '11px')
+    .text('Debugger duration (s)');
+}
+
+/* ── Token Histogram ───────────────────────────────────────────────── */
+
+function renderTokenHistogram(data) {
+  const bTokens = data.tasks.map(t => t.baseline.input_tokens + t.baseline.output_tokens).filter(v => v > 0);
+  const dTokens = data.tasks.map(t => t.debugger.input_tokens + t.debugger.output_tokens).filter(v => v > 0);
+  if (bTokens.length === 0 && dTokens.length === 0) {
+    document.getElementById('token-hist-section').style.display = 'none';
+    return;
+  }
+
+  const container = d3.select('#chart-token-hist');
+  const w = container.node().getBoundingClientRect().width;
+  const margin = { top: 20, right: 20, bottom: 40, left: 50 };
+  const width = w - margin.left - margin.right;
+  const height = 200;
+
+  const svg = container.append('svg')
+    .attr('width', w).attr('height', height + margin.top + margin.bottom);
+  const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+  const allVals = bTokens.concat(dTokens);
+  const maxTok = d3.max(allVals) || 1;
+  const x = d3.scaleLinear().domain([0, maxTok]).range([0, width]);
+  const bins = d3.bin().domain(x.domain()).thresholds(20);
+
+  const bBins = bins(bTokens);
+  const dBins = bins(dTokens);
+  const maxCount = d3.max(bBins.concat(dBins), b => b.length) || 1;
+  const y = d3.scaleLinear().domain([0, maxCount]).range([height, 0]);
+
+  g.append('g').attr('class', 'axis').attr('transform', `translate(0,${height})`)
+    .call(d3.axisBottom(x).ticks(6).tickFormat(v => v >= 1000 ? (v/1000).toFixed(0) + 'k' : v));
+  g.append('g').attr('class', 'axis').call(d3.axisLeft(y).ticks(5));
+
+  // Baseline bins
+  g.selectAll('.bar-baseline').data(bBins).enter().append('rect')
+    .attr('x', d => x(d.x0) + 1).attr('y', d => y(d.length))
+    .attr('width', d => Math.max(0, x(d.x1) - x(d.x0) - 2))
+    .attr('height', d => height - y(d.length))
+    .attr('fill', BASELINE_COLOR).attr('opacity', 0.4);
+
+  // Debugger bins
+  g.selectAll('.bar-debugger').data(dBins).enter().append('rect')
+    .attr('x', d => x(d.x0) + 1).attr('y', d => y(d.length))
+    .attr('width', d => Math.max(0, x(d.x1) - x(d.x0) - 2))
+    .attr('height', d => height - y(d.length))
+    .attr('fill', DEBUGGER_COLOR).attr('opacity', 0.4);
+
+  g.append('text').attr('x', width / 2).attr('y', height + 35)
+    .attr('text-anchor', 'middle').attr('fill', 'var(--text-dim)').attr('font-size', '11px')
+    .text('Total tokens');
+}
+
+/* ── Detail Table ──────────────────────────────────────────────────── */
+
+let sortCol = null;
+let sortAsc = true;
+
+function renderTable(data) {
+  const fmtK = n => n >= 1000000 ? (n/1000000).toFixed(1) + 'M' : n >= 1000 ? (n/1000).toFixed(0) + 'k' : String(n);
+  const table = document.getElementById('data-table');
+
+  const columns = [
+    { key: 'instance_id', label: 'Instance', sort: (a, b) => a.instance_id.localeCompare(b.instance_id) },
+    { key: 'repo', label: 'Repo', sort: (a, b) => a.repo.localeCompare(b.repo) },
+    { key: 'd_resolved', label: 'Dbg Resolved', sort: (a, b) => (a.debugger.resolved ? 1 : 0) - (b.debugger.resolved ? 1 : 0) },
+    { key: 'b_resolved', label: 'Base Resolved', sort: (a, b) => (a.baseline.resolved ? 1 : 0) - (b.baseline.resolved ? 1 : 0) },
+    { key: 'd_tokens', label: 'Dbg Tokens', sort: (a, b) => (a.debugger.input_tokens + a.debugger.output_tokens) - (b.debugger.input_tokens + b.debugger.output_tokens) },
+    { key: 'b_tokens', label: 'Base Tokens', sort: (a, b) => (a.baseline.input_tokens + a.baseline.output_tokens) - (b.baseline.input_tokens + b.baseline.output_tokens) },
+    { key: 'd_cost', label: 'Dbg Cost', sort: (a, b) => a.debugger.cost_usd - b.debugger.cost_usd },
+    { key: 'b_cost', label: 'Base Cost', sort: (a, b) => a.baseline.cost_usd - b.baseline.cost_usd },
+    { key: 'd_time', label: 'Dbg Time', sort: (a, b) => a.debugger.duration_ms - b.debugger.duration_ms },
+    { key: 'b_time', label: 'Base Time', sort: (a, b) => a.baseline.duration_ms - b.baseline.duration_ms },
+    { key: 'd_turns', label: 'Dbg Turns', sort: (a, b) => a.debugger.num_turns - b.debugger.num_turns },
+    { key: 'b_turns', label: 'Base Turns', sort: (a, b) => a.baseline.num_turns - b.baseline.num_turns },
+    { key: 'd_tools', label: 'Dbg Tools', sort: (a, b) => (a.debugger.debug_tool_calls || 0) - (b.debugger.debug_tool_calls || 0) },
+  ];
+
+  function buildTable(tasks) {
+    let headerHtml = '<thead><tr>';
+    columns.forEach(col => {
+      const arrow = sortCol === col.key ? (sortAsc ? ' ▲' : ' ▼') : '';
+      headerHtml += `<th data-col="${col.key}">${col.label}<span class="sort-arrow">${arrow}</span></th>`;
+    });
+    headerHtml += '</tr></thead>';
+
+    let bodyHtml = '<tbody>';
+    tasks.forEach(t => {
+      const dTok = t.debugger.input_tokens + t.debugger.output_tokens;
+      const bTok = t.baseline.input_tokens + t.baseline.output_tokens;
+      bodyHtml += `<tr>
+        <td class="instance-col" title="${t.instance_id}">${t.instance_id}</td>
+        <td class="repo-col">${t.repo}</td>
+        <td class="${t.debugger.resolved ? 'resolved' : 'unresolved'}">${t.debugger.resolved ? 'YES' : 'NO'}</td>
+        <td class="${t.baseline.resolved ? 'resolved' : 'unresolved'}">${t.baseline.resolved ? 'YES' : 'NO'}</td>
+        <td class="debugger-val">${fmtK(dTok)}</td>
+        <td class="baseline-val">${fmtK(bTok)}</td>
+        <td class="debugger-val">$${t.debugger.cost_usd.toFixed(4)}</td>
+        <td class="baseline-val">$${t.baseline.cost_usd.toFixed(4)}</td>
+        <td class="debugger-val">${(t.debugger.duration_ms / 1000).toFixed(0)}s</td>
+        <td class="baseline-val">${(t.baseline.duration_ms / 1000).toFixed(0)}s</td>
+        <td class="debugger-val">${t.debugger.num_turns}</td>
+        <td class="baseline-val">${t.baseline.num_turns}</td>
+        <td class="${(t.debugger.debug_tool_calls || 0) > 0 ? 'resolved' : 'unresolved'}">${t.debugger.debug_tool_calls || 0}</td>
+      </tr>`;
+    });
+    bodyHtml += '</tbody>';
+    table.innerHTML = headerHtml + bodyHtml;
+
+    // Attach sort handlers
+    table.querySelectorAll('th').forEach(th => {
+      th.addEventListener('click', () => {
+        const colKey = th.dataset.col;
+        if (sortCol === colKey) {
+          sortAsc = !sortAsc;
+        } else {
+          sortCol = colKey;
+          sortAsc = true;
+        }
+        const col = columns.find(c => c.key === colKey);
+        if (col && col.sort) {
+          const sorted = [...data.tasks].sort((a, b) => sortAsc ? col.sort(a, b) : col.sort(b, a));
+          buildTable(sorted);
+        }
+      });
+    });
+  }
+
+  buildTable(data.tasks);
+}
+
+/* ── Tooltip ───────────────────────────────────────────────────────── */
+
+function showTooltip(event, title, subtitle, value) {
+  const tooltip = document.getElementById('tooltip');
+  tooltip.innerHTML = `
+    <div class="tt-label">${title}${subtitle ? ' — ' + subtitle : ''}</div>
+    <div class="tt-value">${value}</div>
+  `;
+  tooltip.style.opacity = 1;
+  tooltip.style.left = (event.pageX + 12) + 'px';
+  tooltip.style.top = (event.pageY - 10) + 'px';
+}
+
+function hideTooltip() {
+  document.getElementById('tooltip').style.opacity = 0;
+}
+</script>
+</body>
+</html>

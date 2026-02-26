@@ -233,12 +233,12 @@ pub fn initializeRequestParams(allocator: std.mem.Allocator, seq: i64, adapter_i
 }
 
 pub fn launchRequest(allocator: std.mem.Allocator, seq: i64, program: []const u8, args: []const []const u8, stop_on_entry: bool) ![]const u8 {
-    return launchRequestEx(allocator, seq, program, args, stop_on_entry, null, null);
+    return launchRequestEx(allocator, seq, program, args, stop_on_entry, null, null, null);
 }
 
 /// Build a launch request with optional extra arguments merged from JSON and optional cwd.
 /// extra_args_json, when non-null, is parsed and each field is written into the arguments object.
-pub fn launchRequestEx(allocator: std.mem.Allocator, seq: i64, program: []const u8, args: []const []const u8, stop_on_entry: bool, extra_args_json: ?[]const u8, cwd: ?[]const u8) ![]const u8 {
+pub fn launchRequestEx(allocator: std.mem.Allocator, seq: i64, program: []const u8, args: []const []const u8, stop_on_entry: bool, extra_args_json: ?[]const u8, cwd: ?[]const u8, module: ?[]const u8) ![]const u8 {
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -284,8 +284,15 @@ pub fn launchRequestEx(allocator: std.mem.Allocator, seq: i64, program: []const 
         }
     }
 
-    try s.objectField("program");
-    try s.write(program);
+    // debugpy supports "module" for `python -m <module>` launch mode
+    // (e.g. module="pytest" for `python -m pytest <args>`).
+    if (module) |m| {
+        try s.objectField("module");
+        try s.write(m);
+    } else {
+        try s.objectField("program");
+        try s.write(program);
+    }
     if (args.len > 0) {
         try s.objectField("args");
         try s.beginArray();

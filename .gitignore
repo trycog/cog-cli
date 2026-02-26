@@ -36,3 +36,18 @@ opencode.json
 /bench/**/__pycache__/
 /bench/swedebug/workspace/
 /bench/swedebug/candidates.json
+/bench/swebench/workspace/
+/bench/swebench/predictions/
+/bench/swebench/results/
+/bench/swebench/.bench/
+/bench/swebench/logs/
+/bench/swebench/tasks.json
+/bench/explore/flask/
+/bench/explore/gin/
+/bench/explore/react/
+/bench/explore/ripgrep/
+/bench/react/
+
+# Research notes (temporary)
+/debug*.txt
+/CLAUDE.md.debug

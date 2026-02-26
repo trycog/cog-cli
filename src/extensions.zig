@@ -213,6 +213,9 @@ pub const builtins = [_]Extension{
             .adapter_command = "python3",
             .adapter_args = &.{ "-m", "debugpy.adapter" },
             .transport = .stdio,
+            .launch_extra_args_json =
+            \\{"justMyCode":false}
+            ,
             .dependencies = &.{
                 .{ .command = "python3", .check_args = &.{ "-c", "import debugpy" }, .error_message = "debugpy not available. Ensure python3 and debugpy are installed (pip install debugpy)" },
             },
