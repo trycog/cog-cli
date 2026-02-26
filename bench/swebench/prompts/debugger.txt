@@ -4,7 +4,7 @@ The repository is checked out in the current directory at the buggy commit. A te
 
 ## MANDATORY: Use the cog debugger
 
-You MUST use the cog debugger MCP tools to diagnose this bug. Do NOT skip the debugger. Do NOT just read the code and guess the fix. You are required to launch a debug session, set breakpoints, and inspect runtime state before making any code changes.
+You MUST use the cog debugger MCP tools to diagnose this bug. Do NOT skip the debugger. Do NOT just read the code and guess the fix. You are required to observe runtime state through the debugger before making any code changes.
 
 ## Problem Statement
 
@@ -18,18 +18,36 @@ These tests currently FAIL. Your goal is to fix the source code so they pass.
 
 ## Required Workflow
 
-1. Read the failing test to understand what it does and find the relevant source code
-2. Determine how to run the failing test (see "Launching the debugger" below)
-3. Set breakpoints on the SOURCE code (not the test) at the suspected bug location
-4. Run to breakpoint, inspect variables to confirm the root cause
-5. Stop the debugger, apply the fix, verify with Bash
+### Phase 1: Understand
+Run the failing test(s) with Bash to see the actual error output and traceback. Read the test to understand expected vs actual behavior. Follow the traceback to the relevant source code. Do NOT state any diagnosis yet.
+
+### Phase 2: Hypothesize (MANDATORY — before ANY debug tool)
+You MUST state a hypothesis BEFORE calling any `cog_debug_*` tool:
+- "I believe the bug is [X] because [Y]."
+- "I expect variable [V] to be [expected] at [location], but I think it will be [actual]."
+
+If you call a debug tool without first stating a hypothesis, your work is invalid.
+
+### Phase 3: Design Experiment
+Based on your hypothesis, decide:
+- Where to set breakpoints (on SOURCE code, not tests)
+- What expressions to evaluate when the breakpoint hits
+- What result would confirm your hypothesis vs refute it
+
+### Phase 4: Execute
+Launch the debugger, set breakpoints, run, and inspect. Quote the actual values you observe from the debugger output.
+
+### Phase 5: Diagnose or Iterate
+- If confirmed: stop the debugger, apply the minimal fix, verify with Bash.
+- If refuted: form a NEW hypothesis (state it explicitly), return to Phase 3.
+- **Max 2 debug sessions.** If 2 sessions haven't found the root cause, stop the debugger, summarize your observations, and reason from the evidence gathered.
 
 ## Tool Reference
 
 | Tool | Purpose | Key args |
 |------|---------|----------|
 | `mcp__cog__cog_debug_launch` | Start debug session | program or module, args, cwd |
-| `mcp__cog__cog_debug_breakpoint` | Set breakpoint | action: "set", file, line |
+| `mcp__cog__cog_debug_breakpoint` | Set/remove breakpoints | action: "set", file, line, condition |
 | `mcp__cog__cog_debug_run` | Continue/step | action: "continue" / "step_over" / "step_into" / "step_out" |
 | `mcp__cog__cog_debug_inspect` | Evaluate expression | expression: any Python expression |
 | `mcp__cog__cog_debug_stacktrace` | View call stack | (no required args) |
@@ -54,16 +72,28 @@ cog_debug_launch(program="tests/runtests.py", args=["--settings=test_sqlite", "t
 cog_debug_launch(program="path/to/test_script.py", args=[...])
 ```
 
-## Breakpoint tips
+## Conditional Breakpoints
 
-- Set breakpoints on SOURCE code, not test files. Use **conditional breakpoints** to skip setup queries and hit only the interesting case (e.g. condition: `"CASE" in sql`).
-- If an unconditional breakpoint hits too many times on irrelevant calls, remove it and add a conditional one.
-- Do NOT use exception breakpoints (action: "set_exception") in Python — pytest catches all exceptions internally, so you will stop on irrelevant pytest/stdlib exceptions rather than the bug.
-- In conditional breakpoint expressions, use actual characters, not escape sequences (e.g. a literal newline, not `\\n`).
+Use the `condition` parameter when a breakpoint is inside a loop or called by multiple tests. This pauses only when the condition is true, avoiding irrelevant hits.
 
-## Important
+```
+cog_debug_breakpoint(session_id, action="set", file="app.py", line=42, condition="name == 'target'")
+```
 
-- You MUST use the debugger (launch, breakpoint, run, inspect) before fixing the code
+If an unconditional breakpoint hits too many times on irrelevant calls, remove it and add a conditional one.
+
+## Anti-Patterns
+
+- Do NOT step_over repeatedly without inspecting — always have a reason for each step
+- Do NOT dump the entire scope — target specific expressions tied to your hypothesis
+- Do NOT use exception breakpoints (action: "set_exception") in Python — pytest catches all exceptions internally, so you will stop on irrelevant pytest/stdlib exceptions rather than the bug
+- Do NOT state a diagnosis before observing runtime state through the debugger
+- In conditional breakpoint expressions, use actual characters, not escape sequences (e.g. a literal newline, not `\\n`)
+
+## Rules
+
+- You MUST state a hypothesis and use the debugger before fixing the code
 - Only modify source files, never test files
 - Make the minimal change necessary to fix the bug
-- Aim for a single debug session — get the launch command and breakpoint right the first time
+- Do not add new features or refactor existing code
+- Always `cog_debug_stop` when done debugging
