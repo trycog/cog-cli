@@ -87,31 +87,23 @@ for variant in "${VARIANTS[@]}"; do
   OUTPUT_DIR="$SCRIPT_DIR/trajectories/${variant}"
   mkdir -p "$OUTPUT_DIR"
 
-  # Build sweagent command
+  # For debugger-subagent, activate CogDebugAgent via env var
+  if [[ "$variant" == "debugger-subagent" ]]; then
+    export COG_DEBUG_AGENT=1
+    export COG_BIN="$COG_BIN"
+  fi
+
+  # Always use run_sweagent.py wrapper (applies /bin/bash fix for Apple Silicon
+  # and CogDebugAgent activation when COG_DEBUG_AGENT=1)
   SWEAGENT_CMD=(
-    sweagent run-batch
+    python3 "$SCRIPT_DIR/run_sweagent.py"
+    run-batch
     --config "$CONFIG"
     --instances.type file
     --instances.path "$INSTANCE_FILE"
     --num_workers "$NUM_WORKERS"
     --output_dir "$OUTPUT_DIR"
   )
-
-  # For debugger-subagent, use our wrapper with CogDebugAgent
-  if [[ "$variant" == "debugger-subagent" ]]; then
-    export COG_DEBUG_AGENT=1
-    export COG_BIN="$COG_BIN"
-
-    SWEAGENT_CMD=(
-      python3 "$SCRIPT_DIR/run_sweagent.py"
-      run-batch
-      --config "$CONFIG"
-      --instances.type file
-      --instances.path "$INSTANCE_FILE"
-      --num_workers "$NUM_WORKERS"
-      --output_dir "$OUTPUT_DIR"
-    )
-  fi
 
   echo "  Command: ${SWEAGENT_CMD[*]}"
   echo ""
