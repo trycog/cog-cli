@@ -84,6 +84,13 @@ Use the `condition` parameter when a breakpoint is inside a loop or called by mu
 cog_debug_breakpoint(session_id, action="set", file="app.py", line=42, condition="name == 'target'")
 ```
 
+## Anti-Patterns
+
+- Do NOT step_over repeatedly without inspecting — always have a reason for each step
+- Do NOT dump the entire scope — target specific expressions tied to your hypothesis
+- Do NOT state a diagnosis before observing runtime state through the debugger
+- Do NOT use exception breakpoints in Python — pytest catches all exceptions internally
+
 ## Rules
 
 - You MUST state a hypothesis and use the debugger before fixing the code
