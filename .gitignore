@@ -41,8 +41,10 @@ opencode.json
 /bench/swebench/results/
 /bench/swebench/.bench/
 /bench/swebench/logs/
+/bench/swebench/trajectories/
 /bench/swebench/tasks.json
 /bench/swebench/tasks_sweagent.jsonl
+/bench/swebench/.tasks_sliced.jsonl
 /bench/explore/flask/
 /bench/explore/gin/
 /bench/explore/react/

@@ -1,447 +1,158 @@
 #!/usr/bin/env bash
-# SWE-bench Pro benchmark runner (Docker-based)
-# Runs baseline and/or debugger variants via `claude -p`, captures patches and metrics
+# SWE-bench Pro benchmark runner (SWE-agent based)
+#
+# Invokes `sweagent run-batch` for each variant, then converts predictions to JSONL.
 #
 # Usage:
-#   bash bench/swebench/run.sh [baseline|debugger|debugger-lite|all] [max_tasks] [timeout]
+#   bash bench/swebench/run.sh [baseline|debugger-subagent|all] [max_tasks] [num_workers]
 #
 # Examples:
 #   bash bench/swebench/run.sh all              # all tasks, all variants
 #   bash bench/swebench/run.sh baseline 2       # baseline only, first 2 tasks
-#   bash bench/swebench/run.sh debugger 5 1200  # debugger, 5 tasks, 20min timeout
-#   bash bench/swebench/run.sh debugger-lite 5  # debugger with only 6 core tools
-#   bash bench/swebench/run.sh debugger-subagent 5  # debugger via Task delegation
+#   bash bench/swebench/run.sh debugger-subagent 5 2  # debugger, 5 tasks, 2 workers
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PREDICTIONS_DIR="$SCRIPT_DIR/predictions"
+COG_BIN="$ROOT_DIR/zig-out/bin/cog"
+TASKS_JSONL="$SCRIPT_DIR/tasks_sweagent.jsonl"
+
+VARIANT_ARG="${1:-all}"
+MAX_TASKS="${2:-0}"
+NUM_WORKERS="${3:-1}"
 
 # Allow nested claude invocations when run from within Claude Code
 unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BENCH_DIR="$SCRIPT_DIR/.bench"
-PREDICTIONS_DIR="$SCRIPT_DIR/predictions"
-LOGS_DIR="$SCRIPT_DIR/logs"
-WORKSPACE="$SCRIPT_DIR/workspace"
-COG_BIN="$ROOT_DIR/zig-out/bin/cog"
-
-mkdir -p "$BENCH_DIR" "$PREDICTIONS_DIR" "$LOGS_DIR"
-
-VARIANT_ARG="${1:-all}"
-MAX_TASKS="${2:-0}"
-TIMEOUT="${3:-900}"
-
-export SCRIPT_DIR ROOT_DIR BENCH_DIR PREDICTIONS_DIR LOGS_DIR WORKSPACE COG_BIN
-export VARIANT_ARG MAX_TASKS TIMEOUT
-
 echo "══════════════════════════════════════"
 echo "  SWE-bench Pro Benchmark Runner"
+echo "  (SWE-agent scaffold)"
 echo "══════════════════════════════════════"
 echo ""
-echo "  Variant:  $VARIANT_ARG"
-echo "  Max tasks: ${MAX_TASKS:-all}"
-echo "  Timeout:  ${TIMEOUT}s"
+echo "  Variant:     $VARIANT_ARG"
+echo "  Max tasks:   ${MAX_TASKS:-all}"
+echo "  Workers:     $NUM_WORKERS"
 echo ""
 
-python3 -u << 'PYEOF'
-import json, os, subprocess, sys, time, re
+# ── Validate ────────────────────────────────────────────────────────────
 
-# Strip Claude Code env vars so nested claude invocations work
-for _k in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT'):
-    os.environ.pop(_k, None)
+if [[ ! -f "$TASKS_JSONL" ]]; then
+  echo "ERROR: tasks_sweagent.jsonl not found. Run setup.sh first."
+  exit 1
+fi
 
-script_dir = os.environ['SCRIPT_DIR']
-bench_dir = os.environ['BENCH_DIR']
-predictions_dir = os.environ['PREDICTIONS_DIR']
-logs_dir = os.environ['LOGS_DIR']
-workspace = os.environ['WORKSPACE']
-cog_bin = os.environ['COG_BIN']
-variant_arg = os.environ.get('VARIANT_ARG', 'all')
-max_tasks = int(os.environ.get('MAX_TASKS', '0'))
-timeout = int(os.environ.get('TIMEOUT', '900'))
-
-tasks_json = os.path.join(script_dir, 'tasks.json')
-with open(tasks_json) as f:
-    tasks = json.load(f)
-
-if not tasks:
-    print("ERROR: tasks.json is empty. Run setup.sh first.", file=sys.stderr)
-    sys.exit(1)
+if ! command -v sweagent &>/dev/null; then
+  echo "ERROR: sweagent not found. Run setup.sh first."
+  exit 1
+fi
 
 # Determine variants to run
-if variant_arg == 'all':
-    variants = ['baseline', 'debugger', 'debugger-lite', 'debugger-subagent']
-elif variant_arg in ('baseline', 'debugger', 'debugger-lite', 'debugger-subagent'):
-    variants = [variant_arg]
-else:
-    print(f"ERROR: Unknown variant '{variant_arg}'. Use: baseline, debugger, debugger-lite, debugger-subagent, or all", file=sys.stderr)
-    sys.exit(1)
+if [[ "$VARIANT_ARG" == "all" ]]; then
+  VARIANTS=("baseline" "debugger-subagent")
+elif [[ "$VARIANT_ARG" == "baseline" || "$VARIANT_ARG" == "debugger-subagent" ]]; then
+  VARIANTS=("$VARIANT_ARG")
+else
+  echo "ERROR: Unknown variant '$VARIANT_ARG'. Use: baseline, debugger-subagent, or all"
+  exit 1
+fi
 
-# Limit tasks if requested
-if max_tasks > 0:
-    tasks = tasks[:max_tasks]
+mkdir -p "$PREDICTIONS_DIR"
 
-# Load prompt templates
-def load_template(name):
-    path = os.path.join(script_dir, 'prompts', f'{name}.txt')
-    with open(path) as f:
-        return f.read()
+# ── Prepare instance file (optionally sliced) ──────────────────────────
 
-templates = {
-    'baseline': load_template('baseline'),
-    'debugger': load_template('debugger'),
-    'debugger-lite': load_template('debugger-lite'),
-    'debugger-subagent': load_template('debugger-subagent'),
-}
+INSTANCE_FILE="$TASKS_JSONL"
+if [[ "$MAX_TASKS" -gt 0 ]]; then
+  INSTANCE_FILE="$SCRIPT_DIR/.tasks_sliced.jsonl"
+  head -n "$MAX_TASKS" "$TASKS_JSONL" > "$INSTANCE_FILE"
+  task_count=$(wc -l < "$INSTANCE_FILE" | tr -d ' ')
+  echo "Sliced to $task_count tasks"
+  echo ""
+fi
 
-print(f"Tasks:    {len(tasks)}")
-print(f"Variants: {' '.join(variants)}")
-print(f"Timeout:  {timeout}s per task")
-print("")
+# ── Run each variant ─────────────────────────────────────────────────
 
+for variant in "${VARIANTS[@]}"; do
+  echo "════════════════════════════════════"
+  echo "  Running variant: $variant"
+  echo "════════════════════════════════════"
+  echo ""
 
-def build_prompt(task, variant):
-    """Build prompt from template with task field substitution."""
-    template = templates[variant]
+  CONFIG="$SCRIPT_DIR/configs/${variant}.yaml"
+  if [[ ! -f "$CONFIG" ]]; then
+    echo "ERROR: Config not found: $CONFIG"
+    exit 1
+  fi
 
-    # Support both Pro (lowercase) and Lite (uppercase) field names
-    fail_to_pass = task.get('fail_to_pass', task.get('FAIL_TO_PASS', []))
-    if isinstance(fail_to_pass, list):
-        fail_str = '\n'.join(f'- {t}' for t in fail_to_pass)
-    else:
-        fail_str = str(fail_to_pass)
+  OUTPUT_DIR="$SCRIPT_DIR/trajectories/${variant}"
+  mkdir -p "$OUTPUT_DIR"
 
-    container_name = f"swebench-{task['instance_id']}"
-    selected_tests = task.get('selected_test_files_to_run', '')
+  # Build sweagent command
+  SWEAGENT_CMD=(
+    sweagent run-batch
+    --config "$CONFIG"
+    --instances.type file
+    --instances.path "$INSTANCE_FILE"
+    --num_workers "$NUM_WORKERS"
+    --output_dir "$OUTPUT_DIR"
+  )
 
-    return template.format(
-        repo=task['repo'],
-        instance_id=task['instance_id'],
-        problem_statement=task['problem_statement'],
-        fail_to_pass=fail_str,
-        container_name=container_name,
-        selected_test_files=selected_tests,
+  # For debugger-subagent, use our wrapper with CogDebugAgent
+  if [[ "$variant" == "debugger-subagent" ]]; then
+    export COG_DEBUG_AGENT=1
+    export COG_BIN="$COG_BIN"
+
+    SWEAGENT_CMD=(
+      python3 "$SCRIPT_DIR/run_sweagent.py"
+      run-batch
+      --config "$CONFIG"
+      --instances.type file
+      --instances.path "$INSTANCE_FILE"
+      --num_workers "$NUM_WORKERS"
+      --output_dir "$OUTPUT_DIR"
     )
+  fi
 
+  echo "  Command: ${SWEAGENT_CMD[*]}"
+  echo ""
 
-def build_mcp_config(task, variant):
-    """Build per-task MCP config with Docker environment."""
-    if variant == 'baseline':
-        return json.dumps({"mcpServers": {}})
+  # Run SWE-agent
+  "${SWEAGENT_CMD[@]}" 2>&1 | tee "$SCRIPT_DIR/logs/${variant}.log" || {
+    echo ""
+    echo "  WARNING: sweagent exited with non-zero status for $variant"
+    echo "  Check logs: $SCRIPT_DIR/logs/${variant}.log"
+    echo ""
+  }
 
-    task_dir = os.path.join(workspace, task['instance_id'])
-    bin_path = os.path.join(task_dir, '.bench', 'bin')
-    container_name = f"swebench-{task['instance_id']}"
-    system_path = os.environ.get('PATH', '')
+  # Unset debugger-subagent env vars
+  unset COG_DEBUG_AGENT 2>/dev/null || true
 
-    args = ["mcp"]
-    if variant in ('debugger-lite', 'debugger-subagent'):
-        args.append("--debug-tools=core")
+  echo ""
+  echo "  $variant complete. Output: $OUTPUT_DIR"
+  echo ""
 
-    return json.dumps({"mcpServers": {"cog": {
-        "command": cog_bin,
-        "args": args,
-        "env": {
-            "PATH": bin_path + ":" + system_path,
-            "SWEBENCH_CONTAINER": container_name,
-        }
-    }}})
+  # Convert predictions to JSONL
+  echo "  Converting predictions..."
+  python3 "$SCRIPT_DIR/convert_preds.py" "$variant" "$OUTPUT_DIR"
+  echo ""
+done
 
+# ── Summary ────────────────────────────────────────────────────────────
 
-def reset_workspace(task_dir, task):
-    """Reset workspace to swebench-base state and ensure container is running."""
-    try:
-        subprocess.run(
-            ['git', 'checkout', 'swebench-base'],
-            cwd=task_dir, capture_output=True, timeout=10
-        )
-        subprocess.run(
-            ['git', 'checkout', '.'],
-            cwd=task_dir, capture_output=True, timeout=10
-        )
-        subprocess.run(
-            ['git', 'clean', '-fd'],
-            cwd=task_dir, capture_output=True, timeout=10
-        )
-    except Exception:
-        pass
-
-    # Ensure container is running
-    container_name = f"swebench-{task['instance_id']}"
-    try:
-        proc = subprocess.run(
-            ['docker', 'inspect', '-f', '{{.State.Running}}', container_name],
-            capture_output=True, text=True, timeout=10
-        )
-        if proc.stdout.strip() != 'true':
-            subprocess.run(
-                ['docker', 'start', container_name],
-                capture_output=True, timeout=30
-            )
-    except Exception:
-        pass
-
-
-def extract_patch(task_dir):
-    """Extract git diff against swebench-base (what the agent changed)."""
-    try:
-        proc = subprocess.run(
-            ['git', 'diff', 'swebench-base'],
-            cwd=task_dir, capture_output=True, text=True, timeout=30
-        )
-        return proc.stdout.strip()
-    except Exception:
-        return ""
-
-
-def append_prediction(variant, instance_id, patch):
-    """Append a prediction to the variant's JSONL file."""
-    pred = {
-        "instance_id": instance_id,
-        "model_name_or_path": f"cog-swebench-{variant}",
-        "model_patch": patch,
-    }
-    path = os.path.join(predictions_dir, f'{variant}.jsonl')
-    with open(path, 'a') as f:
-        f.write(json.dumps(pred) + '\n')
-
-
-total = 0
-completed = 0
-
-# Run variants sequentially: all baseline first, then all debugger
-for variant in variants:
-    print(f"\n{'='*50}")
-    print(f"  Running variant: {variant}")
-    print(f"{'='*50}")
-
-    for i, task in enumerate(tasks):
-        instance_id = task['instance_id']
-        task_dir = os.path.join(workspace, instance_id)
-
-        if not os.path.isdir(task_dir):
-            print(f"\n  ! [{i+1}/{len(tasks)}] {instance_id}: workspace not found (run setup.sh)", flush=True)
-            continue
-
-        total += 1
-        result_file = os.path.join(bench_dir, f'{instance_id}-{variant}.json')
-
-        # Skip if already completed with cost > 0 (resume support)
-        if os.path.exists(result_file):
-            try:
-                with open(result_file) as f:
-                    existing = json.load(f)
-                if existing.get('cost_usd', 0) > 0:
-                    print(f"\n  skip [{i+1}/{len(tasks)}] {instance_id}-{variant} (done: ${existing['cost_usd']:.4f})", flush=True)
-                    completed += 1
-                    continue
-            except Exception:
-                pass
-
-        # Reset workspace
-        reset_workspace(task_dir, task)
-
-        print(f"\n  run  [{i+1}/{len(tasks)}] {instance_id}-{variant}", flush=True)
-        start = time.time()
-
-        # Build prompt and per-task MCP config
-        prompt = build_prompt(task, variant)
-        mcp_config = build_mcp_config(task, variant)
-
-        log_file = os.path.join(logs_dir, f'{instance_id}-{variant}.jsonl')
-
-        # Set up environment with Docker wrapper PATH
-        container_name = f"swebench-{instance_id}"
-        bin_path = os.path.join(task_dir, '.bench', 'bin')
-
-        try:
-            cmd = [
-                'claude', '-p', prompt,
-                '--output-format', 'stream-json',
-                '--verbose',
-                '--model', 'opus',
-                '--dangerously-skip-permissions',
-                '--strict-mcp-config',
-                '--mcp-config', mcp_config,
-            ]
-            env = {k: v for k, v in os.environ.items() if k not in ('CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT')}
-            env['SWEBENCH_CONTAINER'] = container_name
-            env['PATH'] = bin_path + ':' + env.get('PATH', '')
-
-            # Stream output live: write to log file and parse in real-time
-            cost = 0
-            dur = 0
-            in_tok = 0
-            out_tok = 0
-            num_turns = 0
-            debug_tool_calls = 0
-            sessions_launched = 0
-            breakpoints_set = 0
-            conditional_breakpoints = 0
-            task_delegations = 0
-
-            proc = subprocess.Popen(
-                cmd, cwd=task_dir, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1
-            )
-
-            log_fh = open(log_file, 'w')
-            try:
-                for line in proc.stdout:
-                    log_fh.write(line)
-                    log_fh.flush()
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    # Print live summary of each message
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    msg_type = msg.get('type', '')
-
-                    # Show assistant text and tool calls live
-                    if msg_type == 'assistant':
-                        content = msg.get('message', {}).get('content', [])
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict):
-                                    if block.get('type') == 'tool_use':
-                                        tool_name = block.get('name', '')
-                                        print(f"       > tool: {tool_name}", flush=True)
-                                        if 'cog_debug' in tool_name:
-                                            debug_tool_calls += 1
-                                            tool_input = block.get('input', {})
-                                            if tool_name.endswith('cog_debug_launch'):
-                                                sessions_launched += 1
-                                            elif tool_name.endswith('cog_debug_breakpoint'):
-                                                action = tool_input.get('action', '')
-                                                if action == 'set':
-                                                    breakpoints_set += 1
-                                                    if tool_input.get('condition'):
-                                                        conditional_breakpoints += 1
-                                        if tool_name == 'Task':
-                                            tool_input = block.get('input', {})
-                                            prompt_text = tool_input.get('prompt', '')
-                                            if 'cog_debug' in prompt_text or 'debug' in tool_input.get('subagent_type', '').lower():
-                                                task_delegations += 1
-                                    elif block.get('type') == 'text':
-                                        text = block.get('text', '')
-                                        if text.strip():
-                                            preview = text.strip().replace('\n', ' ')[:120]
-                                            print(f"       > {preview}", flush=True)
-
-                    elif msg_type == 'tool_result':
-                        pass  # tool results can be huge, skip
-
-                    elif msg_type == 'result':
-                        cost = msg.get('total_cost_usd', 0) or 0
-                        dur = msg.get('duration_ms', 0) or 0
-                        num_turns = msg.get('num_turns', 0) or 0
-                        for m, u in (msg.get('modelUsage') or {}).items():
-                            in_tok += u.get('inputTokens', 0) + u.get('cacheReadInputTokens', 0) + u.get('cacheCreationInputTokens', 0)
-                            out_tok += u.get('outputTokens', 0)
-
-                proc.wait(timeout=timeout)
-            finally:
-                stderr = proc.stderr.read() if proc.stderr else ''
-                if stderr:
-                    with open(log_file + '.stderr', 'w') as f:
-                        f.write(stderr)
-                log_fh.close()
-
-            elapsed = int((time.time() - start) * 1000)
-            if dur == 0:
-                dur = elapsed
-
-            # Extract patch
-            patch = extract_patch(task_dir)
-            has_patch = bool(patch)
-            patch_size = len(patch)
-
-            # Append to predictions JSONL
-            append_prediction(variant, instance_id, patch)
-
-            # Record metrics
-            data = {
-                'instance_id': instance_id,
-                'variant': variant,
-                'cost_usd': round(cost, 6),
-                'duration_ms': dur,
-                'num_turns': num_turns,
-                'input_tokens': in_tok,
-                'output_tokens': out_tok,
-                'has_patch': has_patch,
-                'patch_size': patch_size,
-                'debug_tool_calls': debug_tool_calls,
-                'sessions_launched': sessions_launched,
-                'breakpoints_set': breakpoints_set,
-                'conditional_breakpoints': conditional_breakpoints,
-                'task_delegations': task_delegations,
-                'log_file': log_file,
-            }
-            with open(result_file, 'w') as f:
-                json.dump(data, f, indent=2)
-
-            total_tokens = in_tok + out_tok
-            status = 'OK' if cost > 0 else 'FAIL'
-            patch_str = f"patch={patch_size}B" if has_patch else "no-patch"
-            is_debug_variant = variant in ('debugger', 'debugger-lite', 'debugger-subagent')
-            dbg_str = f" debug_tools={debug_tool_calls} sessions={sessions_launched} bp={breakpoints_set} cond_bp={conditional_breakpoints}" if is_debug_variant else ""
-            if variant == 'debugger-subagent':
-                dbg_str += f" delegations={task_delegations}"
-                if task_delegations == 0 and cost > 0:
-                    dbg_str += " WARNING:NO_DELEGATIONS"
-            elif is_debug_variant and debug_tool_calls == 0 and cost > 0:
-                dbg_str += " WARNING:NO_DEBUG_TOOLS_USED"
-            print(f"       {status}  cost=${cost:.4f} tokens={total_tokens} turns={num_turns} time={dur/1000:.1f}s {patch_str}{dbg_str}", flush=True)
-            if cost > 0:
-                completed += 1
-
-        except subprocess.TimeoutExpired:
-            elapsed = int((time.time() - start) * 1000)
-            print(f"       TIMEOUT ({timeout}s)", flush=True)
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-            # Still extract whatever patch exists
-            patch = extract_patch(task_dir)
-            if patch:
-                append_prediction(variant, instance_id, patch)
-            data = {
-                'instance_id': instance_id,
-                'variant': variant,
-                'cost_usd': round(cost, 6),
-                'duration_ms': elapsed,
-                'num_turns': num_turns,
-                'input_tokens': in_tok,
-                'output_tokens': out_tok,
-                'has_patch': bool(patch),
-                'patch_size': len(patch) if patch else 0,
-                'debug_tool_calls': debug_tool_calls,
-                'sessions_launched': sessions_launched,
-                'breakpoints_set': breakpoints_set,
-                'conditional_breakpoints': conditional_breakpoints,
-                'task_delegations': task_delegations,
-                'timeout': True,
-            }
-            with open(result_file, 'w') as f:
-                json.dump(data, f, indent=2)
-
-        except Exception as e:
-            print(f"       FAIL: {e}", flush=True)
-
-        # Reset workspace for next run
-        reset_workspace(task_dir, task)
-
-print(f"\n{'='*50}")
-print(f"  {completed}/{total} runs completed")
-print(f"{'='*50}")
-print(f"\nPredictions written to {predictions_dir}/")
-print(f"Run evaluation:  bash bench/swebench/evaluate.sh")
-print(f"Collect results: bash bench/swebench/collect.sh")
-PYEOF
+echo "══════════════════════════════════════"
+echo "  All variants complete"
+echo "══════════════════════════════════════"
+echo ""
+echo "Predictions in: $PREDICTIONS_DIR/"
+for variant in "${VARIANTS[@]}"; do
+  pred_file="$PREDICTIONS_DIR/${variant}.jsonl"
+  if [[ -f "$pred_file" ]]; then
+    count=$(wc -l < "$pred_file" | tr -d ' ')
+    echo "  $variant: $count predictions"
+  fi
+done
+echo ""
+echo "Next steps:"
+echo "  bash bench/swebench/evaluate.sh"
+echo "  bash bench/swebench/collect.sh"
+echo "  open bench/swebench/dashboard.html"
