@@ -297,7 +297,7 @@ pub const debug_breakpoint_schema =
 ;
 
 pub const debug_run_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"action":{"type":"string","enum":["continue","step_into","step_over","step_out","restart","pause","goto","reverse_continue","step_back"],"description":"continue: run until next breakpoint, step_over: next line, step_into: enter function, step_out: finish current function, pause: suspend running program, goto: jump to file:line, restart: re-run from start"},"file":{"type":"string","description":"Target file for goto action"},"line":{"type":"integer","description":"Target line for goto action"},"granularity":{"type":"string","enum":["statement","line","instruction"],"description":"Stepping granularity (default: statement)"}},"required":["session_id","action"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"action":{"type":"string","enum":["continue","step_into","step_over","step_out","restart","pause","goto","reverse_continue","step_back"],"description":"continue: run until next breakpoint, step_over: next line, step_into: enter function, step_out: finish current function, pause: suspend running program, goto: jump to file:line, restart: re-run from start"},"file":{"type":"string","description":"Target file for goto action"},"line":{"type":"integer","description":"Target line for goto action"},"granularity":{"type":"string","enum":["statement","line","instruction"],"description":"Stepping granularity (default: statement)"},"timeout_ms":{"type":"integer","description":"Block until debuggee stops or timeout (ms). Default 30000. Set to 0 for async (returns immediately with status:running).","default":30000}},"required":["session_id","action"]}
 ;
 
 pub const debug_inspect_schema =
@@ -938,11 +938,17 @@ pub const DebugServer = struct {
             return .{ .ok = result };
         }
 
-        // Async execution control: continue, step_into, step_over, step_out,
-        // reverse_continue, step_back — spawn background thread, return immediately.
+        // Execution control: continue, step_into, step_over, step_out,
+        // reverse_continue, step_back.
         if (session.pending_run != null) {
             return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Session is already running. Use debug_poll_events to check status or debug_stop to cancel." } };
         }
+
+        // Parse timeout_ms: default 30000 (synchronous blocking), 0 = async
+        const timeout_ms: i64 = if (a.object.get("timeout_ms")) |v|
+            (if (v == .integer) v.integer else 30000)
+        else
+            30000;
 
         session.status = .running;
         self.emitRunEvent(session_id_val.string, action_val.string);
@@ -969,17 +975,93 @@ pub const DebugServer = struct {
             .allocator = self.allocator,
         };
 
-        var aw: Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-        var jw: Stringify = .{ .writer = &aw.writer };
-        try jw.beginObject();
-        try jw.objectField("status");
-        try jw.write("running");
-        try jw.objectField("session_id");
-        try jw.write(session_id_val.string);
-        try jw.endObject();
-        const result = try aw.toOwnedSlice();
-        return .{ .ok = result };
+        // Async path: return immediately with status:running
+        if (timeout_ms <= 0) {
+            var aw: Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var jw: Stringify = .{ .writer = &aw.writer };
+            try jw.beginObject();
+            try jw.objectField("status");
+            try jw.write("running");
+            try jw.objectField("session_id");
+            try jw.write(session_id_val.string);
+            try jw.endObject();
+            const result = try aw.toOwnedSlice();
+            return .{ .ok = result };
+        }
+
+        // Synchronous blocking path: release mutex, poll until done or timeout,
+        // then re-acquire mutex before returning.
+        self.mutex.unlock();
+        defer self.mutex.lock();
+
+        const deadline_ns: i128 = @as(i128, std.time.milliTimestamp()) + timeout_ms;
+        const poll_interval_ns: u64 = 10 * std.time.ns_per_ms; // 10ms
+
+        while (true) {
+            if (session.pending_run) |*pr| {
+                const status = pr.result.load(.acquire);
+                if (status == 1) {
+                    // Completed successfully
+                    if (pr.stop_state) |state| {
+                        session.status = if (state.exit_code != null) .terminated else .stopped;
+                        self.dashboard.onRun(session_id_val.string, action_val.string, state);
+                        self.emitStopEvent(session_id_val.string, action_val.string, state);
+
+                        var aw: Writer.Allocating = .init(allocator);
+                        defer aw.deinit();
+                        var jw: Stringify = .{ .writer = &aw.writer };
+                        try state.jsonStringify(&jw);
+                        const stop_result = try aw.toOwnedSlice();
+
+                        pr.thread.join();
+                        pr.deinit();
+                        session.pending_run = null;
+
+                        return .{ .ok = stop_result };
+                    }
+                    // stop_state was null — shouldn't happen, treat as error
+                    pr.thread.join();
+                    pr.deinit();
+                    session.pending_run = null;
+                    session.status = .stopped;
+                    return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Run completed but no stop state" } };
+                } else if (status == 2) {
+                    // Error
+                    const err_msg = pr.error_msg orelse "unknown error";
+                    session.status = .stopped;
+
+                    pr.thread.join();
+                    pr.deinit();
+                    session.pending_run = null;
+
+                    return .{ .err = .{ .code = INTERNAL_ERROR, .message = err_msg } };
+                }
+            } else {
+                // pending_run disappeared — session was cleaned up
+                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Session run state lost" } };
+            }
+
+            // Check timeout
+            if (std.time.milliTimestamp() >= deadline_ns) {
+                // Timeout: send pause to debuggee and return timeout status
+                session.driver.sendPause(allocator, null) catch {};
+
+                var aw: Writer.Allocating = .init(allocator);
+                defer aw.deinit();
+                var jw: Stringify = .{ .writer = &aw.writer };
+                try jw.beginObject();
+                try jw.objectField("status");
+                try jw.write("timeout");
+                try jw.objectField("session_id");
+                try jw.write(session_id_val.string);
+                try jw.endObject();
+                const timeout_result = try aw.toOwnedSlice();
+                return .{ .ok = timeout_result };
+            }
+
+            std.Thread.sleep(poll_interval_ns);
+        }
     }
 
     /// Background thread function for async execution control.
