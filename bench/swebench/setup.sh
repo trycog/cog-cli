@@ -13,24 +13,19 @@ echo "  SWE-bench Pro Benchmark Setup"
 echo "═══════════════════════════════════════"
 echo ""
 
-# ── Validate tasks.json ──────────────────────────────────────────────────
+# ── Generate tasks.json if missing ───────────────────────────────────────
 
 if [[ ! -f "$TASKS_JSON" ]]; then
-  echo "ERROR: tasks.json not found."
+  echo "tasks.json not found, generating..."
   echo ""
-  echo "Run select_tasks_pro.py first:"
-  echo "  pip install datasets"
-  echo "  python3 bench/swebench/select_tasks_pro.py"
-  exit 1
+  pip install --quiet datasets 2>/dev/null
+  python3 "$SCRIPT_DIR/select_tasks_pro.py"
+  echo ""
 fi
 
 task_count=$(python3 -c "import json; print(len(json.load(open('$TASKS_JSON'))))")
 if [[ "$task_count" -eq 0 ]]; then
-  echo "ERROR: tasks.json is empty."
-  echo ""
-  echo "Run select_tasks_pro.py first:"
-  echo "  pip install datasets"
-  echo "  python3 bench/swebench/select_tasks_pro.py"
+  echo "ERROR: tasks.json is empty. select_tasks_pro.py may have failed."
   exit 1
 fi
 echo "Found $task_count tasks in tasks.json"
