@@ -156,6 +156,21 @@ Use the `condition` parameter when a breakpoint is inside a loop or called multi
 cog_debug_breakpoint(session_id, action="set", file="app.py", line=42, condition="user_id is None")
 ```
 
+### Debug Subagent
+
+For complex debugging (multiple breakpoints, stepping through loops, deep call stacks), delegate to a subagent to keep your main context clean.
+
+- **When to delegate**: Multi-step investigations, high-iteration loops, deep call stacks, or when your context window is getting large
+- **When NOT to delegate**: Single breakpoint-and-inspect, quick variable check — use `cog_debug_inspect` directly
+
+Invoke the `cog-debug` agent by name, or use the Task tool:
+
+```
+Task(prompt="Debug subagent: Using cog_debug tools, answer: What is the value of X at file.py:42 when test_foo runs? Return only observed values, no diagnosis.", subagent_type="general-purpose")
+```
+
+You must formulate your hypothesis and question BEFORE delegating. The subagent answers questions — it does not diagnose bugs.
+
 ### Anti-Patterns
 
 - Do NOT `step_over` repeatedly without inspecting — always have a reason for each step
@@ -163,6 +178,7 @@ cog_debug_breakpoint(session_id, action="set", file="app.py", line=42, condition
 - Do NOT inspect every variable in scope — target specific expressions tied to your hypothesis
 - Do NOT use exception breakpoints in Python/pytest — pytest catches all exceptions internally
 - Do NOT add print statements when you have the debugger — use `cog_debug_inspect` instead
+- Do NOT delegate to a debug subagent without a hypothesis — formulate your question first
 
 ### Bailout Rule
 

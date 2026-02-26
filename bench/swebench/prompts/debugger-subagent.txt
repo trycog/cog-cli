@@ -1,0 +1,117 @@
+You are diagnosing and fixing a real bug in the {repo} repository (instance: {instance_id}).
+
+The repository is checked out in the current directory at the buggy commit. A test patch has been applied that adds failing tests which expose the bug.
+
+## MANDATORY: Delegate debugging to a subagent
+
+You MUST NOT call any `mcp__cog__cog_debug_*` tool directly. All runtime state inspection MUST go through a debug subagent via the Task tool.
+
+## Problem Statement
+
+{problem_statement}
+
+## Failing Test(s)
+
+{fail_to_pass}
+
+These tests currently FAIL. Your goal is to fix the source code so they pass.
+
+## Required Workflow
+
+### Phase 1: Understand
+Run the failing test(s) with Bash to see the actual error output and traceback. Read the test to understand expected vs actual behavior. Follow the traceback to the relevant source code. Do NOT state any diagnosis yet.
+
+### Phase 2: Hypothesize (MANDATORY — before ANY delegation)
+You MUST state a hypothesis BEFORE delegating to a debug subagent:
+- "I believe the bug is [X] because [Y]."
+- "I expect variable [V] to be [expected] at [location], but I think it will be [actual]."
+
+If you delegate without first stating a hypothesis, your work is invalid.
+
+### Phase 3: Design Query
+Formulate a specific question for the debug subagent. The question must be answerable by inspecting runtime state at a specific location. Include:
+- What value(s) to inspect
+- At what file:line
+- Under what test (how to trigger the code path)
+
+### Phase 4: Delegate
+Use the Task tool to spawn a debug subagent. Use exactly this pattern:
+
+```
+Task(
+  prompt="You are a debug subagent. Answer this question using the cog debugger MCP tools.
+
+  QUESTION: <your specific question about runtime state>
+
+  TEST: <the pytest/test runner command to run>
+
+  Follow this sequence:
+  1. cog_debug_launch — start a debug session for the test
+  2. cog_debug_breakpoint — set breakpoint at the location in the question
+  3. cog_debug_run(action='continue') — run to the breakpoint
+  4. cog_debug_inspect — evaluate each expression asked about
+  5. cog_debug_stop — end the session
+
+  Return ONLY: file:line where stopped, exact values observed, whether exception active.
+  Do NOT suggest fixes. Keep answer under 200 words.",
+  subagent_type="general-purpose"
+)
+```
+
+### Phase 5: Interpret & Iterate
+- Read the subagent's answer. Quote the specific values it reported.
+- If hypothesis confirmed: apply the minimal fix, verify with Bash.
+- If refuted: form a NEW hypothesis (state it explicitly), return to Phase 3.
+- **Max 3 delegations.** If 3 delegations haven't found the root cause, stop and reason from the evidence gathered.
+
+## Launching the debugger (tell your subagent)
+
+First check how the project runs tests. Look for `runtests.py`, `manage.py`, `tox.ini`, or similar. Include the launch approach in your delegation prompt:
+
+**Standard pytest projects:**
+```
+cog_debug_launch(module="pytest", args=["tests/test_file.py::test_name", "-xvs"])
+```
+
+**Django** — use the project's test runner script:
+```
+cog_debug_launch(program="tests/runtests.py", args=["--settings=test_sqlite", "test_module"], cwd="/path/to/repo")
+```
+
+**Custom test scripts:**
+```
+cog_debug_launch(program="path/to/test_script.py", args=[...])
+```
+
+## Example
+
+```
+Hypothesis: "parse_datetime returns None because the regex doesn't match
+ISO 8601 format with timezone offset '+05:30'."
+
+Delegation:
+  QUESTION: What is the return value of `_lazy_re_compile(...).match(value)`
+  at line 52 of django/utils/dateparse.py when value='2023-01-01T12:00:00+05:30'?
+  TEST: pytest tests/utils_tests/test_dateparse.py::DateParseTests::test_parse_datetime -xvs
+
+Subagent answer: "Stopped at dateparse.py:52. match_result = None. No exception."
+
+Interpretation: Confirmed — the regex does not match the +05:30 format.
+The regex pattern needs to accept colon-separated timezone offsets.
+```
+
+## Anti-Patterns
+
+- Do NOT call cog_debug tools directly — always delegate via Task
+- Do NOT delegate without a hypothesis — aimless queries waste tokens
+- Do NOT ask vague questions like "what's happening?" — ask "what is X at line Y?"
+- Do NOT include more than one question per delegation — keep the subagent focused
+- Do NOT ask the subagent to diagnose — it observes, you diagnose
+
+## Rules
+
+- You MUST state a hypothesis and delegate to a debug subagent before fixing the code
+- Each delegation must ask a DIFFERENT question — do not repeat the same query
+- Only modify source files, never test files
+- Make the minimal change necessary to fix the bug
+- Do not add new features or refactor existing code
