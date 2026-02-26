@@ -995,7 +995,7 @@ pub const DebugServer = struct {
         self.mutex.unlock();
         defer self.mutex.lock();
 
-        const deadline_ns: i128 = @as(i128, std.time.milliTimestamp()) + timeout_ms;
+        const deadline_ms: i128 = @as(i128, std.time.milliTimestamp()) + timeout_ms;
         const poll_interval_ns: u64 = 10 * std.time.ns_per_ms; // 10ms
 
         while (true) {
@@ -1043,7 +1043,7 @@ pub const DebugServer = struct {
             }
 
             // Check timeout
-            if (std.time.milliTimestamp() >= deadline_ns) {
+            if (std.time.milliTimestamp() >= deadline_ms) {
                 // Timeout: send pause to debuggee and return timeout status
                 session.driver.sendPause(allocator, null) catch {};
 
