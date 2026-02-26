@@ -217,7 +217,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var written_prompts_count: usize = 0;
 
     // Track which agent files have been written (for dedup)
-    var written_agents: [16][]const u8 = undefined;
+    var written_agents: [32][]const u8 = undefined;
     var written_agents_count: usize = 0;
 
     for (selected_indices) |idx| {
@@ -303,9 +303,44 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 printErr(" ");
                 printErr(agent_path);
                 printErr("\n");
-                if (written_agents_count < 16) {
+                if (written_agents_count < 32) {
                     written_agents[written_agents_count] = agent_path;
                     written_agents_count += 1;
+                }
+            }
+        }
+
+        // e. Deploy debug agent file
+        // For agents sharing a path (codex, roo), the writers are additive
+        // so we always call configureDebugAgentFile even if the path was seen.
+        if (agent.debug_file_path) |debug_path| {
+            const shares_path = if (agent.agent_file_path) |ap|
+                std.mem.eql(u8, ap, debug_path)
+            else
+                false;
+
+            if (shares_path) {
+                // Codex/Roo: same file, writers append — always write
+                hooks_mod.configureDebugAgentFile(allocator, agent) catch {};
+            } else {
+                var debug_already_written = false;
+                for (written_agents[0..written_agents_count]) |wa| {
+                    if (std.mem.eql(u8, wa, debug_path)) {
+                        debug_already_written = true;
+                        break;
+                    }
+                }
+                if (!debug_already_written) {
+                    hooks_mod.configureDebugAgentFile(allocator, agent) catch {};
+                    printErr("    ");
+                    tui.checkmark();
+                    printErr(" ");
+                    printErr(debug_path);
+                    printErr("\n");
+                    if (written_agents_count < 32) {
+                        written_agents[written_agents_count] = debug_path;
+                        written_agents_count += 1;
+                    }
                 }
             }
         }

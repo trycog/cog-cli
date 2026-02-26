@@ -507,26 +507,37 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
     const agent_path = agent.agent_file_path orelse return;
 
     if (agent.agent_file_header) |header| {
-        try writeMarkdownAgent(allocator, agent_path, header);
+        try writeMarkdownAgent(allocator, agent_path, header, build_options.agent_body);
     } else if (std.mem.eql(u8, agent.id, "codex")) {
-        try writeTomlAgent(allocator, agent_path);
+        try writeTomlAgent(allocator, agent_path, "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
-        try writeRooAgent(allocator, agent_path);
+        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", "You are a code index exploration agent. Use cog_code_query to answer questions about code structure. Always follow this order: 1) find to locate definitions, 2) symbols to understand the file, 3) refs to see usage, 4) Read source only after you know where to look. Never guess filenames. Return concise summaries with file paths and line numbers.");
     }
 }
 
-fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8) !void {
+pub fn configureDebugAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
+    const debug_path = agent.debug_file_path orelse return;
+
+    if (agent.debug_file_header) |header| {
+        try writeMarkdownAgent(allocator, debug_path, header, build_options.debug_agent_body);
+    } else if (std.mem.eql(u8, agent.id, "codex")) {
+        try writeTomlAgent(allocator, debug_path, "cog-debug", "Debug subagent that inspects runtime state via cog debugger tools", build_options.debug_agent_body);
+    } else if (std.mem.eql(u8, agent.id, "roo")) {
+        try writeRooAgent(allocator, debug_path, "cog-debug", "Cog Debug", "You are a debug subagent. Use cog_debug tools to answer questions about runtime state. Launch a debug session, set breakpoints, run to them, inspect values, then stop. Return only the observed values. Do not suggest fixes.");
+    }
+}
+
+fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         try ensureDir(parent);
     }
 
-    const body = build_options.agent_body;
     const content = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
     defer allocator.free(content);
     try writeCwdFile(path, content);
 }
 
-fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8) !void {
+fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8, section_name: []const u8, description: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         try ensureDir(parent);
     }
@@ -534,7 +545,8 @@ fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8) !void {
     const existing = readCwdFile(allocator, path);
     defer if (existing) |e| allocator.free(e);
 
-    const section_marker = "[agents.cog-code-query]";
+    const section_marker = try std.fmt.allocPrint(allocator, "[agents.{s}]", .{section_name});
+    defer allocator.free(section_marker);
 
     if (existing) |content| {
         if (std.mem.indexOf(u8, content, section_marker) != null) return;
@@ -542,11 +554,11 @@ fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8) !void {
         const toml_section = try std.fmt.allocPrint(allocator,
             \\
             \\{s}
-            \\description = "Explore code structure using the Cog SCIP index"
+            \\description = "{s}"
             \\developer_instructions = """
             \\{s}"""
             \\
-        , .{ section_marker, build_options.agent_body });
+        , .{ section_marker, description, body });
         defer allocator.free(toml_section);
 
         const new_content = try std.fmt.allocPrint(allocator, "{s}{s}", .{ content, toml_section });
@@ -555,23 +567,19 @@ fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8) !void {
     } else {
         const toml_content = try std.fmt.allocPrint(allocator,
             \\{s}
-            \\description = "Explore code structure using the Cog SCIP index"
+            \\description = "{s}"
             \\developer_instructions = """
             \\{s}"""
             \\
-        , .{ section_marker, build_options.agent_body });
+        , .{ section_marker, description, body });
         defer allocator.free(toml_content);
         try writeCwdFile(path, toml_content);
     }
 }
 
-fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8) !void {
+fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8, slug: []const u8, name: []const u8, role_definition: []const u8) !void {
     const existing = readCwdFile(allocator, path);
     defer if (existing) |e| allocator.free(e);
-
-    const mode_slug = "cog-code-query";
-    const mode_name = "Cog Code Query";
-    const role_definition = "You are a code index exploration agent. Use cog_code_query to answer questions about code structure. Always follow this order: 1) find to locate definitions, 2) symbols to understand the file, 3) refs to see usage, 4) Read source only after you know where to look. Never guess filenames. Return concise summaries with file paths and line numbers.";
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -592,14 +600,14 @@ fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8) !void {
                         for (modes.array.items) |mode| {
                             if (mode == .object) {
                                 if (mode.object.get("slug")) |slug_val| {
-                                    if (slug_val == .string and std.mem.eql(u8, slug_val.string, mode_slug)) {
+                                    if (slug_val == .string and std.mem.eql(u8, slug_val.string, slug)) {
                                         found_existing = true;
                                         // Write updated entry
                                         try s.beginObject();
                                         try s.objectField("slug");
-                                        try s.write(mode_slug);
+                                        try s.write(slug);
                                         try s.objectField("name");
-                                        try s.write(mode_name);
+                                        try s.write(name);
                                         try s.objectField("roleDefinition");
                                         try s.write(role_definition);
                                         try s.endObject();
@@ -618,9 +626,9 @@ fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8) !void {
     if (!found_existing) {
         try s.beginObject();
         try s.objectField("slug");
-        try s.write(mode_slug);
+        try s.write(slug);
         try s.objectField("name");
-        try s.write(mode_name);
+        try s.write(name);
         try s.objectField("roleDefinition");
         try s.write(role_definition);
         try s.endObject();
@@ -923,7 +931,7 @@ test "writeMarkdownAgent creates correct file" {
                 \\---
             ;
 
-            try writeMarkdownAgent(allocator, ".claude/agents/cog-code-query.md", header);
+            try writeMarkdownAgent(allocator, ".claude/agents/cog-code-query.md", header, build_options.agent_body);
 
             const content = readCwdFile(allocator, ".claude/agents/cog-code-query.md") orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
@@ -947,11 +955,11 @@ test "writeMarkdownAgent is idempotent" {
                 \\---
             ;
 
-            try writeMarkdownAgent(allocator, ".test/agent.md", header);
+            try writeMarkdownAgent(allocator, ".test/agent.md", header, build_options.agent_body);
             const first = readCwdFile(allocator, ".test/agent.md") orelse return error.TestUnexpectedResult;
             defer allocator.free(first);
 
-            try writeMarkdownAgent(allocator, ".test/agent.md", header);
+            try writeMarkdownAgent(allocator, ".test/agent.md", header, build_options.agent_body);
             const second = readCwdFile(allocator, ".test/agent.md") orelse return error.TestUnexpectedResult;
             defer allocator.free(second);
 
@@ -973,7 +981,7 @@ test "writeTomlAgent appends section" {
             std.fs.cwd().makeDir(".codex") catch {};
             try writeCwdFile(".codex/config.toml", initial);
 
-            try writeTomlAgent(allocator, ".codex/config.toml");
+            try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
 
             const content = readCwdFile(allocator, ".codex/config.toml") orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
@@ -994,8 +1002,8 @@ test "writeTomlAgent is idempotent" {
             std.fs.cwd().makeDir(".codex") catch {};
             try writeCwdFile(".codex/config.toml", "model = \"gpt-5\"\n");
 
-            try writeTomlAgent(allocator, ".codex/config.toml");
-            try writeTomlAgent(allocator, ".codex/config.toml");
+            try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
+            try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
 
             const content = readCwdFile(allocator, ".codex/config.toml") orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
@@ -1011,7 +1019,7 @@ test "writeTomlAgent is idempotent" {
 test "writeRooAgent creates .roomodes" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
-            try writeRooAgent(allocator, ".roomodes");
+            try writeRooAgent(allocator, ".roomodes", "cog-code-query", "Cog Code Query", "You are a code index exploration agent.");
 
             const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
@@ -1040,7 +1048,7 @@ test "writeRooAgent merges with existing modes" {
             ;
             try writeCwdFile(".roomodes", existing);
 
-            try writeRooAgent(allocator, ".roomodes");
+            try writeRooAgent(allocator, ".roomodes", "cog-code-query", "Cog Code Query", "You are a code index exploration agent.");
 
             const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
             defer allocator.free(content);

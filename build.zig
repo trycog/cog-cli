@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "prompt_md", @embedFile("priv/prompts/PROMPT.md"));
     build_options.addOption([]const u8, "agent_body", @embedFile("priv/agents/cog-code-query.md"));
+    build_options.addOption([]const u8, "debug_agent_body", @embedFile("priv/agents/cog-debug.md"));
     const build_options_mod = build_options.createModule();
 
     mod.addImport("build_options", build_options_mod);

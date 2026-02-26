@@ -36,6 +36,8 @@ pub const Agent = struct {
     mcp_format: McpFormat,
     agent_file_path: ?[]const u8,
     agent_file_header: ?[]const u8,
+    debug_file_path: ?[]const u8,
+    debug_file_header: ?[]const u8,
 
     pub fn supportsToolPermissions(self: *const Agent) bool {
         return std.mem.eql(u8, self.id, "claude_code") or
@@ -47,6 +49,7 @@ pub const Agent = struct {
 // ── Agent Registry ──────────────────────────────────────────────────────
 
 pub const agents = [_]Agent{
+    // ── Claude Code ─────────────────────────────────────────────────
     .{
         .id = "claude_code",
         .display_name = "Claude Code",
@@ -68,7 +71,28 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".claude/agents/cog-debug.md",
+        .debug_file_header =
+        \\---
+        \\name: cog-debug
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\tools:
+        \\  - mcp__cog__cog_debug_launch
+        \\  - mcp__cog__cog_debug_breakpoint
+        \\  - mcp__cog__cog_debug_run
+        \\  - mcp__cog__cog_debug_inspect
+        \\  - mcp__cog__cog_debug_stacktrace
+        \\  - mcp__cog__cog_debug_stop
+        \\  - Read
+        \\  - Bash
+        \\mcpServers:
+        \\  - cog
+        \\maxTurns: 15
+        \\---
+        \\
+        ,
     },
+    // ── Gemini CLI ──────────────────────────────────────────────────
     .{
         .id = "gemini",
         .display_name = "Gemini CLI",
@@ -87,7 +111,26 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".gemini/agents/cog-debug.md",
+        .debug_file_header =
+        \\---
+        \\name: cog-debug
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\tools:
+        \\  - cog__cog_debug_launch
+        \\  - cog__cog_debug_breakpoint
+        \\  - cog__cog_debug_run
+        \\  - cog__cog_debug_inspect
+        \\  - cog__cog_debug_stacktrace
+        \\  - cog__cog_debug_stop
+        \\  - read_file
+        \\  - run_shell_command
+        \\max_turns: 15
+        \\---
+        \\
+        ,
     },
+    // ── GitHub Copilot ──────────────────────────────────────────────
     .{
         .id = "copilot",
         .display_name = "GitHub Copilot",
@@ -105,7 +148,21 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".github/agents/cog-debug.agent.md",
+        .debug_file_header =
+        \\---
+        \\name: cog-debug
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\tools:
+        \\  - cog/*
+        \\  - read
+        \\  - execute
+        \\user-invokable: false
+        \\---
+        \\
+        ,
     },
+    // ── Windsurf ────────────────────────────────────────────────────
     .{
         .id = "windsurf",
         .display_name = "Windsurf",
@@ -119,7 +176,15 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".windsurf/workflows/cog-debug.md",
+        .debug_file_header =
+        \\---
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\---
+        \\
+        ,
     },
+    // ── Cursor ──────────────────────────────────────────────────────
     .{
         .id = "cursor",
         .display_name = "Cursor",
@@ -135,7 +200,16 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".cursor/agents/cog-debug.md",
+        .debug_file_header =
+        \\---
+        \\name: cog-debug
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\---
+        \\
+        ,
     },
+    // ── OpenAI Codex CLI ────────────────────────────────────────────
     .{
         .id = "codex",
         .display_name = "OpenAI Codex CLI",
@@ -144,7 +218,10 @@ pub const agents = [_]Agent{
         .mcp_format = .toml,
         .agent_file_path = ".codex/config.toml",
         .agent_file_header = null,
+        .debug_file_path = ".codex/config.toml",
+        .debug_file_header = null,
     },
+    // ── Amp ─────────────────────────────────────────────────────────
     .{
         .id = "amp",
         .display_name = "Amp",
@@ -158,7 +235,16 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".agents/skills/cog-debug.md",
+        .debug_file_header =
+        \\---
+        \\name: cog-debug
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\---
+        \\
+        ,
     },
+    // ── Goose ───────────────────────────────────────────────────────
     .{
         .id = "goose",
         .display_name = "Goose",
@@ -173,7 +259,16 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .debug_file_path = ".goose/cog-debug.yaml",
+        .debug_file_header =
+        \\---
+        \\title: cog-debug
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\---
+        \\
+        ,
     },
+    // ── Roo Code ────────────────────────────────────────────────────
     .{
         .id = "roo",
         .display_name = "Roo Code",
@@ -182,7 +277,10 @@ pub const agents = [_]Agent{
         .mcp_format = .json_mcpServers,
         .agent_file_path = ".roomodes",
         .agent_file_header = null,
+        .debug_file_path = ".roomodes",
+        .debug_file_header = null,
     },
+    // ── OpenCode ────────────────────────────────────────────────────
     .{
         .id = "opencode",
         .display_name = "OpenCode",
@@ -197,6 +295,14 @@ pub const agents = [_]Agent{
         \\tools:
         \\  write: false
         \\  edit: false
+        \\---
+        \\
+        ,
+        .debug_file_path = ".opencode/agents/cog-debug.md",
+        .debug_file_header =
+        \\---
+        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\mode: subagent
         \\---
         \\
         ,
@@ -262,4 +368,10 @@ test "mcp strategy coverage stays explicit" {
 
     try std.testing.expectEqual(@as(usize, 8), local_count);
     try std.testing.expectEqual(@as(usize, 2), global_only_count);
+}
+
+test "all agents have debug_file_path" {
+    for (agents) |agent| {
+        try std.testing.expect(agent.debug_file_path != null);
+    }
 }
