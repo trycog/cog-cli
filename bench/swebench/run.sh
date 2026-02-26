@@ -10,6 +10,7 @@
 #   bash bench/swebench/run.sh baseline 2       # baseline only, first 2 tasks
 #   bash bench/swebench/run.sh debugger 5 1200  # debugger, 5 tasks, 20min timeout
 #   bash bench/swebench/run.sh debugger-lite 5  # debugger with only 6 core tools
+#   bash bench/swebench/run.sh debugger-subagent 5  # debugger via Task delegation
 set -euo pipefail
 
 # Allow nested claude invocations when run from within Claude Code
@@ -68,11 +69,11 @@ if not tasks:
 
 # Determine variants to run
 if variant_arg == 'all':
-    variants = ['baseline', 'debugger', 'debugger-lite']
-elif variant_arg in ('baseline', 'debugger', 'debugger-lite'):
+    variants = ['baseline', 'debugger', 'debugger-lite', 'debugger-subagent']
+elif variant_arg in ('baseline', 'debugger', 'debugger-lite', 'debugger-subagent'):
     variants = [variant_arg]
 else:
-    print(f"ERROR: Unknown variant '{variant_arg}'. Use: baseline, debugger, debugger-lite, or all", file=sys.stderr)
+    print(f"ERROR: Unknown variant '{variant_arg}'. Use: baseline, debugger, debugger-lite, debugger-subagent, or all", file=sys.stderr)
     sys.exit(1)
 
 # Limit tasks if requested
@@ -89,6 +90,7 @@ templates = {
     'baseline': load_template('baseline'),
     'debugger': load_template('debugger'),
     'debugger-lite': load_template('debugger-lite'),
+    'debugger-subagent': load_template('debugger-subagent'),
 }
 
 # MCP configs — CLI-driven isolation, no .mcp.json files
@@ -96,6 +98,7 @@ MCP_CONFIGS = {
     'baseline': json.dumps({"mcpServers": {}}),
     'debugger': json.dumps({"mcpServers": {"cog": {"command": cog_bin, "args": ["mcp"]}}}),
     'debugger-lite': json.dumps({"mcpServers": {"cog": {"command": cog_bin, "args": ["mcp", "--debug-tools=core"]}}}),
+    'debugger-subagent': json.dumps({"mcpServers": {"cog": {"command": cog_bin, "args": ["mcp", "--debug-tools=core"]}}}),
 }
 
 print(f"Tasks:    {len(tasks)}")
@@ -229,6 +232,7 @@ for variant in variants:
             sessions_launched = 0
             breakpoints_set = 0
             conditional_breakpoints = 0
+            task_delegations = 0
 
             proc = subprocess.Popen(
                 cmd, cwd=task_dir, env=env,
@@ -273,6 +277,11 @@ for variant in variants:
                                                     breakpoints_set += 1
                                                     if tool_input.get('condition'):
                                                         conditional_breakpoints += 1
+                                        if tool_name == 'Task':
+                                            tool_input = block.get('input', {})
+                                            prompt_text = tool_input.get('prompt', '')
+                                            if 'cog_debug' in prompt_text or 'debug' in tool_input.get('subagent_type', '').lower():
+                                                task_delegations += 1
                                     elif block.get('type') == 'text':
                                         text = block.get('text', '')
                                         if text.strip():
@@ -325,6 +334,7 @@ for variant in variants:
                 'sessions_launched': sessions_launched,
                 'breakpoints_set': breakpoints_set,
                 'conditional_breakpoints': conditional_breakpoints,
+                'task_delegations': task_delegations,
                 'log_file': log_file,
             }
             with open(result_file, 'w') as f:
@@ -333,9 +343,13 @@ for variant in variants:
             total_tokens = in_tok + out_tok
             status = 'OK' if cost > 0 else 'FAIL'
             patch_str = f"patch={patch_size}B" if has_patch else "no-patch"
-            is_debug_variant = variant in ('debugger', 'debugger-lite')
+            is_debug_variant = variant in ('debugger', 'debugger-lite', 'debugger-subagent')
             dbg_str = f" debug_tools={debug_tool_calls} sessions={sessions_launched} bp={breakpoints_set} cond_bp={conditional_breakpoints}" if is_debug_variant else ""
-            if is_debug_variant and debug_tool_calls == 0 and cost > 0:
+            if variant == 'debugger-subagent':
+                dbg_str += f" delegations={task_delegations}"
+                if task_delegations == 0 and cost > 0:
+                    dbg_str += " WARNING:NO_DELEGATIONS"
+            elif is_debug_variant and debug_tool_calls == 0 and cost > 0:
                 dbg_str += " WARNING:NO_DEBUG_TOOLS_USED"
             print(f"       {status}  cost=${cost:.4f} tokens={total_tokens} turns={num_turns} time={dur/1000:.1f}s {patch_str}{dbg_str}", flush=True)
             if cost > 0:
@@ -367,6 +381,7 @@ for variant in variants:
                 'sessions_launched': sessions_launched,
                 'breakpoints_set': breakpoints_set,
                 'conditional_breakpoints': conditional_breakpoints,
+                'task_delegations': task_delegations,
                 'timeout': True,
             }
             with open(result_file, 'w') as f:

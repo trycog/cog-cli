@@ -22,7 +22,7 @@ fi
 echo "Found $count result files in .bench/"
 
 # Check for SWE-bench evaluation results
-for variant in baseline debugger debugger-lite; do
+for variant in baseline debugger debugger-lite debugger-subagent; do
   report="$RESULTS_DIR/$variant/results.json"
   if [[ -f "$report" ]]; then
     echo "Found SWE-bench eval results for $variant"
@@ -37,8 +37,8 @@ bench_dir = '$BENCH_DIR'
 results_dir = '$RESULTS_DIR'
 tasks_json = '$TASKS_JSON'
 
-ALL_VARIANTS = ['baseline', 'debugger', 'debugger-lite']
-DEBUG_VARIANTS = ['debugger', 'debugger-lite']
+ALL_VARIANTS = ['baseline', 'debugger', 'debugger-lite', 'debugger-subagent']
+DEBUG_VARIANTS = ['debugger', 'debugger-lite', 'debugger-subagent']
 
 # Load task definitions
 with open(tasks_json) as f:
@@ -92,6 +92,7 @@ def build_variant_data(m, is_resolved, is_debug=False):
         d['sessions_launched'] = m.get('sessions_launched', 0)
         d['breakpoints_set'] = m.get('breakpoints_set', 0)
         d['conditional_breakpoints'] = m.get('conditional_breakpoints', 0)
+        d['task_delegations'] = m.get('task_delegations', 0)
     return d
 
 # Build per-task results
@@ -103,6 +104,7 @@ for task in tasks:
     baseline = metrics.get((iid, 'baseline'), {})
     debugger = metrics.get((iid, 'debugger'), {})
     debugger_lite = metrics.get((iid, 'debugger-lite'), {})
+    debugger_subagent = metrics.get((iid, 'debugger-subagent'), {})
 
     entry = {
         'instance_id': iid,
@@ -110,6 +112,7 @@ for task in tasks:
         'baseline': build_variant_data(baseline, iid in resolved['baseline']),
         'debugger': build_variant_data(debugger, iid in resolved['debugger'], is_debug=True),
         'debugger_lite': build_variant_data(debugger_lite, iid in resolved['debugger-lite'], is_debug=True),
+        'debugger_subagent': build_variant_data(debugger_subagent, iid in resolved['debugger-subagent'], is_debug=True),
     }
     task_results.append(entry)
 
@@ -124,52 +127,67 @@ def aggregate(tasks, key):
 b_ran, b_resolved_count, b_total_tokens, b_total_cost = aggregate(task_results, 'baseline')
 d_ran, d_resolved_count, d_total_tokens, d_total_cost = aggregate(task_results, 'debugger')
 dl_ran, dl_resolved_count, dl_total_tokens, dl_total_cost = aggregate(task_results, 'debugger_lite')
+ds_ran, ds_resolved_count, ds_total_tokens, ds_total_cost = aggregate(task_results, 'debugger_subagent')
 
 # Debugger advantage: tasks resolved by debugger but not baseline
 advantage = sum(1 for t in task_results if t['debugger']['resolved'] and not t['baseline']['resolved'])
 disadvantage = sum(1 for t in task_results if t['baseline']['resolved'] and not t['debugger']['resolved'])
 dl_advantage = sum(1 for t in task_results if t['debugger_lite']['resolved'] and not t['baseline']['resolved'])
 dl_disadvantage = sum(1 for t in task_results if t['baseline']['resolved'] and not t['debugger_lite']['resolved'])
+ds_advantage = sum(1 for t in task_results if t['debugger_subagent']['resolved'] and not t['baseline']['resolved'])
+ds_disadvantage = sum(1 for t in task_results if t['baseline']['resolved'] and not t['debugger_subagent']['resolved'])
 
 d_used_tools = sum(1 for t in task_results if t['debugger'].get('debug_tool_calls', 0) > 0)
 d_no_tools = sum(1 for t in task_results if t['debugger']['cost_usd'] > 0 and t['debugger'].get('debug_tool_calls', 0) == 0)
 dl_used_tools = sum(1 for t in task_results if t['debugger_lite'].get('debug_tool_calls', 0) > 0)
 dl_no_tools = sum(1 for t in task_results if t['debugger_lite']['cost_usd'] > 0 and t['debugger_lite'].get('debug_tool_calls', 0) == 0)
+ds_used_delegations = sum(1 for t in task_results if t['debugger_subagent'].get('task_delegations', 0) > 0)
+ds_no_delegations = sum(1 for t in task_results if t['debugger_subagent']['cost_usd'] > 0 and t['debugger_subagent'].get('task_delegations', 0) == 0)
 
 data = {
     'total_tasks': len(tasks),
     'baseline_ran': b_ran,
     'debugger_ran': d_ran,
     'debugger_lite_ran': dl_ran,
+    'debugger_subagent_ran': ds_ran,
     'baseline_resolved': b_resolved_count,
     'debugger_resolved': d_resolved_count,
     'debugger_lite_resolved': dl_resolved_count,
+    'debugger_subagent_resolved': ds_resolved_count,
     'debugger_advantage': advantage,
     'debugger_disadvantage': disadvantage,
     'debugger_lite_advantage': dl_advantage,
     'debugger_lite_disadvantage': dl_disadvantage,
+    'debugger_subagent_advantage': ds_advantage,
+    'debugger_subagent_disadvantage': ds_disadvantage,
     'baseline_total_tokens': b_total_tokens,
     'debugger_total_tokens': d_total_tokens,
     'debugger_lite_total_tokens': dl_total_tokens,
+    'debugger_subagent_total_tokens': ds_total_tokens,
     'baseline_total_cost': round(b_total_cost, 2),
     'debugger_total_cost': round(d_total_cost, 2),
     'debugger_lite_total_cost': round(dl_total_cost, 2),
+    'debugger_subagent_total_cost': round(ds_total_cost, 2),
     'debugger_used_tools': d_used_tools,
     'debugger_no_tools': d_no_tools,
     'debugger_lite_used_tools': dl_used_tools,
     'debugger_lite_no_tools': dl_no_tools,
+    'debugger_subagent_used_delegations': ds_used_delegations,
+    'debugger_subagent_no_delegations': ds_no_delegations,
     'tasks': task_results,
 }
 
 print('const SWEBENCH_DATA = ' + json.dumps(data, indent=2) + ';')
-print(f'Collected {len(task_results)} tasks ({b_ran} baseline, {d_ran} debugger, {dl_ran} debugger-lite runs)', file=sys.stderr)
-print(f'Resolved: baseline={b_resolved_count}, debugger={d_resolved_count}, debugger-lite={dl_resolved_count}', file=sys.stderr)
-print(f'Debugger advantage: +{advantage}/-{disadvantage}  Debugger-lite advantage: +{dl_advantage}/-{dl_disadvantage}', file=sys.stderr)
-print(f'Debugger tool usage: {d_used_tools} used, {d_no_tools} skipped  |  Lite: {dl_used_tools} used, {dl_no_tools} skipped', file=sys.stderr)
+print(f'Collected {len(task_results)} tasks ({b_ran} baseline, {d_ran} debugger, {dl_ran} debugger-lite, {ds_ran} debugger-subagent runs)', file=sys.stderr)
+print(f'Resolved: baseline={b_resolved_count}, debugger={d_resolved_count}, debugger-lite={dl_resolved_count}, debugger-subagent={ds_resolved_count}', file=sys.stderr)
+print(f'Debugger advantage: +{advantage}/-{disadvantage}  Debugger-lite: +{dl_advantage}/-{dl_disadvantage}  Subagent: +{ds_advantage}/-{ds_disadvantage}', file=sys.stderr)
+print(f'Debugger tool usage: {d_used_tools} used, {d_no_tools} skipped  |  Lite: {dl_used_tools} used, {dl_no_tools} skipped  |  Subagent delegations: {ds_used_delegations} used, {ds_no_delegations} skipped', file=sys.stderr)
 if d_no_tools > 0:
     print(f'WARNING: {d_no_tools} debugger runs completed without using any cog_debug tools', file=sys.stderr)
 if dl_no_tools > 0:
     print(f'WARNING: {dl_no_tools} debugger-lite runs completed without using any cog_debug tools', file=sys.stderr)
+if ds_no_delegations > 0:
+    print(f'WARNING: {ds_no_delegations} debugger-subagent runs completed without any Task delegations', file=sys.stderr)
 ")
 
 # Replace the data block between markers in dashboard.html
