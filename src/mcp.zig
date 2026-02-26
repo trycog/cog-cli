@@ -38,6 +38,8 @@ const Runtime = struct {
     mcp_session_id: ?[]const u8 = null,
     watcher: ?watcher_mod.Watcher = null,
     debug_tool_tier: ToolTier = .specialist,
+    /// Protects code_cache, remote_tools, and mcp_session_id from concurrent access.
+    mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator, debug_tool_tier: ToolTier) Runtime {
         return .{
@@ -625,6 +627,11 @@ fn handleInitialize(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
 
 fn handleToolsList(runtime: *Runtime, reply: *ReplyOnce) !void {
     const allocator = runtime.allocator;
+
+    // Protect remote_tools discovery/access
+    runtime.mutex.lock();
+    defer runtime.mutex.unlock();
+
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -835,6 +842,11 @@ fn handleResourcesList(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
 
 fn handleResourcesRead(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !void {
     const allocator = runtime.allocator;
+
+    // Protect code_cache and remote_tools access
+    runtime.mutex.lock();
+    defer runtime.mutex.unlock();
+
     const p = params orelse {
         try reply.sendError(-32602, "Missing params");
         return;
@@ -971,6 +983,15 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
 }
 
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    // Debug tools have their own mutex (DebugServer.mutex) — no Runtime lock needed
+    if (std.mem.startsWith(u8, tool_name, "cog_debug_")) {
+        return callDebugTool(runtime, tool_name, arguments);
+    }
+
+    // All other tools access shared Runtime state (code_cache, remote_tools, etc.)
+    runtime.mutex.lock();
+    defer runtime.mutex.unlock();
+
     // Code tools
     if (std.mem.eql(u8, tool_name, "cog_code_query")) {
         return callCodeQuery(runtime, arguments);
@@ -978,8 +999,6 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
         return callCodeStatus(runtime);
     } else if (std.mem.eql(u8, tool_name, "cog_code_explore")) {
         return callCodeExplore(runtime, arguments);
-    } else if (std.mem.startsWith(u8, tool_name, "cog_debug_")) {
-        return callDebugTool(runtime, tool_name, arguments);
     }
 
     // Memory tools — proxy to remote MCP server
@@ -1284,6 +1303,9 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
 // ── File Watcher Event Processing ───────────────────────────────────────
 
 fn processWatcherEvents(runtime: *Runtime) void {
+    runtime.mutex.lock();
+    defer runtime.mutex.unlock();
+
     var w = &runtime.watcher.?;
     var changed = false;
     while (w.drainOne()) |rel_path| {
