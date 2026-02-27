@@ -65,6 +65,8 @@ agent:
 
       Fix verified. Submit.
 
+    max_observation_length: 3000
+
     instance_template: |
       We are currently solving the following issue within the **{{repo_name}}** repository.
 

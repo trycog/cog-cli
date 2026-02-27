@@ -274,6 +274,12 @@ class CogDebugAgent(DefaultAgent):
 
         step = super().handle_action(step)
 
+        # Smart-truncate large observations (e.g., pytest assertion dumps with
+        # full base64 certificate data). SWE-agent has max_observation_length but
+        # it clips blindly. We extract the useful parts first.
+        if step.observation and len(step.observation) > 3000:
+            step.observation = self._truncate_observation(step.observation)
+
         # Exploration reminder: once, after N steps, if cog_debug hasn't been used yet
         if (
             not self._cog_debug_called
@@ -494,6 +500,75 @@ class CogDebugAgent(DefaultAgent):
         elif stop_reason:
             return f"Unexpected stop_reason: {stop_reason}"
         return ""
+
+    # Maximum observation size we'll pass to the model (chars).
+    # SWE-agent's max_observation_length is a fallback clip; this is smarter.
+    _MAX_OBSERVATION = 3000
+
+    @staticmethod
+    def _truncate_observation(obs: str) -> str:
+        """Smart-truncate a large observation, preserving the most useful parts.
+
+        For pytest output: extract the session header, FAILED/ERROR lines,
+        the short test summary, and the final result line. Skip the huge
+        assertion introspection dumps (e.g., full base64 certificate data).
+        """
+        max_len = CogDebugAgent._MAX_OBSERVATION
+
+        # For pytest output, extract meaningful sections
+        if "pytest" in obs or "FAILED" in obs or "PASSED" in obs or "test session starts" in obs:
+            sections = []
+
+            # 1. Session header (first few lines up to first test result)
+            lines = obs.split("\n")
+            header = []
+            for line in lines[:15]:
+                header.append(line)
+                if "PASSED" in line or "FAILED" in line or "ERROR" in line or "RERUN" in line:
+                    break
+            sections.append("\n".join(header))
+
+            # 2. Short test summary / FAILURES section
+            # Look for "FAILURES" or "short test summary"
+            for marker in ["= FAILURES =", "short test summary", "ERRORS"]:
+                idx = obs.find(marker)
+                if idx >= 0:
+                    # Take up to 800 chars from this section
+                    sections.append("...\n" + obs[idx:idx + 800])
+                    break
+
+            # 3. AssertionError line (the actual assertion that failed)
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("AssertionError") or stripped.startswith("assert ") or "AssertionError" in stripped:
+                    sections.append(f"Assertion: {stripped[:300]}")
+                    break
+                # Also catch "E   assert" lines from pytest
+                if stripped.startswith("E ") and "assert" in stripped:
+                    sections.append(f"Assertion: {stripped[:300]}")
+                    break
+
+            # 4. Final summary line (e.g., "1 failed, 3 rerun in 0.16s")
+            for line in reversed(lines[-10:]):
+                if "passed" in line or "failed" in line or "error" in line:
+                    sections.append(line.strip())
+                    break
+
+            result = "\n\n".join(sections)
+            if len(result) < len(obs):
+                result += f"\n\n[Observation truncated: {len(obs)} → {len(result)} chars]"
+            return result[:max_len]
+
+        # Generic truncation: keep first and last portions
+        if len(obs) > max_len:
+            half = max_len // 2 - 50
+            return (
+                obs[:half]
+                + f"\n\n[... {len(obs) - max_len} chars truncated ...]\n\n"
+                + obs[-half:]
+            )
+
+        return obs
 
     @staticmethod
     def _breakpoint_not_hit_guidance(observation: str, breakpoint_loc: str, test_cmd: str) -> str:
