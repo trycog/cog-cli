@@ -108,11 +108,14 @@ for variant in "${VARIANTS[@]}"; do
   echo "  Command: ${SWEAGENT_CMD[*]}"
   echo ""
 
-  # Run SWE-agent
-  "${SWEAGENT_CMD[@]}" 2>&1 | tee "$SCRIPT_DIR/logs/${variant}.log" || {
+  # Run SWE-agent — use script(1) to preserve the TTY so rich's live
+  # progress bar works, while still capturing output to the log file.
+  mkdir -p "$SCRIPT_DIR/logs"
+  LOG_FILE="$SCRIPT_DIR/logs/${variant}.log"
+  script -q "$LOG_FILE" "${SWEAGENT_CMD[@]}" || {
     echo ""
     echo "  WARNING: sweagent exited with non-zero status for $variant"
-    echo "  Check logs: $SCRIPT_DIR/logs/${variant}.log"
+    echo "  Check logs: $LOG_FILE"
     echo ""
   }
 
