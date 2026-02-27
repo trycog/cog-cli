@@ -90,6 +90,76 @@ class CogDebugAgent(DefaultAgent):
             self._create_python3_wrapper()
             self._create_mcp_config()
 
+        # Discover test commands and entry points, then inject into history
+        if self._container_id:
+            test_info = self._discover_test_info()
+            if test_info:
+                self._append_history({
+                    "role": "user",
+                    "content": test_info,
+                    "agent": self.name,
+                    "message_type": "observation",
+                })
+                self._log("injected test discovery info (%d chars)", len(test_info))
+
+    def _discover_test_info(self) -> str:
+        """Discover available test commands and entry points in the container.
+
+        Returns a string to inject into the conversation history, or empty string.
+        """
+        parts = []
+
+        # 1. Find test directories and sample test files
+        try:
+            test_files = self._env.communicate(
+                "find /app -path '*/test*' -name 'test_*.py' -type f 2>/dev/null"
+                " | head -20"
+            ).strip()
+            if test_files:
+                # Group by directory
+                dirs = {}
+                for f in test_files.split("\n"):
+                    f = f.strip()
+                    if not f:
+                        continue
+                    d = f.rsplit("/", 1)[0] if "/" in f else "."
+                    dirs.setdefault(d, []).append(f.rsplit("/", 1)[-1])
+                if dirs:
+                    lines = ["**Available test files** (use with `python -m pytest <path> -xvs`):"]
+                    for d, files in sorted(dirs.items()):
+                        lines.append(f"  {d}/: {', '.join(files[:5])}" + (" ..." if len(files) > 5 else ""))
+                    parts.append("\n".join(lines))
+        except Exception as e:
+            self._log("WARNING: test file discovery failed: %s", e)
+
+        # 2. Find console_scripts entry points (e.g. ansible-playbook)
+        try:
+            entry_points = self._env.communicate(
+                "python3 -c \""
+                "import importlib.metadata as md;"
+                "eps = [ep for ep in md.entry_points().get('console_scripts', []) "
+                "if not ep.name.startswith('_')];"
+                "[print(f'{ep.name} -> python -m {ep.value.split(\\\":\\\")[0]}') "
+                "for ep in eps[:15]]"
+                "\" 2>/dev/null"
+            ).strip()
+            if entry_points:
+                parts.append(
+                    "**Entry point commands** (for cog_debug test= argument, use the `python -m` form):\n"
+                    + entry_points
+                )
+        except Exception as e:
+            self._log("WARNING: entry point discovery failed: %s", e)
+
+        if not parts:
+            return ""
+
+        return (
+            "[Environment Info] The following test commands and entry points are available "
+            "in this repository. Use these with cog_debug:\n\n"
+            + "\n\n".join(parts)
+        )
+
     def _create_python3_wrapper(self):
         """Create a python3 wrapper script that delegates to docker exec."""
         bin_dir = Path(self._tmp_dir.name) / "bin"
