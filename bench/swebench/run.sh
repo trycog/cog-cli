@@ -10,6 +10,7 @@
 #   bash bench/swebench/run.sh all              # all tasks, all variants
 #   bash bench/swebench/run.sh baseline 2       # baseline only, first 2 tasks
 #   bash bench/swebench/run.sh debugger-subagent 5 2  # debugger, 5 tasks, 2 workers
+#   bash bench/swebench/run.sh --clean debugger-subagent 2  # clean run, no cached trajectories
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,6 +18,12 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PREDICTIONS_DIR="$SCRIPT_DIR/predictions"
 COG_BIN="$ROOT_DIR/zig-out/bin/cog"
 TASKS_JSONL="$SCRIPT_DIR/tasks_sweagent.jsonl"
+
+CLEAN=false
+if [[ "${1:-}" == "--clean" ]]; then
+  CLEAN=true
+  shift
+fi
 
 VARIANT_ARG="${1:-all}"
 MAX_TASKS="${2:-0}"
@@ -85,6 +92,11 @@ for variant in "${VARIANTS[@]}"; do
   fi
 
   OUTPUT_DIR="$SCRIPT_DIR/trajectories/${variant}"
+  if [[ "$CLEAN" == true ]]; then
+    echo "  Cleaning cached data for $variant"
+    rm -rf "$OUTPUT_DIR"
+    rm -f "$PREDICTIONS_DIR/${variant}.jsonl"
+  fi
   mkdir -p "$OUTPUT_DIR"
 
   # For debugger-subagent, activate CogDebugAgent via env var
