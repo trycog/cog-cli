@@ -563,6 +563,75 @@ class CogDebugAgent(DefaultAgent):
             return f"Unexpected stop_reason: {stop_reason}"
         return ""
 
+    # Subagent outputs shorter than this are passed through without distillation.
+    _DISTILL_THRESHOLD = 500
+
+    def _distill_subagent_output(
+        self, raw_output: str, breakpoint_loc: str,
+        inspect_exprs: list, test_cmd: str,
+    ) -> str:
+        """Distill verbose subagent output to only what the primary agent needs.
+
+        Uses a fast model call to extract expression values, errors, and
+        diagnostics while dropping workflow narration. Falls back to the
+        raw output if distillation fails.
+        """
+        # Short outputs and failure markers are already concise
+        if len(raw_output) < self._DISTILL_THRESHOLD:
+            return raw_output
+        if "BREAKPOINT NOT HIT" in raw_output:
+            return raw_output
+
+        expr_bullets = "\n".join(f"  - {e}" for e in inspect_exprs)
+        prompt = (
+            "You are a post-processor for debugging output. Extract ONLY the "
+            "results — do not add commentary or explanation.\n\n"
+            f"Breakpoint: {breakpoint_loc}\n"
+            f"Test command: {test_cmd}\n"
+            f"Expressions requested:\n{expr_bullets}\n\n"
+            "From the raw output below, extract:\n"
+            "1. Whether the breakpoint was hit or not\n"
+            "2. The EXACT value of each expression (preserve verbatim — do not "
+            "paraphrase, truncate, or reformat values)\n"
+            "3. Any errors, exceptions, or unexpected behavior\n\n"
+            "Output format (use exactly, no extra text):\n"
+            "```\n"
+            "breakpoint: hit (or: not hit, exit_code=N)\n"
+            "<expression1> = <exact value>\n"
+            "<expression2> = <exact value>\n"
+            "...\n"
+            "[any errors or diagnostics on separate lines]\n"
+            "```\n\n"
+            f"Raw output:\n{raw_output}"
+        )
+
+        try:
+            env = {
+                k: v for k, v in os.environ.items()
+                if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+            }
+            result = subprocess.run(
+                [
+                    "claude", "-p", prompt,
+                    "--model", "claude-haiku-4-5-20251001",
+                    "--output-format", "json",
+                ],
+                capture_output=True, text=True, timeout=30, env=env,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                parsed = json.loads(result.stdout.strip())
+                distilled = parsed.get("result", "").strip()
+                if distilled:
+                    self._log(
+                        "distilled subagent output: %d chars → %d chars",
+                        len(raw_output), len(distilled),
+                    )
+                    return distilled
+        except Exception as e:
+            self._log("distillation failed, using raw output: %s", e)
+
+        return raw_output
+
     # Maximum observation size we'll pass to the model (chars).
     # SWE-agent's max_observation_length is a fallback clip; this is smarter.
     _MAX_OBSERVATION = 3000
@@ -865,7 +934,10 @@ You need to parse it into cog_debug_launch arguments. Always set `language: "pyt
                     f"Partial stderr: {stderr_content[:500]}"
                 )
             elif returncode == 0:
-                output = self._extract_subagent_output(stdout_content, new_mcp_log)
+                raw_output = self._extract_subagent_output(stdout_content, new_mcp_log)
+                output = self._distill_subagent_output(
+                    raw_output, breakpoint_loc, inspect_exprs, test_cmd,
+                )
                 if stderr_content:
                     self._log("subagent OK — stderr: %s", stderr_content[:500])
                 if new_dap_log:
