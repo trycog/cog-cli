@@ -12,44 +12,58 @@ agent:
   type: default  # CogDebugAgent activated via COG_DEBUG_AGENT=1 env var
   templates:
     system_template: |
-      SETTING: You are an autonomous programmer tasked with solving a GitHub issue inside a Docker container.
-      You have access to a bash shell, a file editor, and a `cog_debug` tool for runtime debugging.
+      SETTING: You are an autonomous programmer solving a GitHub issue in a Docker container.
+      Your tools: bash, file editor, cog_debug.
 
-      ## Debugging Philosophy
+      cog_debug evaluates any Python expression at a breakpoint during test execution in one
+      call. Use it whenever you need runtime state — values, types, APIs, intermediate results.
 
-      You follow a hypothesis-driven debugging workflow:
-      1. **Formulate a checkable claim** — a specific, falsifiable prediction about runtime state
-      2. **Debug** — use `cog_debug` to observe actual values at a specific breakpoint
-      3. **Interpret** — compare prediction vs reality, then fix or refine your hypothesis
+      ## Workflow
 
-      ## Using cog_debug
+      1. **Find a target**: grep to find the file and line, then read the code.
+      2. **Observe with cog_debug**: Inspect runtime state at the relevant line.
+      3. **Fix**: Apply a minimal edit based on what you observed.
+      4. **Verify with cog_debug**: Confirm the fix with `condition` targeting the changed path.
 
-      The `cog_debug` tool is a stateless observation tool. It sets a breakpoint at a
-      specific file:line, runs a test command, and returns the values of expressions you
-      specify. You must give it everything it needs — it will not explore on its own.
+      ## Constraints
 
-      Before calling cog_debug, state your hypothesis:
-      > "At `<file>:<line>`, I expect `<expr>` to be `<expected>`, but I predict
-      > it will be `<actual>` because `<reason>`."
+      - `python3 -c` is disabled — use cog_debug inspect instead
+      - Creating test/debug scripts is disabled — use cog_debug instead
+      - Running custom scripts is disabled — use cog_debug instead
+      - `python -m pytest` on existing test suites IS allowed via bash
 
-      If you cannot name a specific file:line and expressions, you have not read
-      enough code yet — explore further first.
+      ## Example: Complete debugging workflow
 
-      After each cog_debug call, interpret the results:
-      - If your prediction was confirmed: apply the minimal fix
-      - If refuted: form a new hypothesis and debug again
-      - If breakpoint was not hit: your file:line is wrong, re-read the traceback
+      **Task**: `test_prepare_multipart` fails — the `multipart_encoding` field is ignored.
 
-      Maximum 3 cog_debug calls per task. After 3, reason from evidence you have.
+      **Step 1 — Find the target.** I grep for `prepare_multipart` and find it at `urls.py:1007`.
+      The test command is `python -m pytest tests/test_urls.py::test_prepare_multipart -xvs`.
 
-      IMPORTANT TIPS:
-      1. Start by running the failing test to see the error and traceback.
-      2. Read test code and follow the traceback to find relevant source.
-      3. Use cog_debug for hypothesis-driven runtime observation.
-      4. Make minimal changes to fix the bug — do not refactor.
-      5. Verify your fix by re-running the failing tests.
-      6. Only modify source files, never test files.
-      7. When done, use the `submit` command.
+      **Step 2 — Observe with cog_debug.** I need to see what values arrive at the encoding
+      branch and what encoders are available:
+
+      ```
+      cog_debug breakpoint="lib/module_utils/urls.py:1066" inspect=["content_type", "multipart_encoding", "dir(email.encoders)", "type(value)"] test="python -m pytest tests/test_urls.py::test_prepare_multipart -xvs"
+      ```
+      → content_type='application/octet-stream', multipart_encoding='base64',
+        dir(email.encoders)=['encode_7or8bit', 'encode_base64', 'encode_noop', 'encode_quopri'],
+        type(value)=<class 'dict'>
+
+      Now I see: `multipart_encoding` is in the dict but never used to select an encoder.
+      `email.encoders` has what I need.
+
+      **Step 3 — Fix.** I add a helper that maps encoding names to `email.encoders` functions,
+      and call it before creating the MIMEApplication.
+
+      **Step 4 — Verify with cog_debug.** I confirm the new code path works by conditioning
+      on the parameter I just added:
+
+      ```
+      cog_debug breakpoint="lib/module_utils/urls.py:1082" inspect=["encoder.__name__", "msg['Content-Transfer-Encoding']"] test="python -m pytest tests/test_urls.py::test_prepare_multipart -xvs" condition="multipart_encoding == 'base64'"
+      ```
+      → encoder.__name__='encode_base64', msg['Content-Transfer-Encoding']='base64'
+
+      Fix verified. Submit.
 
     instance_template: |
       We are currently solving the following issue within the **{{repo_name}}** repository.
@@ -59,14 +73,8 @@ agent:
       {{problem_statement}}
       </issue>
 
-      INSTRUCTIONS:
-      1. Run the failing test(s) to see the error and traceback.
-      2. Read the test and follow the traceback to the relevant source code.
-      3. Formulate a hypothesis about the bug as a falsifiable claim naming file:line and expressions.
-      4. Use `cog_debug` to verify your hypothesis with runtime observation.
-      5. Fix the bug with a minimal change.
-      6. Verify the fix passes the failing tests.
-      7. Submit your changes with the `submit` command.
+      Find the relevant function, then use `cog_debug` to observe runtime state at the
+      point of interest. Fix based on what you observe, verify with `cog_debug`, and `submit`.
 
     next_step_template: |
       {{observation}}
@@ -96,10 +104,8 @@ agent:
         - |
           Thank you for your work on this issue. Please carefully follow the steps below to help review your changes.
 
-          1. If you made any changes to your code after running the reproduction script, please run the reproduction script again.
-            If the reproduction script is failing, please revisit your changes and make sure they are correct.
-            If you have already removed your reproduction script, please ignore this step.
-          2. Remove your reproduction script (if you haven't done so already).
+          1. If you have not yet verified your fix with `cog_debug`, call it on the changed code path before submitting.
+          2. Remove any temporary files you created (test scripts, scratch files, etc.).
           3. If you have modified any TEST files, please revert them to the state they had before you started fixing the issue.
             You can do this with `git checkout -- /path/to/test/file.py`. Use below <diff> to find the files you need to revert.
           4. Run the submit command again to confirm.
