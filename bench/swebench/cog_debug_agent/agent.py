@@ -849,28 +849,29 @@ Expressions to inspect:
 You have these tools (and ONLY these — no bash, no local commands):
 
 1. **cog_debug_launch** — Start a debug session. Takes: program OR module, args (list), cwd, env (object), language.
-2. **cog_debug_breakpoint** — Set a breakpoint. Takes: session_id, file, line, condition (optional).
+2. **cog_debug_breakpoint** — Set a breakpoint. Takes: session_id, file, line, condition (optional). Also supports action="set_exception", filters=["raised"] to break on exceptions.
 3. **cog_debug_run** — Run/continue the program. Takes: session_id, action ("continue"), timeout_ms.
-4. **cog_debug_inspect** — Evaluate an expression at the current stop. Takes: session_id, expression, frame_id.
-5. **cog_debug_stop** — Stop the debug session. Takes: session_id.
+4. **cog_debug_inspect** — Evaluate an expression at the current stop. Takes: session_id, expression, scope (locals/globals), frame_id.
+5. **cog_debug_stacktrace** — Get the call stack. Takes: session_id.
+6. **cog_debug_stop** — Stop the debug session. Takes: session_id.
 
 ## Workflow
 
 1. **Launch** the debug session (see parsing guide below)
-2. **Set breakpoint** at `{breakpoint_loc}` (split into file and line){' with condition `' + condition + '`' if condition else ''}
+2. **Set TWO breakpoints**:
+   a. Line breakpoint at `{breakpoint_loc}` (split into file and line){' with condition `' + condition + '`' if condition else ''}
+   b. Exception breakpoint: action="set_exception", filters=["raised"] — this is a safety net
 3. **Run** with action="continue", timeout_ms=15000
 4. **Check stop_reason**:
-   - "breakpoint" -> inspect ALL expressions (use frame_id=0 for all)
+   - "breakpoint" -> inspect ALL requested expressions (use frame_id=0)
+   - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0 to capture the failure context. Report what exception occurred and where.
    - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>"
-   - "exception" -> report the exception text
 5. **Stop** the session (always, even on failure)
 6. **Write a text response** with results
 
 {self._TEST_COMMAND_PARSING_GUIDE.format(test_cmd=test_cmd)}
 
 ## CRITICAL CONSTRAINTS
-
-- You have a budget of exactly **5 tool calls**: launch, breakpoint, run, inspect(s), stop. Do NOT exceed this.
 - **NEVER launch more than one debug session.** One launch, one attempt. If the breakpoint is not hit, report that and stop.
 - If stop_reason is "exited", call cog_debug_stop and write: "BREAKPOINT NOT HIT — exit_code: <N>". Do NOT retry.
 - **ALWAYS call cog_debug_stop** before your final text response, even if earlier steps failed.
@@ -912,18 +913,23 @@ Track these expressions at each step:
 You have these tools (and ONLY these — no bash, no local commands):
 
 1. **cog_debug_launch** — Start a debug session. Takes: program OR module, args (list), cwd, env (object), language.
-2. **cog_debug_breakpoint** — Set a breakpoint. Takes: session_id, file, line, condition (optional).
+2. **cog_debug_breakpoint** — Set a breakpoint. Takes: session_id, file, line, condition (optional). Also supports action="set_exception", filters=["raised"] to break on exceptions.
 3. **cog_debug_run** — Control execution. Takes: session_id, action (continue/step_over/step_into/step_out), timeout_ms.
-4. **cog_debug_inspect** — Evaluate an expression at the current stop. Takes: session_id, expression, frame_id.
+4. **cog_debug_inspect** — Evaluate an expression at the current stop. Takes: session_id, expression, scope (locals/globals), frame_id.
 5. **cog_debug_stacktrace** — Get the call stack. Takes: session_id.
 6. **cog_debug_stop** — Stop the debug session. Takes: session_id.
 
 ## Workflow
 
 1. **Launch** the debug session
-2. **Set breakpoint** at `{breakpoint_loc}`{' with condition `' + condition + '`' if condition else ''}
+2. **Set TWO breakpoints**:
+   a. Line breakpoint at `{breakpoint_loc}`{' with condition `' + condition + '`' if condition else ''}
+   b. Exception breakpoint: action="set_exception", filters=["raised"] — safety net if the test crashes before your line
 3. **Run** with action="continue", timeout_ms=15000
-4. **If breakpoint hit**, begin stepping loop:
+4. **Check stop_reason**:
+   - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0. Report the exception and stop (no stepping).
+   - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>" and stop.
+5. **If breakpoint hit**, begin stepping loop:
    a. **stacktrace** — record current file:line and function name
    b. **inspect** each tracked expression (frame_id=0)
    c. **run** with action="step_over", timeout_ms=5000
