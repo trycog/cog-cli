@@ -850,7 +850,7 @@ You have these tools (and ONLY these — no bash, no local commands):
 
 1. **cog_debug_launch** — Start a debug session. Takes: program OR module, args (list), cwd, env (object), language.
 2. **cog_debug_breakpoint** — Set a breakpoint. Takes: session_id, file, line, condition (optional). Also supports action="set_exception", filters=["raised"] to break on exceptions.
-3. **cog_debug_run** — Run/continue the program. Takes: session_id, action ("continue"), timeout_ms.
+3. **cog_debug_run** — Control execution. Takes: session_id, action ("continue", "step_over", "step_into", "step_out"), timeout_ms.
 4. **cog_debug_inspect** — Evaluate an expression at the current stop. Takes: session_id, expression, scope (locals/globals), frame_id.
 5. **cog_debug_stacktrace** — Get the call stack. Takes: session_id.
 6. **cog_debug_stop** — Stop the debug session. Takes: session_id.
@@ -863,7 +863,7 @@ You have these tools (and ONLY these — no bash, no local commands):
    b. Exception breakpoint: action="set_exception", filters=["raised"] — this is a safety net
 3. **Run** with action="continue", timeout_ms=15000
 4. **Check stop_reason**:
-   - "breakpoint" -> inspect ALL requested expressions (use frame_id=0)
+   - "breakpoint" -> inspect ALL requested expressions (use frame_id=0). If any expression is not yet in scope, use **step_over** (up to 5 steps) until it is, then inspect again. Use the code context to judge how far to step.
    - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0 to capture the failure context. Report what exception occurred and where.
    - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>"
 5. **Stop** the session (always, even on failure)
@@ -878,7 +878,6 @@ You have these tools (and ONLY these — no bash, no local commands):
 - ONLY use MCP tools. No bash, no local commands.
 - NEVER pass "python" or "python3" as the program argument.
 - ALWAYS use frame_id=0 for inspect calls.
-- Do NOT call scope="locals". Only inspect the specific expressions listed.
 - CRITICAL: You MUST end with a text response. NEVER end with only tool calls."""
 
     def _build_trace_prompt(
