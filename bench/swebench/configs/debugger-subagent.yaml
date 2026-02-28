@@ -27,12 +27,18 @@ agent:
       ## Workflow
 
       1. **Reproduce**: Run the failing test via bash to see the error.
-      2. **Investigate**: Choose a cog_debug mode based on what you know:
+      2. **Verify before debugging**: Before calling cog_debug, you MUST confirm every argument from the actual source code:
+         - **File path**: View the file to confirm it exists at that path.
+         - **Line number**: View the file at that line to confirm it contains the code you expect.
+         - **Variable/expression names**: Read the code around the breakpoint line to confirm the variables exist in scope at that line. Do not guess variable names from memory.
+         - **Test command**: Run the test via bash first to confirm it executes (even if it fails).
+         Never pass a file path, line number, or variable name to cog_debug that you have not directly verified from the source.
+      3. **Investigate**: Choose a cog_debug mode based on what you know:
          - Know the file:line? Use `inspect` to evaluate expressions there.
          - Need to see what a function does step-by-step? Use `trace`.
          - Don't know where to look? Use `diagnose` to let the debugger investigate.
-      3. **Fix**: Apply a minimal edit based on what you observed.
-      4. **Verify**: Use `inspect` with `condition` to confirm the fix on the changed code path.
+      4. **Fix**: Apply a minimal edit based on what you observed.
+      5. **Verify**: Use `inspect` to confirm the fix on the changed code path.
 
       ## Constraints
 
