@@ -908,28 +908,29 @@ Track these expressions:
 {code_snippet}
 ## Available MCP Tools
 
-You have these tools (and ONLY these — no bash, no local commands):
+You will see many tools from the MCP server. Ignore all except these five:
 
-1. **cog_debug_launch** — Start a debug session. Takes: program OR module, args (list), cwd, env (object), language.
-2. **cog_debug_breakpoint** — Set a breakpoint. Takes: session_id, file, line, condition (optional). Also supports action="set_exception", filters=["raised"] to break on exceptions.
-3. **cog_debug_run** — Control execution. Takes: session_id, action, timeout_ms. The action **step_over_inspect** steps repeatedly while evaluating expressions, returning all results in one call.
-4. **cog_debug_inspect** — Evaluate an expression at the current stop. Takes: session_id, expression, scope (locals/globals), frame_id.
-5. **cog_debug_stacktrace** — Get the call stack. Takes: session_id.
-6. **cog_debug_stop** — Stop the debug session. Takes: session_id.
+1. **cog_debug_launch** — Start a debug session
+2. **cog_debug_breakpoint** — Set breakpoints
+3. **cog_debug_run** — Control execution (continue, step_over_inspect)
+4. **cog_debug_inspect** — Only for exception/condition inspection (NOT for tracing)
+5. **cog_debug_stop** — Stop the debug session
 
 ## Workflow
 
-1. **Launch** the debug session
+1. **Launch** the debug session (program OR module, args, cwd, env, language)
 2. **Set TWO breakpoints**:
    a. **Unconditional** line breakpoint at `{breakpoint_loc}` — NEVER use the debugger's condition parameter
    b. Exception breakpoint: action="set_exception", filters=["raised"] — safety net if the test crashes before your line
 3. **Run** with action="continue", timeout_ms=15000
 4. **Check stop_reason**:
-   - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0. Report the exception and stop (no stepping).
+   - "exception" -> the test crashed before reaching your line. Call **inspect** with scope="locals" at frame_id=0. Report the exception and stop.
    - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>" and stop.
-5. **If breakpoint hit**:{(' first **inspect** the condition `' + condition + '` to see its actual value and report it.') if condition else ''} Use **step_over_inspect** to trace through the function:
-   Call **cog_debug_run** with action="step_over_inspect", expressions={expressions_json}, max_steps=25
-   This single call will step through the function line-by-line, evaluating each expression at every step.
+5. **If breakpoint hit**:{(' first **inspect** the condition `' + condition + '` to see its actual value and report it.') if condition else ''} call **cog_debug_run** with these EXACT parameters:
+   - action: "step_over_inspect"
+   - expressions: {expressions_json}
+   - max_steps: 25
+   This ONE call does all the stepping and expression evaluation for you. Do NOT call step_over or inspect in a loop — that is too slow and will timeout.
    The response contains:
    - "steps": array of per-step records, each with step number, file, line, function, and values (object mapping each expression to its value or null if not in scope)
    - "unresolved": list of expressions that never resolved at any step
@@ -967,6 +968,7 @@ Control flow summary:
 
 ## CRITICAL CONSTRAINTS
 
+- **NEVER call step_over or inspect in a loop to trace.** Use action="step_over_inspect" — it does the entire trace in one call. Calling step_over + inspect individually WILL timeout.
 - **NEVER launch more than one debug session.** One launch, one attempt. If the breakpoint is not hit, report that and stop.
 - If stop_reason is "exited" after continue, call cog_debug_stop and write: "BREAKPOINT NOT HIT — exit_code: <N>". Do NOT retry.
 - **ALWAYS call cog_debug_stop** before your final text response, even if earlier steps failed.
