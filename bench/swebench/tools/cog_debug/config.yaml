@@ -4,9 +4,8 @@
 # The actual execution is intercepted HOST-SIDE by CogDebugAgent before it
 # reaches the container. The bin/cog_debug placeholder should never run.
 #
-# Three modes:
-#   inspect  — Evaluate expressions at a breakpoint (default, current behavior)
-#   trace    — Step through a function and report how values evolve
+# Two modes:
+#   trace    — Set a breakpoint, evaluate expressions, step through code
 #   diagnose — Open-ended investigation of a test failure
 
 tools:
@@ -15,15 +14,11 @@ tools:
     docstring: |
       Debug a program by running it under a debugger. Choose a mode:
 
-      **inspect** — Evaluate specific expressions at a breakpoint. Use when you
-      know WHERE to look and WHAT to evaluate. Requires `breakpoint` and `inspect`.
-        Example: mode="inspect" breakpoint="urls.py:1066" inspect=["content_type", "type(value)"]
-                 test="python -m pytest tests/test_urls.py::test_prepare_multipart -xvs"
-
-      **trace** — Step through a function line-by-line and report how tracked
-      values change at each step. Use when you need to understand control flow
-      or find WHERE a value goes wrong. Requires `breakpoint` and `inspect`.
-        Example: mode="trace" breakpoint="urls.py:1050" inspect=["encoder", "content_type", "headers"]
+      **trace** — Set a breakpoint, evaluate expressions, and step through code.
+      Evaluates all expressions at the breakpoint and steps forward if any are
+      not yet in scope. Use whenever you know WHERE to look. Requires `breakpoint`
+      and `inspect`.
+        Example: mode="trace" breakpoint="urls.py:1066" inspect=["content_type", "type(value)"]
                  test="python -m pytest tests/test_urls.py::test_prepare_multipart -xvs"
 
       **diagnose** — Investigate a test failure and report findings. Use when you
@@ -35,8 +30,8 @@ tools:
     arguments:
       - name: mode
         type: string
-        enum: ["inspect", "trace", "diagnose"]
-        description: "inspect: evaluate expressions at a breakpoint. trace: step through code and track value evolution. diagnose: investigate a test failure autonomously."
+        enum: ["trace", "diagnose"]
+        description: "trace: evaluate expressions at a breakpoint and step through code. diagnose: investigate a test failure autonomously."
         required: true
       - name: test
         type: string

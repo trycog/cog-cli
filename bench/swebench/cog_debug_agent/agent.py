@@ -4,7 +4,7 @@ This agent subclasses SWE-agent's DefaultAgent. When the model calls the `cog_de
 tool, instead of executing it in the container (where it would fail), the agent:
 
 1. Extracts mode/breakpoint/inspect/test/condition/question arguments
-2. Builds a mode-specific subagent prompt (inspect, trace, or diagnose)
+2. Builds a mode-specific subagent prompt (trace or diagnose)
 3. Creates a temporary python3 docker-exec wrapper for the current container
 4. Spawns `claude -p` with cog MCP config pointing to the container
 5. Returns the subagent's output as the tool observation
@@ -193,15 +193,14 @@ class CogDebugAgent(DefaultAgent):
         self._log("MCP config at %s", config_path)
 
     _COG_DEBUG_REMINDER = (
-        "\n\n[Reminder] You have `cog_debug` available with three modes:\n"
-        "- **inspect**: evaluate expressions at a breakpoint (fastest for known locations)\n"
-        "- **trace**: step through a function to see how values evolve\n"
+        "\n\n[Reminder] You have `cog_debug` available with two modes:\n"
+        "- **trace**: evaluate expressions at a breakpoint and step through code to see how values evolve\n"
         "- **diagnose**: investigate a test failure when you don't know where to look\n"
         "Use cog_debug instead of writing scripts or using python3 -c."
     )
 
     _COG_DEBUG_VERIFY_REMINDER = (
-        "\n\n[Reminder] You can verify this fix with `cog_debug` mode=\"inspect\" using "
+        "\n\n[Reminder] You can verify this fix with `cog_debug` mode=\"trace\" using "
         "`condition` to target the changed code path — one call confirms the fix without "
         "writing a test script."
     )
@@ -209,15 +208,14 @@ class CogDebugAgent(DefaultAgent):
     _PYTHON_C_BLOCKED = (
         "python3 -c is not available. Use cog_debug to evaluate expressions "
         "at a breakpoint in the actual runtime context:\n\n"
-        "  cog_debug mode=\"inspect\" breakpoint=\"file.py:line\" "
+        "  cog_debug mode=\"trace\" breakpoint=\"file.py:line\" "
         "inspect=[\"expr1\", \"expr2\"] "
         "test=\"python -m pytest tests/... -xvs\""
     )
 
     _SCRIPT_CREATE_REDIRECT = (
         "Standalone debugging scripts are not allowed. Use cog_debug instead:\n\n"
-        "  mode=\"inspect\" — evaluate expressions at a breakpoint\n"
-        "  mode=\"trace\"   — step through a function and track values\n"
+        "  mode=\"trace\"    — evaluate expressions at a breakpoint and step through code\n"
         "  mode=\"diagnose\" — investigate a test failure autonomously\n\n"
         "If you need a test that exercises a specific code path, create a proper "
         "pytest test file (with `def test_*` functions and assertions) — that is allowed."
@@ -225,7 +223,7 @@ class CogDebugAgent(DefaultAgent):
 
     _SCRIPT_RUN_BLOCKED = (
         "Running custom scripts is not available. Use cog_debug instead:\n\n"
-        "  cog_debug mode=\"inspect\" breakpoint=\"file.py:line\" "
+        "  cog_debug mode=\"trace\" breakpoint=\"file.py:line\" "
         "inspect=[\"expr1\", \"expr2\"] "
         "test=\"python -m pytest tests/... -xvs\""
     )
@@ -601,49 +599,26 @@ class CogDebugAgent(DefaultAgent):
                 "```\n\n"
                 f"Raw output:\n{raw_output}"
             )
-        elif mode == "trace":
+        else:
+            # trace mode (default for breakpoint-based debugging)
             expr_bullets = "\n".join(f"  - {e}" for e in inspect_exprs)
             prompt = (
-                "You are a post-processor for execution trace output. Extract ONLY the "
-                "step-by-step trace — do not add commentary.\n\n"
+                "You are a post-processor for debugging output. Extract ONLY the "
+                "results — do not add commentary.\n\n"
                 f"Breakpoint: {breakpoint_loc}\n"
                 f"Test command: {test_cmd}\n"
                 f"Tracked expressions:\n{expr_bullets}\n\n"
                 "From the raw output below, extract:\n"
-                "1. The sequence of lines executed (file:line)\n"
-                "2. How each tracked expression changed at each step\n"
-                "3. Any branch decisions (which if/else path was taken)\n\n"
-                "Output format (use exactly, no extra text):\n"
-                "```\n"
-                "step 1: <file:line> — <function_name>\n"
-                "  <expr1> = <value>\n"
-                "  <expr2> = <value>\n"
-                "step 2: <file:line> — <function_name>\n"
-                "  <expr1> = <value> (changed)\n"
-                "...\n"
-                "[summary of control flow path taken]\n"
-                "```\n\n"
-                f"Raw output:\n{raw_output}"
-            )
-        else:
-            # inspect mode (default)
-            expr_bullets = "\n".join(f"  - {e}" for e in inspect_exprs)
-            prompt = (
-                "You are a post-processor for debugging output. Extract ONLY the "
-                "results — do not add commentary or explanation.\n\n"
-                f"Breakpoint: {breakpoint_loc}\n"
-                f"Test command: {test_cmd}\n"
-                f"Expressions requested:\n{expr_bullets}\n\n"
-                "From the raw output below, extract:\n"
                 "1. Whether the breakpoint was hit or not\n"
-                "2. The EXACT value of each expression (preserve verbatim — do not "
-                "paraphrase, truncate, or reformat values)\n"
-                "3. Any errors, exceptions, or unexpected behavior\n\n"
+                "2. The EXACT value of each expression at each step (preserve verbatim)\n"
+                "3. Any branch decisions or control flow observations\n"
+                "4. Any errors, exceptions, or unexpected behavior\n\n"
                 "Output format (use exactly, no extra text):\n"
                 "```\n"
                 "breakpoint: hit (or: not hit, exit_code=N)\n"
-                "<expression1> = <exact value>\n"
-                "<expression2> = <exact value>\n"
+                "step 1: <file:line> — <function_name>\n"
+                "  <expr1> = <value>\n"
+                "  <expr2> = <value>\n"
                 "...\n"
                 "[any errors or diagnostics on separate lines]\n"
                 "```\n\n"
@@ -818,67 +793,6 @@ You need to parse it into cog_debug_launch arguments. Always set `language: "pyt
 """
 
     # ── Subagent Prompt Builders ──────────────────────────────────────────
-
-    def _build_inspect_prompt(
-        self, breakpoint_loc: str, inspect_exprs: list,
-        test_cmd: str, condition: str, code_snippet: str,
-    ) -> str:
-        """Build the subagent prompt for INSPECT mode.
-
-        Subagent behavior: Set one breakpoint, continue to it, evaluate all
-        expressions, stop. No stepping, no exploration. Deterministic 5-tool
-        workflow.
-        """
-        condition_section = ""
-        if condition:
-            condition_section = f'\n- Condition to check: `{condition}`'
-
-        inspect_list = "\n".join(f"  - `{e}`" for e in inspect_exprs)
-
-        return f"""You are an autonomous debugging agent. You have MCP tools that control a debugger (debugpy) inside a Docker container. Your goal is to inspect specific expressions at a breakpoint while running a test.
-
-## Goal
-
-Inspect these expressions at breakpoint `{breakpoint_loc}` while running: `{test_cmd}`
-{condition_section}
-Expressions to inspect:
-{inspect_list}
-{code_snippet}
-## Available MCP Tools
-
-You will see many tools from the MCP server. Ignore all except these five:
-
-1. **cog_debug_launch** — Start a debug session
-2. **cog_debug_breakpoint** — Set breakpoints
-3. **cog_debug_run** — Control execution (continue, step_over_inspect)
-4. **cog_debug_inspect** — Only for exception/condition inspection (NOT for evaluating the main expressions)
-5. **cog_debug_stop** — Stop the debug session
-
-## Workflow
-
-1. **Launch** the debug session (see parsing guide below)
-2. **Set TWO breakpoints**:
-   a. **Unconditional** line breakpoint at `{breakpoint_loc}` (split into file and line) — NEVER use the debugger's condition parameter
-   b. Exception breakpoint: action="set_exception", filters=["raised"] — this is a safety net
-3. **Run** with action="continue", timeout_ms=15000
-4. **Check stop_reason**:
-   - "breakpoint" -> {('first **inspect** the condition `' + condition + '` to see its actual value. Report what it evaluates to. Then use step_over_inspect to evaluate all remaining expressions. ') if condition else ''}call **cog_debug_run** with action="step_over_inspect", expressions={json.dumps(inspect_exprs)}, max_steps=5. This evaluates all expressions at the current stop and steps forward (up to 5 times) if any are not yet in scope. Do NOT call step_over + inspect individually — that is too slow.
-   - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0 to capture the failure context. Report what exception occurred and where.
-   - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>"
-5. **Stop** the session (always, even on failure)
-6. **Write a text response** with results
-
-{self._TEST_COMMAND_PARSING_GUIDE.format(test_cmd=test_cmd)}
-
-## CRITICAL CONSTRAINTS
-- **NEVER call step_over or inspect in a loop to evaluate expressions.** Use action="step_over_inspect" — it evaluates all expressions and steps if needed, in one call. Calling step_over + inspect individually WILL timeout.
-- **NEVER launch more than one debug session.** One launch, one attempt. If the breakpoint is not hit, report that and stop.
-- If stop_reason is "exited", call cog_debug_stop and write: "BREAKPOINT NOT HIT — exit_code: <N>". Do NOT retry.
-- **ALWAYS call cog_debug_stop** before your final text response, even if earlier steps failed.
-- ONLY use MCP tools. No bash, no local commands.
-- NEVER pass "python" or "python3" as the program argument.
-- ALWAYS use frame_id=0 for inspect calls.
-- CRITICAL: You MUST end with a text response. NEVER end with only tool calls."""
 
     def _build_trace_prompt(
         self, breakpoint_loc: str, inspect_exprs: list,
@@ -1064,7 +978,10 @@ Your final text response MUST use this format:
         """Execute cog_debug by spawning a Claude subagent with cog MCP."""
         args = self._extract_cog_debug_args(step)
 
-        mode = args.get("mode", "inspect")
+        mode = args.get("mode", "trace")
+        # "inspect" is now an alias for "trace" — both use step_over_inspect
+        if mode == "inspect":
+            mode = "trace"
         breakpoint_loc = args.get("breakpoint", "")
         inspect_exprs = args.get("inspect", [])
         test_cmd = args.get("test", "")
@@ -1072,14 +989,7 @@ Your final text response MUST use this format:
         question = args.get("question", "")
 
         # Validate required arguments per mode
-        if mode == "inspect":
-            if not breakpoint_loc or not inspect_exprs or not test_cmd:
-                step.observation = (
-                    "ERROR: mode=\"inspect\" requires breakpoint, inspect, and test arguments. "
-                    f"Got: breakpoint={breakpoint_loc!r}, inspect={inspect_exprs!r}, test={test_cmd!r}"
-                )
-                return step
-        elif mode == "trace":
+        if mode == "trace":
             if not breakpoint_loc or not inspect_exprs or not test_cmd:
                 step.observation = (
                     "ERROR: mode=\"trace\" requires breakpoint, inspect, and test arguments. "
@@ -1095,7 +1005,7 @@ Your final text response MUST use this format:
                 return step
         else:
             step.observation = (
-                f"ERROR: Unknown mode={mode!r}. Valid modes: inspect, trace, diagnose."
+                f"ERROR: Unknown mode={mode!r}. Valid modes: trace, diagnose."
             )
             return step
 
@@ -1121,15 +1031,10 @@ Your final text response MUST use this format:
             subagent_prompt = self._build_trace_prompt(
                 breakpoint_loc, inspect_exprs, test_cmd, condition, code_snippet,
             )
-            timeout = 120  # trace takes longer due to stepping loop
-        elif mode == "diagnose":
+            timeout = 120
+        else:  # diagnose
             subagent_prompt = self._build_diagnose_prompt(test_cmd, question)
-            timeout = 120  # more exploration time
-        else:
-            subagent_prompt = self._build_inspect_prompt(
-                breakpoint_loc, inspect_exprs, test_cmd, condition, code_snippet,
-            )
-            timeout = 90
+            timeout = 120
 
         if not self._container_id:
             step.observation = "ERROR: No Docker container discovered. Cannot run cog debug subagent."
