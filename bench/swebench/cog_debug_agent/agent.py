@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 
 from sweagent.agent.agents import DefaultAgent
+from sweagent.agent.models import GLOBAL_STATS, GLOBAL_STATS_LOCK
 from sweagent.types import StepOutput
 
 logger = logging.getLogger(__name__)
@@ -494,6 +495,27 @@ class CogDebugAgent(DefaultAgent):
         logger.info(formatted)
         print(f"[CogDebugAgent] {formatted}", flush=True)
 
+    def _track_subagent_cost(self, cost_usd: float) -> None:
+        """Add subagent/distillation cost to SWE-agent's cost tracking."""
+        if cost_usd <= 0:
+            return
+        self.model.stats.instance_cost += cost_usd
+        with GLOBAL_STATS_LOCK:
+            GLOBAL_STATS.total_cost += cost_usd
+        self._log("subagent cost: $%.4f (instance total: $%.2f)",
+                  cost_usd, self.model.stats.instance_cost)
+
+    @staticmethod
+    def _extract_cost_from_json(stdout_content: str) -> float:
+        """Extract cost_usd from claude --output-format json response."""
+        if not stdout_content:
+            return 0.0
+        try:
+            result = json.loads(stdout_content)
+            return float(result.get("cost_usd", 0) or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return 0.0
+
     def _extract_subagent_output(self, stdout_content: str, mcp_log: str) -> str:
         """Extract meaningful output from subagent, with JSON parsing and MCP log fallback.
 
@@ -640,6 +662,9 @@ class CogDebugAgent(DefaultAgent):
             )
             if result.returncode == 0 and result.stdout.strip():
                 parsed = json.loads(result.stdout.strip())
+                distill_cost = float(parsed.get("cost_usd", 0) or 0)
+                if distill_cost > 0:
+                    self._track_subagent_cost(distill_cost)
                 distilled = parsed.get("result", "").strip()
                 if distilled:
                     self._log(
@@ -1093,6 +1118,11 @@ Your final text response MUST use this format:
             # Read captured output from files (survives process kill)
             stdout_content = stdout_path.read_text().strip() if stdout_path.exists() else ""
             stderr_content = stderr_path.read_text().strip() if stderr_path.exists() else ""
+
+            # Track subagent cost (even on timeout — partial work still costs)
+            subagent_cost = self._extract_cost_from_json(stdout_content)
+            if subagent_cost > 0:
+                self._track_subagent_cost(subagent_cost)
 
             # Read new cog DAP/MCP logs since before the call
             new_mcp_log = self._read_log_tail(mcp_log, mcp_pos_before)
