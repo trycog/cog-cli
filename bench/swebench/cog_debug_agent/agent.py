@@ -831,7 +831,7 @@ You need to parse it into cog_debug_launch arguments. Always set `language: "pyt
         """
         condition_section = ""
         if condition:
-            condition_section = f'\n- Breakpoint condition: `{condition}`'
+            condition_section = f'\n- Condition to check: `{condition}`'
 
         inspect_list = "\n".join(f"  - `{e}`" for e in inspect_exprs)
 
@@ -859,11 +859,11 @@ You have these tools (and ONLY these — no bash, no local commands):
 
 1. **Launch** the debug session (see parsing guide below)
 2. **Set TWO breakpoints**:
-   a. Line breakpoint at `{breakpoint_loc}` (split into file and line){' with condition `' + condition + '`' if condition else ''}
+   a. **Unconditional** line breakpoint at `{breakpoint_loc}` (split into file and line) — NEVER use the debugger's condition parameter
    b. Exception breakpoint: action="set_exception", filters=["raised"] — this is a safety net
 3. **Run** with action="continue", timeout_ms=15000
 4. **Check stop_reason**:
-   - "breakpoint" -> inspect ALL requested expressions (use frame_id=0). If any expression is not yet in scope, use **step_over** (up to 5 steps) until it is, then inspect again. Use the code context to judge how far to step.
+   - "breakpoint" -> {('first **inspect** the condition `' + condition + '` to see its actual value. Report what it evaluates to. Then inspect ALL requested expressions. ') if condition else ''}inspect ALL requested expressions (use frame_id=0). If any expression is not yet in scope, use **step_over** (up to 5 steps) until it is, then inspect again. Use the code context to judge how far to step.
    - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0 to capture the failure context. Report what exception occurred and where.
    - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>"
 5. **Stop** the session (always, even on failure)
@@ -894,7 +894,7 @@ You have these tools (and ONLY these — no bash, no local commands):
         """
         condition_section = ""
         if condition:
-            condition_section = f'\n- Breakpoint condition: `{condition}`'
+            condition_section = f'\n- Condition to check: `{condition}`'
 
         tracked_list = "\n".join(f"  - `{e}`" for e in inspect_exprs)
 
@@ -922,13 +922,13 @@ You have these tools (and ONLY these — no bash, no local commands):
 
 1. **Launch** the debug session
 2. **Set TWO breakpoints**:
-   a. Line breakpoint at `{breakpoint_loc}`{' with condition `' + condition + '`' if condition else ''}
+   a. **Unconditional** line breakpoint at `{breakpoint_loc}` — NEVER use the debugger's condition parameter
    b. Exception breakpoint: action="set_exception", filters=["raised"] — safety net if the test crashes before your line
 3. **Run** with action="continue", timeout_ms=15000
 4. **Check stop_reason**:
    - "exception" -> the test crashed before reaching your line. Call **stacktrace**, then **inspect** with scope="locals" at frame_id=0. Report the exception and stop (no stepping).
    - "exited" -> report "BREAKPOINT NOT HIT — exit_code: <N>" and stop.
-5. **If breakpoint hit**, begin stepping loop:
+5. **If breakpoint hit**:{(' first **inspect** the condition `' + condition + '` to see its actual value and report it.') if condition else ''} Begin stepping loop:
    a. **stacktrace** — record current file:line and function name
    b. **inspect** each tracked expression (frame_id=0)
    c. **run** with action="step_over", timeout_ms=5000
