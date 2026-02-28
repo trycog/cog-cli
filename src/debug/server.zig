@@ -81,7 +81,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "cog_debug_run",
-        .description = "Control program execution. Actions: 'continue' resumes until next breakpoint or exit, 'step_over' executes current line and stops at next line, 'step_into' enters function calls, 'step_out' runs until current function returns, 'pause' suspends a running program, 'restart' re-runs from the beginning, 'goto' jumps to a specific file:line (use with file and line params).",
+        .description = "Control program execution. Actions: 'continue' resumes until next breakpoint or exit, 'step_over' executes current line and stops at next line, 'step_into' enters function calls, 'step_out' runs until current function returns, 'pause' suspends a running program, 'restart' re-runs from the beginning, 'goto' jumps to a specific file:line (use with file and line params). 'step_over_inspect' steps repeatedly while evaluating expressions from the 'expressions' array, returning all results in one call (use 'max_steps' to limit, default 5).",
         .input_schema = debug_run_schema,
         .tier = .core,
     },
@@ -289,147 +289,147 @@ const ToolDef = struct {
 };
 
 pub const debug_launch_schema =
-    \\{"type":"object","properties":{"program":{"type":"string","description":"Path to the script or executable to debug (e.g. /path/to/script.py)"},"module":{"type":"string","description":"Python module to run (e.g. \"pytest\" for python -m pytest). Use this instead of program for pytest debugging. Pass test files/options in args."},"args":{"type":"array","items":{"type":"string"},"description":"Program arguments (e.g. [\"tests/test_foo.py::test_bar\", \"-xvs\"])"},"env":{"type":"object","description":"Environment variables"},"cwd":{"type":"string","description":"Working directory"},"language":{"type":"string","description":"Language hint (e.g. python, javascript). Auto-detected from file extension or interpreter name."},"stop_on_entry":{"type":"boolean","default":false}}}
+    \\{"type":"object","properties":{"program":{"type":"string","description":"Path to the script or executable to debug (e.g. /path/to/script.py, /path/to/app.js)"},"module":{"type":"string","description":"Module to run via the language runtime's module system (e.g. \"pytest\" for python -m pytest). Use instead of program when invoking a module. Pass module arguments in args."},"args":{"type":"array","items":{"type":"string"},"description":"Program arguments (e.g. [\"tests/test_foo.py::test_bar\", \"-xvs\"])"},"env":{"type":"object","description":"Environment variables"},"cwd":{"type":"string","description":"Working directory"},"language":{"type":"string","description":"Language hint (e.g. python, javascript). Auto-detected from file extension or interpreter name."},"stop_on_entry":{"type":"boolean","default":false}},"additionalProperties":false}
 ;
 
 pub const debug_breakpoint_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID from launch or attach"},"action":{"type":"string","enum":["set","remove","list","set_function","set_exception"],"description":"set: line breakpoint (file+line), set_function: break on function entry (function), set_exception: break on exceptions (filters), remove: delete by id, list: show all"},"file":{"type":"string","description":"Source file path (for set action)"},"line":{"type":"integer","description":"Line number (for set action)"},"condition":{"type":"string","description":"Expression that must be true for breakpoint to trigger"},"hit_condition":{"type":"string","description":"Break after N hits (e.g. \"> 5\", \"== 3\")"},"log_message":{"type":"string","description":"Log this message instead of stopping (logpoint). Expressions in {} are interpolated."},"function":{"type":"string","description":"Function name (for set_function action)"},"filters":{"type":"array","items":{"type":"string"},"description":"Exception filter IDs for set_exception (e.g. [\"raised\"], [\"uncaught\"])"},"id":{"type":"integer","description":"Breakpoint ID to remove (for remove action)"}},"required":["session_id","action"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID from launch or attach"},"action":{"type":"string","enum":["set","remove","list","set_function","set_exception"],"description":"set: line breakpoint (file+line), set_function: break on function entry (function), set_exception: break on exceptions (filters), remove: delete by id, list: show all"},"file":{"type":"string","description":"Source file path (for set action)"},"line":{"type":"integer","description":"Line number (for set action)"},"condition":{"type":"string","description":"Expression that must be true for breakpoint to trigger"},"hit_condition":{"type":"string","description":"Break after N hits (e.g. \"> 5\", \"== 3\")"},"log_message":{"type":"string","description":"Log this message instead of stopping (logpoint). Expressions in {} are interpolated."},"function":{"type":"string","description":"Function name (for set_function action)"},"filters":{"type":"array","items":{"type":"string"},"description":"Exception filter IDs for set_exception (e.g. [\"raised\"], [\"uncaught\"])"},"id":{"type":"integer","description":"Breakpoint ID to remove (for remove action)"}},"required":["session_id","action"],"additionalProperties":false}
 ;
 
 pub const debug_run_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"action":{"type":"string","enum":["continue","step_into","step_over","step_out","restart","pause","goto","reverse_continue","step_back"],"description":"continue: run until next breakpoint, step_over: next line, step_into: enter function, step_out: finish current function, pause: suspend running program, goto: jump to file:line, restart: re-run from start"},"file":{"type":"string","description":"Target file for goto action"},"line":{"type":"integer","description":"Target line for goto action"},"granularity":{"type":"string","enum":["statement","line","instruction"],"description":"Stepping granularity (default: statement)"},"timeout_ms":{"type":"integer","description":"Block until debuggee stops or timeout (ms). Default 30000. Set to 0 for async (returns immediately with status:running).","default":30000}},"required":["session_id","action"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"action":{"type":"string","enum":["continue","step_into","step_over","step_out","restart","pause","goto","reverse_continue","step_back","step_over_inspect"],"description":"continue: run until next breakpoint, step_over: next line, step_into: enter function, step_out: finish current function, pause: suspend running program, goto: jump to file:line, restart: re-run from start, step_over_inspect: step over repeatedly while evaluating expressions"},"file":{"type":"string","description":"Target file for goto action"},"line":{"type":"integer","description":"Target line for goto action"},"granularity":{"type":"string","enum":["statement","line","instruction"],"description":"Stepping granularity (default: statement)"},"timeout_ms":{"type":"integer","description":"Block until debuggee stops or timeout (ms). Default 30000. Set to 0 for async (returns immediately with status:running).","default":30000},"expressions":{"type":"array","items":{"type":"string"},"description":"Expressions to evaluate at each step (for step_over_inspect action)"},"max_steps":{"type":"integer","description":"Maximum number of steps before stopping (for step_over_inspect, default 5)","default":5}},"required":["session_id","action"],"additionalProperties":false}
 ;
 
 pub const debug_inspect_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"expression":{"type":"string","description":"Expression to evaluate (e.g. \"x + 1\", \"obj.field\", \"len(arr)\")"},"variable_ref":{"type":"integer","description":"Variable reference ID from a previous inspect or scopes result — use to expand compound variables (objects, arrays, structs)"},"frame_id":{"type":"integer","description":"Stack frame to evaluate in (0 = topmost frame, from stacktrace results)"},"scope":{"type":"string","enum":["locals","globals","arguments"],"description":"List all variables in this scope instead of evaluating an expression"},"context":{"type":"string","enum":["watch","repl","hover","clipboard"],"description":"Evaluation context hint for the debug adapter (default: repl)"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"expression":{"type":"string","description":"Expression to evaluate (e.g. \"x + 1\", \"obj.field\", \"len(arr)\")"},"variable_ref":{"type":"integer","description":"Variable reference ID from a previous inspect or scopes result — use to expand compound variables (objects, arrays, structs)"},"frame_id":{"type":"integer","description":"Stack frame to evaluate in (0 = topmost frame, from stacktrace results)"},"scope":{"type":"string","enum":["locals","globals","arguments"],"description":"List all variables in this scope instead of evaluating an expression"},"context":{"type":"string","enum":["watch","repl","hover","clipboard"],"description":"Evaluation context hint for the debug adapter (default: repl)"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_stop_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"terminate_only":{"type":"boolean","default":false,"description":"If true, terminate the debuggee but keep the debug adapter alive (DAP only)"},"detach":{"type":"boolean","default":false,"description":"Detach from debuggee without terminating"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"terminate_only":{"type":"boolean","default":false,"description":"If true, terminate the debuggee but keep the debug adapter alive (DAP only)"},"detach":{"type":"boolean","default":false,"description":"Detach from debuggee without terminating"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_threads_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_stacktrace_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_id":{"type":"integer","default":1,"description":"Thread to get stack from (default: main thread)"},"start_frame":{"type":"integer","default":0,"description":"Skip this many frames from the top"},"levels":{"type":"integer","default":20,"description":"Maximum number of frames to return"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_id":{"type":"integer","default":1,"description":"Thread to get stack from (default: main thread)"},"start_frame":{"type":"integer","default":0,"description":"Skip this many frames from the top"},"levels":{"type":"integer","default":20,"description":"Maximum number of frames to return"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_memory_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string"},"action":{"type":"string","enum":["read","write"]},"address":{"type":"string","description":"Hex address e.g. 0x1000"},"size":{"type":"integer","default":64},"data":{"type":"string","description":"Hex string for write"},"offset":{"type":"integer","description":"Byte offset from the base address"}},"required":["session_id","action","address"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string"},"action":{"type":"string","enum":["read","write"]},"address":{"type":"string","description":"Hex address e.g. 0x1000"},"size":{"type":"integer","default":64},"data":{"type":"string","description":"Hex string for write"},"offset":{"type":"integer","description":"Byte offset from the base address"}},"required":["session_id","action","address"],"additionalProperties":false}
 ;
 
 pub const debug_disassemble_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string"},"address":{"type":"string","description":"Hex address e.g. 0x1000"},"instruction_count":{"type":"integer","default":10},"instruction_offset":{"type":"integer","description":"Offset in instructions from the address"},"resolve_symbols":{"type":"boolean","description":"Whether to resolve symbol names","default":true}},"required":["session_id","address"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string"},"address":{"type":"string","description":"Hex address e.g. 0x1000"},"instruction_count":{"type":"integer","default":10},"instruction_offset":{"type":"integer","description":"Offset in instructions from the address"},"resolve_symbols":{"type":"boolean","description":"Whether to resolve symbol names","default":true}},"required":["session_id","address"],"additionalProperties":false}
 ;
 
 pub const debug_attach_schema =
-    \\{"type":"object","properties":{"pid":{"type":"integer","description":"Process ID to attach to"},"language":{"type":"string","description":"Language hint"}},"required":["pid"]}
+    \\{"type":"object","properties":{"pid":{"type":"integer","description":"Process ID to attach to"},"language":{"type":"string","description":"Language hint"}},"required":["pid"],"additionalProperties":false}
 ;
 
 pub const debug_set_variable_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"variable":{"type":"string","description":"Variable name to modify"},"value":{"type":"string","description":"New value as a string (e.g. \"42\", \"true\", \"\\\"hello\\\"\")"},"frame_id":{"type":"integer","default":0,"description":"Stack frame context (0 = topmost)"}},"required":["session_id","variable","value"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"variable":{"type":"string","description":"Variable name to modify"},"value":{"type":"string","description":"New value as a string (e.g. \"42\", \"true\", \"\\\"hello\\\"\")"},"frame_id":{"type":"integer","default":0,"description":"Stack frame context (0 = topmost)"}},"required":["session_id","variable","value"],"additionalProperties":false}
 ;
 
 pub const debug_scopes_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"frame_id":{"type":"integer","default":0,"description":"Stack frame to get scopes for (0 = topmost, from stacktrace results)"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"frame_id":{"type":"integer","default":0,"description":"Stack frame to get scopes for (0 = topmost, from stacktrace results)"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_watchpoint_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"variable":{"type":"string","description":"Variable name to watch"},"access_type":{"type":"string","enum":["read","write","readWrite"],"default":"write","description":"Break on read, write, or both (default: write)"},"frame_id":{"type":"integer","description":"Stack frame context for variable resolution"}},"required":["session_id","variable"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"variable":{"type":"string","description":"Variable name to watch"},"access_type":{"type":"string","enum":["read","write","readWrite"],"default":"write","description":"Break on read, write, or both (default: write)"},"frame_id":{"type":"integer","description":"Stack frame context for variable resolution"}},"required":["session_id","variable"],"additionalProperties":false}
 ;
 
 pub const debug_capabilities_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_completions_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"text":{"type":"string","description":"Partial text to complete"},"column":{"type":"integer","default":0,"description":"Cursor column position in the text"},"frame_id":{"type":"integer","description":"Stack frame context for completions"}},"required":["session_id","text"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"text":{"type":"string","description":"Partial text to complete"},"column":{"type":"integer","default":0,"description":"Cursor column position in the text"},"frame_id":{"type":"integer","description":"Stack frame context for completions"}},"required":["session_id","text"],"additionalProperties":false}
 ;
 
 pub const debug_modules_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_loaded_sources_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_source_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"source_reference":{"type":"integer","description":"Source reference ID from stacktrace or loadedSources results"}},"required":["session_id","source_reference"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"source_reference":{"type":"integer","description":"Source reference ID from stacktrace or loadedSources results"}},"required":["session_id","source_reference"],"additionalProperties":false}
 ;
 
 pub const debug_set_expression_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"expression":{"type":"string","description":"Left-hand expression to assign to (e.g. \"obj.field\", \"arr[0]\")"},"value":{"type":"string","description":"New value to assign"},"frame_id":{"type":"integer","default":0,"description":"Stack frame context"}},"required":["session_id","expression","value"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"expression":{"type":"string","description":"Left-hand expression to assign to (e.g. \"obj.field\", \"arr[0]\")"},"value":{"type":"string","description":"New value to assign"},"frame_id":{"type":"integer","default":0,"description":"Stack frame context"}},"required":["session_id","expression","value"],"additionalProperties":false}
 ;
 
 pub const debug_restart_frame_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"frame_id":{"type":"integer","description":"Stack frame ID to restart from (from stacktrace results)"}},"required":["session_id","frame_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"frame_id":{"type":"integer","description":"Stack frame ID to restart from (from stacktrace results)"}},"required":["session_id","frame_id"],"additionalProperties":false}
 ;
 
 pub const debug_exception_info_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_id":{"type":"integer","default":1,"description":"Thread that hit the exception"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_id":{"type":"integer","default":1,"description":"Thread that hit the exception"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_registers_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_id":{"type":"integer","default":1,"description":"Thread to read registers from"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_id":{"type":"integer","default":1,"description":"Thread to read registers from"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_instruction_breakpoint_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string"},"instruction_reference":{"type":"string","description":"Memory reference to an instruction"},"offset":{"type":"integer","description":"Optional offset from the instruction reference"},"condition":{"type":"string","description":"Optional breakpoint condition expression"},"hit_condition":{"type":"string","description":"Optional hit count condition"}},"required":["session_id","instruction_reference"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string"},"instruction_reference":{"type":"string","description":"Memory reference to an instruction"},"offset":{"type":"integer","description":"Optional offset from the instruction reference"},"condition":{"type":"string","description":"Optional breakpoint condition expression"},"hit_condition":{"type":"string","description":"Optional hit count condition"}},"required":["session_id","instruction_reference"],"additionalProperties":false}
 ;
 
 pub const debug_step_in_targets_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string"},"frame_id":{"type":"integer","description":"Stack frame ID to get step-in targets for"}},"required":["session_id","frame_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string"},"frame_id":{"type":"integer","description":"Stack frame ID to get step-in targets for"}},"required":["session_id","frame_id"],"additionalProperties":false}
 ;
 
 pub const debug_breakpoint_locations_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","description":"Source file path"},"line":{"type":"integer","description":"Start line to query"},"end_line":{"type":"integer","description":"Optional end line for range query"}},"required":["session_id","source","line"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string"},"source":{"type":"string","description":"Source file path"},"line":{"type":"integer","description":"Start line to query"},"end_line":{"type":"integer","description":"Optional end line for range query"}},"required":["session_id","source","line"],"additionalProperties":false}
 ;
 
 pub const debug_cancel_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"request_id":{"type":"integer","description":"ID of the request to cancel"},"progress_id":{"type":"string","description":"ID of the progress to cancel"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"request_id":{"type":"integer","description":"ID of the request to cancel"},"progress_id":{"type":"string","description":"ID of the progress to cancel"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_terminate_threads_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_ids":{"type":"array","items":{"type":"integer"},"description":"Thread IDs to terminate (from threads results)"}},"required":["session_id","thread_ids"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"thread_ids":{"type":"array","items":{"type":"integer"},"description":"Thread IDs to terminate (from threads results)"}},"required":["session_id","thread_ids"],"additionalProperties":false}
 ;
 
 pub const debug_restart_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"}},"required":["session_id"],"additionalProperties":false}
 ;
 
 pub const debug_sessions_schema =
-    \\{"type":"object","properties":{}}
+    \\{"type":"object","properties":{},"additionalProperties":false}
 ;
 
 pub const debug_goto_targets_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"file":{"type":"string","description":"Source file path"},"line":{"type":"integer","description":"Target line number"}},"required":["session_id","file","line"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"file":{"type":"string","description":"Source file path"},"line":{"type":"integer","description":"Target line number"}},"required":["session_id","file","line"],"additionalProperties":false}
 ;
 
 pub const debug_find_symbol_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"name":{"type":"string","description":"Symbol name to search for"}},"required":["session_id","name"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"name":{"type":"string","description":"Symbol name to search for"}},"required":["session_id","name"],"additionalProperties":false}
 ;
 
 pub const debug_write_register_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"name":{"type":"string","description":"Register name (e.g. rax, rsp, pc)"},"value":{"type":"integer","description":"Value to write"},"thread_id":{"type":"integer","default":0,"description":"Thread to write register in"}},"required":["session_id","name","value"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"name":{"type":"string","description":"Register name (e.g. rax, rsp, pc)"},"value":{"type":"integer","description":"Value to write"},"thread_id":{"type":"integer","default":0,"description":"Thread to write register in"}},"required":["session_id","name","value"],"additionalProperties":false}
 ;
 
 pub const debug_variable_location_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"name":{"type":"string","description":"Variable name to locate"},"frame_id":{"type":"integer","default":0,"description":"Stack frame context"}},"required":["session_id","name"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Debug session ID"},"name":{"type":"string","description":"Variable name to locate"},"frame_id":{"type":"integer","default":0,"description":"Stack frame context"}},"required":["session_id","name"],"additionalProperties":false}
 ;
 
 pub const debug_poll_events_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Poll specific session, or omit for all sessions"}}}
+    \\{"type":"object","properties":{"session_id":{"type":"string","description":"Poll specific session, or omit for all sessions"}},"additionalProperties":false}
 ;
 
 pub const debug_load_core_schema =
-    \\{"type":"object","properties":{"core_path":{"type":"string","description":"Path to core dump file"},"executable":{"type":"string","description":"Path to the executable that generated the core dump"}},"required":["core_path"]}
+    \\{"type":"object","properties":{"core_path":{"type":"string","description":"Path to core dump file"},"executable":{"type":"string","description":"Path to the executable that generated the core dump"}},"required":["core_path"],"additionalProperties":false}
 ;
 
 pub const debug_dap_request_schema =
-    \\{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"string","description":"DAP command name (e.g. evaluate, threads)"},"arguments":{"type":"object","description":"DAP request arguments"}},"required":["session_id","command"]}
+    \\{"type":"object","properties":{"session_id":{"type":"string"},"command":{"type":"string","description":"DAP command name (e.g. evaluate, threads)"},"arguments":{"type":"object","description":"DAP request arguments"}},"required":["session_id","command"],"additionalProperties":false}
 ;
 
 // ── Tool Result Type ────────────────────────────────────────────────────
@@ -874,6 +874,11 @@ pub const DebugServer = struct {
             return .{ .ok = result };
         }
 
+        // Handle step_over_inspect — composite action: step + evaluate in a loop
+        if (std.mem.eql(u8, action_val.string, "step_over_inspect")) {
+            return self.toolStepOverInspect(allocator, a, session);
+        }
+
         const action = types.RunAction.parse(action_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Invalid action" } };
 
@@ -1079,6 +1084,198 @@ pub const DebugServer = struct {
             pr.stop_state = state;
             pr.result.store(1, .release);
         }
+    }
+
+    /// Composite action: step over repeatedly while evaluating expressions.
+    /// At each stop, tries to evaluate all pending expressions. Successful ones
+    /// are removed from the pending list. Stops when: all resolved, max steps
+    /// reached, function returned (stack depth decreased), or program exited.
+    fn toolStepOverInspect(self: *DebugServer, allocator: std.mem.Allocator, a: json.Value, session: *session_mod.Session) !ToolResult {
+        if (requireStopped(session)) |err_result| return err_result;
+
+        // Parse expressions array
+        const expr_val = a.object.get("expressions") orelse
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing expressions for step_over_inspect" } };
+        if (expr_val != .array) return .{ .err = .{ .code = INVALID_PARAMS, .message = "expressions must be array" } };
+        if (expr_val.array.items.len == 0) return .{ .err = .{ .code = INVALID_PARAMS, .message = "expressions must not be empty" } };
+
+        const max_steps: u32 = if (a.object.get("max_steps")) |v|
+            (if (v == .integer and v.integer > 0) @as(u32, @intCast(v.integer)) else 5)
+        else
+            5;
+
+        // Collect expression strings
+        var expressions = std.ArrayListUnmanaged([]const u8).empty;
+        defer expressions.deinit(allocator);
+        for (expr_val.array.items) |item| {
+            if (item == .string) {
+                try expressions.append(allocator, item.string);
+            }
+        }
+        if (expressions.items.len == 0) return .{ .err = .{ .code = INVALID_PARAMS, .message = "No valid string expressions" } };
+
+        // Get initial stack depth via stacktrace
+        const initial_depth: usize = blk: {
+            const frames = session.driver.stackTrace(allocator, 1, 0, 100) catch break :blk 0;
+            break :blk frames.len;
+        };
+
+        // Result storage: expression -> value (duped strings owned by allocator)
+        var results = std.StringArrayHashMapUnmanaged([]const u8).empty;
+        defer {
+            for (results.keys(), results.values()) |k, v| {
+                allocator.free(k);
+                allocator.free(v);
+            }
+            results.deinit(allocator);
+        }
+
+        // Pending expressions (indices into expressions array)
+        var pending = std.ArrayListUnmanaged(usize).empty;
+        defer pending.deinit(allocator);
+        for (0..expressions.items.len) |i| {
+            try pending.append(allocator, i);
+        }
+
+        // Release mutex for blocking DAP calls
+        self.mutex.unlock();
+        defer self.mutex.lock();
+
+        var steps_taken: u32 = 0;
+        var final_stop_reason: []const u8 = "max_steps";
+        var final_location: ?types.SourceLocation = null;
+
+        while (pending.items.len > 0) {
+            // Try to evaluate each pending expression
+            var still_pending = std.ArrayListUnmanaged(usize).empty;
+            defer still_pending.deinit(allocator);
+
+            for (pending.items) |idx| {
+                const expr = expressions.items[idx];
+                const inspect_result = session.driver.inspect(allocator, .{
+                    .expression = expr,
+                    .frame_id = 0,
+                }) catch {
+                    // Transport error — keep pending
+                    try still_pending.append(allocator, idx);
+                    continue;
+                };
+                defer inspect_result.deinit(allocator);
+
+                if (inspect_result.result.len > 0 and !isEvalError(inspect_result.result)) {
+                    // Success — store result
+                    const key = try allocator.dupe(u8, expr);
+                    errdefer allocator.free(key);
+                    const val = try allocator.dupe(u8, inspect_result.result);
+                    errdefer allocator.free(val);
+                    try results.put(allocator, key, val);
+                } else {
+                    // Evaluation failed (not in scope, etc.) — keep pending
+                    try still_pending.append(allocator, idx);
+                }
+            }
+
+            // Replace pending with still_pending
+            pending.deinit(allocator);
+            pending = .empty;
+            for (still_pending.items) |idx| {
+                try pending.append(allocator, idx);
+            }
+
+            if (pending.items.len == 0) {
+                final_stop_reason = "all_resolved";
+                break;
+            }
+
+            // Step over
+            const state = session.driver.runEx(allocator, .step_over, .{}) catch {
+                // Transport/driver error — return what we have
+                final_stop_reason = "error";
+                break;
+            };
+
+            // Update location from step result
+            final_location = state.location;
+
+            // Check if program exited
+            if (state.exit_code != null or state.stop_reason == .exited) {
+                session.status = .terminated;
+                final_stop_reason = "exited";
+                break;
+            }
+
+            // Check if we stepped out of the function (stack depth decreased)
+            const current_depth: usize = depth_blk: {
+                const frames = session.driver.stackTrace(allocator, 1, 0, 100) catch break :depth_blk initial_depth;
+                break :depth_blk frames.len;
+            };
+            if (current_depth < initial_depth) {
+                final_stop_reason = "stepped_out";
+                break;
+            }
+
+            steps_taken += 1;
+            if (steps_taken >= max_steps) {
+                final_stop_reason = "max_steps";
+                break;
+            }
+        }
+
+        // Build JSON response
+        var aw: Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        try jw.beginObject();
+
+        try jw.objectField("results");
+        try jw.beginObject();
+        for (results.keys(), results.values()) |k, v| {
+            try jw.objectField(k);
+            try jw.write(v);
+        }
+        try jw.endObject();
+
+        if (pending.items.len > 0) {
+            try jw.objectField("unresolved");
+            try jw.beginArray();
+            for (pending.items) |idx| {
+                try jw.write(expressions.items[idx]);
+            }
+            try jw.endArray();
+        }
+
+        try jw.objectField("steps_taken");
+        try jw.write(steps_taken);
+        try jw.objectField("stop_reason");
+        try jw.write(final_stop_reason);
+
+        if (final_location) |loc| {
+            try jw.objectField("location");
+            try jw.beginObject();
+            try jw.objectField("file");
+            try jw.write(loc.file);
+            try jw.objectField("line");
+            try jw.write(loc.line);
+            try jw.objectField("function");
+            try jw.write(loc.function);
+            try jw.endObject();
+        }
+
+        try jw.endObject();
+        const result = try aw.toOwnedSlice();
+
+        return .{ .ok = result };
+    }
+
+    /// Check if an inspect result looks like an evaluation error (name not defined, etc.)
+    fn isEvalError(result: []const u8) bool {
+        // DAP adapters typically return error messages for undefined names
+        if (std.mem.startsWith(u8, result, "NameError:")) return true;
+        if (std.mem.startsWith(u8, result, "name '")) return true;
+        if (std.mem.indexOf(u8, result, "is not defined")) |_| return true;
+        if (std.mem.indexOf(u8, result, "not found")) |_| return true;
+        if (std.mem.startsWith(u8, result, "ReferenceError:")) return true;
+        return false;
     }
 
     fn toolInspect(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
