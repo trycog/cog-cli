@@ -344,6 +344,41 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
             }
         }
+
+        // f. Deploy memory agent file (only when memory is configured)
+        if (setup_mem) {
+            if (agent.mem_file_path) |mem_path| {
+                const shares_path = if (agent.agent_file_path) |ap|
+                    std.mem.eql(u8, ap, mem_path)
+                else
+                    false;
+
+                if (shares_path) {
+                    // Codex/Roo: same file, writers append — always write
+                    hooks_mod.configureMemAgentFile(allocator, agent) catch {};
+                } else {
+                    var mem_already_written = false;
+                    for (written_agents[0..written_agents_count]) |wa| {
+                        if (std.mem.eql(u8, wa, mem_path)) {
+                            mem_already_written = true;
+                            break;
+                        }
+                    }
+                    if (!mem_already_written) {
+                        hooks_mod.configureMemAgentFile(allocator, agent) catch {};
+                        printErr("    ");
+                        tui.checkmark();
+                        printErr(" ");
+                        printErr(mem_path);
+                        printErr("\n");
+                        if (written_agents_count < 32) {
+                            written_agents[written_agents_count] = mem_path;
+                            written_agents_count += 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Ensure .cog/ is in .gitignore (only in git repos)

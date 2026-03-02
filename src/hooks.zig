@@ -527,6 +527,18 @@ pub fn configureDebugAgentFile(allocator: std.mem.Allocator, agent: agents_mod.A
     }
 }
 
+pub fn configureMemAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
+    const mem_path = agent.mem_file_path orelse return;
+
+    if (agent.mem_file_header) |header| {
+        try writeMarkdownAgent(allocator, mem_path, header, build_options.mem_agent_body);
+    } else if (std.mem.eql(u8, agent.id, "codex")) {
+        try writeTomlAgent(allocator, mem_path, "cog-mem", "Memory sub-agent for recall, consolidation, and maintenance", build_options.mem_agent_body);
+    } else if (std.mem.eql(u8, agent.id, "roo")) {
+        try writeRooAgent(allocator, mem_path, "cog-mem", "Cog Memory", "You are a memory sub-agent for Cog's persistent associative knowledge graph. Search memory with cog_mem_recall, consolidate short-term memories with cog_mem_list_short_term and cog_mem_reinforce, and check brain health with cog_mem_stats. Return concise summaries with engram IDs.");
+    }
+}
+
 fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
         try ensureDir(parent);
