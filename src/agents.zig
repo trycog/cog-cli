@@ -38,6 +38,8 @@ pub const Agent = struct {
     agent_file_header: ?[]const u8,
     debug_file_path: ?[]const u8,
     debug_file_header: ?[]const u8,
+    mem_file_path: ?[]const u8,
+    mem_file_header: ?[]const u8,
 
     pub fn supportsToolPermissions(self: *const Agent) bool {
         return std.mem.eql(u8, self.id, "claude_code") or
@@ -75,7 +77,7 @@ pub const agents = [_]Agent{
         .debug_file_header =
         \\---
         \\name: cog-debug
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
         \\tools:
         \\  - mcp__cog__cog_debug_launch
         \\  - mcp__cog__cog_debug_breakpoint
@@ -83,11 +85,54 @@ pub const agents = [_]Agent{
         \\  - mcp__cog__cog_debug_inspect
         \\  - mcp__cog__cog_debug_stacktrace
         \\  - mcp__cog__cog_debug_stop
+        \\  - mcp__cog__cog_debug_threads
+        \\  - mcp__cog__cog_debug_scopes
+        \\  - mcp__cog__cog_debug_set_variable
+        \\  - mcp__cog__cog_debug_watchpoint
+        \\  - mcp__cog__cog_debug_exception_info
+        \\  - mcp__cog__cog_debug_attach
+        \\  - mcp__cog__cog_debug_restart
+        \\  - mcp__cog__cog_debug_sessions
+        \\  - mcp__cog__cog_debug_poll_events
+        \\  - mcp__cog__cog_code_query
+        \\  - mcp__cog__cog_code_explore
+        \\  - mcp__cog__cog_code_status
+        \\  - mcp__cog__cog_mem_recall
+        \\  - mcp__cog__cog_mem_bulk_recall
         \\  - Read
         \\  - Bash
         \\mcpServers:
         \\  - cog
         \\maxTurns: 15
+        \\---
+        \\
+        ,
+        .mem_file_path = ".claude/agents/cog-mem.md",
+        .mem_file_header =
+        \\---
+        \\name: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\tools:
+        \\  - mcp__cog__cog_mem_recall
+        \\  - mcp__cog__cog_mem_bulk_recall
+        \\  - mcp__cog__cog_mem_trace
+        \\  - mcp__cog__cog_mem_connections
+        \\  - mcp__cog__cog_mem_get
+        \\  - mcp__cog__cog_mem_list_short_term
+        \\  - mcp__cog__cog_mem_reinforce
+        \\  - mcp__cog__cog_mem_flush
+        \\  - mcp__cog__cog_mem_stale
+        \\  - mcp__cog__cog_mem_verify
+        \\  - mcp__cog__cog_mem_stats
+        \\  - mcp__cog__cog_mem_orphans
+        \\  - mcp__cog__cog_mem_connectivity
+        \\  - mcp__cog__cog_mem_list_terms
+        \\  - mcp__cog__cog_mem_unlink
+        \\  - mcp__cog__cog_mem_meld
+        \\  - mcp__cog__cog_mem_bulk_learn
+        \\  - mcp__cog__cog_mem_bulk_associate
+        \\mcpServers:
+        \\  - cog
         \\---
         \\
         ,
@@ -115,7 +160,7 @@ pub const agents = [_]Agent{
         .debug_file_header =
         \\---
         \\name: cog-debug
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
         \\tools:
         \\  - cog__cog_debug_launch
         \\  - cog__cog_debug_breakpoint
@@ -123,9 +168,20 @@ pub const agents = [_]Agent{
         \\  - cog__cog_debug_inspect
         \\  - cog__cog_debug_stacktrace
         \\  - cog__cog_debug_stop
+        \\  - cog__cog_code_query
+        \\  - cog__cog_code_explore
+        \\  - cog__cog_mem_recall
         \\  - read_file
         \\  - run_shell_command
         \\max_turns: 15
+        \\---
+        \\
+        ,
+        .mem_file_path = ".gemini/agents/cog-mem.md",
+        .mem_file_header =
+        \\---
+        \\name: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
         ,
@@ -152,11 +208,22 @@ pub const agents = [_]Agent{
         .debug_file_header =
         \\---
         \\name: cog-debug
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
         \\tools:
         \\  - cog/*
         \\  - read
         \\  - execute
+        \\user-invokable: false
+        \\---
+        \\
+        ,
+        .mem_file_path = ".github/agents/cog-mem.agent.md",
+        .mem_file_header =
+        \\---
+        \\name: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\tools:
+        \\  - cog/*
         \\user-invokable: false
         \\---
         \\
@@ -179,7 +246,14 @@ pub const agents = [_]Agent{
         .debug_file_path = ".windsurf/workflows/cog-debug.md",
         .debug_file_header =
         \\---
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\---
+        \\
+        ,
+        .mem_file_path = ".windsurf/workflows/cog-mem.md",
+        .mem_file_header =
+        \\---
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
         ,
@@ -204,7 +278,15 @@ pub const agents = [_]Agent{
         .debug_file_header =
         \\---
         \\name: cog-debug
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\---
+        \\
+        ,
+        .mem_file_path = ".cursor/agents/cog-mem.md",
+        .mem_file_header =
+        \\---
+        \\name: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
         ,
@@ -220,6 +302,8 @@ pub const agents = [_]Agent{
         .agent_file_header = null,
         .debug_file_path = ".codex/config.toml",
         .debug_file_header = null,
+        .mem_file_path = ".codex/config.toml",
+        .mem_file_header = null,
     },
     // ── Amp ─────────────────────────────────────────────────────────
     .{
@@ -239,7 +323,15 @@ pub const agents = [_]Agent{
         .debug_file_header =
         \\---
         \\name: cog-debug
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\---
+        \\
+        ,
+        .mem_file_path = ".agents/skills/cog-mem.md",
+        .mem_file_header =
+        \\---
+        \\name: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
         ,
@@ -263,7 +355,15 @@ pub const agents = [_]Agent{
         .debug_file_header =
         \\---
         \\title: cog-debug
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\---
+        \\
+        ,
+        .mem_file_path = ".goose/cog-mem.yaml",
+        .mem_file_header =
+        \\---
+        \\title: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
         ,
@@ -279,6 +379,8 @@ pub const agents = [_]Agent{
         .agent_file_header = null,
         .debug_file_path = ".roomodes",
         .debug_file_header = null,
+        .mem_file_path = ".roomodes",
+        .mem_file_header = null,
     },
     // ── OpenCode ────────────────────────────────────────────────────
     .{
@@ -301,7 +403,15 @@ pub const agents = [_]Agent{
         .debug_file_path = ".opencode/agents/cog-debug.md",
         .debug_file_header =
         \\---
-        \\description: Debug subagent that inspects runtime state via cog debugger tools
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\mode: subagent
+        \\---
+        \\
+        ,
+        .mem_file_path = ".opencode/agents/cog-mem.md",
+        .mem_file_header =
+        \\---
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\mode: subagent
         \\---
         \\
