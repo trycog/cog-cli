@@ -8,6 +8,9 @@ BENCH_DIR="$SCRIPT_DIR"
 COG_BIN="${COG_BIN:-zig-out/bin/cog}"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Source shared deployment library
+source "$SCRIPT_DIR/../lib/deploy.sh"
+
 # Resolve cog binary
 if [[ ! -f "$ROOT_DIR/$COG_BIN" ]]; then
   echo "Building cog binary..."
@@ -66,8 +69,10 @@ configure_claude() {
   # .mcp.json — MCP server config
   echo "{\"mcpServers\":{\"cog\":{\"command\":\"$COG\",\"args\":[\"mcp\"]}}}" > "$dir/.mcp.json"
 
+  # Deploy canonical CLAUDE.md and all 3 sub-agent files
+  deploy_canonical "$dir"
+
   # .claude/settings.json — auto-allow all benchmark tools
-  mkdir -p "$dir/.claude"
   echo "$SETTINGS_JSON" > "$dir/.claude/settings.json"
 }
 
