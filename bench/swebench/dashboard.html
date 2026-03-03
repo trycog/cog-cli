@@ -348,11 +348,11 @@ bash bench/swebench/collect.sh</pre>
 const SWEBENCH_DATA = {
   "total_tasks": 0,
   "baseline_ran": 0,
-  "debugger_subagent_ran": 0,
+  "debugger_ran": 0,
   "baseline_resolved": 0,
-  "debugger_subagent_resolved": 0,
-  "debugger_subagent_advantage": 0,
-  "debugger_subagent_disadvantage": 0,
+  "debugger_resolved": 0,
+  "debugger_advantage": 0,
+  "debugger_disadvantage": 0,
   "tasks": []
 };
 </script>
@@ -376,7 +376,7 @@ const UNRESOLVED_COLOR = '#f85149';
 
 function render(data) {
   const tasks = data.tasks;
-  const hasRuns = data.baseline_ran > 0 || data.debugger_subagent_ran > 0;
+  const hasRuns = data.baseline_ran > 0 || data.debugger_ran > 0;
   if (!hasRuns) {
     document.getElementById('dashboard').style.display = 'none';
     document.getElementById('no-data').style.display = '';
@@ -395,13 +395,13 @@ function render(data) {
 function renderSummary(data) {
   const d = data;
   const bRate = d.baseline_ran > 0 ? (d.baseline_resolved / d.baseline_ran * 100).toFixed(1) : '0';
-  const dsRate = d.debugger_subagent_ran > 0 ? (d.debugger_subagent_resolved / d.debugger_subagent_ran * 100).toFixed(1) : '0';
+  const dsRate = d.debugger_ran > 0 ? (d.debugger_resolved / d.debugger_ran * 100).toFixed(1) : '0';
 
   document.getElementById('summary').innerHTML = `
     <div class="card">
       <div class="value">${dsRate}%</div>
       <div class="label">Debugger-Subagent Resolve Rate</div>
-      <div class="detail">${d.debugger_subagent_resolved}/${d.debugger_subagent_ran} tasks</div>
+      <div class="detail">${d.debugger_resolved}/${d.debugger_ran} tasks</div>
     </div>
     <div class="card">
       <div class="value neutral">${bRate}%</div>
@@ -409,9 +409,9 @@ function renderSummary(data) {
       <div class="detail">${d.baseline_resolved}/${d.baseline_ran} tasks</div>
     </div>
     <div class="card">
-      <div class="value ${d.debugger_subagent_advantage > 0 ? '' : 'neutral'}">+${d.debugger_subagent_advantage}</div>
+      <div class="value ${d.debugger_advantage > 0 ? '' : 'neutral'}">+${d.debugger_advantage}</div>
       <div class="label">Debugger Advantage</div>
-      <div class="detail">${d.debugger_subagent_advantage} extra resolved, ${d.debugger_subagent_disadvantage} missed</div>
+      <div class="detail">${d.debugger_advantage} extra resolved, ${d.debugger_disadvantage} missed</div>
     </div>
     <div class="card">
       <div class="value neutral">${d.total_tasks}</div>
@@ -435,8 +435,8 @@ function renderResolveChart(data) {
   const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
 
   const categories = ['Debugger-Subagent', 'Baseline'];
-  const values = [data.debugger_subagent_resolved, data.baseline_resolved];
-  const totals = [data.debugger_subagent_ran, data.baseline_ran];
+  const values = [data.debugger_resolved, data.baseline_resolved];
+  const totals = [data.debugger_ran, data.baseline_ran];
   const colors = [DEBUGGER_COLOR, BASELINE_COLOR];
 
   const x = d3.scaleLinear().domain([0, Math.max(data.total_tasks, d3.max(values) * 1.2)]).range([0, width]);
@@ -473,10 +473,10 @@ function renderResolveChart(data) {
 function renderRepoChart(data) {
   const repos = {};
   data.tasks.forEach(t => {
-    if (!repos[t.repo]) repos[t.repo] = { baseline: 0, debugger_subagent: 0, total: 0 };
+    if (!repos[t.repo]) repos[t.repo] = { baseline: 0, debugger: 0, total: 0 };
     repos[t.repo].total++;
     if (t.baseline && t.baseline.resolved) repos[t.repo].baseline++;
-    if (t.debugger_subagent && t.debugger_subagent.resolved) repos[t.repo].debugger_subagent++;
+    if (t.debugger && t.debugger.resolved) repos[t.repo].debugger++;
   });
 
   const entries = Object.entries(repos).sort((a, b) => b[1].total - a[1].total);
@@ -502,7 +502,7 @@ function renderRepoChart(data) {
 
   entries.forEach(([repo, counts], i) => {
     const yOff = i * (groupHeight + groupPad);
-    const dsPct = counts.total > 0 ? (counts.debugger_subagent / counts.total * 100) : 0;
+    const dsPct = counts.total > 0 ? (counts.debugger / counts.total * 100) : 0;
     const bPct = counts.total > 0 ? (counts.baseline / counts.total * 100) : 0;
 
     g.append('text').attr('class', 'bar-label')
@@ -516,7 +516,7 @@ function renderRepoChart(data) {
     g.append('text').attr('class', 'bar-value')
       .attr('x', x(dsPct) + 4).attr('y', yOff + barHeight / 2)
       .attr('dominant-baseline', 'middle')
-      .text(`${dsPct.toFixed(0)}% (${counts.debugger_subagent}/${counts.total})`);
+      .text(`${dsPct.toFixed(0)}% (${counts.debugger}/${counts.total})`);
 
     g.append('rect').attr('x', 0).attr('y', yOff + barHeight + 3)
       .attr('width', x(bPct)).attr('height', barHeight)
@@ -532,16 +532,16 @@ function renderRepoChart(data) {
 
 function renderVennInfo(data) {
   const both = data.tasks.filter(t =>
-    t.baseline && t.baseline.resolved && t.debugger_subagent && t.debugger_subagent.resolved
+    t.baseline && t.baseline.resolved && t.debugger && t.debugger.resolved
   ).length;
   const onlyBaseline = data.tasks.filter(t =>
-    t.baseline && t.baseline.resolved && !(t.debugger_subagent && t.debugger_subagent.resolved)
+    t.baseline && t.baseline.resolved && !(t.debugger && t.debugger.resolved)
   ).length;
   const onlyDebugger = data.tasks.filter(t =>
-    t.debugger_subagent && t.debugger_subagent.resolved && !(t.baseline && t.baseline.resolved)
+    t.debugger && t.debugger.resolved && !(t.baseline && t.baseline.resolved)
   ).length;
   const neither = data.tasks.filter(t =>
-    !(t.baseline && t.baseline.resolved) && !(t.debugger_subagent && t.debugger_subagent.resolved)
+    !(t.baseline && t.baseline.resolved) && !(t.debugger && t.debugger.resolved)
   ).length;
 
   const container = document.getElementById('chart-venn');
@@ -553,7 +553,7 @@ function renderVennInfo(data) {
       </div>
       <div style="background: var(--bg); border-radius: 6px; padding: 1rem;">
         <div style="font-size: 1.5rem; font-weight: 700; color: var(--green);">${onlyDebugger}</div>
-        <div style="font-size: 0.75rem; color: var(--text-dim);">Only debugger-subagent</div>
+        <div style="font-size: 0.75rem; color: var(--text-dim);">Only debugger</div>
       </div>
       <div style="background: var(--bg); border-radius: 6px; padding: 1rem;">
         <div style="font-size: 1.5rem; font-weight: 700; color: var(--baseline-color);">${onlyBaseline}</div>
@@ -578,7 +578,7 @@ function renderTable(data) {
   const columns = [
     { key: 'instance_id', label: 'Instance', sort: (a, b) => a.instance_id.localeCompare(b.instance_id) },
     { key: 'repo', label: 'Repo', sort: (a, b) => a.repo.localeCompare(b.repo) },
-    { key: 'ds_resolved', label: 'Subagent Resolved', sort: (a, b) => ((a.debugger_subagent||{}).resolved ? 1 : 0) - ((b.debugger_subagent||{}).resolved ? 1 : 0) },
+    { key: 'ds_resolved', label: 'Subagent Resolved', sort: (a, b) => ((a.debugger||{}).resolved ? 1 : 0) - ((b.debugger||{}).resolved ? 1 : 0) },
     { key: 'b_resolved', label: 'Baseline Resolved', sort: (a, b) => ((a.baseline||{}).resolved ? 1 : 0) - ((b.baseline||{}).resolved ? 1 : 0) },
   ];
 
@@ -592,7 +592,7 @@ function renderTable(data) {
 
     let bodyHtml = '<tbody>';
     tasks.forEach(t => {
-      const dsResolved = t.debugger_subagent && t.debugger_subagent.resolved;
+      const dsResolved = t.debugger && t.debugger.resolved;
       const bResolved = t.baseline && t.baseline.resolved;
       bodyHtml += `<tr>
         <td class="instance-col" title="${t.instance_id}">${t.instance_id}</td>
