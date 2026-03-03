@@ -1,3 +1,0 @@
-[submodule "bench/swebench/SWE-agent"]
-	path = bench/swebench/SWE-agent
-	url = https://github.com/SWE-agent/SWE-agent.git

@@ -1,5 +1,0 @@
-#!/bin/bash
-# Placeholder: cog_debug tool calls are intercepted host-side by CogDebugAgent.
-# This script should never execute inside the container.
-echo "ERROR: cog_debug should be intercepted by CogDebugAgent, not run in container" >&2
-exit 1
