@@ -14,14 +14,23 @@ pub const DebugConfig = struct {
     timeout: ?i64 = null,
 };
 
-pub const Settings = struct {
+pub const MemoryConfig = struct {
     brain: ?BrainConfig = null,
-    debug: ?DebugConfig = null,
+};
+
+pub const CodeConfig = struct {
+    index: ?[]const []const u8 = null,
     indexer: ?ToolConfig = null,
     editor: ?ToolConfig = null,
     creator: ?ToolConfig = null,
     deleter: ?ToolConfig = null,
     renamer: ?ToolConfig = null,
+};
+
+pub const Settings = struct {
+    memory: ?MemoryConfig = null,
+    code: ?CodeConfig = null,
+    debug: ?DebugConfig = null,
 
     /// Load merged settings: global (~/.config/cog/settings.json) with local (.cog/settings.json) overrides.
     pub fn load(allocator: std.mem.Allocator) ?Settings {
@@ -35,35 +44,9 @@ pub const Settings = struct {
         const g = global orelse Settings{};
         const l = local orelse Settings{};
 
-        result.brain = l.brain orelse g.brain;
+        result.memory = mergeMemoryConfig(allocator, l.memory, g.memory);
+        result.code = mergeCodeConfig(allocator, l.code, g.code);
         result.debug = mergeDebugConfig(l.debug, g.debug);
-        result.indexer = l.indexer orelse g.indexer;
-        result.editor = l.editor orelse g.editor;
-        result.creator = l.creator orelse g.creator;
-        result.deleter = l.deleter orelse g.deleter;
-        result.renamer = l.renamer orelse g.renamer;
-
-        // Free the non-winning side's allocations
-        if (l.brain != null) {
-            if (g.brain) |gb| freeBrainConfig(allocator, &gb);
-        }
-        if (l.indexer != null) {
-            if (g.indexer) |gi| freeToolConfig(allocator, &gi);
-        } else if (local != null) {
-            // local existed but had no indexer — nothing to free
-        }
-        if (l.editor != null) {
-            if (g.editor) |ge| freeToolConfig(allocator, &ge);
-        }
-        if (l.creator != null) {
-            if (g.creator) |gc| freeToolConfig(allocator, &gc);
-        }
-        if (l.deleter != null) {
-            if (g.deleter) |gd| freeToolConfig(allocator, &gd);
-        }
-        if (l.renamer != null) {
-            if (g.renamer) |gr| freeToolConfig(allocator, &gr);
-        }
 
         return result;
     }
@@ -97,7 +80,20 @@ pub const Settings = struct {
         const data = file.readToEndAlloc(allocator, 64 * 1024) catch return null;
         defer allocator.free(data);
 
-        return parse(allocator, data);
+        const result = parse(allocator, data);
+        if (result == null and data.len > 0) {
+            warnInvalidSettings(path);
+        }
+        return result;
+    }
+
+    fn warnInvalidSettings(path: []const u8) void {
+        var buf: [8192]u8 = undefined;
+        var w = std.fs.File.stderr().writer(&buf);
+        w.interface.writeAll("warning: invalid JSON in ") catch {};
+        w.interface.writeAll(path) catch {};
+        w.interface.writeAll("\n") catch {};
+        w.interface.flush() catch {};
     }
 
     /// Parse settings from JSON content.
@@ -110,40 +106,63 @@ pub const Settings = struct {
 
         var result: Settings = .{};
 
-        if (obj.get("brain")) |v| {
-            result.brain = parseBrainConfig(allocator, v) catch return null;
+        if (obj.get("memory")) |v| {
+            result.memory = parseMemoryConfig(allocator, v) catch return null;
+        }
+        if (obj.get("code")) |v| {
+            result.code = parseCodeConfig(allocator, v) catch return null;
         }
         if (obj.get("debug")) |v| {
             result.debug = parseDebugConfig(v);
-        }
-        if (obj.get("indexer")) |v| {
-            result.indexer = parseToolConfig(allocator, v) catch return null;
-        }
-        if (obj.get("editor")) |v| {
-            result.editor = parseToolConfig(allocator, v) catch return null;
-        }
-        if (obj.get("creator")) |v| {
-            result.creator = parseToolConfig(allocator, v) catch return null;
-        }
-        if (obj.get("deleter")) |v| {
-            result.deleter = parseToolConfig(allocator, v) catch return null;
-        }
-        if (obj.get("renamer")) |v| {
-            result.renamer = parseToolConfig(allocator, v) catch return null;
         }
 
         return result;
     }
 
     pub fn deinit(self: *const Settings, allocator: std.mem.Allocator) void {
-        if (self.brain) |cfg| freeBrainConfig(allocator, &cfg);
-        if (self.indexer) |cfg| freeToolConfig(allocator, &cfg);
-        if (self.editor) |cfg| freeToolConfig(allocator, &cfg);
-        if (self.creator) |cfg| freeToolConfig(allocator, &cfg);
-        if (self.deleter) |cfg| freeToolConfig(allocator, &cfg);
-        if (self.renamer) |cfg| freeToolConfig(allocator, &cfg);
+        if (self.memory) |cfg| freeMemoryConfig(allocator, &cfg);
+        if (self.code) |cfg| freeCodeConfig(allocator, &cfg);
     }
 };
+
+fn parseMemoryConfig(allocator: std.mem.Allocator, value: std.json.Value) !MemoryConfig {
+    if (value != .object) return error.InvalidSettings;
+    const obj = value.object;
+
+    var result: MemoryConfig = .{};
+    if (obj.get("brain")) |v| {
+        result.brain = try parseBrainConfig(allocator, v);
+    }
+    return result;
+}
+
+fn parseCodeConfig(allocator: std.mem.Allocator, value: std.json.Value) !CodeConfig {
+    if (value != .object) return error.InvalidSettings;
+    const obj = value.object;
+
+    var result: CodeConfig = .{};
+    errdefer freeCodeConfig(allocator, &result);
+
+    if (obj.get("index")) |v| {
+        result.index = try parseIndexPatterns(allocator, v);
+    }
+    if (obj.get("indexer")) |v| {
+        result.indexer = try parseToolConfig(allocator, v);
+    }
+    if (obj.get("editor")) |v| {
+        result.editor = try parseToolConfig(allocator, v);
+    }
+    if (obj.get("creator")) |v| {
+        result.creator = try parseToolConfig(allocator, v);
+    }
+    if (obj.get("deleter")) |v| {
+        result.deleter = try parseToolConfig(allocator, v);
+    }
+    if (obj.get("renamer")) |v| {
+        result.renamer = try parseToolConfig(allocator, v);
+    }
+    return result;
+}
 
 fn parseToolConfig(allocator: std.mem.Allocator, value: std.json.Value) !ToolConfig {
     if (value != .object) return error.InvalidSettings;
@@ -193,6 +212,19 @@ fn freeBrainConfig(allocator: std.mem.Allocator, config: *const BrainConfig) voi
     allocator.free(config.url);
 }
 
+fn freeMemoryConfig(allocator: std.mem.Allocator, config: *const MemoryConfig) void {
+    if (config.brain) |b| freeBrainConfig(allocator, &b);
+}
+
+fn freeCodeConfig(allocator: std.mem.Allocator, config: *const CodeConfig) void {
+    if (config.index) |idx| freeIndexPatterns(allocator, idx);
+    if (config.indexer) |cfg| freeToolConfig(allocator, &cfg);
+    if (config.editor) |cfg| freeToolConfig(allocator, &cfg);
+    if (config.creator) |cfg| freeToolConfig(allocator, &cfg);
+    if (config.deleter) |cfg| freeToolConfig(allocator, &cfg);
+    if (config.renamer) |cfg| freeToolConfig(allocator, &cfg);
+}
+
 fn parseDebugConfig(value: std.json.Value) ?DebugConfig {
     if (value != .object) return null;
     const obj = value.object;
@@ -201,6 +233,57 @@ fn parseDebugConfig(value: std.json.Value) ?DebugConfig {
     if (obj.get("timeout")) |v| {
         if (v == .integer) result.timeout = v.integer;
     }
+    return result;
+}
+
+fn mergeMemoryConfig(allocator: std.mem.Allocator, local: ?MemoryConfig, global: ?MemoryConfig) ?MemoryConfig {
+    const l = local orelse return global;
+    const g = global orelse return local;
+
+    var result: MemoryConfig = .{};
+    result.brain = l.brain orelse g.brain;
+    if (l.brain != null) {
+        if (g.brain) |gb| freeBrainConfig(allocator, &gb);
+    }
+    return result;
+}
+
+fn mergeCodeConfig(allocator: std.mem.Allocator, local: ?CodeConfig, global: ?CodeConfig) ?CodeConfig {
+    const l = local orelse return global;
+    const g = global orelse return local;
+
+    var result: CodeConfig = .{};
+
+    result.index = l.index orelse g.index;
+    if (l.index != null) {
+        if (g.index) |gi| freeIndexPatterns(allocator, gi);
+    }
+
+    result.indexer = l.indexer orelse g.indexer;
+    if (l.indexer != null) {
+        if (g.indexer) |gi| freeToolConfig(allocator, &gi);
+    }
+
+    result.editor = l.editor orelse g.editor;
+    if (l.editor != null) {
+        if (g.editor) |ge| freeToolConfig(allocator, &ge);
+    }
+
+    result.creator = l.creator orelse g.creator;
+    if (l.creator != null) {
+        if (g.creator) |gc| freeToolConfig(allocator, &gc);
+    }
+
+    result.deleter = l.deleter orelse g.deleter;
+    if (l.deleter != null) {
+        if (g.deleter) |gd| freeToolConfig(allocator, &gd);
+    }
+
+    result.renamer = l.renamer orelse g.renamer;
+    if (l.renamer != null) {
+        if (g.renamer) |gr| freeToolConfig(allocator, &gr);
+    }
+
     return result;
 }
 
@@ -220,6 +303,31 @@ fn freeToolConfig(allocator: std.mem.Allocator, config: *const ToolConfig) void 
         allocator.free(config.args);
     }
     allocator.free(config.command);
+}
+
+fn parseIndexPatterns(allocator: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
+    if (value != .array) return error.InvalidSettings;
+
+    const items = value.array.items;
+    const patterns = try allocator.alloc([]const u8, items.len);
+    var i: usize = 0;
+    errdefer {
+        for (patterns[0..i]) |p| allocator.free(p);
+        allocator.free(patterns);
+    }
+
+    for (items) |item| {
+        if (item != .string) return error.InvalidSettings;
+        patterns[i] = try allocator.dupe(u8, item.string);
+        i += 1;
+    }
+
+    return patterns;
+}
+
+fn freeIndexPatterns(allocator: std.mem.Allocator, patterns: []const []const u8) void {
+    for (patterns) |p| allocator.free(p);
+    allocator.free(patterns);
 }
 
 /// Substitute placeholders in a single arg string.
@@ -304,30 +412,32 @@ pub fn freeSubstitutedArgs(allocator: std.mem.Allocator, args: []const []const u
 test "parse settings with indexer and editor" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"indexer":{"command":"scip-zig","args":["--root-path",".","--output","{output}"]},"editor":{"command":"sed","args":["-i","","s/{old}/{new}/g","{file}"]}}
+        \\{"code":{"indexer":{"command":"scip-zig","args":["--root-path",".","--output","{output}"]},"editor":{"command":"sed","args":["-i","","s/{old}/{new}/g","{file}"]}}}
     ;
     const settings = Settings.parse(allocator, json) orelse return error.ParseFailed;
     defer settings.deinit(allocator);
 
-    try std.testing.expectEqualStrings("scip-zig", settings.indexer.?.command);
-    try std.testing.expectEqual(@as(usize, 4), settings.indexer.?.args.len);
-    try std.testing.expectEqualStrings("--output", settings.indexer.?.args[2]);
-    try std.testing.expectEqualStrings("{output}", settings.indexer.?.args[3]);
+    const code = settings.code.?;
+    try std.testing.expectEqualStrings("scip-zig", code.indexer.?.command);
+    try std.testing.expectEqual(@as(usize, 4), code.indexer.?.args.len);
+    try std.testing.expectEqualStrings("--output", code.indexer.?.args[2]);
+    try std.testing.expectEqualStrings("{output}", code.indexer.?.args[3]);
 
-    try std.testing.expectEqualStrings("sed", settings.editor.?.command);
-    try std.testing.expectEqual(@as(usize, 4), settings.editor.?.args.len);
+    try std.testing.expectEqualStrings("sed", code.editor.?.command);
+    try std.testing.expectEqual(@as(usize, 4), code.editor.?.args.len);
 }
 
 test "parse settings with only indexer" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"indexer":{"command":"scip-go","args":["--output","{output}"]}}
+        \\{"code":{"indexer":{"command":"scip-go","args":["--output","{output}"]}}}
     ;
     const settings = Settings.parse(allocator, json) orelse return error.ParseFailed;
     defer settings.deinit(allocator);
 
-    try std.testing.expect(settings.indexer != null);
-    try std.testing.expect(settings.editor == null);
+    try std.testing.expect(settings.code != null);
+    try std.testing.expect(settings.code.?.indexer != null);
+    try std.testing.expect(settings.code.?.editor == null);
 }
 
 test "parse settings empty object" {
@@ -336,8 +446,8 @@ test "parse settings empty object" {
     const settings = Settings.parse(allocator, json) orelse return error.ParseFailed;
     defer settings.deinit(allocator);
 
-    try std.testing.expect(settings.indexer == null);
-    try std.testing.expect(settings.editor == null);
+    try std.testing.expect(settings.code == null);
+    try std.testing.expect(settings.memory == null);
 }
 
 test "parse settings invalid json returns null" {
@@ -349,29 +459,30 @@ test "parse settings invalid json returns null" {
 test "parse settings command without args" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"indexer":{"command":"my-indexer"}}
+        \\{"code":{"indexer":{"command":"my-indexer"}}}
     ;
     const settings = Settings.parse(allocator, json) orelse return error.ParseFailed;
     defer settings.deinit(allocator);
 
-    try std.testing.expectEqualStrings("my-indexer", settings.indexer.?.command);
-    try std.testing.expectEqual(@as(usize, 0), settings.indexer.?.args.len);
+    try std.testing.expectEqualStrings("my-indexer", settings.code.?.indexer.?.command);
+    try std.testing.expectEqual(@as(usize, 0), settings.code.?.indexer.?.args.len);
 }
 
 test "parse settings with all CRUD tool configs" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"creator":{"command":"touch","args":["{file}"]},"deleter":{"command":"rm","args":["{file}"]},"renamer":{"command":"mv","args":["{old}","{new}"]}}
+        \\{"code":{"creator":{"command":"touch","args":["{file}"]},"deleter":{"command":"rm","args":["{file}"]},"renamer":{"command":"mv","args":["{old}","{new}"]}}}
     ;
     const settings = Settings.parse(allocator, json) orelse return error.ParseFailed;
     defer settings.deinit(allocator);
 
-    try std.testing.expect(settings.creator != null);
-    try std.testing.expectEqualStrings("touch", settings.creator.?.command);
-    try std.testing.expect(settings.deleter != null);
-    try std.testing.expectEqualStrings("rm", settings.deleter.?.command);
-    try std.testing.expect(settings.renamer != null);
-    try std.testing.expectEqualStrings("mv", settings.renamer.?.command);
+    const code = settings.code.?;
+    try std.testing.expect(code.creator != null);
+    try std.testing.expectEqualStrings("touch", code.creator.?.command);
+    try std.testing.expect(code.deleter != null);
+    try std.testing.expectEqualStrings("rm", code.deleter.?.command);
+    try std.testing.expect(code.renamer != null);
+    try std.testing.expectEqualStrings("mv", code.renamer.?.command);
 }
 
 test "substitutePlaceholder basic" {
@@ -435,4 +546,66 @@ test "substituteArgs multiple placeholders" {
     try std.testing.expectEqualStrings("", result[1]);
     try std.testing.expectEqualStrings("s/hello/world/g", result[2]);
     try std.testing.expectEqualStrings("test.txt", result[3]);
+}
+
+test "parse settings with index patterns" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"code":{"index":["**/*.ts","**/*.go","src/**/*.zig"]}}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.code != null);
+    const idx = s.code.?.index.?;
+    try std.testing.expectEqual(@as(usize, 3), idx.len);
+    try std.testing.expectEqualStrings("**/*.ts", idx[0]);
+    try std.testing.expectEqualStrings("**/*.go", idx[1]);
+    try std.testing.expectEqualStrings("src/**/*.zig", idx[2]);
+}
+
+test "parse settings without index has null" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"code":{"indexer":{"command":"scip-go","args":["--output","{output}"]}}}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.code.?.index == null);
+}
+
+test "parse settings with empty index array" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"code":{"index":[]}}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.code != null);
+    try std.testing.expect(s.code.?.index != null);
+    try std.testing.expectEqual(@as(usize, 0), s.code.?.index.?.len);
+}
+
+test "parse settings index with non-string element returns null" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"code":{"index":["**/*.ts", 42]}}
+    ;
+    const result = Settings.parse(allocator, json);
+    try std.testing.expect(result == null);
+}
+
+test "parse settings with memory brain" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"brain":{"url":"https://trycog.ai/user/brain"}}}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.memory != null);
+    try std.testing.expect(s.memory.?.brain != null);
+    try std.testing.expectEqualStrings("https://trycog.ai/user/brain", s.memory.?.brain.?.url);
 }

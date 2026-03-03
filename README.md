@@ -88,22 +88,22 @@ That's it. The interactive setup walks you through everything:
 2. **Agent selection**: pick which AI coding agents you use
 3. **Tool permissions**: optionally auto-allow all Cog tools so your agent doesn't prompt you on every call
 
-For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, and optionally auto-allows tool permissions.
+For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents, and optionally auto-allows tool permissions.
 
 ### Supported agents
 
-| Agent | MCP Config | Tool Permissions |
-|-------|------------|------------------|
-| Claude Code | `.mcp.json` | Auto-allow |
-| Gemini CLI | `.gemini/settings.json` | Auto-allow |
-| Amp | `.amp/settings.json` | Auto-allow |
-| GitHub Copilot | `.vscode/mcp.json` | |
-| Cursor | `.cursor/mcp.json` | |
-| OpenAI Codex CLI | `.codex/config.toml` | |
-| Roo Code | `.roo/mcp.json` | |
-| OpenCode | `opencode.json` | |
-| Windsurf | Global config | |
-| Goose | Global config | |
+| Agent | MCP Config | Sub-Agents | Tool Permissions |
+|-------|------------|:----------:|------------------|
+| Claude Code | `.mcp.json` | Yes | Auto-allow |
+| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow |
+| Amp | `.amp/settings.json` | Yes | Auto-allow |
+| Cursor | `.cursor/mcp.json` | Yes | |
+| OpenCode | `opencode.json` | Yes | |
+| GitHub Copilot | `.vscode/mcp.json` | | |
+| OpenAI Codex CLI | `.codex/config.toml` | | |
+| Roo Code | `.roo/mcp.json` | | |
+| Windsurf | Global config | | |
+| Goose | Global config | | |
 
 ---
 
@@ -121,8 +121,18 @@ Your Agent  <->  MCP (stdio)  <->  cog mcp
 Tool families your agent discovers:
 
 - `cog_mem_*` for memory operations (when configured)
-- `cog_code_*` for code intelligence (query, index status)
-- `cog_debug_*` for the debugger (launch, breakpoints, stepping, inspection)
+- `cog_code_*` for code intelligence (query, explore, index status)
+- `cog_debug_*` for the debugger (36 tools: launch, breakpoints, stepping, inspection, and more)
+
+### Sub-agents
+
+For supported agents, `cog init` deploys specialized sub-agent prompts that your primary agent delegates to:
+
+- **cog-code-query** — code exploration via the SCIP index. Finds definitions, references, and symbols in a single call.
+- **cog-debug** — autonomous hypothesis-driven debugging. Sets breakpoints, inspects variables, steps through code, and reports findings.
+- **cog-mem** — memory lifecycle management. Handles recall, consolidation, and maintenance of your agent's knowledge graph.
+
+Sub-agents keep the primary agent's context clean by offloading specialized work.
 
 ---
 
@@ -141,12 +151,11 @@ Memory is hosted on [trycog.ai](https://trycog.ai) and requires an account and A
 
 ### How agents use it
 
-The system prompt we inject into your agent instructs it to follow a four-step lifecycle:
+The system prompt we inject into your agent instructs it to follow a lifecycle:
 
 1. **Recall** before exploring code. Query memory for relevant context first.
 2. **Work and record**. Learn new concepts as they come up during the session.
-3. **Reinforce**. After completing work, consolidate important memories to long-term.
-4. **Consolidate**. Before ending the session, review short-term memories and reinforce or flush them.
+3. **Consolidate**. After completing work, reinforce validated memories and flush incorrect ones.
 
 The result is an agent that gets better over time. It stops rediscovering the same solutions and starts building on what it already knows.
 
@@ -221,9 +230,25 @@ Or put it in a `.env` file in your project root.
 
 ## Code Intelligence
 
-SCIP-based code indexing powered by tree-sitter. Instead of your agent grepping through files across multiple rounds, it gets structured answers (definitions, references, symbols) in a single tool call.
+SCIP-based code indexing powered by tree-sitter. Instead of your agent grepping through files across multiple rounds, it gets structured answers in a single tool call.
 
 This runs entirely locally. No account required.
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `cog_code_explore` | Find symbols by name, return full definition bodies, file symbol table of contents, and references. Primary tool for code exploration. |
+| `cog_code_query` | Low-level index query with three modes: `find` (locate definitions), `refs` (find all references), `symbols` (list symbols in a file). |
+| `cog_code_status` | Check index availability and coverage. |
+
+### Pattern matching
+
+The `name` parameter supports flexible matching:
+
+- **Glob patterns**: `*init*`, `get*`, `Handle?`
+- **Alternation**: `banner|header|splash` to search multiple names at once
+- **Combined**: `*init*|setup|*boot*`
 
 ### Indexing
 
@@ -232,9 +257,18 @@ cog code:index              # Index everything
 cog code:index "**/*.ts"    # Specific pattern
 ```
 
-Results go into `.cog/index.scip`. Your agent searches it through the `cog_code_query` MCP tool.
+Results go into `.cog/index.scip`. A built-in file watcher automatically keeps the index up to date as files are created, modified, deleted, or renamed. No manual re-indexing needed after the initial build.
 
-A built-in file watcher automatically keeps the index up to date as files are created, modified, deleted, or renamed. No manual re-indexing needed after the initial build.
+### File operations
+
+Your agent can also manage files through MCP tools that automatically keep the index in sync:
+
+| Tool | Description |
+|------|-------------|
+| `code:edit` | Edit files with string replacement and re-index |
+| `code:create` | Create new files and add to index |
+| `code:delete` | Delete files and remove from index |
+| `code:rename` | Rename files and update index |
 
 ### Built-in language support
 
@@ -246,9 +280,17 @@ Additional languages are supported through [extensions](#extensions).
 
 ## Debug
 
-An interactive debugger your agent controls through MCP. It supports breakpoints, stepping, variable inspection, stack traces, memory reads, and disassembly. 36 tools exposed through MCP.
+An interactive debugger your agent controls through MCP. 36 tools covering breakpoints, stepping, variable inspection, stack traces, expression evaluation, memory reads, disassembly, and more.
 
 Under the hood, a local daemon communicates with debug adapters (DAP). The daemon starts automatically when your agent launches its first debug session.
+
+### Key capabilities
+
+- **Launch or attach** to processes with full breakpoint support (line, function, exception, conditional, data watchpoints)
+- **Step-over-inspect** — step repeatedly while evaluating expressions in a single call, reducing round trips
+- **Module launch mode** — debug by module name (e.g. `python -m pytest`) in addition to script path
+- **Synchronous or async** — `timeout_ms` controls whether the agent blocks for results or polls asynchronously
+- **Low-level access** — memory reads, disassembly, register inspection, core dump loading
 
 ### CLI utilities
 

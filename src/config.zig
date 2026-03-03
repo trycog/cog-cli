@@ -139,15 +139,19 @@ pub fn resolveUrl(allocator: std.mem.Allocator, cog_content: []const u8) ![]cons
 }
 
 pub fn resolveBrainUrl(allocator: std.mem.Allocator, cog_content: []const u8) ![]const u8 {
-    // Try JSON format first: {"brain": {"url": "https://host/user/brain"}}
+    // Try JSON format: {"memory": {"brain": {"url": "https://host/user/brain"}}}
     if (std.json.parseFromSlice(std.json.Value, allocator, cog_content, .{})) |parsed| {
         defer parsed.deinit();
         if (parsed.value == .object) {
-            if (parsed.value.object.get("brain")) |brain| {
-                if (brain == .object) {
-                    if (brain.object.get("url")) |url_val| {
-                        if (url_val == .string) {
-                            return allocator.dupe(u8, url_val.string);
+            if (parsed.value.object.get("memory")) |memory| {
+                if (memory == .object) {
+                    if (memory.object.get("brain")) |brain| {
+                        if (brain == .object) {
+                            if (brain.object.get("url")) |url_val| {
+                                if (url_val == .string) {
+                                    return allocator.dupe(u8, url_val.string);
+                                }
+                            }
                         }
                     }
                 }
@@ -183,7 +187,7 @@ fn printErr(msg: []const u8) void {
 test "resolveUrl JSON format" {
     const allocator = std.testing.allocator;
     const url = try resolveUrl(allocator,
-        \\{"brain":{"url":"https://trycog.ai/user/brain"}}
+        \\{"memory":{"brain":{"url":"https://trycog.ai/user/brain"}}}
     );
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://trycog.ai/api/v1/user/brain", url);

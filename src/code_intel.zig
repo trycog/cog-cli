@@ -269,30 +269,50 @@ pub const CodeIndex = struct {
     /// Find symbols matching a name (searches display_name and extracted name).
     /// Returns matches sorted by relevance score (exact match > non-test > partial match).
     /// Supports glob patterns (* and ?) when the name contains wildcard characters.
+    /// Supports alternation via '|' to match any of several names (e.g. "banner|header|splash").
     /// When file_filter is set, only symbols in matching files are returned.
     /// Caller must call `matches.deinit(allocator)` when done.
     fn findSymbol(self: *const CodeIndex, allocator: std.mem.Allocator, name: []const u8, kind_filter: ?[]const u8, file_filter: ?[]const u8) !MatchList {
-        const is_glob = hasGlobChars(name);
+        // Split on '|' for alternation (e.g. "banner|header|splash")
+        const alternatives = splitAlternatives(name);
+
         var matches: MatchList = .empty;
         var iter = self.symbol_to_defs.iterator();
         while (iter.next()) |entry| {
             const sym_name = entry.key_ptr.*;
             const def = entry.value_ptr.*;
-
-            // Match against display_name
-            const display_match = if (is_glob)
-                (def.display_name.len > 0 and nameGlobMatch(name, def.display_name))
-            else
-                (def.display_name.len > 0 and std.ascii.eqlIgnoreCase(def.display_name, name));
-
-            // Match against extracted name from symbol string
             const extracted = scip.extractSymbolName(sym_name);
-            const extracted_match = if (is_glob)
-                nameGlobMatch(name, extracted)
-            else
-                std.ascii.eqlIgnoreCase(extracted, name);
 
-            if (display_match or extracted_match) {
+            var matched = false;
+            var matched_exact = false;
+
+            for (alternatives.items()) |alt| {
+                const is_glob = hasGlobChars(alt);
+
+                // Match against display_name
+                const display_match = if (is_glob)
+                    (def.display_name.len > 0 and nameGlobMatch(alt, def.display_name))
+                else
+                    (def.display_name.len > 0 and std.ascii.eqlIgnoreCase(def.display_name, alt));
+
+                // Match against extracted name from symbol string
+                const extracted_match = if (is_glob)
+                    nameGlobMatch(alt, extracted)
+                else
+                    std.ascii.eqlIgnoreCase(extracted, alt);
+
+                if (display_match or extracted_match) {
+                    matched = true;
+                    if (!is_glob) {
+                        if (std.mem.eql(u8, def.display_name, alt) or std.mem.eql(u8, extracted, alt)) {
+                            matched_exact = true;
+                        }
+                    }
+                    break; // one alternative matching is enough
+                }
+            }
+
+            if (matched) {
                 // Apply kind filter
                 if (kind_filter) |kf| {
                     const k = scip.kindName(def.kind);
@@ -307,14 +327,10 @@ pub const CodeIndex = struct {
                 // Calculate relevance score
                 var score: u8 = 0;
 
-                if (is_glob) {
-                    // For glob matches, award points for short-name match
-                    score += 80;
+                if (matched_exact) {
+                    score += 100;
                 } else {
-                    // Exact case-sensitive match (highest priority)
-                    if (std.mem.eql(u8, def.display_name, name) or std.mem.eql(u8, extracted, name)) {
-                        score += 100;
-                    }
+                    score += 80;
                 }
 
                 // Not in a test file
@@ -750,10 +766,33 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
+    // If no CLI patterns, fall back to settings
+    var settings_holder: ?settings_mod.Settings = null;
+    defer if (settings_holder) |s| s.deinit(allocator);
+
+    if (patterns.items.len == 0) {
+        if (settings_mod.Settings.load(allocator)) |s| {
+            if (s.code) |code| {
+                if (code.index) |index_patterns| {
+                    for (index_patterns) |p| {
+                        try patterns.append(allocator, p);
+                    }
+                }
+            }
+            if (patterns.items.len > 0) {
+                settings_holder = s;
+            } else {
+                s.deinit(allocator);
+            }
+        }
+    }
+
     if (patterns.items.len == 0) {
         const static_part = bold ++ "  cog code:index" ++ reset ++ " " ++ dim ++ "<pattern> [pattern...]" ++ reset ++ "\n"
             ++ "\n"
             ++ "  Specify one or more glob patterns to index.\n"
+            ++ "  Patterns can also be configured in " ++ dim ++ ".cog/settings.json" ++ reset ++ ":\n"
+            ++ dim ++ "    { \"code\": { \"index\": [\"**/*.ts\", \"**/*.go\"] } }" ++ reset ++ "\n"
             ++ "\n"
             ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
             ++ "    cog code:index \"**/*.ts\"       " ++ dim ++ "All .ts files recursively" ++ reset ++ "\n"
@@ -832,22 +871,9 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return error.Explained;
     }
 
-    // Count indexable files (those with a recognized extension) for accurate progress
-    var indexable_count: usize = 0;
-    for (files.items) |file_path| {
-        const ext = std.fs.path.extension(file_path);
-        if (ext.len == 0) continue;
-        if (extensions.isBuiltinSupported(ext)) {
-            indexable_count += 1;
-        } else if (extensions.resolveByExtension(allocator, ext)) |resolved| {
-            extensions.freeExtension(allocator, &resolved);
-            indexable_count += 1;
-        }
-    }
-
-    // TTY progress display
+    // TTY progress display — show header immediately so the user sees output
     const show_progress = tui.isStderrTty();
-    const total_files = indexable_count;
+    const total_files = files.items.len;
     if (show_progress) {
         tui.header();
         tui.progressStart(total_files);
@@ -1191,6 +1217,44 @@ fn hasGlobChars(s: []const u8) bool {
         if (c == '*' or c == '?') return true;
     }
     return false;
+}
+
+/// Split a name pattern on '|' for alternation support.
+/// Returns a bounded array of slices into the original string.
+/// Example: "banner|header|splash" → {"banner", "header", "splash"}
+/// If there is no '|', returns a single-element array with the original string.
+const Alternatives = struct {
+    buf: [max_alternatives][]const u8 = undefined,
+    len: usize = 0,
+    const max_alternatives = 16;
+
+    fn items(self: *const Alternatives) []const []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+fn splitAlternatives(name: []const u8) Alternatives {
+    var result: Alternatives = .{};
+    var start: usize = 0;
+    for (name, 0..) |c, i| {
+        if (c == '|') {
+            if (i > start) {
+                if (result.len < Alternatives.max_alternatives) {
+                    result.buf[result.len] = name[start..i];
+                    result.len += 1;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    // Last segment (or only segment if no '|')
+    if (start < name.len) {
+        if (result.len < Alternatives.max_alternatives) {
+            result.buf[result.len] = name[start..];
+            result.len += 1;
+        }
+    }
+    return result;
 }
 
 /// Case-insensitive glob match for symbol names.
@@ -1640,10 +1704,10 @@ fn codeEdit(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const settings = settings_mod.Settings.load(allocator);
     defer if (settings) |s| s.deinit(allocator);
 
-    const use_external_editor = if (settings) |s| s.editor != null else false;
+    const use_external_editor = if (settings) |s| if (s.code) |c| c.editor != null else false else false;
 
     if (use_external_editor) {
-        const editor_cfg = settings.?.editor.?;
+        const editor_cfg = settings.?.code.?.editor.?;
         const subs: []const settings_mod.Substitution = &.{
             .{ .key = "{file}", .value = file_path },
             .{ .key = "{old}", .value = old_text },
@@ -2015,16 +2079,13 @@ fn codeCreate(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    if (s) |ss| {
-        if (ss.creator) |cfg| {
-            const subs: []const settings_mod.Substitution = &.{
-                .{ .key = "{file}", .value = file_path },
-                .{ .key = "{content}", .value = content },
-            };
-            try runExternalTool(allocator, cfg, subs);
-        } else {
-            try builtinCreate(file_path, content);
-        }
+    const creator_cfg = if (s) |ss| if (ss.code) |c| c.creator else null else null;
+    if (creator_cfg) |cfg| {
+        const subs: []const settings_mod.Substitution = &.{
+            .{ .key = "{file}", .value = file_path },
+            .{ .key = "{content}", .value = content },
+        };
+        try runExternalTool(allocator, cfg, subs);
     } else {
         try builtinCreate(file_path, content);
     }
@@ -2093,15 +2154,12 @@ fn codeDelete(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    if (s) |ss| {
-        if (ss.deleter) |cfg| {
-            const subs: []const settings_mod.Substitution = &.{
-                .{ .key = "{file}", .value = file_path },
-            };
-            try runExternalTool(allocator, cfg, subs);
-        } else {
-            try builtinDelete(file_path);
-        }
+    const deleter_cfg = if (s) |ss| if (ss.code) |c| c.deleter else null else null;
+    if (deleter_cfg) |cfg| {
+        const subs: []const settings_mod.Substitution = &.{
+            .{ .key = "{file}", .value = file_path },
+        };
+        try runExternalTool(allocator, cfg, subs);
     } else {
         try builtinDelete(file_path);
     }
@@ -2175,16 +2233,13 @@ fn codeRename(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    if (s) |ss| {
-        if (ss.renamer) |cfg| {
-            const subs: []const settings_mod.Substitution = &.{
-                .{ .key = "{old}", .value = old_path },
-                .{ .key = "{new}", .value = new_path },
-            };
-            try runExternalTool(allocator, cfg, subs);
-        } else {
-            try builtinRename(old_path, new_path);
-        }
+    const renamer_cfg = if (s) |ss| if (ss.code) |c| c.renamer else null else null;
+    if (renamer_cfg) |cfg| {
+        const subs: []const settings_mod.Substitution = &.{
+            .{ .key = "{old}", .value = old_path },
+            .{ .key = "{new}", .value = new_path },
+        };
+        try runExternalTool(allocator, cfg, subs);
     } else {
         try builtinRename(old_path, new_path);
     }
@@ -2945,9 +3000,9 @@ pub fn codeEditInner(allocator: std.mem.Allocator, file_path: []const u8, old_te
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    const use_external = if (s) |ss| ss.editor != null else false;
+    const use_external = if (s) |ss| if (ss.code) |c| c.editor != null else false else false;
     if (use_external) {
-        const editor_cfg = s.?.editor.?;
+        const editor_cfg = s.?.code.?.editor.?;
         const subs: []const settings_mod.Substitution = &.{
             .{ .key = "{file}", .value = file_path },
             .{ .key = "{old}", .value = old_text },
@@ -2978,16 +3033,13 @@ pub fn codeCreateInner(allocator: std.mem.Allocator, file_path: []const u8, cont
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    if (s) |ss| {
-        if (ss.creator) |cfg| {
-            const subs: []const settings_mod.Substitution = &.{
-                .{ .key = "{file}", .value = file_path },
-                .{ .key = "{content}", .value = content },
-            };
-            try runExternalTool(allocator, cfg, subs);
-        } else {
-            try builtinCreate(file_path, content);
-        }
+    const creator_cfg = if (s) |ss| if (ss.code) |c| c.creator else null else null;
+    if (creator_cfg) |cfg| {
+        const subs: []const settings_mod.Substitution = &.{
+            .{ .key = "{file}", .value = file_path },
+            .{ .key = "{content}", .value = content },
+        };
+        try runExternalTool(allocator, cfg, subs);
     } else {
         try builtinCreate(file_path, content);
     }
@@ -3012,15 +3064,12 @@ pub fn codeDeleteInner(allocator: std.mem.Allocator, file_path: []const u8) ![]c
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    if (s) |ss| {
-        if (ss.deleter) |cfg| {
-            const subs: []const settings_mod.Substitution = &.{
-                .{ .key = "{file}", .value = file_path },
-            };
-            try runExternalTool(allocator, cfg, subs);
-        } else {
-            try builtinDelete(file_path);
-        }
+    const deleter_cfg = if (s) |ss| if (ss.code) |c| c.deleter else null else null;
+    if (deleter_cfg) |cfg| {
+        const subs: []const settings_mod.Substitution = &.{
+            .{ .key = "{file}", .value = file_path },
+        };
+        try runExternalTool(allocator, cfg, subs);
     } else {
         try builtinDelete(file_path);
     }
@@ -3045,16 +3094,13 @@ pub fn codeRenameInner(allocator: std.mem.Allocator, old_path: []const u8, new_p
     const s = settings_mod.Settings.load(allocator);
     defer if (s) |ss| ss.deinit(allocator);
 
-    if (s) |ss| {
-        if (ss.renamer) |cfg| {
-            const subs: []const settings_mod.Substitution = &.{
-                .{ .key = "{old}", .value = old_path },
-                .{ .key = "{new}", .value = new_path },
-            };
-            try runExternalTool(allocator, cfg, subs);
-        } else {
-            try builtinRename(old_path, new_path);
-        }
+    const renamer_cfg = if (s) |ss| if (ss.code) |c| c.renamer else null else null;
+    if (renamer_cfg) |cfg| {
+        const subs: []const settings_mod.Substitution = &.{
+            .{ .key = "{old}", .value = old_path },
+            .{ .key = "{new}", .value = new_path },
+        };
+        try runExternalTool(allocator, cfg, subs);
     } else {
         try builtinRename(old_path, new_path);
     }
@@ -3649,6 +3695,44 @@ test "hasGlobChars" {
     try std.testing.expect(!hasGlobChars("foo.bar"));
 }
 
+test "splitAlternatives" {
+    // Single name, no pipe
+    const single = splitAlternatives("banner");
+    try std.testing.expectEqual(@as(usize, 1), single.len);
+    try std.testing.expectEqualStrings("banner", single.items()[0]);
+
+    // Two alternatives
+    const two = splitAlternatives("banner|header");
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqualStrings("banner", two.items()[0]);
+    try std.testing.expectEqualStrings("header", two.items()[1]);
+
+    // Three alternatives
+    const three = splitAlternatives("banner|header|splash");
+    try std.testing.expectEqual(@as(usize, 3), three.len);
+    try std.testing.expectEqualStrings("banner", three.items()[0]);
+    try std.testing.expectEqualStrings("header", three.items()[1]);
+    try std.testing.expectEqualStrings("splash", three.items()[2]);
+
+    // Glob patterns mixed with plain names
+    const mixed = splitAlternatives("*init*|setup|*boot*");
+    try std.testing.expectEqual(@as(usize, 3), mixed.len);
+    try std.testing.expectEqualStrings("*init*", mixed.items()[0]);
+    try std.testing.expectEqualStrings("setup", mixed.items()[1]);
+    try std.testing.expectEqualStrings("*boot*", mixed.items()[2]);
+
+    // Empty segments are skipped
+    const with_empty = splitAlternatives("foo||bar");
+    try std.testing.expectEqual(@as(usize, 2), with_empty.len);
+    try std.testing.expectEqualStrings("foo", with_empty.items()[0]);
+    try std.testing.expectEqualStrings("bar", with_empty.items()[1]);
+
+    // Trailing pipe
+    const trailing = splitAlternatives("foo|");
+    try std.testing.expectEqual(@as(usize, 1), trailing.len);
+    try std.testing.expectEqualStrings("foo", trailing.items()[0]);
+}
+
 test "fileMatchesSuffix" {
     // Exact match
     try std.testing.expect(fileMatchesSuffix("src/main.zig", "src/main.zig"));
@@ -3754,6 +3838,110 @@ test "findSymbol with glob patterns" {
     var no_file_matches = try ci.findSymbol(allocator, "Foo", null, "other.go");
     defer no_file_matches.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), no_file_matches.items.len);
+}
+
+test "findSymbol with alternation" {
+    const allocator = std.testing.allocator;
+
+    var occurrences = try allocator.alloc(scip.Occurrence, 3);
+    defer allocator.free(occurrences);
+    occurrences[0] = .{
+        .range = .{ .start_line = 1, .start_char = 0, .end_line = 1, .end_char = 6 },
+        .symbol = "pkg/Header#",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+    };
+    occurrences[1] = .{
+        .range = .{ .start_line = 10, .start_char = 0, .end_line = 10, .end_char = 6 },
+        .symbol = "pkg/Splash#",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+    };
+    occurrences[2] = .{
+        .range = .{ .start_line = 20, .start_char = 0, .end_line = 20, .end_char = 6 },
+        .symbol = "pkg/Footer#",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+    };
+
+    var doc_symbols = try allocator.alloc(scip.SymbolInformation, 3);
+    defer allocator.free(doc_symbols);
+    doc_symbols[0] = .{
+        .symbol = "pkg/Header#",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 49,
+        .display_name = "Header",
+        .enclosing_symbol = "",
+    };
+    doc_symbols[1] = .{
+        .symbol = "pkg/Splash#",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 49,
+        .display_name = "Splash",
+        .enclosing_symbol = "",
+    };
+    doc_symbols[2] = .{
+        .symbol = "pkg/Footer#",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 49,
+        .display_name = "Footer",
+        .enclosing_symbol = "",
+    };
+
+    var documents = try allocator.alloc(scip.Document, 1);
+    documents[0] = .{
+        .language = "go",
+        .relative_path = "pkg/ui.go",
+        .occurrences = occurrences,
+        .symbols = doc_symbols,
+    };
+
+    const index: scip.Index = .{
+        .metadata = .{
+            .version = 0,
+            .tool_info = .{ .name = "test", .version = "1.0" },
+            .project_root = "file:///test",
+            .text_document_encoding = 0,
+        },
+        .documents = documents,
+        .external_symbols = &.{},
+    };
+
+    var ci = try CodeIndex.build(allocator, index);
+    defer {
+        ci.symbol_to_defs.deinit(allocator);
+        var ref_iter = ci.symbol_to_refs.iterator();
+        while (ref_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        ci.symbol_to_refs.deinit(allocator);
+        ci.path_to_doc_idx.deinit(allocator);
+        allocator.free(ci.index.documents);
+    }
+
+    // Alternation: "Banner|Header" should find Header (no Banner exists)
+    var alt_matches = try ci.findSymbol(allocator, "Banner|Header", null, null);
+    defer alt_matches.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), alt_matches.items.len);
+    try std.testing.expectEqualStrings("pkg/Header#", alt_matches.items[0].symbol);
+
+    // Alternation: "Header|Splash" should find both
+    var both_matches = try ci.findSymbol(allocator, "Header|Splash", null, null);
+    defer both_matches.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), both_matches.items.len);
+
+    // Alternation with globs: "*ead*|*oot*" should find Header and Footer
+    var glob_alt = try ci.findSymbol(allocator, "*ead*|*oot*", null, null);
+    defer glob_alt.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), glob_alt.items.len);
+
+    // No match at all
+    var no_matches = try ci.findSymbol(allocator, "Banner|Logo|Title", null, null);
+    defer no_matches.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), no_matches.items.len);
 }
 
 // ── Disambiguation Tests ────────────────────────────────────────────────

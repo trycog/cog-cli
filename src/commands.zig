@@ -8,6 +8,7 @@ const config_mod = @import("config.zig");
 const client = @import("client.zig");
 const tui = @import("tui.zig");
 const agents_mod = @import("agents.zig");
+const settings_mod = @import("settings.zig");
 const hooks_mod = @import("hooks.zig");
 
 const Config = config_mod.Config;
@@ -116,6 +117,39 @@ fn processCogMemTags(allocator: std.mem.Allocator, content: []const u8, keep_con
     return try result.toOwnedSlice(allocator);
 }
 
+// ── Brain URL Parser ────────────────────────────────────────────────────
+
+const BrainUrlParts = struct {
+    host: []const u8,
+    account: []const u8,
+    brain: []const u8,
+};
+
+fn parseBrainUrl(url: []const u8) ?BrainUrlParts {
+    const after_scheme = if (std.mem.startsWith(u8, url, "https://"))
+        url["https://".len..]
+    else if (std.mem.startsWith(u8, url, "http://"))
+        url["http://".len..]
+    else
+        return null;
+
+    const first_slash = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return null;
+    const host = after_scheme[0..first_slash];
+    const rest = after_scheme[first_slash + 1 ..];
+
+    const second_slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const account = rest[0..second_slash];
+    const brain = rest[second_slash + 1 ..];
+
+    if (host.len == 0 or account.len == 0 or brain.len == 0) return null;
+
+    return .{
+        .host = host,
+        .account = account,
+        .brain = brain,
+    };
+}
+
 // ── Init Command ────────────────────────────────────────────────────────
 
 pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -125,6 +159,18 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     tui.header();
+
+    // Load existing settings for defaults
+    const existing_settings = settings_mod.Settings.load(allocator);
+    defer if (existing_settings) |s| s.deinit(allocator);
+
+    const existing_brain_parts: ?BrainUrlParts = if (existing_settings) |s|
+        if (s.memory) |m|
+            if (m.brain) |b| parseBrainUrl(b.url) else null
+        else
+            null
+    else
+        null;
 
     // Ask which features to set up
     const feature_options = [_]tui.MenuItem{
@@ -152,16 +198,39 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         // Ask for host (--host flag overrides the interactive prompt)
         const effective_host: []const u8 = if (findFlag(args, "--host")) |h| h else blk: {
-            const host_options = [_]tui.MenuItem{
-                .{ .label = "trycog.ai" },
-                .{ .label = "Custom host", .is_input_option = true },
-            };
+            var host_items_buf: [3]tui.MenuItem = undefined;
+            var host_count: usize = 0;
+            var host_initial: usize = 0;
+
+            const existing_custom_host: ?[]const u8 = if (existing_brain_parts) |parts|
+                if (!std.mem.eql(u8, parts.host, "trycog.ai")) parts.host else null
+            else
+                null;
+
+            if (existing_custom_host) |custom| {
+                host_items_buf[host_count] = .{ .label = custom };
+                host_count += 1;
+            }
+            const trycog_idx = host_count;
+            host_items_buf[host_count] = .{ .label = "trycog.ai" };
+            host_count += 1;
+            host_items_buf[host_count] = .{ .label = "Custom host", .is_input_option = true };
+            host_count += 1;
+
+            if (existing_brain_parts != null) {
+                host_initial = if (existing_custom_host != null) 0 else trycog_idx;
+            }
+
             const host_result = try tui.select(allocator, .{
                 .prompt = "Server host:",
-                .items = &host_options,
+                .items = host_items_buf[0..host_count],
+                .initial = host_initial,
             });
             break :blk switch (host_result) {
-                .selected => "trycog.ai",
+                .selected => |idx| if (idx == trycog_idx)
+                    @as([]const u8, "trycog.ai")
+                else
+                    (existing_custom_host orelse unreachable),
                 .input => |custom| custom,
                 .back, .cancelled => {
                     printErr("  Aborted.\n");
@@ -171,7 +240,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
 
         printErr("\n");
-        try initBrain(allocator, effective_host);
+        try initBrain(allocator, effective_host, existing_brain_parts);
     }
 
     tui.separator();
@@ -391,7 +460,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 }
 
-fn initBrain(allocator: std.mem.Allocator, host: []const u8) !void {
+fn initBrain(allocator: std.mem.Allocator, host: []const u8, existing_parts: ?BrainUrlParts) !void {
     // Get API key
     const api_key = config_mod.getApiKey(allocator) catch {
         printErr("  error: COG_API_KEY not set. Set it in your environment or .env file.\n");
@@ -465,7 +534,7 @@ fn initBrain(allocator: std.mem.Allocator, host: []const u8) !void {
         }
 
         // Account + Brain selection loop (Esc on brain goes back to account)
-        const selection = try selectAccountAndBrain(allocator, accounts_array, host, api_key);
+        const selection = try selectAccountAndBrain(allocator, accounts_array, host, api_key, existing_parts);
         if (selection == null) {
             printErr("Aborted.\n");
             return;
@@ -505,6 +574,7 @@ fn selectAccountAndBrain(
     accounts_array: []const json.Value,
     host: []const u8,
     api_key: []const u8,
+    existing_parts: ?BrainUrlParts,
 ) !?AccountBrainSelection {
     // Single account — skip account selection
     if (accounts_array.len == 1) {
@@ -513,7 +583,11 @@ fn selectAccountAndBrain(
             printErr("error: invalid account data\n");
             return error.Explained;
         };
-        const brain = try selectBrain(allocator, account, slug, host, api_key);
+        const existing_brain_name: ?[]const u8 = if (existing_parts) |p|
+            if (std.mem.eql(u8, p.account, slug)) p.brain else null
+        else
+            null;
+        const brain = try selectBrain(allocator, account, slug, host, api_key, existing_brain_name);
         if (brain) |b| return .{ .account_slug = slug, .brain_name = b };
         return null; // cancelled
     }
@@ -533,11 +607,22 @@ fn selectAccountAndBrain(
         try menu_items.append(allocator, .{ .label = label });
     }
 
+    // Pre-select existing account if known
+    const initial_account: usize = if (existing_parts) |parts| blk: {
+        for (accounts_array, 0..) |account, idx| {
+            if (getAccountSlug(account)) |slug| {
+                if (std.mem.eql(u8, slug, parts.account)) break :blk idx;
+            }
+        }
+        break :blk 0;
+    } else 0;
+
     // Loop: account → brain, Esc on brain returns to account
     while (true) {
         const acct_result = try tui.select(allocator, .{
             .prompt = "Select an account:",
             .items = menu_items.items,
+            .initial = initial_account,
         });
         switch (acct_result) {
             .selected => |idx| {
@@ -546,7 +631,11 @@ fn selectAccountAndBrain(
                     printErr("error: invalid account data\n");
                     return error.Explained;
                 };
-                const brain = try selectBrain(allocator, account, slug, host, api_key);
+                const existing_brain_name: ?[]const u8 = if (existing_parts) |p|
+                    if (std.mem.eql(u8, p.account, slug)) p.brain else null
+                else
+                    null;
+                const brain = try selectBrain(allocator, account, slug, host, api_key, existing_brain_name);
                 if (brain) |b| return .{ .account_slug = slug, .brain_name = b };
                 // brain returned null (back) — loop to re-show account menu
             },
@@ -571,6 +660,7 @@ fn selectBrain(
     account_slug: []const u8,
     host: []const u8,
     api_key: []const u8,
+    existing_brain_name: ?[]const u8,
 ) !?[]const u8 {
     // Extract brains array, or go to create if none
     const brains_items = blk: {
@@ -601,9 +691,23 @@ fn selectBrain(
     const prompt_text = try std.fmt.allocPrint(allocator, "Select a brain in {s}:", .{account_slug});
     defer allocator.free(prompt_text);
 
+    const initial_brain: usize = if (existing_brain_name) |name| blk: {
+        for (brains_items, 0..) |brain, idx| {
+            const bname = if (brain == .object)
+                if (brain.object.get("name")) |n| (if (n == .string) n.string else null) else null
+            else
+                null;
+            if (bname) |bn| {
+                if (std.mem.eql(u8, bn, name)) break :blk idx;
+            }
+        }
+        break :blk 0;
+    } else 0;
+
     const result = try tui.select(allocator, .{
         .prompt = prompt_text,
         .items = menu_items.items,
+        .initial = initial_brain,
         .input_validator = &tui.validateBrainName,
     });
     switch (result) {
@@ -739,7 +843,7 @@ fn writeSettingsMerge(allocator: std.mem.Allocator, brain_url: []const u8) !void
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
 
     try s.beginObject();
 
@@ -748,55 +852,50 @@ fn writeSettingsMerge(allocator: std.mem.Allocator, brain_url: []const u8) !void
             defer parsed.deinit();
 
             if (parsed.value == .object) {
-                // Copy all non-brain top-level keys
+                // Copy all non-memory top-level keys
                 var top_iter = parsed.value.object.iterator();
                 while (top_iter.next()) |entry| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, "brain")) continue;
+                    if (std.mem.eql(u8, entry.key_ptr.*, "memory")) continue;
                     try s.objectField(entry.key_ptr.*);
                     try s.write(entry.value_ptr.*);
                 }
 
-                // Write brain object, preserving non-url keys from existing brain
+                // Write memory.brain, preserving non-url keys from existing brain
+                try s.objectField("memory");
+                try s.beginObject();
                 try s.objectField("brain");
                 try s.beginObject();
 
-                if (parsed.value.object.get("brain")) |brain| {
-                    if (brain == .object) {
-                        var brain_iter = brain.object.iterator();
-                        while (brain_iter.next()) |entry| {
-                            if (std.mem.eql(u8, entry.key_ptr.*, "url")) continue;
-                            try s.objectField(entry.key_ptr.*);
-                            try s.write(entry.value_ptr.*);
+                if (parsed.value.object.get("memory")) |memory| {
+                    if (memory == .object) {
+                        if (memory.object.get("brain")) |brain| {
+                            if (brain == .object) {
+                                var brain_iter = brain.object.iterator();
+                                while (brain_iter.next()) |entry| {
+                                    if (std.mem.eql(u8, entry.key_ptr.*, "url")) continue;
+                                    try s.objectField(entry.key_ptr.*);
+                                    try s.write(entry.value_ptr.*);
+                                }
+                            }
                         }
                     }
                 }
 
                 try s.objectField("url");
                 try s.write(brain_url);
-                try s.endObject();
+                try s.endObject(); // brain
+                try s.endObject(); // memory
             } else {
-                // Root isn't an object, write fresh brain
-                try s.objectField("brain");
-                try s.beginObject();
-                try s.objectField("url");
-                try s.write(brain_url);
-                try s.endObject();
+                // Root isn't an object, write fresh
+                try writeFreshMemoryBrain(&s, brain_url);
             }
         } else |_| {
-            // Parse failed, write fresh brain
-            try s.objectField("brain");
-            try s.beginObject();
-            try s.objectField("url");
-            try s.write(brain_url);
-            try s.endObject();
+            // Parse failed, write fresh
+            try writeFreshMemoryBrain(&s, brain_url);
         }
     } else {
         // No existing file, write fresh
-        try s.objectField("brain");
-        try s.beginObject();
-        try s.objectField("url");
-        try s.write(brain_url);
-        try s.endObject();
+        try writeFreshMemoryBrain(&s, brain_url);
     }
 
     try s.endObject();
@@ -804,10 +903,28 @@ fn writeSettingsMerge(allocator: std.mem.Allocator, brain_url: []const u8) !void
     const new_content = try aw.toOwnedSlice();
     defer allocator.free(new_content);
 
+    // Append trailing newline
+    const with_newline = std.fmt.allocPrint(allocator, "{s}\n", .{new_content}) catch {
+        printErr("  error: failed to format settings\n");
+        return error.Explained;
+    };
+    defer allocator.free(with_newline);
+
     printErr("  Writing settings... ");
-    try writeCwdFile(".cog/settings.json", new_content);
+    try writeCwdFile(".cog/settings.json", with_newline);
     tui.checkmark();
     printErr(" .cog/settings.json\n\n");
+}
+
+fn writeFreshMemoryBrain(s: *Stringify, brain_url: []const u8) !void {
+    try s.objectField("memory");
+    try s.beginObject();
+    try s.objectField("brain");
+    try s.beginObject();
+    try s.objectField("url");
+    try s.write(brain_url);
+    try s.endObject(); // brain
+    try s.endObject(); // memory
 }
 
 // ── System Prompt Setup ─────────────────────────────────────────────────
@@ -1122,3 +1239,39 @@ fn showDiff(allocator: std.mem.Allocator, old_content: []const u8, new_content: 
     printErr("\n");
 }
 
+// ── Tests ───────────────────────────────────────────────────────────────
+
+test "parseBrainUrl standard URL" {
+    const parts = parseBrainUrl("https://trycog.ai/myuser/mybrain") orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("trycog.ai", parts.host);
+    try std.testing.expectEqualStrings("myuser", parts.account);
+    try std.testing.expectEqualStrings("mybrain", parts.brain);
+}
+
+test "parseBrainUrl custom host" {
+    const parts = parseBrainUrl("https://custom.example.com/org/project-brain") orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("custom.example.com", parts.host);
+    try std.testing.expectEqualStrings("org", parts.account);
+    try std.testing.expectEqualStrings("project-brain", parts.brain);
+}
+
+test "parseBrainUrl http scheme" {
+    const parts = parseBrainUrl("http://localhost:3000/user/brain") orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("localhost:3000", parts.host);
+    try std.testing.expectEqualStrings("user", parts.account);
+    try std.testing.expectEqualStrings("brain", parts.brain);
+}
+
+test "parseBrainUrl invalid no scheme" {
+    try std.testing.expect(parseBrainUrl("trycog.ai/user/brain") == null);
+}
+
+test "parseBrainUrl invalid missing brain" {
+    try std.testing.expect(parseBrainUrl("https://trycog.ai/user") == null);
+}
+
+test "parseBrainUrl invalid empty parts" {
+    try std.testing.expect(parseBrainUrl("https:///user/brain") == null);
+    try std.testing.expect(parseBrainUrl("https://host//brain") == null);
+    try std.testing.expect(parseBrainUrl("https://host/user/") == null);
+}
