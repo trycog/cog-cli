@@ -366,9 +366,9 @@ pub fn bootstrapStart(title: []const u8, total_files: usize, subtitle: ?[]const 
     stderrWrite(title);
     stderrWrite(reset ++ "\n");
     if (subtitle) |sub| {
-        stderrWrite("  ");
+        stderrWrite("  Watch the brain build: " ++ cyan);
         stderrWrite(sub);
-        stderrWrite("\n");
+        stderrWrite(reset ++ "\n");
     }
     stderrWrite("\n");
     var bar_buf: [512]u8 = undefined;
