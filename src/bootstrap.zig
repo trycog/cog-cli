@@ -573,16 +573,20 @@ fn runBootstrap(
         printFmtErr(allocator, "  Agent: " ++ bold ++ "{s}" ++ reset ++ "\n", .{cmd});
     }
 
-    const total_files = remaining.items.len;
+    const total_files = files.items.len;
+    const already_done = processed.count();
     const use_tui = !debug and tui.isStderrTty();
 
     if (use_tui) {
         tui.bootstrapStart("Bootstrapping", total_files);
+        if (already_done > 0) {
+            tui.bootstrapUpdate(already_done, total_files, 0, 0, 0, 0, "");
+        }
     } else {
-        printFmtErr(allocator, "  Processing {d} files (concurrency={d})\n\n", .{ total_files, concurrency });
+        printFmtErr(allocator, "  Processing {d} files (concurrency={d})\n\n", .{ remaining.items.len, concurrency });
     }
 
-    var files_done: usize = 0;
+    var files_done: usize = already_done;
     var errors: usize = 0;
     var total_input_tokens: usize = 0;
     var total_output_tokens: usize = 0;
