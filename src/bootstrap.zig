@@ -652,7 +652,7 @@ fn runBootstrap(
     } else {
         // Concurrent processing — thread pool of `concurrency` workers
         var file_index = std.atomic.Value(usize).init(0);
-        var done_count = std.atomic.Value(usize).init(0);
+        var done_count = std.atomic.Value(usize).init(already_done);
         var error_count = std.atomic.Value(usize).init(0);
         var atomic_input_tokens = std.atomic.Value(usize).init(0);
         var atomic_output_tokens = std.atomic.Value(usize).init(0);
