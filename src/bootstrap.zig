@@ -6,6 +6,8 @@ const scip = @import("scip.zig");
 const protobuf = @import("protobuf.zig");
 const tui = @import("tui.zig");
 const help_text = @import("help_text.zig");
+const config_mod = @import("config.zig");
+const client = @import("client.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -189,6 +191,68 @@ fn dismissReaper(handle: ?ReaperHandle) void {
     posix.close(h.pipe_write_fd);
     // Reap the reaper to prevent zombies.
     _ = posix.waitpid(h.reaper_pid, 0);
+}
+
+// ── Brain empty check ───────────────────────────────────────────────────
+// Calls cog_stats via the brain's MCP endpoint to check if the brain has
+// any engrams. Used to detect stale checkpoints after a brain reset.
+
+fn isBrainEmpty(allocator: std.mem.Allocator) bool {
+    // Load config silently — no error output if unconfigured.
+    const api_key = config_mod.getApiKey(allocator) catch return false;
+    defer allocator.free(api_key);
+
+    const cog_content = config_mod.findCogFile(allocator) catch return false;
+    defer allocator.free(cog_content);
+
+    const brain_url = config_mod.resolveBrainUrl(allocator, cog_content) catch return false;
+    defer allocator.free(brain_url);
+
+    const endpoint = std.fmt.allocPrint(allocator, "{s}/mcp", .{brain_url}) catch return false;
+    defer allocator.free(endpoint);
+
+    const body =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"," ++
+        "\"params\":{\"name\":\"cog_stats\",\"arguments\":{}}}";
+
+    const response = client.postRaw(allocator, endpoint, api_key, body) catch return false;
+    defer allocator.free(response.body);
+
+    if (response.status_code != 200) return false;
+
+    // Parse JSON-RPC response: {"result":{"content":[{"type":"text","text":"{...}"}]}}
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, response.body, .{}) catch return false;
+    defer parsed.deinit();
+
+    const text = extractMcpResultText(parsed.value) orelse return false;
+
+    // Parse the inner JSON for engram count
+    const inner = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return false;
+    defer inner.deinit();
+
+    if (inner.value != .object) return false;
+
+    if (inner.value.object.get("total_engrams")) |v| {
+        return switch (v) {
+            .integer => v.integer == 0,
+            else => false,
+        };
+    }
+
+    return false;
+}
+
+fn extractMcpResultText(root: std.json.Value) ?[]const u8 {
+    if (root != .object) return null;
+    const result_val = root.object.get("result") orelse return null;
+    if (result_val != .object) return null;
+    const content = result_val.object.get("content") orelse return null;
+    if (content != .array or content.array.items.len == 0) return null;
+    const first = content.array.items[0];
+    if (first != .object) return null;
+    const text_val = first.object.get("text") orelse return null;
+    if (text_val != .string) return null;
+    return text_val.string;
 }
 
 fn printErr(msg: []const u8) void {
@@ -415,6 +479,18 @@ fn runBootstrap(
     if (clean) {
         std.fs.deleteFileAbsolute(checkpoint_path) catch {};
         printErr("  Checkpoint cleared\n");
+    } else {
+        // If brain is empty but a checkpoint exists, the brain was reset —
+        // delete the stale checkpoint so bootstrap starts fresh.
+        const checkpoint_exists = blk: {
+            const f = std.fs.openFileAbsolute(checkpoint_path, .{}) catch break :blk false;
+            f.close();
+            break :blk true;
+        };
+        if (checkpoint_exists and isBrainEmpty(allocator)) {
+            std.fs.deleteFileAbsolute(checkpoint_path) catch {};
+            printErr("  Brain is empty — checkpoint cleared, starting fresh\n");
+        }
     }
 
     var processed = loadCheckpoint(allocator, checkpoint_path);
