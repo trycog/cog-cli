@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-04
+
+### Added
+
+- `mem:bootstrap` command to scan project files and populate memory from codebase
+- TUI progress display for bootstrap with concurrency, per-file activity, and brain URL
+- Cost warning and confirmation prompt before running bootstrap
+- Per-file timeout for bootstrap (default 10 minutes)
+- Auto-clear stale checkpoint when brain is empty
+- Reaper process to kill orphaned children on parent SIGKILL
+- Ctrl+C watchdog thread for reliable bootstrap cancellation
+- Graceful signal termination of spawned agent processes
+- Three-mode autonomous debugging subagent (inspect/trace/diagnose)
+- `step_over_inspect` action for stepping with expression evaluation in a single call
+- Module launch mode for debugging (e.g., `python -m pytest`)
+- Native DWARF debug engine for Go
+- JavaScript and Java debug adapters with DAP proxy improvements
+- TypeScript source-map debugging support
+- Exception breakpoint as safety net in inspect/trace debug modes
+- Memory sub-agent prompt with recall, consolidate, and maintenance modes
+- `cog_code_explore` single-call complete symbol exploration
+- Query alternation with `|` separator for multi-name symbol search
+- Agent selection menu for bootstrap
+- Debug benchmark: 20 test programs across 4 languages
+- SWE-bench Pro integration (Docker-based, replacing SWE-bench Lite)
+- SWE-agent integration with debugger-subagent variant
+
+### Changed
+
+- Rewrote debug subagent from puppet model to autonomous agent
+- Distilled subagent output before returning to primary agent
+- Compressed PROMPT.md from 287 to 107 lines
+- Unified language dispatch into extension-driven architecture
+- Watcher events filtered using index patterns from settings.json
+- Removed JSON stdout output from `cog code:index`
+- Rounded cost display to nearest cent
+
+### Fixed
+
+- Concurrent bootstrap progress resetting to 0 on resume
+- Headless debugging: detached process spawning, clean shutdown, terminal prevention
+- Subagent no-output bug with JSON parsing and MCP log fallback
+- Shell operator precedence in debugpy uv fallback
+- Session status bug in step_over_inspect
+- Thread safety: added mutexes to Runtime, DebugServer, StdoutWriter, and MCP server
+- Heap-allocated debug sessions for pointer stability across concurrent access
+
 ## [0.4.0] - 2026-02-19
 
 ### Added
@@ -113,6 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.5.0]: https://github.com/trycog/cog-cli/releases/tag/v0.5.0
 [0.4.0]: https://github.com/trycog/cog-cli/releases/tag/v0.4.0
 [0.3.0]: https://github.com/trycog/cog-cli/releases/tag/v0.3.0
 [0.2.2]: https://github.com/trycog/cog-cli/releases/tag/v0.2.2
