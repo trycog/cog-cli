@@ -496,6 +496,24 @@ pub fn bootstrapTotal(in_tokens: usize, out_tokens: usize, cost_microdollars: us
     stderrWrite("\n\n");
 }
 
+/// Redraw the bottom line of the bootstrap progress block with a spinner and elapsed time.
+/// Used by the background ticker thread to show activity during long agent calls.
+pub fn bootstrapTickLine(spinner: []const u8, label: []const u8, elapsed_s: u64) void {
+    clearLines(1);
+    stderrWrite("    " ++ dim);
+    stderrWrite(spinner);
+    stderrWrite(" ");
+    var path_buf: [64]u8 = undefined;
+    stderrWrite(truncatePath(&path_buf, label, 50));
+    var time_buf: [32]u8 = undefined;
+    if (elapsed_s >= 60) {
+        stderrWrite(std.fmt.bufPrint(&time_buf, " ({d}m {d}s)", .{ elapsed_s / 60, elapsed_s % 60 }) catch "");
+    } else {
+        stderrWrite(std.fmt.bufPrint(&time_buf, " ({d}s)", .{elapsed_s}) catch "");
+    }
+    stderrWrite(reset ++ "\n");
+}
+
 // ── Select (TTY) ────────────────────────────────────────────────────────
 
 pub fn select(allocator: std.mem.Allocator, options: SelectOptions) !SelectResult {
