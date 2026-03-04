@@ -352,10 +352,11 @@ pub fn progressFinish(files: usize, symbols: usize, skipped: usize, index_path: 
 
 /// Format cost from microdollars into a stack buffer. Returns formatted slice.
 fn formatCostBuf(buf: []u8, microdollars: usize) []const u8 {
-    const dollars = microdollars / 1_000_000;
-    const cents = (microdollars % 1_000_000) / 10_000;
-    const frac = (microdollars % 10_000) / 100;
-    return std.fmt.bufPrint(buf, "{d}.{d:0>2}{d:0>2}", .{ dollars, cents, frac }) catch "?.??";
+    // Round to nearest cent (10_000 microdollars = 1 cent)
+    const rounded = (microdollars + 5_000) / 10_000;
+    const dollars = rounded / 100;
+    const cents = rounded % 100;
+    return std.fmt.bufPrint(buf, "{d}.{d:0>2}", .{ dollars, cents }) catch "?.??";
 }
 
 /// Print the initial bootstrap progress block (7 lines):
@@ -373,7 +374,7 @@ pub fn bootstrapStart(title: []const u8, total_files: usize) void {
     stderrWrite(formatNumber(&num_buf, total_files));
     stderrWrite("\n");
     stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   0 in / 0 out\n");
-    stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $0.0000\n");
+    stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $0.00\n");
     stderrWrite("\n");
 }
 

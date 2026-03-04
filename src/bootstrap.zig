@@ -1261,10 +1261,11 @@ fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8
 }
 
 fn formatCost(allocator: std.mem.Allocator, microdollars: usize) []const u8 {
-    const dollars = microdollars / 1_000_000;
-    const cents = (microdollars % 1_000_000) / 10_000;
-    const frac = (microdollars % 10_000) / 100;
-    return std.fmt.allocPrint(allocator, "{d}.{d:0>2}{d:0>2}", .{ dollars, cents, frac }) catch "?.??";
+    // Round to nearest cent (10_000 microdollars = 1 cent)
+    const rounded = (microdollars + 5_000) / 10_000;
+    const dollars = rounded / 100;
+    const cents = rounded % 100;
+    return std.fmt.allocPrint(allocator, "{d}.{d:0>2}", .{ dollars, cents }) catch "?.??";
 }
 
 // ── Usage parsing per agent ─────────────────────────────────────────────
