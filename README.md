@@ -160,46 +160,33 @@ The system prompt we inject into your agent instructs it to follow a lifecycle:
 The result is an agent that gets better over time. It stops rediscovering the same solutions and starts building on what it already knows.
 
 <details>
-<summary><strong>CLI commands</strong></summary>
+<summary><strong>Bootstrap</strong></summary>
 
 <br>
 
-Your agent uses memory through MCP tools (`cog_mem_*`). The CLI is there for manual inspection and debugging.
+Seed your brain with knowledge from an existing codebase. Requires an existing SCIP index (`cog code:index`).
 
-**Read:**
+```sh
+cog mem:bootstrap              # Bootstrap with defaults
+cog mem:bootstrap --concurrency 3   # 3 parallel agent invocations
+cog mem:bootstrap --clean           # Reset checkpoint, start fresh
+cog mem:bootstrap --debug           # Show agent stderr output
+```
 
-| Command | Description |
-|---------|-------------|
-| `mem:recall <query>` | Search with spreading activation |
-| `mem:get <id>` | Retrieve engram by UUID |
-| `mem:connections <id>` | List synaptic connections |
-| `mem:trace <from> <to>` | Find reasoning path between concepts |
-| `mem:bulk-recall <q1> <q2>...` | Multiple queries in one call |
-| `mem:list-short-term` | Pending short-term memories |
-| `mem:stale` | Synapses approaching staleness |
-| `mem:stats` | Brain statistics |
-| `mem:orphans` | Unconnected engrams |
-| `mem:connectivity` | Graph connectivity analysis |
-| `mem:list-terms` | All engram terms |
+Bootstrap scans all indexed source files in batches, spawns your AI agent to read each batch, and the agent stores concepts and relationships directly into memory using `cog_mem_*` tools. Progress is checkpointed so interrupted runs can resume.
 
-**Write:**
+</details>
 
-| Command | Description |
-|---------|-------------|
-| `mem:learn --term T --definition D` | Store a new concept |
-| `mem:associate --source S --target T` | Link two concepts |
-| `mem:bulk-learn --item ...` | Batch store concepts |
-| `mem:bulk-associate --link ...` | Batch create links |
-| `mem:update <id>` | Update term or definition |
-| `mem:unlink <synapse-id>` | Remove a synapse |
-| `mem:refactor --term T --definition D` | Update by term lookup |
-| `mem:deprecate --term T` | Mark concept as obsolete |
-| `mem:reinforce <id>` | Convert short-term to long-term |
-| `mem:flush <id>` | Delete short-term memory |
-| `mem:verify <synapse-id>` | Confirm synapse accuracy |
-| `mem:meld --target BRAIN` | Cross-brain knowledge link |
+<details>
+<summary><strong>MCP tools</strong></summary>
 
-Run `cog mem:<command> --help` for full options.
+<br>
+
+Your agent interacts with memory through MCP tools (`cog_mem_*`). These are discovered dynamically from your brain's remote MCP server — not CLI commands. The full set includes:
+
+**Read:** `recall`, `get`, `connections`, `trace`, `bulk_recall`, `list_short_term`, `stale`, `stats`, `orphans`, `connectivity`, `list_terms`
+
+**Write:** `learn`, `associate`, `bulk_learn`, `bulk_associate`, `update`, `unlink`, `refactor`, `deprecate`, `reinforce`, `flush`, `verify`, `meld`
 
 </details>
 
@@ -213,7 +200,7 @@ If you'd rather not use `cog init`, you can set things up by hand.
 **1.** Place a `.cog/settings.json` in your project (or any parent directory up to `$HOME`):
 
 ```json
-{"brain": {"url": "https://trycog.ai/username/brain"}}
+{"memory": {"brain": {"url": "https://trycog.ai/username/brain"}}}
 ```
 
 **2.** Set your API key:
@@ -257,18 +244,18 @@ cog code:index              # Index everything
 cog code:index "**/*.ts"    # Specific pattern
 ```
 
-Results go into `.cog/index.scip`. A built-in file watcher automatically keeps the index up to date as files are created, modified, deleted, or renamed. No manual re-indexing needed after the initial build.
+Results go into `.cog/index.scip`. A built-in file watcher automatically keeps the index up to date as files are created, modified, deleted, or renamed — only watching files that match the glob patterns configured in `.cog/settings.json` under `code.index`. No manual re-indexing needed after the initial build.
 
 ### File operations
 
-Your agent can also manage files through MCP tools that automatically keep the index in sync:
+CLI commands for managing files with automatic index updates:
 
-| Tool | Description |
-|------|-------------|
-| `code:edit` | Edit files with string replacement and re-index |
-| `code:create` | Create new files and add to index |
-| `code:delete` | Delete files and remove from index |
-| `code:rename` | Rename files and update index |
+| Command | Description |
+|---------|-------------|
+| `cog code:edit` | Edit files with string replacement and re-index |
+| `cog code:create` | Create new files and add to index |
+| `cog code:delete` | Delete files and remove from index |
+| `cog code:rename` | Rename files and update index |
 
 ### Built-in language support
 
