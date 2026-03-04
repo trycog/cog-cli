@@ -375,12 +375,13 @@ pub fn bootstrapStart(title: []const u8, total_files: usize) void {
     stderrWrite("\n");
     stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   0 in / 0 out\n");
     stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $0.00\n");
-    stderrWrite("\n");
 }
 
-/// Update the bottom 5 bootstrap progress lines (bar, files, tokens, cost, current file).
-pub fn bootstrapUpdate(processed: usize, total: usize, errors: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, current_file: []const u8) void {
-    clearLines(5);
+/// Update the bootstrap progress stats (bar, files, tokens, cost).
+/// `extra_lines` is the number of file-activity lines drawn below the stats
+/// by the ticker thread — they are cleared before redrawing.
+pub fn bootstrapUpdate(processed: usize, total: usize, errors: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, extra_lines: usize) void {
+    clearLines(4 + extra_lines);
     var bar_buf: [512]u8 = undefined;
     stderrWrite("    ");
     stderrWrite(renderBar(&bar_buf, processed, total));
@@ -405,15 +406,12 @@ pub fn bootstrapUpdate(processed: usize, total: usize, errors: usize, in_tokens:
     var cost_buf: [32]u8 = undefined;
     stderrWrite(formatCostBuf(&cost_buf, cost_microdollars));
     stderrWrite("\n");
-    var path_buf: [64]u8 = undefined;
-    stderrWrite("    " ++ dim);
-    stderrWrite(truncatePath(&path_buf, current_file, 60));
-    stderrWrite(reset ++ "\n");
 }
 
-/// Replace all 7 bootstrap progress lines with final state (title ✓ + stats).
-pub fn bootstrapFinish(title: []const u8, processed: usize, errors: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize) void {
-    clearLines(7);
+/// Replace all bootstrap progress lines with final state (title ✓ + stats).
+/// `extra_lines` is the number of file-activity lines drawn by the ticker.
+pub fn bootstrapFinish(title: []const u8, processed: usize, errors: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, extra_lines: usize) void {
+    clearLines(6 + extra_lines);
     stderrWrite("  " ++ cyan ++ bold);
     stderrWrite(title);
     stderrWrite(" " ++ check ++ reset ++ "\n\n");
@@ -451,9 +449,10 @@ pub fn bootstrapPhaseStart(title: []const u8, label: []const u8, count: usize) v
     stderrWrite("    " ++ dim ++ "Running agent..." ++ reset ++ "\n");
 }
 
-/// Finish a bootstrap phase, replacing 4 lines with result.
-pub fn bootstrapPhaseFinish(title: []const u8, label: []const u8, count: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, success: bool) void {
-    clearLines(4);
+/// Finish a bootstrap phase, replacing lines with result.
+/// `extra_lines` is the number of file-activity lines drawn by the ticker.
+pub fn bootstrapPhaseFinish(title: []const u8, label: []const u8, count: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, success: bool, extra_lines: usize) void {
+    clearLines(4 + extra_lines);
     stderrWrite("  " ++ cyan ++ bold);
     stderrWrite(title);
     if (success) {
@@ -497,10 +496,9 @@ pub fn bootstrapTotal(in_tokens: usize, out_tokens: usize, cost_microdollars: us
     stderrWrite("\n\n");
 }
 
-/// Redraw the bottom line of the bootstrap progress block with a spinner and elapsed time.
+/// Write a single spinner + file line (no clearing — caller must clear first).
 /// Used by the background ticker thread to show activity during long agent calls.
 pub fn bootstrapTickLine(spinner: []const u8, label: []const u8, elapsed_s: u64) void {
-    clearLines(1);
     stderrWrite("    " ++ dim);
     stderrWrite(spinner);
     stderrWrite(" ");
@@ -703,7 +701,7 @@ fn redraw(options: SelectOptions, old_line_count: usize, cursor: usize, input_ac
     renderMenu(options, cursor, input_active, input_text, validation_error);
 }
 
-fn clearLines(line_count: usize) void {
+pub fn clearLines(line_count: usize) void {
     if (line_count == 0) return;
     stderrFmt("\x1B[{d}A", .{line_count});
     for (0..line_count) |_| {

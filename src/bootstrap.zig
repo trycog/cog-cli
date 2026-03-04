@@ -580,7 +580,7 @@ fn runBootstrap(
     if (use_tui) {
         tui.bootstrapStart("Bootstrapping", total_files);
         if (already_done > 0) {
-            tui.bootstrapUpdate(already_done, total_files, 0, 0, 0, 0, "");
+            tui.bootstrapUpdate(already_done, total_files, 0, 0, 0, 0, 0);
         }
     } else {
         printFmtErr(allocator, "  Processing {d} files (concurrency={d})\n\n", .{ remaining.items.len, concurrency });
@@ -594,7 +594,7 @@ fn runBootstrap(
 
     // Activity ticker — background thread that shows a spinner + elapsed time
     var tui_mutex: std.Thread.Mutex = .{};
-    var ticker_ctx = TickerContext{ .mutex = &tui_mutex };
+    var ticker_ctx = TickerContext{ .mutex = &tui_mutex, .num_slots = @min(concurrency, max_ticker_slots) };
     var ticker_thread: ?std.Thread = null;
     if (use_tui) {
         ticker_thread = std.Thread.spawn(.{}, tickerFn, .{&ticker_ctx}) catch null;
@@ -605,8 +605,7 @@ fn runBootstrap(
         for (remaining.items) |file_path| {
             if (use_tui) {
                 tui_mutex.lock();
-                ticker_ctx.current_label = file_path;
-                ticker_ctx.start_ms = std.time.milliTimestamp();
+                _ = ticker_ctx.claimSlot(file_path);
                 tui_mutex.unlock();
             } else {
                 printFmtErr(allocator, "  " ++ cyan ++ "[{d}/{d}]" ++ reset ++ " {s}\n", .{
@@ -633,8 +632,10 @@ fn runBootstrap(
 
             if (use_tui) {
                 tui_mutex.lock();
-                tui.bootstrapUpdate(files_done + errors, total_files, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, file_path);
-                ticker_ctx.current_label = "";
+                ticker_ctx.releaseSlot(0);
+                const tl = ticker_ctx.prev_lines;
+                ticker_ctx.prev_lines = 0;
+                tui.bootstrapUpdate(files_done + errors, total_files, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, tl);
                 tui_mutex.unlock();
             } else if (result.success) {
                 printFmtErr(allocator, "    " ++ green ++ "done" ++ reset ++ " ({d}/{d}) tokens: {d}in/{d}out ${s}\n", .{
@@ -702,11 +703,12 @@ fn runBootstrap(
     }
 
     // Stop ticker before phase 1 finish
+    const finish_extra_lines = ticker_ctx.prev_lines;
     stopTicker(&ticker_thread, &ticker_ctx);
 
     // Phase 1 finish
     if (use_tui) {
-        tui.bootstrapFinish("Bootstrapping", files_done + errors, errors, total_input_tokens, total_output_tokens, total_cost_microdollars);
+        tui.bootstrapFinish("Bootstrapping", files_done + errors, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, finish_extra_lines);
     } else {
         printErr("\n" ++ bold ++ "  Phase 1: Extraction Summary" ++ reset ++ "\n");
         printFmtErr(allocator, "    Files processed: {d}\n", .{files_done});
@@ -739,6 +741,7 @@ fn runBootstrap(
 
                 const assoc_result = runAssociationPhase(allocator, project_root, selected_agent, custom_cmd, cf.text, debug, timeout_ms);
 
+                const phase2_extra = ticker_ctx.prev_lines;
                 stopTicker(&ticker_thread, &ticker_ctx);
 
                 if (assoc_result.success) {
@@ -748,7 +751,7 @@ fn runBootstrap(
                 }
 
                 if (use_tui) {
-                    tui.bootstrapPhaseFinish("Associating", "Pairs", cf.pair_count, assoc_result.input_tokens, assoc_result.output_tokens, assoc_result.cost_microdollars, assoc_result.success);
+                    tui.bootstrapPhaseFinish("Associating", "Pairs", cf.pair_count, assoc_result.input_tokens, assoc_result.output_tokens, assoc_result.cost_microdollars, assoc_result.success, phase2_extra);
                     tui.bootstrapTotal(total_input_tokens, total_output_tokens, total_cost_microdollars);
                 } else {
                     if (assoc_result.success) {
@@ -799,11 +802,11 @@ fn workerThread(shared: *WorkerShared) void {
 
         const file_path = shared.remaining[idx];
 
+        var my_slot: usize = 0;
         if (shared.use_tui) {
             if (shared.ticker) |ticker| {
                 shared.tui_mutex.lock();
-                ticker.current_label = file_path;
-                ticker.start_ms = std.time.milliTimestamp();
+                my_slot = ticker.claimSlot(file_path);
                 shared.tui_mutex.unlock();
             }
         } else {
@@ -828,15 +831,20 @@ fn workerThread(shared: *WorkerShared) void {
 
             if (shared.use_tui) {
                 shared.tui_mutex.lock();
-                tui.bootstrapUpdate(
-                    done + shared.error_count.load(.acquire),
-                    shared.total_files,
-                    shared.error_count.load(.acquire),
-                    shared.atomic_input_tokens.load(.acquire),
-                    shared.atomic_output_tokens.load(.acquire),
-                    shared.atomic_cost.load(.acquire),
-                    file_path,
-                );
+                if (shared.ticker) |ticker| {
+                    ticker.releaseSlot(my_slot);
+                    const tl = ticker.prev_lines;
+                    ticker.prev_lines = 0;
+                    tui.bootstrapUpdate(
+                        done + shared.error_count.load(.acquire),
+                        shared.total_files,
+                        shared.error_count.load(.acquire),
+                        shared.atomic_input_tokens.load(.acquire),
+                        shared.atomic_output_tokens.load(.acquire),
+                        shared.atomic_cost.load(.acquire),
+                        tl,
+                    );
+                }
                 shared.tui_mutex.unlock();
             } else {
                 const in_tok = shared.atomic_input_tokens.load(.acquire);
@@ -856,15 +864,20 @@ fn workerThread(shared: *WorkerShared) void {
 
             if (shared.use_tui) {
                 shared.tui_mutex.lock();
-                tui.bootstrapUpdate(
-                    shared.done_count.load(.acquire) + errs,
-                    shared.total_files,
-                    errs,
-                    shared.atomic_input_tokens.load(.acquire),
-                    shared.atomic_output_tokens.load(.acquire),
-                    shared.atomic_cost.load(.acquire),
-                    file_path,
-                );
+                if (shared.ticker) |ticker| {
+                    ticker.releaseSlot(my_slot);
+                    const tl = ticker.prev_lines;
+                    ticker.prev_lines = 0;
+                    tui.bootstrapUpdate(
+                        shared.done_count.load(.acquire) + errs,
+                        shared.total_files,
+                        errs,
+                        shared.atomic_input_tokens.load(.acquire),
+                        shared.atomic_output_tokens.load(.acquire),
+                        shared.atomic_cost.load(.acquire),
+                        tl,
+                    );
+                }
                 shared.tui_mutex.unlock();
             } else {
                 printFmtErr(shared.allocator, "    " ++ red ++ "failed" ++ reset ++ " {s}\n", .{file_path});
@@ -874,15 +887,42 @@ fn workerThread(shared: *WorkerShared) void {
 }
 
 // ── Activity ticker ─────────────────────────────────────────────────────
-// Background thread that redraws the bottom line of the TUI progress block
-// with a spinner + elapsed time, giving clear visual feedback during
-// long-running agent invocations.
+// Background thread that redraws the active-file lines of the TUI progress
+// block. Supports multiple concurrent slots so each worker's file is visible.
+
+const max_ticker_slots = 16;
+
+const TickerSlot = struct {
+    label: []const u8 = "",
+    start_ms: i64 = 0,
+};
 
 const TickerContext = struct {
     mutex: *std.Thread.Mutex,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    current_label: []const u8 = "",
-    start_ms: i64 = 0,
+    slots: [max_ticker_slots]TickerSlot = [_]TickerSlot{.{}} ** max_ticker_slots,
+    num_slots: usize = 1, // how many slots are available (= concurrency)
+    prev_lines: usize = 0, // how many file lines were drawn last tick
+
+    fn claimSlot(self: *TickerContext, label: []const u8) usize {
+        for (self.slots[0..self.num_slots], 0..) |*slot, i| {
+            if (slot.label.len == 0) {
+                slot.label = label;
+                slot.start_ms = std.time.milliTimestamp();
+                return i;
+            }
+        }
+        // Fallback: overwrite slot 0
+        self.slots[0].label = label;
+        self.slots[0].start_ms = std.time.milliTimestamp();
+        return 0;
+    }
+
+    fn releaseSlot(self: *TickerContext, slot_idx: usize) void {
+        if (slot_idx < self.num_slots) {
+            self.slots[slot_idx] = .{};
+        }
+    }
 };
 
 const spinner_frames = [_][]const u8{ "\xe2\xa0\x8b", "\xe2\xa0\x99", "\xe2\xa0\xb9", "\xe2\xa0\xb8", "\xe2\xa0\xbc", "\xe2\xa0\xb4", "\xe2\xa0\xa6", "\xe2\xa0\xa7", "\xe2\xa0\x87", "\xe2\xa0\x8f" };
@@ -896,15 +936,29 @@ fn tickerFn(ctx: *TickerContext) void {
         ctx.mutex.lock();
         defer ctx.mutex.unlock();
 
-        const label = ctx.current_label;
-        const start = ctx.start_ms;
-        if (label.len == 0 or start == 0) continue;
+        // Count active slots
+        var active: usize = 0;
+        for (ctx.slots[0..ctx.num_slots]) |slot| {
+            if (slot.label.len > 0) active += 1;
+        }
+        if (active == 0) continue;
 
+        // Clear previous file lines
+        if (ctx.prev_lines > 0) {
+            tui.clearLines(ctx.prev_lines);
+        }
+
+        // Draw one line per active slot
         const now = std.time.milliTimestamp();
-        const elapsed_ms = now - start;
-        const elapsed_s: u64 = if (elapsed_ms > 0) @intCast(@divTrunc(elapsed_ms, 1000)) else 0;
-
-        tui.bootstrapTickLine(spinner_frames[frame % spinner_frames.len], label, elapsed_s);
+        var drawn: usize = 0;
+        for (ctx.slots[0..ctx.num_slots]) |slot| {
+            if (slot.label.len == 0) continue;
+            const elapsed_ms = now - slot.start_ms;
+            const elapsed_s: u64 = if (elapsed_ms > 0) @intCast(@divTrunc(elapsed_ms, 1000)) else 0;
+            tui.bootstrapTickLine(spinner_frames[frame % spinner_frames.len], slot.label, elapsed_s);
+            drawn += 1;
+        }
+        ctx.prev_lines = drawn;
         frame +%= 1;
     }
 }
@@ -919,8 +973,8 @@ fn stopTicker(ticker_thread: *?std.Thread, ticker_ctx: *TickerContext) void {
 
 fn startTicker(ticker_thread: *?std.Thread, ticker_ctx: *TickerContext, label: []const u8) void {
     ticker_ctx.stop = std.atomic.Value(bool).init(false);
-    ticker_ctx.current_label = label;
-    ticker_ctx.start_ms = std.time.milliTimestamp();
+    ticker_ctx.slots[0] = .{ .label = label, .start_ms = std.time.milliTimestamp() };
+    ticker_ctx.prev_lines = 0;
     ticker_thread.* = std.Thread.spawn(.{}, tickerFn, .{ticker_ctx}) catch null;
 }
 
