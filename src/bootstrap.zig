@@ -175,6 +175,8 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         return;
     }
 
+    tui.header();
+
     // Parse options
     const concurrency: usize = if (getFlagValue(args, "--concurrency")) |v|
         std.fmt.parseInt(usize, v, 10) catch {
