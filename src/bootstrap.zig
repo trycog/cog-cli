@@ -433,8 +433,18 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         else => null,
     };
 
-    printErr("\n  " ++ dim ++ "This can take a while depending on the size of your codebase." ++ reset ++ "\n");
-    printErr("  " ++ dim ++ "Progress is saved — press Ctrl+C to stop and resume later." ++ reset ++ "\n");
+    // Warn about cost and get confirmation
+    printErr("\n");
+    printErr("  " ++ bold ++ "Note:" ++ reset ++ " Bootstrap invokes your agent once per source file.\n");
+    printErr("  This will consume tokens on your agent's model and may incur costs.\n");
+    printErr("  The process can take a while depending on the size of your codebase.\n");
+    printErr("  Progress is saved — press Ctrl+C to stop and resume later.\n\n");
+
+    const confirmed = try tui.confirm("Continue?");
+    if (!confirmed) {
+        printErr("  Aborted.\n");
+        return;
+    }
 
     try runBootstrap(allocator, concurrency, clean, debug, cog_dir, selected_agent, custom_cmd);
 }
