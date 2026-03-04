@@ -348,6 +348,154 @@ pub fn progressFinish(files: usize, symbols: usize, skipped: usize, index_path: 
     stderrWrite(reset ++ "\n");
 }
 
+// ── Bootstrap Progress ──────────────────────────────────────────────────
+
+/// Format cost from microdollars into a stack buffer. Returns formatted slice.
+fn formatCostBuf(buf: []u8, microdollars: usize) []const u8 {
+    const dollars = microdollars / 1_000_000;
+    const cents = (microdollars % 1_000_000) / 10_000;
+    const frac = (microdollars % 10_000) / 100;
+    return std.fmt.bufPrint(buf, "{d}.{d:0>2}{d:0>2}", .{ dollars, cents, frac }) catch "?.??";
+}
+
+/// Print the initial bootstrap progress block (7 lines):
+///   <title>\n \n bar 0%\n Files 0/total\n Tokens 0/0\n Cost $0\n \n
+pub fn bootstrapStart(title: []const u8, total_files: usize) void {
+    stderrWrite("  " ++ cyan ++ bold);
+    stderrWrite(title);
+    stderrWrite(reset ++ "\n\n");
+    var bar_buf: [512]u8 = undefined;
+    stderrWrite("    ");
+    stderrWrite(renderBar(&bar_buf, 0, total_files));
+    stderrWrite("\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Files" ++ reset ++ "    0 / ");
+    stderrWrite(formatNumber(&num_buf, total_files));
+    stderrWrite("\n");
+    stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   0 in / 0 out\n");
+    stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $0.0000\n");
+    stderrWrite("\n");
+}
+
+/// Update the bottom 5 bootstrap progress lines (bar, files, tokens, cost, current file).
+pub fn bootstrapUpdate(processed: usize, total: usize, errors: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, current_file: []const u8) void {
+    clearLines(5);
+    var bar_buf: [512]u8 = undefined;
+    stderrWrite("    ");
+    stderrWrite(renderBar(&bar_buf, processed, total));
+    stderrWrite("\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Files" ++ reset ++ "    ");
+    stderrWrite(formatNumber(&num_buf, processed));
+    stderrWrite(" / ");
+    stderrWrite(formatNumber(&num_buf, total));
+    if (errors > 0) {
+        stderrWrite("  " ++ dim ++ "(");
+        stderrWrite(formatNumber(&num_buf, errors));
+        stderrWrite(" errors)" ++ reset);
+    }
+    stderrWrite("\n");
+    stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   ");
+    stderrWrite(formatNumber(&num_buf, in_tokens));
+    stderrWrite(" in / ");
+    stderrWrite(formatNumber(&num_buf, out_tokens));
+    stderrWrite(" out\n");
+    stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $");
+    var cost_buf: [32]u8 = undefined;
+    stderrWrite(formatCostBuf(&cost_buf, cost_microdollars));
+    stderrWrite("\n");
+    var path_buf: [64]u8 = undefined;
+    stderrWrite("    " ++ dim);
+    stderrWrite(truncatePath(&path_buf, current_file, 60));
+    stderrWrite(reset ++ "\n");
+}
+
+/// Replace all 7 bootstrap progress lines with final state (title ✓ + stats).
+pub fn bootstrapFinish(title: []const u8, processed: usize, errors: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize) void {
+    clearLines(7);
+    stderrWrite("  " ++ cyan ++ bold);
+    stderrWrite(title);
+    stderrWrite(" " ++ check ++ reset ++ "\n\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Files" ++ reset ++ "    ");
+    stderrWrite(formatNumber(&num_buf, processed));
+    if (errors > 0) {
+        stderrWrite("  " ++ dim ++ "(");
+        stderrWrite(formatNumber(&num_buf, errors));
+        stderrWrite(" errors)" ++ reset);
+    }
+    stderrWrite("\n");
+    stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   ");
+    stderrWrite(formatNumber(&num_buf, in_tokens));
+    stderrWrite(" in / ");
+    stderrWrite(formatNumber(&num_buf, out_tokens));
+    stderrWrite(" out\n");
+    stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $");
+    var cost_buf: [32]u8 = undefined;
+    stderrWrite(formatCostBuf(&cost_buf, cost_microdollars));
+    stderrWrite("\n\n");
+}
+
+/// Print a bootstrap phase start block (4 lines).
+pub fn bootstrapPhaseStart(title: []const u8, label: []const u8, count: usize) void {
+    stderrWrite("  " ++ cyan ++ bold);
+    stderrWrite(title);
+    stderrWrite(reset ++ "\n\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold);
+    stderrWrite(label);
+    stderrWrite(reset ++ "  ");
+    stderrWrite(formatNumber(&num_buf, count));
+    stderrWrite("\n");
+    stderrWrite("    " ++ dim ++ "Running agent..." ++ reset ++ "\n");
+}
+
+/// Finish a bootstrap phase, replacing 4 lines with result.
+pub fn bootstrapPhaseFinish(title: []const u8, label: []const u8, count: usize, in_tokens: usize, out_tokens: usize, cost_microdollars: usize, success: bool) void {
+    clearLines(4);
+    stderrWrite("  " ++ cyan ++ bold);
+    stderrWrite(title);
+    if (success) {
+        stderrWrite(" " ++ check);
+    } else {
+        stderrWrite(" " ++ cross);
+    }
+    stderrWrite(reset ++ "\n\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold);
+    stderrWrite(label);
+    stderrWrite(reset ++ "  ");
+    stderrWrite(formatNumber(&num_buf, count));
+    stderrWrite("\n");
+    if (success) {
+        stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   ");
+        stderrWrite(formatNumber(&num_buf, in_tokens));
+        stderrWrite(" in / ");
+        stderrWrite(formatNumber(&num_buf, out_tokens));
+        stderrWrite(" out\n");
+        stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $");
+        var cost_buf: [32]u8 = undefined;
+        stderrWrite(formatCostBuf(&cost_buf, cost_microdollars));
+        stderrWrite("\n");
+    }
+    stderrWrite("\n");
+}
+
+/// Print a bootstrap total summary (non-live, just appended output).
+pub fn bootstrapTotal(in_tokens: usize, out_tokens: usize, cost_microdollars: usize) void {
+    stderrWrite("  " ++ bold ++ "Total" ++ reset ++ "\n\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Tokens" ++ reset ++ "   ");
+    stderrWrite(formatNumber(&num_buf, in_tokens));
+    stderrWrite(" in / ");
+    stderrWrite(formatNumber(&num_buf, out_tokens));
+    stderrWrite(" out\n");
+    stderrWrite("    " ++ bold ++ "Cost" ++ reset ++ "     $");
+    var cost_buf: [32]u8 = undefined;
+    stderrWrite(formatCostBuf(&cost_buf, cost_microdollars));
+    stderrWrite("\n\n");
+}
+
 // ── Select (TTY) ────────────────────────────────────────────────────────
 
 pub fn select(allocator: std.mem.Allocator, options: SelectOptions) !SelectResult {

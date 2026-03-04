@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const build_options = @import("build_options");
 const paths = @import("paths.zig");
 const scip = @import("scip.zig");
@@ -14,6 +15,53 @@ const reset = "\x1B[0m";
 const green = "\x1B[32m";
 const red = "\x1B[31m";
 
+// ── SIGINT handling ─────────────────────────────────────────────────────
+// Track active child PIDs so Ctrl+C can kill them immediately.
+
+const max_active_children = 16;
+var g_active_children: [max_active_children]std.atomic.Value(i32) = initChildSlots();
+
+fn initChildSlots() [max_active_children]std.atomic.Value(i32) {
+    var slots: [max_active_children]std.atomic.Value(i32) = undefined;
+    for (&slots) |*s| s.* = std.atomic.Value(i32).init(0);
+    return slots;
+}
+
+fn registerChild(pid: i32) void {
+    for (&g_active_children) |*slot| {
+        if (slot.cmpxchgStrong(0, pid, .monotonic, .monotonic) == null) return;
+    }
+}
+
+fn unregisterChild(pid: i32) void {
+    for (&g_active_children) |*slot| {
+        if (slot.cmpxchgStrong(pid, 0, .monotonic, .monotonic) == null) return;
+    }
+}
+
+fn installSigintHandler() void {
+    const sa = posix.Sigaction{
+        .handler = .{ .handler = handleSigint },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, null);
+}
+
+fn handleSigint(_: c_int) callconv(.c) void {
+    // Kill all active child processes
+    for (&g_active_children) |*slot| {
+        const pid = slot.load(.monotonic);
+        if (pid > 0) {
+            _ = std.c.kill(pid, posix.SIG.TERM);
+        }
+    }
+    // Write a newline so the terminal prompt isn't mangled
+    const msg = "\n  Cancelled.\n";
+    _ = std.c.write(2, msg, msg.len);
+    std.c._exit(130); // 128 + SIGINT
+}
+
 fn printErr(msg: []const u8) void {
     if (@import("builtin").is_test) return;
     var buf: [4096]u8 = undefined;
@@ -28,22 +76,15 @@ fn printFmtErr(allocator: std.mem.Allocator, comptime fmt: []const u8, args: any
     printErr(msg);
 }
 
-const BatchResult = struct {
-    success: bool,
-    file_count: usize,
-};
-
 // ── Agent CLI definitions ───────────────────────────────────────────────
 // Only agents that support non-interactive CLI prompting are listed here.
 
 const CliAgent = struct {
     id: []const u8,
     display_name: []const u8,
-    /// Command tokens to build argv. The prompt is inserted where {prompt} appears.
-    /// Example: &.{"claude", "-p", "{prompt}", "--dangerously-skip-permissions"}
     cmd_prefix: []const []const u8,
     cmd_suffix: []const []const u8,
-    /// Environment variables to unset (via env -u) before spawning.
+    /// Environment variables to unset before spawning (via env -u wrapper).
     env_unset: []const []const u8,
 };
 
@@ -59,35 +100,35 @@ const cli_agents = [_]CliAgent{
         .id = "gemini",
         .display_name = "Gemini CLI",
         .cmd_prefix = &.{ "gemini", "-p" },
-        .cmd_suffix = &.{"--yolo"},
+        .cmd_suffix = &.{ "--output-format", "json", "--yolo" },
         .env_unset = &.{},
     },
     .{
         .id = "codex",
         .display_name = "OpenAI Codex CLI",
         .cmd_prefix = &.{ "codex", "exec" },
-        .cmd_suffix = &.{"--full-auto"},
+        .cmd_suffix = &.{ "--json", "--full-auto" },
         .env_unset = &.{},
     },
     .{
         .id = "amp",
         .display_name = "Amp",
         .cmd_prefix = &.{ "amp", "-x" },
-        .cmd_suffix = &.{"--dangerously-allow-all"},
+        .cmd_suffix = &.{ "--stream-json", "--dangerously-allow-all" },
         .env_unset = &.{},
     },
     .{
         .id = "goose",
         .display_name = "Goose",
         .cmd_prefix = &.{ "goose", "run", "-t" },
-        .cmd_suffix = &.{},
+        .cmd_suffix = &.{ "--output-format", "json" },
         .env_unset = &.{},
     },
     .{
         .id = "opencode",
         .display_name = "OpenCode",
         .cmd_prefix = &.{ "opencode", "run" },
-        .cmd_suffix = &.{},
+        .cmd_suffix = &.{ "--format", "json" },
         .env_unset = &.{},
     },
 };
@@ -135,14 +176,6 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
     }
 
     // Parse options
-    const batch_size: usize = if (getFlagValue(args, "--batch-size")) |v|
-        std.fmt.parseInt(usize, v, 10) catch {
-            printErr("error: invalid --batch-size value\n");
-            return error.Explained;
-        }
-    else
-        20;
-
     const concurrency: usize = if (getFlagValue(args, "--concurrency")) |v|
         std.fmt.parseInt(usize, v, 10) catch {
             printErr("error: invalid --concurrency value\n");
@@ -151,16 +184,13 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
     else
         1;
 
-    if (batch_size == 0) {
-        printErr("error: --batch-size must be at least 1\n");
-        return error.Explained;
-    }
     if (concurrency == 0) {
         printErr("error: --concurrency must be at least 1\n");
         return error.Explained;
     }
 
     const clean = hasFlag(args, "--clean");
+    const debug = hasFlag(args, "--debug");
 
     // Require SCIP index
     const cog_dir = paths.findCogDir(allocator) catch {
@@ -208,18 +238,21 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         else => null,
     };
 
-    try runBootstrap(allocator, batch_size, concurrency, clean, cog_dir, selected_agent, custom_cmd);
+    try runBootstrap(allocator, concurrency, clean, debug, cog_dir, selected_agent, custom_cmd);
 }
 
 fn runBootstrap(
     allocator: std.mem.Allocator,
-    batch_size: usize,
     concurrency: usize,
     clean: bool,
+    debug: bool,
     cog_dir: []const u8,
     selected_agent: ?*const CliAgent,
     custom_cmd: ?[]const u8,
 ) !void {
+    // Install SIGINT handler so Ctrl+C kills active agent processes
+    installSigintHandler();
+
     // Get project root (cwd)
     const project_root = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(project_root);
@@ -242,7 +275,6 @@ fn runBootstrap(
     defer allocator.free(checkpoint_path);
 
     if (clean) {
-        // Delete checkpoint file
         std.fs.deleteFileAbsolute(checkpoint_path) catch {};
         printErr("  Checkpoint cleared\n");
     }
@@ -279,241 +311,852 @@ fn runBootstrap(
         printFmtErr(allocator, "  Agent: " ++ bold ++ "{s}" ++ reset ++ "\n", .{cmd});
     }
 
-    // Split into batches
-    const total_batches = (remaining.items.len + batch_size - 1) / batch_size;
-    printFmtErr(allocator, "  Processing {d} files in {d} batches (size={d}, concurrency={d})\n\n", .{
-        remaining.items.len,
-        total_batches,
-        batch_size,
-        concurrency,
-    });
+    const total_files = remaining.items.len;
+    const use_tui = !debug and tui.isStderrTty();
 
-    var batches_done: usize = 0;
+    if (use_tui) {
+        tui.bootstrapStart("Bootstrapping", total_files);
+    } else {
+        printFmtErr(allocator, "  Processing {d} files (concurrency={d})\n\n", .{ total_files, concurrency });
+    }
+
     var files_done: usize = 0;
     var errors: usize = 0;
+    var total_input_tokens: usize = 0;
+    var total_output_tokens: usize = 0;
+    var total_cost_microdollars: usize = 0; // cost * 1_000_000
 
     if (concurrency <= 1) {
-        // Sequential processing
-        var batch_start: usize = 0;
-        while (batch_start < remaining.items.len) {
-            const batch_end = @min(batch_start + batch_size, remaining.items.len);
-            const batch_files = remaining.items[batch_start..batch_end];
-            batches_done += 1;
+        // Sequential processing — one file at a time
+        for (remaining.items) |file_path| {
+            if (!use_tui) {
+                printFmtErr(allocator, "  " ++ cyan ++ "[{d}/{d}]" ++ reset ++ " {s}\n", .{
+                    files_done + errors + 1,
+                    total_files,
+                    file_path,
+                });
+            }
 
-            printFmtErr(allocator, "  " ++ cyan ++ "Batch {d}/{d}" ++ reset ++ " ({d} files)...\n", .{
-                batches_done,
-                total_batches,
-                batch_files.len,
-            });
-
-            const result = runBatch(allocator, batch_files, project_root, selected_agent, custom_cmd);
+            const result = runFile(allocator, file_path, project_root, selected_agent, custom_cmd, debug);
             if (result.success) {
-                files_done += result.file_count;
-                // Update checkpoint
-                for (batch_files) |f| {
-                    const duped = allocator.dupe(u8, f) catch continue;
-                    processed.put(allocator, duped, {}) catch {
-                        allocator.free(duped);
-                    };
-                }
+                files_done += 1;
+                total_input_tokens += result.input_tokens;
+                total_output_tokens += result.output_tokens;
+                total_cost_microdollars += result.cost_microdollars;
+                const duped = allocator.dupe(u8, file_path) catch continue;
+                processed.put(allocator, duped, {}) catch {
+                    allocator.free(duped);
+                };
                 saveCheckpoint(allocator, checkpoint_path, &processed);
-                printErr("    " ++ green ++ "done" ++ reset ++ "\n");
             } else {
                 errors += 1;
+            }
+
+            if (use_tui) {
+                tui.bootstrapUpdate(files_done + errors, total_files, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, file_path);
+            } else if (result.success) {
+                printFmtErr(allocator, "    " ++ green ++ "done" ++ reset ++ " ({d}/{d}) tokens: {d}in/{d}out ${s}\n", .{
+                    files_done,
+                    total_files,
+                    total_input_tokens,
+                    total_output_tokens,
+                    formatCost(allocator, total_cost_microdollars),
+                });
+            } else {
                 printErr("    " ++ red ++ "failed" ++ reset ++ "\n");
             }
-
-            batch_start = batch_end;
         }
     } else {
-        // Concurrent processing using threads
-        var batch_start: usize = 0;
-        while (batch_start < remaining.items.len) {
-            // Launch up to `concurrency` batches in parallel
-            var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
-            defer threads.deinit(allocator);
+        // Concurrent processing — thread pool of `concurrency` workers
+        var file_index = std.atomic.Value(usize).init(0);
+        var done_count = std.atomic.Value(usize).init(0);
+        var error_count = std.atomic.Value(usize).init(0);
+        var atomic_input_tokens = std.atomic.Value(usize).init(0);
+        var atomic_output_tokens = std.atomic.Value(usize).init(0);
+        var atomic_cost = std.atomic.Value(usize).init(0);
+        var tui_mutex: std.Thread.Mutex = .{};
 
-            var contexts: std.ArrayListUnmanaged(ThreadContext) = .empty;
-            defer contexts.deinit(allocator);
+        var shared = WorkerShared{
+            .file_index = &file_index,
+            .done_count = &done_count,
+            .error_count = &error_count,
+            .atomic_input_tokens = &atomic_input_tokens,
+            .atomic_output_tokens = &atomic_output_tokens,
+            .atomic_cost = &atomic_cost,
+            .remaining = remaining.items,
+            .total_files = total_files,
+            .project_root = project_root,
+            .selected_agent = selected_agent,
+            .custom_cmd = custom_cmd,
+            .allocator = allocator,
+            .checkpoint_path = checkpoint_path,
+            .processed = &processed,
+            .debug = debug,
+            .use_tui = use_tui,
+            .tui_mutex = &tui_mutex,
+        };
 
-            var launched: usize = 0;
-            while (launched < concurrency and batch_start < remaining.items.len) {
-                const batch_end = @min(batch_start + batch_size, remaining.items.len);
-                const batch_files = remaining.items[batch_start..batch_end];
+        // Spawn worker threads
+        var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+        defer threads.deinit(allocator);
 
-                try contexts.append(allocator, .{
-                    .batch_files = batch_files,
-                    .project_root = project_root,
-                    .allocator = allocator,
-                    .selected_agent = selected_agent,
-                    .custom_cmd = custom_cmd,
-                });
+        const worker_count = @min(concurrency, total_files);
+        for (0..worker_count) |_| {
+            const thread = std.Thread.spawn(.{}, workerThread, .{&shared}) catch continue;
+            try threads.append(allocator, thread);
+        }
 
-                batch_start = batch_end;
-                launched += 1;
-            }
+        // Join all
+        for (threads.items) |thread| {
+            thread.join();
+        }
 
-            // Spawn threads for each context
-            for (contexts.items) |*ctx| {
-                const thread = std.Thread.spawn(.{}, runBatchThread, .{ctx}) catch {
-                    ctx.result = .{ .success = false, .file_count = 0 };
-                    continue;
-                };
-                try threads.append(allocator, thread);
-            }
+        files_done = done_count.load(.acquire);
+        errors = error_count.load(.acquire);
+        total_input_tokens = atomic_input_tokens.load(.acquire);
+        total_output_tokens = atomic_output_tokens.load(.acquire);
+        total_cost_microdollars = atomic_cost.load(.acquire);
+    }
 
-            // Join all threads
-            for (threads.items) |thread| {
-                thread.join();
-            }
+    // Phase 1 finish
+    if (use_tui) {
+        tui.bootstrapFinish("Bootstrapping", files_done + errors, errors, total_input_tokens, total_output_tokens, total_cost_microdollars);
+    } else {
+        printErr("\n" ++ bold ++ "  Phase 1: Extraction Summary" ++ reset ++ "\n");
+        printFmtErr(allocator, "    Files processed: {d}\n", .{files_done});
+        if (errors > 0) {
+            printFmtErr(allocator, "    Errors:          {d}\n", .{errors});
+        }
+        printFmtErr(allocator, "    Input tokens:    {d}\n", .{total_input_tokens});
+        printFmtErr(allocator, "    Output tokens:   {d}\n", .{total_output_tokens});
+        printFmtErr(allocator, "    Cost:            ${s}\n", .{formatCost(allocator, total_cost_microdollars)});
+        printFmtErr(allocator, "    Total processed: {d}/{d}\n", .{ processed.count(), files.items.len });
+    }
 
-            // Collect results
-            for (contexts.items) |ctx| {
-                batches_done += 1;
-                if (ctx.result.success) {
-                    files_done += ctx.result.file_count;
-                    for (ctx.batch_files) |f| {
-                        const duped = allocator.dupe(u8, f) catch continue;
-                        processed.put(allocator, duped, {}) catch {
-                            allocator.free(duped);
-                        };
-                    }
-                    printFmtErr(allocator, "  " ++ green ++ "Batch {d}/{d} done" ++ reset ++ " ({d} files)\n", .{
-                        batches_done,
-                        total_batches,
-                        ctx.batch_files.len,
-                    });
+    // Phase 2: Cross-file association from SCIP index
+    if (files_done > 1) {
+        // Build cross-file relationship text from SCIP index
+        const cross_file = buildCrossFileRelationships(allocator, cog_dir);
+        defer if (cross_file) |cf| allocator.free(cf.text);
+
+        if (cross_file) |cf| {
+            if (cf.text.len == 0) {
+                if (!use_tui) printErr("    No cross-file references found in SCIP index\n");
+            } else {
+                if (use_tui) {
+                    tui.bootstrapPhaseStart("Associating", "Pairs", cf.pair_count);
                 } else {
-                    errors += 1;
-                    printFmtErr(allocator, "  " ++ red ++ "Batch {d}/{d} failed" ++ reset ++ "\n", .{
-                        batches_done,
-                        total_batches,
-                    });
+                    printErr("\n" ++ bold ++ "  Phase 2: Cross-file associations" ++ reset ++ "\n");
+                    printFmtErr(allocator, "    Found {d} cross-file dependency pairs\n", .{cf.pair_count});
+                }
+
+                const assoc_result = runAssociationPhase(allocator, project_root, selected_agent, custom_cmd, cf.text, debug);
+                if (assoc_result.success) {
+                    total_input_tokens += assoc_result.input_tokens;
+                    total_output_tokens += assoc_result.output_tokens;
+                    total_cost_microdollars += assoc_result.cost_microdollars;
+                }
+
+                if (use_tui) {
+                    tui.bootstrapPhaseFinish("Associating", "Pairs", cf.pair_count, assoc_result.input_tokens, assoc_result.output_tokens, assoc_result.cost_microdollars, assoc_result.success);
+                    tui.bootstrapTotal(total_input_tokens, total_output_tokens, total_cost_microdollars);
+                } else {
+                    if (assoc_result.success) {
+                        printErr("    " ++ green ++ "done" ++ reset ++ "\n");
+                    } else {
+                        printErr("    " ++ red ++ "failed" ++ reset ++ "\n");
+                    }
+                    printErr("\n" ++ bold ++ "  Total" ++ reset ++ "\n");
+                    printFmtErr(allocator, "    Input tokens:    {d}\n", .{total_input_tokens});
+                    printFmtErr(allocator, "    Output tokens:   {d}\n", .{total_output_tokens});
+                    printFmtErr(allocator, "    Cost:            ${s}\n", .{formatCost(allocator, total_cost_microdollars)});
                 }
             }
-
-            // Save checkpoint after each wave
-            saveCheckpoint(allocator, checkpoint_path, &processed);
+        } else {
+            if (!use_tui) printErr("    Could not load SCIP index for cross-file analysis\n");
         }
     }
 
-    // Summary
-    printErr("\n" ++ bold ++ "  Summary" ++ reset ++ "\n");
-    printFmtErr(allocator, "    Files processed: {d}\n", .{files_done});
-    if (errors > 0) {
-        printFmtErr(allocator, "    Batch errors:    {d}\n", .{errors});
-    }
-    printFmtErr(allocator, "    Total processed: {d}/{d}\n\n", .{ processed.count(), files.items.len });
+    printErr("\n");
 }
 
-const ThreadContext = struct {
-    batch_files: []const []const u8,
+const WorkerShared = struct {
+    file_index: *std.atomic.Value(usize),
+    done_count: *std.atomic.Value(usize),
+    error_count: *std.atomic.Value(usize),
+    atomic_input_tokens: *std.atomic.Value(usize),
+    atomic_output_tokens: *std.atomic.Value(usize),
+    atomic_cost: *std.atomic.Value(usize),
+    remaining: []const []const u8,
+    total_files: usize,
     project_root: []const u8,
-    allocator: std.mem.Allocator,
     selected_agent: ?*const CliAgent,
     custom_cmd: ?[]const u8,
-    result: BatchResult = .{ .success = false, .file_count = 0 },
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+    processed: *std.StringHashMapUnmanaged(void),
+    debug: bool,
+    use_tui: bool,
+    tui_mutex: *std.Thread.Mutex,
 };
 
-fn runBatchThread(ctx: *ThreadContext) void {
-    ctx.result = runBatch(ctx.allocator, ctx.batch_files, ctx.project_root, ctx.selected_agent, ctx.custom_cmd);
+fn workerThread(shared: *WorkerShared) void {
+    while (true) {
+        const idx = shared.file_index.fetchAdd(1, .monotonic);
+        if (idx >= shared.remaining.len) break;
+
+        const file_path = shared.remaining[idx];
+
+        if (!shared.use_tui) {
+            printFmtErr(shared.allocator, "  " ++ cyan ++ "[{d}/{d}]" ++ reset ++ " {s}\n", .{
+                idx + 1,
+                shared.total_files,
+                file_path,
+            });
+        }
+
+        const result = runFile(shared.allocator, file_path, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug);
+        if (result.success) {
+            const done = shared.done_count.fetchAdd(1, .monotonic) + 1;
+            _ = shared.atomic_input_tokens.fetchAdd(result.input_tokens, .monotonic);
+            _ = shared.atomic_output_tokens.fetchAdd(result.output_tokens, .monotonic);
+            _ = shared.atomic_cost.fetchAdd(result.cost_microdollars, .monotonic);
+            const duped = shared.allocator.dupe(u8, file_path) catch continue;
+            shared.processed.put(shared.allocator, duped, {}) catch {
+                shared.allocator.free(duped);
+            };
+            saveCheckpoint(shared.allocator, shared.checkpoint_path, shared.processed);
+
+            if (shared.use_tui) {
+                shared.tui_mutex.lock();
+                tui.bootstrapUpdate(
+                    done + shared.error_count.load(.acquire),
+                    shared.total_files,
+                    shared.error_count.load(.acquire),
+                    shared.atomic_input_tokens.load(.acquire),
+                    shared.atomic_output_tokens.load(.acquire),
+                    shared.atomic_cost.load(.acquire),
+                    file_path,
+                );
+                shared.tui_mutex.unlock();
+            } else {
+                const in_tok = shared.atomic_input_tokens.load(.acquire);
+                const out_tok = shared.atomic_output_tokens.load(.acquire);
+                const cost = shared.atomic_cost.load(.acquire);
+                printFmtErr(shared.allocator, "    " ++ green ++ "done" ++ reset ++ " {s} ({d}/{d}) tokens: {d}in/{d}out ${s}\n", .{
+                    file_path,
+                    done,
+                    shared.total_files,
+                    in_tok,
+                    out_tok,
+                    formatCost(shared.allocator, cost),
+                });
+            }
+        } else {
+            const errs = shared.error_count.fetchAdd(1, .monotonic) + 1;
+
+            if (shared.use_tui) {
+                shared.tui_mutex.lock();
+                tui.bootstrapUpdate(
+                    shared.done_count.load(.acquire) + errs,
+                    shared.total_files,
+                    errs,
+                    shared.atomic_input_tokens.load(.acquire),
+                    shared.atomic_output_tokens.load(.acquire),
+                    shared.atomic_cost.load(.acquire),
+                    file_path,
+                );
+                shared.tui_mutex.unlock();
+            } else {
+                printFmtErr(shared.allocator, "    " ++ red ++ "failed" ++ reset ++ " {s}\n", .{file_path});
+            }
+        }
+    }
 }
 
-fn runBatch(
+const FileResult = struct {
+    success: bool,
+    input_tokens: usize,
+    output_tokens: usize,
+    cost_microdollars: usize, // cost_usd * 1_000_000
+};
+
+fn runFile(
     allocator: std.mem.Allocator,
-    batch_files: []const []const u8,
+    file_path: []const u8,
     project_root: []const u8,
     selected_agent: ?*const CliAgent,
     custom_cmd: ?[]const u8,
-) BatchResult {
-    // Build prompt: template + file list
+    debug: bool,
+) FileResult {
+    const fail: FileResult = .{ .success = false, .input_tokens = 0, .output_tokens = 0, .cost_microdollars = 0 };
+
+    // Build prompt: template with file path
     const template = build_options.bootstrap_prompt;
-
-    // Build file list string
-    var file_list_buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer file_list_buf.deinit(allocator);
-    for (batch_files) |f| {
-        file_list_buf.appendSlice(allocator, "- ") catch return .{ .success = false, .file_count = 0 };
-        file_list_buf.appendSlice(allocator, f) catch return .{ .success = false, .file_count = 0 };
-        file_list_buf.append(allocator, '\n') catch return .{ .success = false, .file_count = 0 };
-    }
-
-    // Replace {file_list} placeholder in template
-    const prompt = replaceFileList(allocator, template, file_list_buf.items) catch return .{ .success = false, .file_count = 0 };
+    const prompt = replacePlaceholder(allocator, template, "{file_path}", file_path) catch return fail;
     defer allocator.free(prompt);
 
-    // Build argv for the selected agent
+    // Build argv
     var argv_buf: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv_buf.deinit(allocator);
 
     if (selected_agent) |agent| {
-        // env -u VAR1 -u VAR2 ... <command>
+        // Prepend env -u for each env var to unset
         if (agent.env_unset.len > 0) {
-            argv_buf.append(allocator, "env") catch return .{ .success = false, .file_count = 0 };
+            argv_buf.append(allocator, "env") catch return fail;
             for (agent.env_unset) |var_name| {
-                argv_buf.append(allocator, "-u") catch return .{ .success = false, .file_count = 0 };
-                argv_buf.append(allocator, var_name) catch return .{ .success = false, .file_count = 0 };
+                argv_buf.append(allocator, "-u") catch return fail;
+                argv_buf.append(allocator, var_name) catch return fail;
             }
         }
-        // cmd_prefix (e.g. "claude", "-p")
         for (agent.cmd_prefix) |token| {
-            argv_buf.append(allocator, token) catch return .{ .success = false, .file_count = 0 };
+            argv_buf.append(allocator, token) catch return fail;
         }
-        // prompt
-        argv_buf.append(allocator, prompt) catch return .{ .success = false, .file_count = 0 };
-        // cmd_suffix (e.g. "--dangerously-skip-permissions")
+        argv_buf.append(allocator, prompt) catch return fail;
         for (agent.cmd_suffix) |token| {
-            argv_buf.append(allocator, token) catch return .{ .success = false, .file_count = 0 };
+            argv_buf.append(allocator, token) catch return fail;
         }
     } else if (custom_cmd) |cmd| {
-        // Parse custom command: split on spaces, append prompt
-        // e.g. "my-agent -p" becomes ["my-agent", "-p", <prompt>]
         var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
         while (cmd_iter.next()) |token| {
             if (token.len > 0) {
-                argv_buf.append(allocator, token) catch return .{ .success = false, .file_count = 0 };
+                argv_buf.append(allocator, token) catch return fail;
             }
         }
-        argv_buf.append(allocator, prompt) catch return .{ .success = false, .file_count = 0 };
+        argv_buf.append(allocator, prompt) catch return fail;
     } else {
-        return .{ .success = false, .file_count = 0 };
+        return fail;
     }
 
     var child = std.process.Child.init(argv_buf.items, allocator);
     child.cwd = project_root;
-    child.stderr_behavior = .Inherit;
+    child.stderr_behavior = if (debug) .Inherit else .Ignore;
     child.stdout_behavior = .Pipe;
 
-    child.spawn() catch return .{ .success = false, .file_count = 0 };
-
-    // Drain stdout to prevent pipe blockage
-    const stdout = child.stdout orelse {
-        _ = child.wait() catch {};
-        return .{ .success = false, .file_count = 0 };
+    child.spawn() catch |err| {
+        printFmtErr(allocator, "    " ++ red ++ "spawn error: {s}" ++ reset ++ "\n", .{@errorName(err)});
+        return fail;
     };
-    _ = stdout.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
-        _ = child.wait() catch {};
-        return .{ .success = false, .file_count = 0 };
-    };
+    const child_pid: i32 = child.id;
+    if (child_pid > 0) registerChild(child_pid);
 
-    const term = child.wait() catch return .{ .success = false, .file_count = 0 };
-    const success = term.Exited == 0;
+    // Read stdout (JSON output from agents like Claude)
+    const stdout_data = if (child.stdout) |stdout|
+        stdout.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
+    else
+        null;
+    defer if (stdout_data) |d| allocator.free(d);
+
+    const term = child.wait() catch |err| {
+        if (child_pid > 0) unregisterChild(child_pid);
+        printFmtErr(allocator, "    " ++ red ++ "wait error: {s}" ++ reset ++ "\n", .{@errorName(err)});
+        return fail;
+    };
+    if (child_pid > 0) unregisterChild(child_pid);
+
+    if (term.Exited != 0) {
+        printFmtErr(allocator, "    " ++ red ++ "exited with code {d}" ++ reset ++ "\n", .{term.Exited});
+        return fail;
+    }
+
+    // Parse token usage from stdout
+    const agent_id: ?[]const u8 = if (selected_agent) |a| a.id else null;
+    var usage = UsageStats{};
+    if (stdout_data) |data| {
+        if (data.len > 0 and agent_id != null) {
+            usage = parseUsageFromStdout(allocator, agent_id.?, data);
+        }
+    }
 
     return .{
-        .success = success,
-        .file_count = if (success) batch_files.len else 0,
+        .success = true,
+        .input_tokens = usage.input_tokens,
+        .output_tokens = usage.output_tokens,
+        .cost_microdollars = usage.cost_microdollars,
     };
 }
 
-fn replaceFileList(allocator: std.mem.Allocator, template: []const u8, file_list: []const u8) ![]u8 {
-    const placeholder = "{file_list}";
-    const idx = std.mem.indexOf(u8, template, placeholder) orelse {
-        return allocator.dupe(u8, template);
+fn runAssociationPhase(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    selected_agent: ?*const CliAgent,
+    custom_cmd: ?[]const u8,
+    relationships_text: []const u8,
+    debug: bool,
+) FileResult {
+    const fail: FileResult = .{ .success = false, .input_tokens = 0, .output_tokens = 0, .cost_microdollars = 0 };
+
+    // Build prompt from association template with SCIP-derived relationships
+    const template = build_options.bootstrap_associate_prompt;
+    const prompt = replacePlaceholder(allocator, template, "{relationships}", relationships_text) catch return fail;
+    defer allocator.free(prompt);
+
+    // Build argv
+    var argv_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv_buf.deinit(allocator);
+
+    if (selected_agent) |agent| {
+        if (agent.env_unset.len > 0) {
+            argv_buf.append(allocator, "env") catch return fail;
+            for (agent.env_unset) |var_name| {
+                argv_buf.append(allocator, "-u") catch return fail;
+                argv_buf.append(allocator, var_name) catch return fail;
+            }
+        }
+        for (agent.cmd_prefix) |token| {
+            argv_buf.append(allocator, token) catch return fail;
+        }
+        argv_buf.append(allocator, prompt) catch return fail;
+        for (agent.cmd_suffix) |token| {
+            argv_buf.append(allocator, token) catch return fail;
+        }
+    } else if (custom_cmd) |cmd| {
+        var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
+        while (cmd_iter.next()) |token| {
+            if (token.len > 0) {
+                argv_buf.append(allocator, token) catch return fail;
+            }
+        }
+        argv_buf.append(allocator, prompt) catch return fail;
+    } else {
+        return fail;
+    }
+
+    var child = std.process.Child.init(argv_buf.items, allocator);
+    child.cwd = project_root;
+    child.stderr_behavior = if (debug) .Inherit else .Ignore;
+    child.stdout_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        printFmtErr(allocator, "    " ++ red ++ "spawn error: {s}" ++ reset ++ "\n", .{@errorName(err)});
+        return fail;
     };
-    const result = try allocator.alloc(u8, template.len - placeholder.len + file_list.len);
-    @memcpy(result[0..idx], template[0..idx]);
-    @memcpy(result[idx .. idx + file_list.len], file_list);
-    @memcpy(result[idx + file_list.len ..], template[idx + placeholder.len ..]);
+    const assoc_pid: i32 = child.id;
+    if (assoc_pid > 0) registerChild(assoc_pid);
+
+    const stdout_data = if (child.stdout) |stdout|
+        stdout.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
+    else
+        null;
+    defer if (stdout_data) |d| allocator.free(d);
+
+    const term = child.wait() catch |err| {
+        if (assoc_pid > 0) unregisterChild(assoc_pid);
+        printFmtErr(allocator, "    " ++ red ++ "wait error: {s}" ++ reset ++ "\n", .{@errorName(err)});
+        return fail;
+    };
+    if (assoc_pid > 0) unregisterChild(assoc_pid);
+
+    if (term.Exited != 0) {
+        printFmtErr(allocator, "    " ++ red ++ "exited with code {d}" ++ reset ++ "\n", .{term.Exited});
+        return fail;
+    }
+
+    // Parse token usage
+    const agent_id: ?[]const u8 = if (selected_agent) |a| a.id else null;
+    var usage = UsageStats{};
+    if (stdout_data) |data| {
+        if (data.len > 0 and agent_id != null) {
+            usage = parseUsageFromStdout(allocator, agent_id.?, data);
+        }
+    }
+
+    return .{
+        .success = true,
+        .input_tokens = usage.input_tokens,
+        .output_tokens = usage.output_tokens,
+        .cost_microdollars = usage.cost_microdollars,
+    };
+}
+
+// ── SCIP-based cross-file relationship extraction ───────────────────────
+
+const CrossFileResult = struct {
+    text: []u8,
+    pair_count: usize,
+};
+
+/// Walk the SCIP index to find cross-file symbol references.
+/// Returns a human-readable text describing file pairs and their shared symbols,
+/// suitable for embedding in the association prompt. Returns null on failure.
+fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8) ?CrossFileResult {
+    const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return null;
+    defer allocator.free(index_path);
+
+    const file = std.fs.openFileAbsolute(index_path, .{}) catch return null;
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch return null;
+    var index = scip.decode(allocator, data) catch {
+        allocator.free(data);
+        return null;
+    };
+    defer {
+        scip.freeIndex(allocator, &index);
+        allocator.free(data);
+    }
+
+    // Step 1: Build symbol → defining file map
+    // Only track non-local symbols (local symbols are file-scoped)
+    var symbol_to_file: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer symbol_to_file.deinit(allocator);
+
+    for (index.documents) |doc| {
+        for (doc.occurrences) |occ| {
+            if (occ.symbol.len == 0 or std.mem.startsWith(u8, occ.symbol, "local ")) continue;
+            if (scip.SymbolRole.isDefinition(occ.symbol_roles)) {
+                symbol_to_file.put(allocator, occ.symbol, doc.relative_path) catch continue;
+            }
+        }
+    }
+
+    // Step 2: For each file, find references to symbols defined in other files.
+    // Group by (referencing_file, defining_file) pair → list of symbol names.
+    const FilePairKey = struct {
+        referencing: []const u8,
+        defining: []const u8,
+    };
+    const PairContext = struct {
+        pub fn hash(_: @This(), key: FilePairKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(key.referencing);
+            h.update("\x00");
+            h.update(key.defining);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: FilePairKey, b: FilePairKey) bool {
+            return std.mem.eql(u8, a.referencing, b.referencing) and
+                std.mem.eql(u8, a.defining, b.defining);
+        }
+    };
+
+    var pair_symbols: std.HashMapUnmanaged(
+        FilePairKey,
+        std.ArrayListUnmanaged([]const u8),
+        PairContext,
+        80,
+    ) = .empty;
+    defer {
+        var it = pair_symbols.valueIterator();
+        while (it.next()) |list| {
+            list.deinit(allocator);
+        }
+        pair_symbols.deinit(allocator);
+    }
+
+    for (index.documents) |doc| {
+        for (doc.occurrences) |occ| {
+            if (occ.symbol.len == 0 or std.mem.startsWith(u8, occ.symbol, "local ")) continue;
+            if (scip.SymbolRole.isDefinition(occ.symbol_roles)) continue;
+
+            const defining_file = symbol_to_file.get(occ.symbol) orelse continue;
+            if (std.mem.eql(u8, defining_file, doc.relative_path)) continue;
+
+            const key = FilePairKey{
+                .referencing = doc.relative_path,
+                .defining = defining_file,
+            };
+
+            const gop = pair_symbols.getOrPut(allocator, key) catch continue;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+            }
+
+            // Deduplicate symbol names within pair
+            const sym_name = scip.extractSymbolName(occ.symbol);
+            var found = false;
+            for (gop.value_ptr.items) |existing| {
+                if (std.mem.eql(u8, existing, sym_name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                gop.value_ptr.append(allocator, sym_name) catch continue;
+            }
+        }
+    }
+
+    if (pair_symbols.count() == 0) return .{ .text = allocator.dupe(u8, "") catch return null, .pair_count = 0 };
+
+    // Step 3: Build text output — collect pairs sorted for deterministic output
+    const PairEntry = struct {
+        key: FilePairKey,
+        symbols: []const []const u8,
+    };
+    var entries: std.ArrayListUnmanaged(PairEntry) = .empty;
+    defer entries.deinit(allocator);
+
+    var pair_iter = pair_symbols.iterator();
+    while (pair_iter.next()) |entry| {
+        entries.append(allocator, .{
+            .key = entry.key_ptr.*,
+            .symbols = entry.value_ptr.items,
+        }) catch continue;
+    }
+
+    // Sort by referencing file, then defining file
+    std.mem.sort(PairEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: PairEntry, b: PairEntry) bool {
+            const ref_cmp = std.mem.order(u8, a.key.referencing, b.key.referencing);
+            if (ref_cmp == .lt) return true;
+            if (ref_cmp == .gt) return false;
+            return std.mem.order(u8, a.key.defining, b.key.defining) == .lt;
+        }
+    }.lessThan);
+
+    // Build text
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    for (entries.items) |entry| {
+        // Header: file pair
+        buf.appendSlice(allocator, "## ") catch continue;
+        buf.appendSlice(allocator, entry.key.referencing) catch continue;
+        buf.appendSlice(allocator, " → ") catch continue;
+        buf.appendSlice(allocator, entry.key.defining) catch continue;
+        buf.appendSlice(allocator, "\n") catch continue;
+
+        // List shared symbols
+        for (entry.symbols) |sym_name| {
+            buf.appendSlice(allocator, "- ") catch continue;
+            buf.appendSlice(allocator, sym_name) catch continue;
+            buf.appendSlice(allocator, "\n") catch continue;
+        }
+        buf.appendSlice(allocator, "\n") catch continue;
+    }
+
+    const pair_count = entries.items.len;
+    return .{ .text = buf.toOwnedSlice(allocator) catch return null, .pair_count = pair_count };
+}
+
+fn formatCost(allocator: std.mem.Allocator, microdollars: usize) []const u8 {
+    const dollars = microdollars / 1_000_000;
+    const cents = (microdollars % 1_000_000) / 10_000;
+    const frac = (microdollars % 10_000) / 100;
+    return std.fmt.allocPrint(allocator, "{d}.{d:0>2}{d:0>2}", .{ dollars, cents, frac }) catch "?.??";
+}
+
+// ── Usage parsing per agent ─────────────────────────────────────────────
+
+const UsageStats = struct {
+    input_tokens: usize = 0,
+    output_tokens: usize = 0,
+    cost_microdollars: usize = 0,
+};
+
+fn parseUsageFromStdout(allocator: std.mem.Allocator, agent_id: []const u8, data: []const u8) UsageStats {
+    if (std.mem.eql(u8, agent_id, "claude_code")) return parseClaudeUsage(allocator, data);
+    if (std.mem.eql(u8, agent_id, "gemini")) return parseGeminiUsage(allocator, data);
+    if (std.mem.eql(u8, agent_id, "codex")) return parseCodexUsage(allocator, data);
+    if (std.mem.eql(u8, agent_id, "amp")) return parseAmpUsage(allocator, data);
+    if (std.mem.eql(u8, agent_id, "goose")) return parseGooseUsage(allocator, data);
+    if (std.mem.eql(u8, agent_id, "opencode")) return parseOpenCodeUsage(allocator, data);
+    return .{};
+}
+
+fn jsonInt(val: std.json.Value) usize {
+    return switch (val) {
+        .integer => @intCast(@max(0, val.integer)),
+        .float => @intFromFloat(@max(0.0, val.float)),
+        else => 0,
+    };
+}
+
+fn jsonFloat(val: std.json.Value) f64 {
+    return switch (val) {
+        .float => val.float,
+        .integer => @floatFromInt(val.integer),
+        else => 0.0,
+    };
+}
+
+/// Claude Code: single JSON object with usage.input_tokens, usage.output_tokens,
+/// usage.cache_creation_input_tokens, usage.cache_read_input_tokens, total_cost_usd
+fn parseClaudeUsage(allocator: std.mem.Allocator, data: []const u8) UsageStats {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    var stats = UsageStats{};
+
+    if (parsed.value.object.get("usage")) |usage| {
+        if (usage == .object) {
+            stats.input_tokens = jsonInt(usage.object.get("input_tokens") orelse .null);
+            stats.output_tokens = jsonInt(usage.object.get("output_tokens") orelse .null);
+            stats.input_tokens += jsonInt(usage.object.get("cache_creation_input_tokens") orelse .null);
+            stats.input_tokens += jsonInt(usage.object.get("cache_read_input_tokens") orelse .null);
+        }
+    }
+    if (parsed.value.object.get("total_cost_usd")) |v| {
+        stats.cost_microdollars = @intFromFloat(jsonFloat(v) * 1_000_000.0);
+    }
+    return stats;
+}
+
+/// Gemini CLI: single JSON with stats.models.<model>.tokens.prompt/candidates/cached
+fn parseGeminiUsage(allocator: std.mem.Allocator, data: []const u8) UsageStats {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    var stats = UsageStats{};
+
+    const stats_obj = parsed.value.object.get("stats") orelse return stats;
+    if (stats_obj != .object) return stats;
+    const models = stats_obj.object.get("models") orelse return stats;
+    if (models != .object) return stats;
+
+    // Sum across all models
+    var model_iter = models.object.iterator();
+    while (model_iter.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const tokens = entry.value_ptr.object.get("tokens") orelse continue;
+        if (tokens != .object) continue;
+        stats.input_tokens += jsonInt(tokens.object.get("prompt") orelse .null);
+        stats.output_tokens += jsonInt(tokens.object.get("candidates") orelse .null);
+    }
+    return stats;
+}
+
+/// Codex CLI: JSONL stream, sum turn.completed events' usage.input_tokens/output_tokens
+fn parseCodexUsage(allocator: std.mem.Allocator, data: []const u8) UsageStats {
+    var stats = UsageStats{};
+    var line_iter = std.mem.splitScalar(u8, data, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        const type_val = parsed.value.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (!std.mem.eql(u8, type_val.string, "turn.completed")) continue;
+
+        const usage = parsed.value.object.get("usage") orelse continue;
+        if (usage != .object) continue;
+        stats.input_tokens += jsonInt(usage.object.get("input_tokens") orelse .null);
+        stats.output_tokens += jsonInt(usage.object.get("output_tokens") orelse .null);
+    }
+    return stats;
+}
+
+/// Amp: JSONL stream, sum assistant messages' usage.input_tokens/output_tokens/cache_*
+fn parseAmpUsage(allocator: std.mem.Allocator, data: []const u8) UsageStats {
+    var stats = UsageStats{};
+    var line_iter = std.mem.splitScalar(u8, data, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        const type_val = parsed.value.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (!std.mem.eql(u8, type_val.string, "assistant")) continue;
+
+        const message = parsed.value.object.get("message") orelse continue;
+        if (message != .object) continue;
+        const usage = message.object.get("usage") orelse continue;
+        if (usage != .object) continue;
+
+        stats.input_tokens += jsonInt(usage.object.get("input_tokens") orelse .null);
+        stats.input_tokens += jsonInt(usage.object.get("cache_creation_input_tokens") orelse .null);
+        stats.input_tokens += jsonInt(usage.object.get("cache_read_input_tokens") orelse .null);
+        stats.output_tokens += jsonInt(usage.object.get("output_tokens") orelse .null);
+    }
+    return stats;
+}
+
+/// Goose: single JSON with metadata.total_tokens (no in/out breakdown)
+fn parseGooseUsage(allocator: std.mem.Allocator, data: []const u8) UsageStats {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    var stats = UsageStats{};
+    const metadata = parsed.value.object.get("metadata") orelse return stats;
+    if (metadata != .object) return stats;
+    // Goose only gives total_tokens — report as input since there's no breakdown
+    stats.input_tokens = jsonInt(metadata.object.get("total_tokens") orelse .null);
+    return stats;
+}
+
+/// OpenCode: JSONL stream, sum step_finish events' part.tokens.input/output/cache.*
+/// and part.cost
+fn parseOpenCodeUsage(allocator: std.mem.Allocator, data: []const u8) UsageStats {
+    var stats = UsageStats{};
+    var line_iter = std.mem.splitScalar(u8, data, '\n');
+    while (line_iter.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        const type_val = parsed.value.object.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (!std.mem.eql(u8, type_val.string, "step_finish")) continue;
+
+        const part = parsed.value.object.get("part") orelse continue;
+        if (part != .object) continue;
+
+        // part.cost
+        if (part.object.get("cost")) |cost_val| {
+            stats.cost_microdollars += @intFromFloat(jsonFloat(cost_val) * 1_000_000.0);
+        }
+
+        const tokens = part.object.get("tokens") orelse continue;
+        if (tokens != .object) continue;
+        stats.input_tokens += jsonInt(tokens.object.get("input") orelse .null);
+        stats.output_tokens += jsonInt(tokens.object.get("output") orelse .null);
+
+        // cache.read + cache.write count as input
+        if (tokens.object.get("cache")) |cache| {
+            if (cache == .object) {
+                stats.input_tokens += jsonInt(cache.object.get("read") orelse .null);
+                stats.input_tokens += jsonInt(cache.object.get("write") orelse .null);
+            }
+        }
+    }
+    return stats;
+}
+
+fn replacePlaceholder(allocator: std.mem.Allocator, template: []const u8, placeholder: []const u8, value: []const u8) ![]u8 {
+    // Count occurrences
+    var count: usize = 0;
+    var search_from: usize = 0;
+    while (search_from < template.len) {
+        const idx = std.mem.indexOfPos(u8, template, search_from, placeholder) orelse break;
+        count += 1;
+        search_from = idx + placeholder.len;
+    }
+
+    if (count == 0) {
+        return allocator.dupe(u8, template);
+    }
+
+    // Allocate result: original length - (placeholder * count) + (value * count)
+    const result_len = template.len - (placeholder.len * count) + (value.len * count);
+    const result = try allocator.alloc(u8, result_len);
+
+    var src_pos: usize = 0;
+    var dst_pos: usize = 0;
+    while (src_pos < template.len) {
+        const idx = std.mem.indexOfPos(u8, template, src_pos, placeholder) orelse {
+            // Copy remaining
+            @memcpy(result[dst_pos..], template[src_pos..]);
+            break;
+        };
+        // Copy before placeholder
+        const before_len = idx - src_pos;
+        @memcpy(result[dst_pos .. dst_pos + before_len], template[src_pos..idx]);
+        dst_pos += before_len;
+        // Copy value
+        @memcpy(result[dst_pos .. dst_pos + value.len], value);
+        dst_pos += value.len;
+        src_pos = idx + placeholder.len;
+    }
+
     return result;
 }
 
@@ -675,7 +1318,6 @@ fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, pro
 
     for (keys.items, 0..) |key, i| {
         buf.appendSlice(allocator, "    \"") catch return;
-        // Escape the key for JSON
         for (key) |c| {
             switch (c) {
                 '"' => buf.appendSlice(allocator, "\\\"") catch return,
@@ -693,23 +1335,29 @@ fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, pro
 
     buf.appendSlice(allocator, "  ]\n}\n") catch return;
 
-    // Write atomically
     const file = std.fs.createFileAbsolute(checkpoint_path, .{}) catch return;
     defer file.close();
     file.writeAll(buf.items) catch {};
 }
 
 // Tests
-test "replaceFileList basic" {
+test "replacePlaceholder basic" {
     const allocator = std.testing.allocator;
-    const result = try replaceFileList(allocator, "prefix {file_list} suffix", "a.zig\nb.zig\n");
+    const result = try replacePlaceholder(allocator, "process {file_path} now", "{file_path}", "src/main.zig");
     defer allocator.free(result);
-    try std.testing.expectEqualStrings("prefix a.zig\nb.zig\n suffix", result);
+    try std.testing.expectEqualStrings("process src/main.zig now", result);
 }
 
-test "replaceFileList no placeholder" {
+test "replacePlaceholder multiple occurrences" {
     const allocator = std.testing.allocator;
-    const result = try replaceFileList(allocator, "no placeholder here", "files");
+    const result = try replacePlaceholder(allocator, "{file_path} and {file_path} again", "{file_path}", "a.zig");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("a.zig and a.zig again", result);
+}
+
+test "replacePlaceholder no match" {
+    const allocator = std.testing.allocator;
+    const result = try replacePlaceholder(allocator, "no placeholder here", "{file_path}", "src/main.zig");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("no placeholder here", result);
 }
@@ -749,4 +1397,72 @@ test "cli_agents have non-empty prefix" {
         try std.testing.expect(agent.display_name.len > 0);
         try std.testing.expect(agent.id.len > 0);
     }
+}
+
+test "parseClaudeUsage" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"type":"result","usage":{"input_tokens":3,"cache_creation_input_tokens":34419,"cache_read_input_tokens":0,"output_tokens":35},"total_cost_usd":0.216}
+    ;
+    const stats = parseClaudeUsage(allocator, data);
+    try std.testing.expectEqual(@as(usize, 34422), stats.input_tokens);
+    try std.testing.expectEqual(@as(usize, 35), stats.output_tokens);
+    try std.testing.expect(stats.cost_microdollars > 0);
+}
+
+test "parseGeminiUsage" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"response":"hi","stats":{"models":{"gemini-2.5-pro":{"tokens":{"prompt":3676,"candidates":20,"cached":100}}}}}
+    ;
+    const stats = parseGeminiUsage(allocator, data);
+    try std.testing.expectEqual(@as(usize, 3676), stats.input_tokens);
+    try std.testing.expectEqual(@as(usize, 20), stats.output_tokens);
+}
+
+test "parseCodexUsage" {
+    const allocator = std.testing.allocator;
+    const data = "{\"type\":\"turn.started\"}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":50}}\n";
+    const stats = parseCodexUsage(allocator, data);
+    try std.testing.expectEqual(@as(usize, 1000), stats.input_tokens);
+    try std.testing.expectEqual(@as(usize, 50), stats.output_tokens);
+}
+
+test "parseAmpUsage" {
+    const allocator = std.testing.allocator;
+    const data = "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":500,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":200,\"output_tokens\":30}}}\n";
+    const stats = parseAmpUsage(allocator, data);
+    try std.testing.expectEqual(@as(usize, 800), stats.input_tokens);
+    try std.testing.expectEqual(@as(usize, 30), stats.output_tokens);
+}
+
+test "parseGooseUsage" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"messages":[],"metadata":{"total_tokens":1379,"status":"completed"}}
+    ;
+    const stats = parseGooseUsage(allocator, data);
+    try std.testing.expectEqual(@as(usize, 1379), stats.input_tokens);
+    try std.testing.expectEqual(@as(usize, 0), stats.output_tokens);
+}
+
+test "parseOpenCodeUsage" {
+    const allocator = std.testing.allocator;
+    const data = "{\"type\":\"step_finish\",\"part\":{\"cost\":0.003,\"tokens\":{\"input\":22144,\"output\":156,\"cache\":{\"read\":100,\"write\":50}}}}\n";
+    const stats = parseOpenCodeUsage(allocator, data);
+    try std.testing.expectEqual(@as(usize, 22294), stats.input_tokens);
+    try std.testing.expectEqual(@as(usize, 156), stats.output_tokens);
+    try std.testing.expect(stats.cost_microdollars > 0);
+}
+
+test "parseUsageFromStdout unknown agent" {
+    const allocator = std.testing.allocator;
+    const stats = parseUsageFromStdout(allocator, "unknown", "{}");
+    try std.testing.expectEqual(@as(usize, 0), stats.input_tokens);
+}
+
+test "parseUsageFromStdout empty data" {
+    const allocator = std.testing.allocator;
+    const stats = parseUsageFromStdout(allocator, "claude_code", "");
+    try std.testing.expectEqual(@as(usize, 0), stats.input_tokens);
 }
