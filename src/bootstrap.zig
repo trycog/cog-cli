@@ -470,17 +470,6 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         else => null,
     };
 
-    // Show brain URL if available
-    if (config_mod.findCogFile(allocator)) |cog_content| {
-        defer allocator.free(cog_content);
-        if (config_mod.resolveBrainUrl(allocator, cog_content)) |brain_url| {
-            defer allocator.free(brain_url);
-            printErr("\n  You can watch the brain build in real-time at:\n  " ++ cyan);
-            printErr(brain_url);
-            printErr(reset ++ "\n");
-        } else |_| {}
-    } else |_| {}
-
     // Warn about cost and get confirmation
     printErr("\n");
     printErr("  " ++ bold ++ "Note:" ++ reset ++ " Bootstrap invokes your agent once per source file.\n");
@@ -588,8 +577,17 @@ fn runBootstrap(
     const already_done = processed.count();
     const use_tui = !debug and tui.isStderrTty();
 
+    // Resolve brain URL for display
+    const brain_url_subtitle: ?[]const u8 = blk: {
+        const cog_content = config_mod.findCogFile(allocator) catch break :blk null;
+        defer allocator.free(cog_content);
+        const url = config_mod.resolveBrainUrl(allocator, cog_content) catch break :blk null;
+        break :blk url;
+    };
+    defer if (brain_url_subtitle) |u| allocator.free(u);
+
     if (use_tui) {
-        tui.bootstrapStart("Bootstrapping", total_files);
+        tui.bootstrapStart("Bootstrapping", total_files, brain_url_subtitle);
         if (already_done > 0) {
             tui.bootstrapUpdate(already_done, total_files, 0, 0, 0, 0, 0);
         }

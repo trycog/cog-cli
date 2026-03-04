@@ -361,10 +361,16 @@ fn formatCostBuf(buf: []u8, microdollars: usize) []const u8 {
 
 /// Print the initial bootstrap progress block (7 lines):
 ///   <title>\n \n bar 0%\n Files 0/total\n Tokens 0/0\n Cost $0\n \n
-pub fn bootstrapStart(title: []const u8, total_files: usize) void {
+pub fn bootstrapStart(title: []const u8, total_files: usize, subtitle: ?[]const u8) void {
     stderrWrite("  " ++ cyan ++ bold);
     stderrWrite(title);
-    stderrWrite(reset ++ "\n\n");
+    stderrWrite(reset ++ "\n");
+    if (subtitle) |sub| {
+        stderrWrite("  ");
+        stderrWrite(sub);
+        stderrWrite("\n");
+    }
+    stderrWrite("\n");
     var bar_buf: [512]u8 = undefined;
     stderrWrite("    ");
     stderrWrite(renderBar(&bar_buf, 0, total_files));
