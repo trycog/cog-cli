@@ -470,6 +470,17 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         else => null,
     };
 
+    // Show brain URL if available
+    if (config_mod.findCogFile(allocator)) |cog_content| {
+        defer allocator.free(cog_content);
+        if (config_mod.resolveBrainUrl(allocator, cog_content)) |brain_url| {
+            defer allocator.free(brain_url);
+            printErr("\n  You can watch the brain build in real-time at:\n  " ++ cyan);
+            printErr(brain_url);
+            printErr(reset ++ "\n");
+        } else |_| {}
+    } else |_| {}
+
     // Warn about cost and get confirmation
     printErr("\n");
     printErr("  " ++ bold ++ "Note:" ++ reset ++ " Bootstrap invokes your agent once per source file.\n");
