@@ -1651,6 +1651,9 @@ fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.Ar
     return files;
 }
 
+/// Extract only document paths from the SCIP index without fully decoding it.
+/// This avoids allocating occurrences, symbols, and relationships — just scans
+/// the protobuf for document relative_path fields (field 2 → sub-field 1).
 fn loadScipFiles(
     allocator: std.mem.Allocator,
     cog_dir: []const u8,
@@ -1664,25 +1667,41 @@ fn loadScipFiles(
     defer file.close();
 
     const data = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch return;
-    var index = scip.decode(allocator, data) catch {
-        allocator.free(data);
-        return;
-    };
-    defer {
-        scip.freeIndex(allocator, &index);
-        allocator.free(data);
-    }
+    defer allocator.free(data);
 
-    for (index.documents) |doc| {
-        if (doc.relative_path.len > 0 and !seen.contains(doc.relative_path)) {
-            const duped = allocator.dupe(u8, doc.relative_path) catch continue;
-            files.append(allocator, duped) catch {
-                allocator.free(duped);
-                continue;
-            };
-            seen.put(allocator, duped, {}) catch {};
+    // Scan top-level Index message for field 2 (documents)
+    var dec = protobuf.Decoder.init(data);
+    while (dec.hasMore()) {
+        const field = dec.readField() catch return;
+        if (field.number == 2) {
+            // Document — scan for field 1 (relative_path) without decoding the rest
+            const doc_data = dec.readLengthDelimited() catch return;
+            const path = extractDocumentPath(doc_data) orelse continue;
+            if (path.len > 0 and !seen.contains(path)) {
+                const duped = allocator.dupe(u8, path) catch continue;
+                files.append(allocator, duped) catch {
+                    allocator.free(duped);
+                    continue;
+                };
+                seen.put(allocator, duped, {}) catch {};
+            }
+        } else {
+            dec.skipField(field.wire_type) catch return;
         }
     }
+}
+
+/// Extract just the relative_path (field 1) from a SCIP Document message.
+fn extractDocumentPath(data: []const u8) ?[]const u8 {
+    var dec = protobuf.Decoder.init(data);
+    while (dec.hasMore()) {
+        const field = dec.readField() catch return null;
+        if (field.number == 1 and field.wire_type == .LEN) {
+            return dec.readString() catch null;
+        }
+        dec.skipField(field.wire_type) catch return null;
+    }
+    return null;
 }
 
 /// Collect files matching settings.json code.index patterns that aren't already in the file list.
