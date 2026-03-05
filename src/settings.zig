@@ -16,6 +16,7 @@ pub const DebugConfig = struct {
 
 pub const MemoryConfig = struct {
     brain: ?BrainConfig = null,
+    model: ?[]const u8 = null,
 };
 
 pub const CodeConfig = struct {
@@ -133,6 +134,11 @@ fn parseMemoryConfig(allocator: std.mem.Allocator, value: std.json.Value) !Memor
     if (obj.get("brain")) |v| {
         result.brain = try parseBrainConfig(allocator, v);
     }
+    if (obj.get("model")) |v| {
+        if (v == .string) {
+            result.model = try allocator.dupe(u8, v.string);
+        }
+    }
     return result;
 }
 
@@ -214,6 +220,7 @@ fn freeBrainConfig(allocator: std.mem.Allocator, config: *const BrainConfig) voi
 
 fn freeMemoryConfig(allocator: std.mem.Allocator, config: *const MemoryConfig) void {
     if (config.brain) |b| freeBrainConfig(allocator, &b);
+    if (config.model) |m| allocator.free(m);
 }
 
 fn freeCodeConfig(allocator: std.mem.Allocator, config: *const CodeConfig) void {

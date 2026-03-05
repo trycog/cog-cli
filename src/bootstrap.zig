@@ -485,7 +485,12 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         return;
     }
 
-    try runBootstrap(allocator, concurrency, clean, debug, timeout_ms, cog_dir, selected_agent, custom_cmd);
+    // Load model from settings.json memory.model
+    const settings = settings_mod.Settings.load(allocator);
+    defer if (settings) |s| s.deinit(allocator);
+    const model: ?[]const u8 = if (settings) |s| if (s.memory) |m| m.model else null else null;
+
+    try runBootstrap(allocator, concurrency, clean, debug, timeout_ms, cog_dir, selected_agent, custom_cmd, model);
 }
 
 fn runBootstrap(
@@ -497,6 +502,7 @@ fn runBootstrap(
     cog_dir: []const u8,
     selected_agent: ?*const CliAgent,
     custom_cmd: ?[]const u8,
+    model: ?[]const u8,
 ) !void {
     // Ctrl+C handling: watchdog thread monitors stdin directly,
     // SIGINT handler is a fallback for programmatic signals.
@@ -626,7 +632,7 @@ fn runBootstrap(
                 });
             }
 
-            const result = runFile(allocator, file_path, project_root, selected_agent, custom_cmd, debug, timeout_ms);
+            const result = runFile(allocator, file_path, project_root, selected_agent, custom_cmd, debug, timeout_ms, model);
             if (result.success) {
                 files_done += 1;
                 total_input_tokens += result.input_tokens;
@@ -681,6 +687,7 @@ fn runBootstrap(
             .project_root = project_root,
             .selected_agent = selected_agent,
             .custom_cmd = custom_cmd,
+            .model = model,
             .allocator = allocator,
             .checkpoint_path = checkpoint_path,
             .processed = &processed,
@@ -750,7 +757,7 @@ fn runBootstrap(
                     printFmtErr(allocator, "    Found {d} cross-file dependency pairs\n", .{cf.pair_count});
                 }
 
-                const assoc_result = runAssociationPhase(allocator, project_root, selected_agent, custom_cmd, cf.text, debug, timeout_ms);
+                const assoc_result = runAssociationPhase(allocator, project_root, selected_agent, custom_cmd, cf.text, debug, timeout_ms, model);
 
                 const phase2_extra = ticker_ctx.prev_lines;
                 stopTicker(&ticker_thread, &ticker_ctx);
@@ -796,6 +803,7 @@ const WorkerShared = struct {
     project_root: []const u8,
     selected_agent: ?*const CliAgent,
     custom_cmd: ?[]const u8,
+    model: ?[]const u8,
     allocator: std.mem.Allocator,
     checkpoint_path: []const u8,
     processed: *std.StringHashMapUnmanaged(void),
@@ -828,7 +836,7 @@ fn workerThread(shared: *WorkerShared) void {
             });
         }
 
-        const result = runFile(shared.allocator, file_path, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug, shared.timeout_ms);
+        const result = runFile(shared.allocator, file_path, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug, shared.timeout_ms, shared.model);
         if (result.success) {
             const done = shared.done_count.fetchAdd(1, .monotonic) + 1;
             _ = shared.atomic_input_tokens.fetchAdd(result.input_tokens, .monotonic);
@@ -1004,6 +1012,7 @@ fn runFile(
     custom_cmd: ?[]const u8,
     debug: bool,
     timeout_ms: u64,
+    model: ?[]const u8,
 ) FileResult {
     const fail: FileResult = .{ .success = false, .input_tokens = 0, .output_tokens = 0, .cost_microdollars = 0 };
 
@@ -1031,6 +1040,10 @@ fn runFile(
         argv_buf.append(allocator, prompt) catch return fail;
         for (agent.cmd_suffix) |token| {
             argv_buf.append(allocator, token) catch return fail;
+        }
+        if (model) |m| {
+            argv_buf.append(allocator, "--model") catch return fail;
+            argv_buf.append(allocator, m) catch return fail;
         }
     } else if (custom_cmd) |cmd| {
         var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
@@ -1127,6 +1140,7 @@ fn runAssociationPhase(
     relationships_text: []const u8,
     debug: bool,
     timeout_ms: u64,
+    model: ?[]const u8,
 ) FileResult {
     const fail: FileResult = .{ .success = false, .input_tokens = 0, .output_tokens = 0, .cost_microdollars = 0 };
 
@@ -1153,6 +1167,10 @@ fn runAssociationPhase(
         argv_buf.append(allocator, prompt) catch return fail;
         for (agent.cmd_suffix) |token| {
             argv_buf.append(allocator, token) catch return fail;
+        }
+        if (model) |m| {
+            argv_buf.append(allocator, "--model") catch return fail;
+            argv_buf.append(allocator, m) catch return fail;
         }
     } else if (custom_cmd) |cmd| {
         var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
