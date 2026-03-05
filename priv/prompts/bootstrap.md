@@ -56,22 +56,26 @@ Extract concepts across MULTIPLE DIMENSIONS, not just what code does:
 - **security** — Authentication, authorization, trust boundaries, access control
 - **constraint** — Invariants, ordering requirements, guarantees, assumptions, validation rules
 
-## Documentation vs Code
+## Documentation and Markdown Files
 
-For documentation files (README, CHANGELOG, LICENSE), focus on DESIGN KNOWLEDGE:
+For documentation files (.md, README, CHANGELOG, LICENSE, etc.), focus on DESIGN KNOWLEDGE:
 
 **Prioritize:**
 - Architectural principles and WHY components are structured this way
 - Design constraints and invariants
-- Tradeoffs and alternatives
+- Tradeoffs and alternatives considered
 - Boundaries between components and WHY those boundaries exist
+- Domain concepts, terminology, and glossary definitions
 - Security model and trust boundaries
+- Data models, schemas, and entity relationships
+- Workflow descriptions and state machines
 
 **De-prioritize:**
 - Setup/installation/deployment instructions
 - Command-line invocations and flag lists
 - Version-specific configuration values
 - Tutorial walkthroughs
+- Boilerplate legal text
 
 ## Quality Guidelines
 

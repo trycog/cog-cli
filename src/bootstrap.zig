@@ -8,6 +8,8 @@ const tui = @import("tui.zig");
 const help_text = @import("help_text.zig");
 const config_mod = @import("config.zig");
 const client = @import("client.zig");
+const settings_mod = @import("settings.zig");
+const code_intel = @import("code_intel.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -1630,7 +1632,7 @@ fn replacePlaceholder(allocator: std.mem.Allocator, template: []const u8, placeh
     return result;
 }
 
-/// Collect files from SCIP index + doc globs.
+/// Collect files from SCIP index + settings.json patterns.
 fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.ArrayListUnmanaged([]const u8) {
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -1639,8 +1641,9 @@ fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.Ar
     // 1. Load SCIP index
     loadScipFiles(allocator, cog_dir, &files, &seen);
 
-    // 2. Walk for documentation files
-    try walkForDocs(allocator, ".", &files, &seen);
+    // 2. Collect additional files from settings.json code.index patterns
+    //    (e.g. "**/*.md" for markdown files that aren't in the SCIP index)
+    loadSettingsPatternFiles(allocator, &files, &seen);
 
     // 3. Sort alphabetically
     sortFiles(files.items);
@@ -1682,53 +1685,36 @@ fn loadScipFiles(
     }
 }
 
-/// Recursively collect README*, CHANGELOG*, LICENSE* files.
-fn walkForDocs(
+/// Collect files matching settings.json code.index patterns that aren't already in the file list.
+fn loadSettingsPatternFiles(
     allocator: std.mem.Allocator,
-    dir_path: []const u8,
     files: *std.ArrayListUnmanaged([]const u8),
     seen: *std.StringHashMapUnmanaged(void),
-) !void {
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+) void {
+    const settings = settings_mod.Settings.load(allocator) orelse return;
+    defer settings.deinit(allocator);
 
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        if (entry.name[0] == '.') continue;
-        if (std.mem.eql(u8, entry.name, "node_modules")) continue;
-        if (std.mem.eql(u8, entry.name, "vendor")) continue;
-        if (std.mem.eql(u8, entry.name, "target")) continue;
-        if (std.mem.eql(u8, entry.name, "zig-out")) continue;
-        if (std.mem.eql(u8, entry.name, "zig-cache")) continue;
-        if (std.mem.eql(u8, entry.name, "grammars")) continue;
-        if (std.mem.eql(u8, entry.name, "bench")) continue;
+    const code = settings.code orelse return;
+    const patterns = code.index orelse return;
 
-        const child_path = if (std.mem.eql(u8, dir_path, "."))
-            try allocator.dupe(u8, entry.name)
-        else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+    for (patterns) |pattern| {
+        var pattern_files: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer pattern_files.deinit(allocator);
 
-        if (entry.kind == .directory) {
-            try walkForDocs(allocator, child_path, files, seen);
-            allocator.free(child_path);
-        } else if (entry.kind == .file) {
-            if (isDocFile(entry.name) and !seen.contains(child_path)) {
-                try files.append(allocator, child_path);
-                try seen.put(allocator, child_path, {});
+        code_intel.collectGlobFiles(allocator, pattern, &pattern_files) catch continue;
+
+        for (pattern_files.items) |path| {
+            if (!seen.contains(path)) {
+                files.append(allocator, path) catch {
+                    allocator.free(path);
+                    continue;
+                };
+                seen.put(allocator, path, {}) catch {};
             } else {
-                allocator.free(child_path);
+                allocator.free(path);
             }
-        } else {
-            allocator.free(child_path);
         }
     }
-}
-
-fn isDocFile(name: []const u8) bool {
-    if (std.mem.startsWith(u8, name, "README")) return true;
-    if (std.mem.startsWith(u8, name, "CHANGELOG")) return true;
-    if (std.mem.startsWith(u8, name, "LICENSE")) return true;
-    return false;
 }
 
 fn sortFiles(items: [][]const u8) void {
@@ -1830,16 +1816,6 @@ test "replacePlaceholder no match" {
     const result = try replacePlaceholder(allocator, "no placeholder here", "{file_path}", "src/main.zig");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("no placeholder here", result);
-}
-
-test "isDocFile" {
-    try std.testing.expect(isDocFile("README.md"));
-    try std.testing.expect(isDocFile("CHANGELOG.md"));
-    try std.testing.expect(isDocFile("LICENSE"));
-    try std.testing.expect(isDocFile("README"));
-    try std.testing.expect(!isDocFile("docs.md"));
-    try std.testing.expect(!isDocFile("main.zig"));
-    try std.testing.expect(!isDocFile("config.json"));
 }
 
 test "sortFiles" {

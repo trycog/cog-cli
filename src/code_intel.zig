@@ -1291,7 +1291,7 @@ fn fileMatchesSuffix(indexed_path: []const u8, filter: []const u8) bool {
 /// Collect files matching a glob pattern.
 /// Extracts the literal prefix directory, walks it recursively, and filters
 /// each file path against the full glob pattern using `globMatch`.
-fn collectGlobFiles(allocator: std.mem.Allocator, pattern: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
+pub fn collectGlobFiles(allocator: std.mem.Allocator, pattern: []const u8, out: *std.ArrayListUnmanaged([]const u8)) !void {
     const prefix = globPrefix(pattern);
 
     // Check if the pattern is a literal file path (no wildcards at all)
