@@ -43,7 +43,9 @@ pub fn mcpCall(
         headers_buf[3] = session_header;
     }
 
+    debug_log.log("mcpCall: {s} session={s}", .{ endpoint, if (session_id) |s| s else "none" });
     const result = curl.postCapturingHeaders(allocator, endpoint, headers_buf[0..header_count], body) catch {
+        debug_log.log("mcpCall: connection failed to {s}", .{endpoint});
         printErr("error: failed to connect to MCP endpoint\n");
         return error.Explained;
     };
@@ -68,6 +70,7 @@ pub fn mcpCall(
     allocator.free(result.headers);
     errdefer if (new_session_id) |sid| allocator.free(sid);
 
+    debug_log.log("mcpCall: {s} -> status {d}", .{ endpoint, result.status_code });
     if (result.status_code != 200) {
         if (new_session_id) |sid| allocator.free(sid);
         // Try to extract MCP error message
@@ -111,11 +114,13 @@ pub fn post(
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
+    debug_log.log("post: {s} ({d} bytes)", .{ url, body.len });
     const result = curl.post(allocator, url, &.{
         auth_header,
         "Content-Type: application/json",
         "Accept: application/json",
     }, body) catch {
+        debug_log.log("post: connection failed to {s}", .{url});
         printErr("error: failed to connect to ");
         printErr(url);
         printErr("\n");
@@ -123,6 +128,7 @@ pub fn post(
     };
 
     defer allocator.free(result.body);
+    debug_log.log("post: {s} -> status {d}", .{ url, result.status_code });
 
     if (result.status_code != 200 and result.status_code != 201) {
 
@@ -182,9 +188,11 @@ pub fn postRaw(
 }
 
 pub fn httpGetPublic(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+    debug_log.log("httpGetPublic: {s}", .{url});
     const result = curl.get(allocator, url, &.{}) catch return error.HttpError;
     errdefer allocator.free(result.body);
 
+    debug_log.log("httpGetPublic: {s} -> status {d}", .{ url, result.status_code });
     if (result.status_code != 200) {
         allocator.free(result.body);
         return error.HttpError;
@@ -194,6 +202,7 @@ pub fn httpGetPublic(allocator: std.mem.Allocator, url: []const u8) ![]const u8 
 }
 
 pub fn httpGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8) ![]const u8 {
+    debug_log.log("httpGet: {s}", .{url});
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -203,6 +212,7 @@ pub fn httpGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u
     }) catch return error.HttpError;
     errdefer allocator.free(result.body);
 
+    debug_log.log("httpGet: {s} -> status {d}", .{ url, result.status_code });
     if (result.status_code != 200) {
         allocator.free(result.body);
         return error.HttpError;

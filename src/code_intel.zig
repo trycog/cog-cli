@@ -22,14 +22,17 @@ const LOCK_UN: c_int = 8;
 /// Acquire an exclusive advisory lock on .cog/index.lock.
 /// Blocks until the lock is acquired. Returns the lock fd, or null on failure.
 fn acquireIndexLock(allocator: std.mem.Allocator, cog_dir: []const u8) ?posix.fd_t {
+    debug_log.log("acquireIndexLock: {s}/index.lock", .{cog_dir});
     const lock_path = std.fmt.allocPrint(allocator, "{s}/index.lock", .{cog_dir}) catch return null;
     defer allocator.free(lock_path);
     const lock_path_z = posix.toPosixPath(lock_path) catch return null;
     const fd = posix.open(&lock_path_z, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644) catch return null;
     if (flock(fd, LOCK_EX) != 0) {
+        debug_log.log("acquireIndexLock: flock failed", .{});
         posix.close(fd);
         return null;
     }
+    debug_log.log("acquireIndexLock: acquired", .{});
     return fd;
 }
 
@@ -37,6 +40,7 @@ fn acquireIndexLock(allocator: std.mem.Allocator, cog_dir: []const u8) ?posix.fd
 fn releaseIndexLock(fd: posix.fd_t) void {
     _ = flock(fd, LOCK_UN);
     posix.close(fd);
+    debug_log.log("releaseIndexLock: released", .{});
 }
 
 // ANSI styles
@@ -693,6 +697,7 @@ fn loadIndex(allocator: std.mem.Allocator) !CodeIndex {
     const index_path = try getIndexPath(allocator);
     defer allocator.free(index_path);
 
+    debug_log.log("loadIndex: opening {s}", .{index_path});
     const file = std.fs.openFileAbsolute(index_path, .{}) catch {
         printErr("error: no index found. Run " ++ dim ++ "cog code:index" ++ reset ++ " first.\n");
         return error.Explained;
@@ -703,12 +708,14 @@ fn loadIndex(allocator: std.mem.Allocator) !CodeIndex {
         printErr("error: failed to read index file\n");
         return error.Explained;
     };
+    debug_log.log("loadIndex: read {d} bytes", .{data.len});
 
     const index = scip.decode(allocator, data) catch {
         allocator.free(data);
         printErr("error: failed to decode index file (corrupt or invalid format)\n");
         return error.Explained;
     };
+    debug_log.log("loadIndex: decoded, {d} documents", .{index.documents.len});
 
     var ci = CodeIndex.build(allocator, index) catch {
         allocator.free(data);
@@ -727,6 +734,7 @@ pub fn loadIndexForRuntime(allocator: std.mem.Allocator) !CodeIndex {
 // ── Commands ────────────────────────────────────────────────────────────
 
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
+    debug_log.log("code_intel.dispatch: {s}", .{subcmd});
     if (std.mem.eql(u8, subcmd, "code:index")) return codeIndex(allocator, args);
 
     if (std.mem.eql(u8, subcmd, "code:query") or

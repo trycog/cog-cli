@@ -159,6 +159,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     }
 
+    debug_log.log("commands.init: starting", .{});
     tui.header();
 
     // Load existing settings for defaults

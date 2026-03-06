@@ -142,6 +142,7 @@ pub const Indexer = struct {
         relative_path: []const u8,
         config: extensions.TreeSitterConfig,
     ) !IndexFileResult {
+        debug_log.log("indexFile: {s} grammar={s}", .{ relative_path, config.grammar_name });
         // Detect Flow-typed JS files and use TypeScript parser instead.
         // Flow's generic syntax (<T>) is invalid JS but valid TS, so the
         // TypeScript parser handles these files correctly. We keep the JS

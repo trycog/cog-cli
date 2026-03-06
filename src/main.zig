@@ -5,6 +5,7 @@ const code_intel = @import("cog").code_intel;
 const extensions_mod = @import("cog").extensions;
 const debug_mod = @import("cog").debug;
 const debug_log = @import("cog").debug_log;
+const settings_mod = @import("cog").settings;
 const tui = @import("cog").tui;
 const help = @import("cog").help_text;
 
@@ -50,6 +51,16 @@ fn mainInner() !void {
         }
     }
 
+    // Enable debug logging from --debug flag or settings.json {"debug":{"log":true}}
+    if (!debug_flag) {
+        if (settings_mod.Settings.load(allocator)) |s| {
+            if (s.debug) |d| {
+                if (d.log) |log_enabled| {
+                    debug_flag = log_enabled;
+                }
+            }
+        }
+    }
     if (debug_flag) {
         debug_log.initFromCwd(allocator);
     }

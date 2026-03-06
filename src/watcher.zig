@@ -28,6 +28,7 @@ pub const Watcher = struct {
     pub fn init(allocator: std.mem.Allocator) ?Watcher {
         if (builtin.os.tag != .macos and builtin.os.tag != .linux) return null;
 
+        debug_log.log("Watcher.init: starting", .{});
         const cog_dir = paths.findCogDir(allocator) catch return null;
         defer allocator.free(cog_dir);
 
@@ -53,6 +54,8 @@ pub const Watcher = struct {
 
         // Set write end to non-blocking
         setNonBlock(pipe_fds[1]);
+
+        debug_log.log("Watcher.init: root={s}, {d} patterns", .{ owned_root, patterns.len });
 
         return .{
             .allocator = allocator,

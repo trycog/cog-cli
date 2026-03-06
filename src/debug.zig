@@ -48,6 +48,7 @@ fn printCommandHelp(comptime help_text: []const u8) void {
 
 /// Dispatch debug subcommands.
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
+    debug_log.log("debug.dispatch: {s}", .{subcmd});
     if (std.mem.eql(u8, subcmd, "debug:serve")) return debugServe(allocator, args);
     if (std.mem.eql(u8, subcmd, "debug:sign")) return debugSign(allocator, args);
     if (std.mem.eql(u8, subcmd, "debug:dashboard")) return debugDashboard(allocator, args);

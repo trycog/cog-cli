@@ -8,17 +8,21 @@ pub const Config = struct {
     brain_url: []const u8,
 
     pub fn load(allocator: std.mem.Allocator) !Config {
+        debug_log.log("Config.load: starting", .{});
         const api_key = getApiKey(allocator) catch |err| switch (err) {
             error.MissingApiKey => {
+                debug_log.log("Config.load: COG_API_KEY not set", .{});
                 printErr("error: COG_API_KEY not set\n");
                 return error.Explained;
             },
             else => return err,
         };
         errdefer allocator.free(api_key);
+        debug_log.log("Config.load: API key resolved", .{});
 
         const cog_content = findCogFile(allocator) catch |err| switch (err) {
             error.NoCogFile => {
+                debug_log.log("Config.load: no .cog/settings.json found", .{});
                 printErr("error: no .cog/settings.json found (searched up to home directory)\n");
                 printErr("       Run " ++ "\x1B[2m" ++ "cog init" ++ "\x1B[0m" ++ " to set up a brain.\n");
                 return error.Explained;
@@ -29,12 +33,14 @@ pub const Config = struct {
 
         const brain_url = resolveBrainUrl(allocator, cog_content) catch |err| switch (err) {
             error.InvalidCogUrl => {
+                debug_log.log("Config.load: invalid URL in settings", .{});
                 printErr("error: invalid URL in settings file\n");
                 return error.Explained;
             },
             else => return err,
         };
         errdefer allocator.free(brain_url);
+        debug_log.log("Config.load: brain_url={s}", .{brain_url});
 
         const url = extractApiUrl(allocator, brain_url) catch |err| switch (err) {
             error.InvalidCogUrl => {
@@ -43,6 +49,7 @@ pub const Config = struct {
             },
             else => return err,
         };
+        debug_log.log("Config.load: api_url={s}", .{url});
 
         return .{ .api_key = api_key, .url = url, .brain_url = brain_url };
     }
@@ -93,6 +100,7 @@ pub fn findCogFile(allocator: std.mem.Allocator) ![]const u8 {
     defer allocator.free(current);
 
     while (true) {
+        debug_log.log("findCogFile: checking {s}/.cog/settings.json", .{current});
         const settings_path = std.fmt.allocPrint(allocator, "{s}/.cog/settings.json", .{current}) catch null;
         const raw = if (settings_path) |sp| blk: {
             defer allocator.free(sp);
@@ -103,6 +111,7 @@ pub fn findCogFile(allocator: std.mem.Allocator) ![]const u8 {
             defer allocator.free(content);
             const trimmed = std.mem.trim(u8, content, &std.ascii.whitespace);
             if (trimmed.len > 0) {
+                debug_log.log("findCogFile: found at {s}", .{current});
                 return allocator.dupe(u8, trimmed);
             }
         }
@@ -116,6 +125,7 @@ pub fn findCogFile(allocator: std.mem.Allocator) ![]const u8 {
         current = new_current;
     }
 
+    debug_log.log("findCogFile: not found", .{});
     return error.NoCogFile;
 }
 

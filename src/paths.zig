@@ -11,6 +11,7 @@ pub fn findCogDir(allocator: std.mem.Allocator) ![]const u8 {
     defer allocator.free(current);
 
     while (true) {
+        debug_log.log("findCogDir: checking {s}", .{current});
         var dir = std.fs.openDirAbsolute(current, .{}) catch {
             // Can't open dir, stop walking
             break;
@@ -24,6 +25,7 @@ pub fn findCogDir(allocator: std.mem.Allocator) ![]const u8 {
             break :blk true;
         };
         if (has_cog_dir) {
+            debug_log.log("findCogDir: found at {s}/.cog", .{current});
             return std.fmt.allocPrint(allocator, "{s}/.cog", .{current});
         }
 

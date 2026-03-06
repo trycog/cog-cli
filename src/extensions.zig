@@ -905,6 +905,7 @@ fn printStdout(text: []const u8) void {
 /// 5. Verify binary exists
 /// 6. Output JSON result
 pub fn installExtension(allocator: std.mem.Allocator, git_url: []const u8) !void {
+    debug_log.log("installExtension: {s}", .{git_url});
     // Extract name from URL (last path segment, strip .git)
     var name = std.fs.path.basename(git_url);
     if (std.mem.endsWith(u8, name, ".git")) {

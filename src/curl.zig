@@ -121,8 +121,10 @@ fn fetch(
     _ = c.curl_easy_setopt(handle, c.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(&response_data)));
 
     // Perform
+    debug_log.log("fetch: {s} {s}", .{ @tagName(method), url });
     const res = c.curl_easy_perform(handle);
     if (res != c.CURLE_OK) {
+        debug_log.log("fetch: curl error for {s}", .{url});
         response_data.list.deinit(allocator);
         return error.HttpError;
     }
@@ -134,6 +136,7 @@ fn fetch(
     // Get status code
     var status_code: c_long = 0;
     _ = c.curl_easy_getinfo(handle, c.CURLINFO_RESPONSE_CODE, &status_code);
+    debug_log.log("fetch: {s} {s} -> status {d}", .{ @tagName(method), url, status_code });
 
     return .{
         .status_code = @intCast(status_code),
@@ -200,8 +203,10 @@ fn fetchCapturingHeaders(
     _ = c.curl_easy_setopt(handle, c.CURLOPT_HEADERFUNCTION, &writeCallback);
     _ = c.curl_easy_setopt(handle, c.CURLOPT_HEADERDATA, @as(*anyopaque, @ptrCast(&header_data)));
 
+    debug_log.log("fetchCapturingHeaders: POST {s} (body {d} bytes)", .{ url, body.len });
     const res = c.curl_easy_perform(handle);
     if (res != c.CURLE_OK) {
+        debug_log.log("fetchCapturingHeaders: curl error for {s}", .{url});
         response_data.list.deinit(allocator);
         header_data.list.deinit(allocator);
         return error.HttpError;
@@ -214,6 +219,7 @@ fn fetchCapturingHeaders(
 
     var status_code: c_long = 0;
     _ = c.curl_easy_getinfo(handle, c.CURLINFO_RESPONSE_CODE, &status_code);
+    debug_log.log("fetchCapturingHeaders: {s} -> status {d}, headers {d} bytes", .{ url, status_code, header_data.list.items.len });
 
     return .{
         .status_code = @intCast(status_code),
@@ -228,6 +234,7 @@ fn findCaBundlePath(allocator: std.mem.Allocator) ?[:0]u8 {
         if (std.posix.getenv(name)) |value| {
             const path: []const u8 = value;
             if (path.len != 0 and fileExists(path)) {
+                debug_log.log("CA bundle: env {s} = {s}", .{ name, path });
                 return allocator.dupeZ(u8, path) catch null;
             }
         }
@@ -243,10 +250,12 @@ fn findCaBundlePath(allocator: std.mem.Allocator) ?[:0]u8 {
 
     for (defaults) |path| {
         if (fileExists(path)) {
+            debug_log.log("CA bundle: using {s}", .{path});
             return allocator.dupeZ(u8, path) catch null;
         }
     }
 
+    debug_log.log("CA bundle: none found", .{});
     return null;
 }
 

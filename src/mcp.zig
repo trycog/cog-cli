@@ -140,6 +140,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
     }
 
+    debug_log_mod.log("mcp.serve: starting version={s} debug_tools={s}", .{ version, @tagName(debug_tool_tier) });
     debugLogInit();
     setupSignalHandler();
 
@@ -676,6 +677,7 @@ fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !v
         return;
     }
     const tool_name = name_val.string;
+    debug_log_mod.log("handleToolsCall: {s}", .{tool_name});
 
     const arguments = if (p.object.get("arguments")) |a| (if (a == .object) a else null) else null;
 
@@ -1057,6 +1059,7 @@ fn rewriteToolReferences(allocator: std.mem.Allocator, desc: []const u8) ![]cons
 }
 
 fn discoverRemoteTools(runtime: *Runtime) !void {
+    debug_log_mod.log("discoverRemoteTools: starting", .{});
     const allocator = runtime.allocator;
     const cfg = runtime.mem_config orelse return;
 
@@ -1144,9 +1147,11 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
 
     runtime.remote_tools = try tool_list.toOwnedSlice(allocator);
     debugLog("Discovered {d} remote memory tools", .{runtime.remote_tools.?.len});
+    debug_log_mod.log("discoverRemoteTools: found {d} tools", .{runtime.remote_tools.?.len});
 }
 
 fn callRemoteMcpTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    debug_log_mod.log("callRemoteMcpTool: {s}", .{tool_name});
     const allocator = runtime.allocator;
     const cfg = runtime.mem_config orelse return error.NotConfigured;
 

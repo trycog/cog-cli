@@ -13,6 +13,7 @@ pub const BrainConfig = struct {
 
 pub const DebugConfig = struct {
     timeout: ?i64 = null,
+    log: ?bool = null,
 };
 
 pub const MemoryConfig = struct {
@@ -36,8 +37,13 @@ pub const Settings = struct {
 
     /// Load merged settings: global (~/.config/cog/settings.json) with local (.cog/settings.json) overrides.
     pub fn load(allocator: std.mem.Allocator) ?Settings {
+        debug_log.log("Settings.load: starting", .{});
         const global = loadGlobal(allocator);
         const local = loadLocal(allocator);
+        debug_log.log("Settings.load: global={s} local={s}", .{
+            if (global != null) "found" else "none",
+            if (local != null) "found" else "none",
+        });
 
         if (global == null and local == null) return null;
 
@@ -241,6 +247,9 @@ fn parseDebugConfig(value: std.json.Value) ?DebugConfig {
     if (obj.get("timeout")) |v| {
         if (v == .integer) result.timeout = v.integer;
     }
+    if (obj.get("log")) |v| {
+        if (v == .bool) result.log = v.bool;
+    }
     return result;
 }
 
@@ -300,6 +309,7 @@ fn mergeDebugConfig(local: ?DebugConfig, global: ?DebugConfig) ?DebugConfig {
     const g = global orelse return local;
     return .{
         .timeout = l.timeout orelse g.timeout,
+        .log = l.log orelse g.log,
     };
 }
 

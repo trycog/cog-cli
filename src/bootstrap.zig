@@ -156,11 +156,13 @@ const ReaperHandle = struct {
 /// signal normal completion.
 fn spawnReaper(target_pid: i32) ?ReaperHandle {
     if (target_pid <= 0) return null;
+    debug_log.log("spawnReaper: target_pid={d}", .{target_pid});
 
     const pipe_fds = posix.pipe() catch return null;
     // pipe_fds[0] = read end, pipe_fds[1] = write end
 
     const pid = posix.fork() catch {
+        debug_log.log("spawnReaper: fork failed", .{});
         posix.close(pipe_fds[0]);
         posix.close(pipe_fds[1]);
         return null;
@@ -366,6 +368,7 @@ const cli_agents = [_]CliAgent{
 
 /// Dispatch mem:* subcommands.
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
+    debug_log.log("bootstrap.dispatch: {s}", .{subcmd});
     if (std.mem.eql(u8, subcmd, "mem:bootstrap")) {
         return memBootstrap(allocator, args);
     }
@@ -1114,6 +1117,8 @@ fn runFile(
     // Bail out if cancellation was requested before spawning
     if (g_cancel_requested.load(.acquire)) return fail;
 
+    debug_log.log("runFile: {s} (argv len={d})", .{ file_path, argv_buf.items.len });
+
     var child = std.process.Child.init(argv_buf.items, allocator);
     child.cwd = project_root;
     child.stdin_behavior = .Ignore; // Prevent children from consuming Ctrl+C bytes on stdin
@@ -1122,10 +1127,12 @@ fn runFile(
     child.pgid = 0; // Make child its own process group leader for reliable group kill
 
     child.spawn() catch |err| {
+        debug_log.log("runFile: spawn error {s}", .{@errorName(err)});
         if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "spawn error: {s}" ++ reset ++ "\n", .{@errorName(err)});
         return fail;
     };
     const child_pid: i32 = child.id;
+    debug_log.log("runFile: spawned child pid={d}", .{child_pid});
     if (child_pid > 0) registerChild(child_pid);
     const reaper = spawnReaper(child_pid);
 
@@ -1169,12 +1176,14 @@ fn runFile(
 
     switch (term) {
         .Exited => |code| {
+            debug_log.log("runFile: {s} exited code={d}", .{ file_path, code });
             if (code != 0) {
                 if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "exited with code {d}" ++ reset ++ "\n", .{code});
                 return fail;
             }
         },
         .Signal => |sig| {
+            debug_log.log("runFile: {s} killed by signal {d}", .{ file_path, sig });
             if (!use_tui) {
                 if (sig == posix.SIG.KILL and tw.fired.load(.acquire)) {
                     printFmtErr(allocator, "    " ++ red ++ "timed out after {d}m" ++ reset ++ "\n", .{timeout_ms / 60_000});
