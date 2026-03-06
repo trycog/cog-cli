@@ -400,6 +400,8 @@ pub fn listInstalled(allocator: std.mem.Allocator) ![]InstalledInfo {
 
         const manifest = readManifest(allocator, manifest_path) catch continue;
         defer {
+            for (manifest.language_names) |n| allocator.free(n);
+            if (manifest.language_names.len > 0) allocator.free(manifest.language_names);
             for (manifest.args) |a| allocator.free(a);
             allocator.free(manifest.args);
             allocator.free(manifest.build_cmd);
