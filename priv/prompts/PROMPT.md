@@ -33,13 +33,23 @@ Record knowledge as you work:
 
 | Trigger | Action |
 |---------|--------|
-| Learned how something works | `cog_mem_learn` (term: 2-5 words, def: 1-3 sentences) |
-| A relates to B | `cog_mem_associate` |
+| Learned how something works | `cog_mem_learn` — see quality guide below |
+| A relates to B | `cog_mem_associate` — use strong predicates |
 | Sequence A → B → C | `cog_mem_learn` with `chain_to` |
 | Hub: A connects to B, C, D | `cog_mem_learn` with `associations` |
 | Code changed for known concept | `cog_mem_refactor` |
 | Feature deleted | `cog_mem_deprecate` |
 | Term or definition wrong | `cog_mem_update` |
+
+**Concept quality** — what you store determines what agents can recall later:
+- **term**: 2-5 words, specific and qualified. Bad: "Configuration". Good: "CLI Settings Loader".
+- **definition**: 1-3 sentences explaining WHY, not just WHAT. Include function names,
+  patterns, and technical terms — these drive keyword search during recall.
+
+**Predicate choice** matters for recall quality. Prefer strong predicates:
+`requires`, `implies`, `is_component_of`, `enables`, `contains`.
+Avoid `related_to` and `similar_to` — these weaken graph traversal signal.
+Every concept should have at least one association; orphans are nearly invisible during recall.
 
 After completing work, use the `cog-mem` sub-agent to reinforce validated memories
 and flush incorrect ones. New memories are short-term (24h decay) unless reinforced.
