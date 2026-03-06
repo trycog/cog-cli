@@ -1,6 +1,5 @@
 const std = @import("std");
 const posix = std.posix;
-const build_options = @import("build_options");
 const paths = @import("paths.zig");
 const scip = @import("scip.zig");
 const protobuf = @import("protobuf.zig");
@@ -565,14 +564,18 @@ fn runBootstrap(
         processed.deinit(allocator);
     }
 
-    // Load custom prompts from .cog/ directory, falling back to compiled-in defaults
-    const custom_bootstrap = loadCustomPrompt(allocator, cog_dir, "MEM_BOOTSTRAP.md");
-    defer if (custom_bootstrap) |p| allocator.free(p);
-    const bootstrap_prompt = custom_bootstrap orelse build_options.bootstrap_prompt;
+    // Load prompts from .cog/ directory (deployed by `cog init`)
+    const bootstrap_prompt = loadCustomPrompt(allocator, cog_dir, "MEM_BOOTSTRAP.md") orelse {
+        printErr("  " ++ bold ++ "error:" ++ reset ++ " .cog/MEM_BOOTSTRAP.md not found. Run " ++ dim ++ "cog init" ++ reset ++ " first.\n\n");
+        return;
+    };
+    defer allocator.free(bootstrap_prompt);
 
-    const custom_associate = loadCustomPrompt(allocator, cog_dir, "MEM_BOOTSTRAP_ASSOCIATE.md");
-    defer if (custom_associate) |p| allocator.free(p);
-    const associate_prompt = custom_associate orelse build_options.bootstrap_associate_prompt;
+    const associate_prompt = loadCustomPrompt(allocator, cog_dir, "MEM_BOOTSTRAP_ASSOCIATE.md") orelse {
+        printErr("  " ++ bold ++ "error:" ++ reset ++ " .cog/MEM_BOOTSTRAP_ASSOCIATE.md not found. Run " ++ dim ++ "cog init" ++ reset ++ " first.\n\n");
+        return;
+    };
+    defer allocator.free(associate_prompt);
 
     // Filter out already-processed files
     var remaining: std.ArrayListUnmanaged([]const u8) = .empty;
