@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-03-06
+
+### Added
+
+- `--debug` global CLI flag writes timestamped diagnostic logs to `.cog/cog.log`
+- `"debug": true` in settings.json enables debug logging without the CLI flag
+- Debug log calls across the codebase: HTTP requests, config resolution, index locking, MCP tool dispatch, subprocess management, file watching, and more
+
 ## [0.6.1] - 2026-03-06
 
 ### Changed
@@ -203,6 +211,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.7.0]: https://github.com/trycog/cog-cli/releases/tag/v0.7.0
 [0.6.1]: https://github.com/trycog/cog-cli/releases/tag/v0.6.1
 [0.6.0]: https://github.com/trycog/cog-cli/releases/tag/v0.6.0
 [0.5.1]: https://github.com/trycog/cog-cli/releases/tag/v0.5.1
