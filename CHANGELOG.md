@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Illegal instruction crash in `code:index` when parsing JavaScript after other grammars (missing `ts_parser_reset`)
 - O(n²) memory allocation in `code:index` for projects with 1000+ files (grow-by-1 document array replaced with ArrayList)
 - Extension manifest re-read from disk for every file during indexing (now cached by file extension)
+- Memory leak: `language_names` not freed in `listInstalled` (leaked on `cog --help` with installed extensions)
 
 ## [0.6.0] - 2026-03-06
 
