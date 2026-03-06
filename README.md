@@ -164,16 +164,30 @@ The result is an agent that gets better over time. It stops rediscovering the sa
 
 <br>
 
-Seed your brain with knowledge from an existing codebase. Requires an existing SCIP index (`cog code:index`).
+Seed your brain with knowledge from an existing codebase. Runs in two phases: first extracts concepts from each source file, then creates cross-file associations using SCIP-derived symbol relationships. Requires an existing SCIP index (`cog code:index`).
 
 ```sh
-cog mem:bootstrap              # Bootstrap with defaults
-cog mem:bootstrap --concurrency 3   # 3 parallel agent invocations
-cog mem:bootstrap --clean           # Reset checkpoint, start fresh
-cog mem:bootstrap --debug           # Show agent stderr output
+cog mem:bootstrap                        # Bootstrap with defaults
+cog mem:bootstrap --concurrency 4        # 4 parallel agent invocations
+cog mem:bootstrap --clean                # Reset checkpoint, start fresh
+cog mem:bootstrap --timeout 15           # 15 minutes per file (default: 10)
+cog mem:bootstrap --debug                # Show agent stderr output
 ```
 
-Bootstrap scans all indexed source files in batches, spawns your AI agent to read each batch, and the agent stores concepts and relationships directly into memory using `cog_mem_*` tools. Progress is checkpointed so interrupted runs can resume.
+On first run, `cog mem:bootstrap` presents an interactive agent selector — pick whichever AI coding agent CLI you have installed (Claude Code, Gemini CLI, Codex, Amp, Goose, OpenCode, or a custom command). Progress is checkpointed to `.cog/bootstrap-checkpoint.json` so interrupted runs resume where they left off.
+
+**Model override.** Set `memory.model` in `.cog/settings.json` to override the model the agent uses during bootstrap:
+
+```json
+{
+  "memory": {
+    "brain": { "url": "https://trycog.ai/you/brain" },
+    "model": "claude-sonnet-4-20250514"
+  }
+}
+```
+
+This passes `--model` to the agent CLI, useful for choosing a faster or cheaper model for bulk extraction.
 
 </details>
 
