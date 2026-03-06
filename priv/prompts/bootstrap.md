@@ -1,60 +1,46 @@
 You are bootstrapping a persistent knowledge graph for a codebase.
 
-Read the file below and extract concepts with rich semantic metadata, then store them in the knowledge graph.
+Read the file below and extract concepts that capture understanding — not an inventory of every function and code path.
 
-# Extraction Depth
+# Guiding Principle
 
-Extract concepts across MULTIPLE DIMENSIONS, not just what code does:
+**Fewer, high-quality concepts that capture understanding — not an inventory.**
 
-**Behaviors & Mechanisms** — What the code does
-- Different functions serving different purposes = separate concepts
-- Different code paths handling different cases = separate behaviors
-- Distinct configuration options that change behavior = separate concepts
+You are building a knowledge graph that replaces expensive code exploration. An agent should be able to understand how a module works, what it's responsible for, and how it connects to the rest of the system by querying memory — without reading the source. Capture the architectural and conceptual knowledge that comes from reading and reasoning about code, so agents don't have to.
 
-**Architectural Properties** — What the code guarantees
-- Concurrency/isolation guarantees
-- Delivery guarantees (at-most-once, at-least-once, exactly-once)
-- Consistency models (eventual, strong, CRDT-based)
-- Scalability properties
+# Extraction Dimensions (use only what applies)
 
-**Boundaries & Layering** — Why components are separated
-- What concern does each layer handle that others don't?
-- Why is this component above/below/beside another?
-- What would break if two layers were merged?
+Not every dimension applies to every file. Skip any that don't add value.
 
-**Constraints & Invariants** — Rules that must always hold
-- Ordering requirements (X must happen before Y)
-- Access control rules (who can reach what)
-- Validation boundaries (where untrusted data becomes trusted)
-- Assumptions the code makes about its environment
+1. **Purpose & Role** — Why does this file exist? What responsibility does it own that nothing else does?
+2. **Key Design Decisions** — Why this approach over alternatives? What tradeoffs were made? Look for comments with "because", "instead of", "tradeoff", "workaround".
+3. **Constraints & Gotchas** — Ordering requirements, invariants, assumptions, validation boundaries, things that would break if changed.
+4. **Public API Summary** — Key entry points and their contracts. Not every function — just the ones a caller needs to know about.
+5. **Data Flow & State** — Only when non-trivial: state machines, lifecycle transitions, complex data transformations.
+6. **Error Handling Strategy** — Only when deliberate: retry policies, recovery mechanisms, error propagation patterns.
 
-**Tradeoffs & Alternatives** — Why this approach over others
-- What was chosen and what was rejected
-- What flexibility was sacrificed for what guarantee
-- Runtime vs compile-time tradeoffs
+## Volume Guidance
+
+- A small utility file: 2-3 concepts
+- A typical module: 4-6 concepts
+- A complex core module: 8-10 concepts
+- If you're extracting more than 10, you're probably inventorying — step back and focus on what matters
 
 ## For Each Concept, Capture
 
-1. **term** — Descriptive name (2-5 words). Must be UNIQUE and FILE-SPECIFIC — qualify generic names with the module or subsystem context. Think: would another file produce a concept with this exact same name? If yes, make it more specific.
-2. **definition** — What it is, how it works, and WHY it exists (1-3 sentences). Include the problem it solves and any design tradeoffs. Explain WHY, not just WHAT.
-3. **category** — One of: core-algorithm, data-structure, api-surface, configuration, optimization, error-handling, state-management, utility, platform-abstraction, testing, design-decision, architecture, security, constraint
+1. **term** — Descriptive name (2-5 words). Must be UNIQUE and FILE-SPECIFIC — qualify generic names with the module or subsystem context.
+2. **definition** — What it is, how it works, and WHY it exists (1-3 sentences). Explain WHY, not just WHAT.
+3. **category** — One of: `core-mechanism`, `api-surface`, `design-decision`, `constraint`, `data-flow`, `error-handling`, `configuration`
 
-### Categories Explained
+### Categories
 
-- **core-algorithm** — Main logic, algorithms, control flow
-- **data-structure** — Data structures and their operations
+- **core-mechanism** — Main logic, algorithms, data structures, control flow, utilities, optimizations, platform abstractions
 - **api-surface** — Public interfaces, exports, entry points
-- **configuration** — Feature flags, settings, constants
-- **optimization** — Performance optimizations, caching, memoization
+- **design-decision** — Why a particular approach was chosen, tradeoffs, alternatives rejected, architectural boundaries
+- **constraint** — Invariants, ordering requirements, guarantees, assumptions, validation rules, security boundaries
+- **data-flow** — State tracking, transitions, lifecycle, data transformations
 - **error-handling** — Error management, recovery, validation
-- **state-management** — State tracking, transitions, lifecycle
-- **utility** — Helper functions, shared utilities
-- **platform-abstraction** — Browser/environment abstractions
-- **testing** — Test utilities, mocks, test helpers
-- **design-decision** — Why a particular approach was chosen, tradeoffs, alternatives rejected
-- **architecture** — High-level system design, separation of concerns, module boundaries
-- **security** — Authentication, authorization, trust boundaries, access control
-- **constraint** — Invariants, ordering requirements, guarantees, assumptions, validation rules
+- **configuration** — Feature flags, settings, constants
 
 ## Documentation and Markdown Files
 
@@ -64,11 +50,8 @@ For documentation files (.md, README, CHANGELOG, LICENSE, etc.), focus on DESIGN
 - Architectural principles and WHY components are structured this way
 - Design constraints and invariants
 - Tradeoffs and alternatives considered
-- Boundaries between components and WHY those boundaries exist
 - Domain concepts, terminology, and glossary definitions
 - Security model and trust boundaries
-- Data models, schemas, and entity relationships
-- Workflow descriptions and state machines
 
 **De-prioritize:**
 - Setup/installation/deployment instructions
@@ -76,29 +59,6 @@ For documentation files (.md, README, CHANGELOG, LICENSE, etc.), focus on DESIGN
 - Version-specific configuration values
 - Tutorial walkthroughs
 - Boilerplate legal text
-
-## Quality Guidelines
-
-**Capture foundational definitions, not just usage:**
-- When code implements a specification/protocol/behaviour, extract what that specification IS
-- If a module defines callbacks or contracts, extract the specification as its own concept
-- When code provides guarantees, extract those as their own concepts
-- When code enforces constraints, extract the rule and WHY it exists
-
-**Include specific API details in definitions:**
-- NAME public functions, callbacks, macros in the definition
-- Include exact event names when code emits or handles events
-- Mention important options or configuration keys
-- Prefer concrete details: "returns {status, socket}" over "returns status information"
-
-**Mine for rationale and design decisions:**
-- Comments with "because", "instead of", "tradeoff", "workaround", "note:" signal design decisions
-- If a comment explains why an alternative was rejected, that's a design-decision concept
-- Capture rules and constraints (e.g., "X must always be called before Y")
-
-**Capture boundaries and layering:**
-- When a module delegates to another, extract WHY the separation exists
-- Architectural boundaries are concepts too — "X handles concern A so that Y doesn't have to"
 
 ## How to Store
 
@@ -117,8 +77,8 @@ For documentation files (.md, README, CHANGELOG, LICENSE, etc.), focus on DESIGN
 ## Rules
 
 - Do NOT store: secrets, credentials, PII, or trivial implementation details
-- Prefer fewer, higher-quality memories over many shallow ones
 - Process the ENTIRE file, do not skip sections
+- When in doubt, leave it out — a missing concept can be added later, but noisy ones pollute the graph
 
 ## File to Process
 

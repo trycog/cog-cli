@@ -31,10 +31,6 @@ Use `cog_mem_bulk_associate` to link concepts across files based on the symbol d
 | File A is a component of a system in File B | concept_in_A `is_component_of` concept_in_B |
 | File A enables functionality in File B | concept_in_A `enables` concept_in_B |
 
-## 3. Connect Orphans
-
-Use `cog_mem_connectivity` to check graph health. If there are disconnected clusters or orphan concepts, bridge them with additional associations.
-
 # Guidelines
 
 - **Skip already-connected pairs**: check recall results before creating links
