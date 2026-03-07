@@ -52,15 +52,29 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: release-tarballs
           path: tarballs
 
+      - name: Extract changelog
+        id: changelog
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          SEMVER="${VERSION#v}"
+          # Extract the section between this version's header and the next version header
+          BODY=$(sed -n "/^## \[${SEMVER}\]/,/^## \[/{/^## \[${SEMVER}\]/d;/^## \[/d;p;}" CHANGELOG.md)
+          # Write to file to preserve newlines
+          echo "$BODY" > /tmp/release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
+          body_path: /tmp/release-notes.md
           files: tarballs/cog-*.tar.gz
 
   update-tap:
