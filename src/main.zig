@@ -248,6 +248,8 @@ fn printMemHelp() void {
         ++ "\n"
         ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n"
         ++ "    " ++ bold ++ "mem:bootstrap" ++ reset ++ "         " ++ dim ++ "Scan project files and populate memory" ++ reset ++ "\n"
+        ++ "    " ++ bold ++ "mem:info" ++ reset ++ "              " ++ dim ++ "Show brain type, path, and memory stats" ++ reset ++ "\n"
+        ++ "    " ++ bold ++ "mem:upgrade" ++ reset ++ "           " ++ dim ++ "Instructions for migrating to hosted brain" ++ reset ++ "\n"
         ++ "\n");
 }
 

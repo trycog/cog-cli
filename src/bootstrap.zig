@@ -10,6 +10,9 @@ const client = @import("client.zig");
 const settings_mod = @import("settings.zig");
 const code_intel = @import("code_intel.zig");
 const debug_log = @import("debug_log.zig");
+const memory_mod = @import("memory.zig");
+const memory_schema = @import("memory_schema.zig");
+const sqlite = @import("sqlite.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -379,11 +382,96 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     if (std.mem.eql(u8, subcmd, "mem:bootstrap")) {
         return memBootstrap(allocator, args);
     }
+    if (std.mem.eql(u8, subcmd, "mem:info")) {
+        return memInfo(allocator);
+    }
+    if (std.mem.eql(u8, subcmd, "mem:upgrade")) {
+        return memUpgrade();
+    }
 
     printErr("error: unknown command '");
     printErr(subcmd);
     printErr("'\nRun " ++ dim ++ "cog mem --help" ++ reset ++ " to see available commands.\n");
     return error.Explained;
+}
+
+fn memInfo(allocator: std.mem.Allocator) !void {
+    tui.header();
+    const brain = config_mod.resolveBrain(allocator);
+    defer brain.deinit(allocator);
+
+    switch (brain) {
+        .local => |local| {
+            printErr(bold ++ "  Brain: " ++ reset ++ "local SQLite\n");
+            printErr(dim ++ "  Path:  " ++ reset);
+            printErr(local.path);
+            printErr("\n");
+            printErr(dim ++ "  ID:    " ++ reset);
+            printErr(local.brain_id);
+            printErr("\n\n");
+
+            // Open DB and show stats
+            const path_z = allocator.dupeZ(u8, local.path) catch {
+                printErr("  (cannot open database)\n");
+                return;
+            };
+            defer allocator.free(path_z);
+
+            var db = sqlite.Db.open(path_z) catch {
+                printErr("  (database not yet created — run a memory tool to initialize)\n");
+                return;
+            };
+            defer db.close();
+            memory_schema.ensureSchema(&db) catch {
+                printErr("  (schema error)\n");
+                return;
+            };
+
+            const engrams = countBrainQuery(&db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ?", local.brain_id);
+            const synapses = countBrainQuery(&db, "SELECT COUNT(*) FROM synapses WHERE brain_id = ?", local.brain_id);
+            const long_term = countBrainQuery(&db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND memory_term = 'long'", local.brain_id);
+            const short_term = countBrainQuery(&db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND memory_term = 'short'", local.brain_id);
+
+            var buf: [256]u8 = undefined;
+            const stats = std.fmt.bufPrint(&buf, "  {s}Engrams:{s}  {d} ({d} long-term, {d} short-term)\n  {s}Synapses:{s} {d}\n", .{
+                bold, reset, engrams, long_term, short_term,
+                bold, reset, synapses,
+            }) catch return;
+            printErr(stats);
+        },
+        .remote => |remote| {
+            printErr(bold ++ "  Brain: " ++ reset ++ "remote (hosted)\n");
+            printErr(dim ++ "  URL:   " ++ reset);
+            printErr(remote.brain_url);
+            printErr("\n\n");
+            printErr(dim ++ "  Visit the web dashboard for detailed stats.\n" ++ reset);
+        },
+        .none => {
+            printErr("  No brain configured.\n");
+            printErr(dim ++ "  Run " ++ reset ++ bold ++ "cog init" ++ reset ++ dim ++ " to set up memory.\n" ++ reset);
+        },
+    }
+    printErr("\n");
+}
+
+fn countBrainQuery(db: *sqlite.Db, sql: [*:0]const u8, brain_id: []const u8) i64 {
+    var stmt = db.prepare(sql) catch return 0;
+    defer stmt.finalize();
+    stmt.bindText(1, brain_id) catch return 0;
+    const result = stmt.step() catch return 0;
+    if (result == .row) return stmt.columnInt(0);
+    return 0;
+}
+
+fn memUpgrade() !void {
+    tui.header();
+    printErr(bold ++ "  Upgrade to Hosted Memory" ++ reset ++ "\n\n");
+    printErr("  Local SQLite brains can be migrated to a hosted brain on trycog.ai\n");
+    printErr("  for cross-project memory, team sharing, and AI-powered features.\n\n");
+    printErr(cyan ++ bold ++ "  Steps" ++ reset ++ "\n");
+    printErr("    1. Sign up at " ++ bold ++ "https://trycog.ai" ++ reset ++ "\n");
+    printErr("    2. Run " ++ bold ++ "cog init" ++ reset ++ " and enter your brain URL\n");
+    printErr("    3. Use " ++ bold ++ "cog mem:bootstrap" ++ reset ++ " to re-populate from your codebase\n\n");
 }
 
 fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
