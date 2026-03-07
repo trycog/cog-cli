@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-03-07
+
+### Fixed
+
+- Linux CI build failure: extracted shared debug types (`WaitResult`, `RegisterState`, `FloatRegisterState`) into platform-neutral `process_types.zig` so Linux no longer transitively imports macOS-only Mach headers
+- Release workflow now gates on CI tests passing on both Ubuntu and macOS before cutting a release
+
 ## [0.7.3] - 2026-03-07
 
 ### Added
@@ -239,6 +246,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.7.4]: https://github.com/trycog/cog-cli/releases/tag/v0.7.4
 [0.7.3]: https://github.com/trycog/cog-cli/releases/tag/v0.7.3
 [0.7.2]: https://github.com/trycog/cog-cli/releases/tag/v0.7.2
 [0.7.1]: https://github.com/trycog/cog-cli/releases/tag/v0.7.1
