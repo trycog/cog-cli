@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const process_mach = @import("process_mach.zig");
+const process_types = @import("process_types.zig");
 
 // ── Linux ptrace-based Process Control ──────────────────────────────────
 
@@ -107,7 +107,7 @@ pub const PtraceProcessControl = struct {
         }
     }
 
-    pub fn waitForStop(self: *PtraceProcessControl) !process_mach.WaitResult {
+    pub fn waitForStop(self: *PtraceProcessControl) !process_types.WaitResult {
         if (self.pid) |pid| {
             const result = posix.waitpid(pid, WUNTRACED);
             self.is_running = false;
@@ -136,7 +136,7 @@ pub const PtraceProcessControl = struct {
     /// Maps x86_64 registers to the platform-independent RegisterState using
     /// the DWARF register numbering: gprs[0]=rax, [1]=rdx, [2]=rcx, [3]=rbx,
     /// [4]=rsi, [5]=rdi, [6]=rbp, [7]=rsp, [8..15]=r8..r15.
-    pub fn readRegisters(self: *PtraceProcessControl) !process_mach.RegisterState {
+    pub fn readRegisters(self: *PtraceProcessControl) !process_types.RegisterState {
         const pid = self.pid orelse return error.NoProcess;
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
@@ -145,7 +145,7 @@ pub const PtraceProcessControl = struct {
             const rc = std.os.linux.ptrace(PTRACE_GETREGS, pid, 0, @intFromPtr(&regs), 0);
             if (rc != 0) return error.PtraceGetRegsFailed;
 
-            var state = process_mach.RegisterState{};
+            var state = process_types.RegisterState{};
             // DWARF x86_64 register mapping
             state.gprs[0] = regs.rax;
             state.gprs[1] = regs.rdx;
@@ -175,7 +175,7 @@ pub const PtraceProcessControl = struct {
     /// Read floating point / SIMD registers from the traced process.
     /// Linux FP register reading via PTRACE_GETREGSET is more complex;
     /// this is a stub that returns empty for now.
-    pub fn readFloatRegisters(self: *PtraceProcessControl) !process_mach.FloatRegisterState {
+    pub fn readFloatRegisters(self: *PtraceProcessControl) !process_types.FloatRegisterState {
         if (self.pid == null) return error.NoProcess;
         // Linux FP register reading via PTRACE_GETREGSET with NT_PRFPREG
         // is more involved and less critical. Return empty state for now.
@@ -185,7 +185,7 @@ pub const PtraceProcessControl = struct {
     /// Write registers back to the tracee via PTRACE_SETREGS.
     /// Reverses the DWARF register mapping from RegisterState back to
     /// the kernel's user_regs_struct layout.
-    pub fn writeRegisters(self: *PtraceProcessControl, regs: process_mach.RegisterState) !void {
+    pub fn writeRegisters(self: *PtraceProcessControl, regs: process_types.RegisterState) !void {
         const pid = self.pid orelse return error.NoProcess;
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 

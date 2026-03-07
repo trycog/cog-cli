@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const process_mach = @import("process_mach.zig");
+const process_types = @import("process_types.zig");
 
-const RegisterState = process_mach.RegisterState;
+const RegisterState = process_types.RegisterState;
 
 // ── Core Dump Loading ─────────────────────────────────────────────────
 //

@@ -3260,39 +3260,39 @@ pub const DwarfEngine = struct {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         if (self.process.pid == null) return error.NoProcess;
 
-        if (builtin.os.tag != .macos) {
-            // Single thread on non-macOS for now
-            const result = try allocator.alloc(types.ThreadInfo, 1);
-            result[0] = .{ .id = 1, .name = "main", .is_stopped = !self.process.is_running, };
-            return result;
-        }
-
-        // On macOS, use task_threads to enumerate
-        const task = self.process.getTask() catch {
-            const result = try allocator.alloc(types.ThreadInfo, 1);
-            result[0] = .{ .id = 1, .name = "main", .is_stopped = !self.process.is_running, };
-            return result;
-        };
-
-        var threads_ptr: std.c.mach_port_array_t = undefined;
-        var thread_count: std.c.mach_msg_type_number_t = undefined;
-        const kr = std.c.task_threads(task, &threads_ptr, &thread_count);
-        if (kr != 0) {
-            const result = try allocator.alloc(types.ThreadInfo, 1);
-            result[0] = .{ .id = 1, .name = "main", .is_stopped = !self.process.is_running, };
-            return result;
-        }
-
-        const result = try allocator.alloc(types.ThreadInfo, thread_count);
-        for (0..thread_count) |i| {
-            var name_buf: [32]u8 = undefined;
-            const name = std.fmt.bufPrint(&name_buf, "thread-{d}", .{i + 1}) catch "thread";
-            result[i] = .{
-                .id = @intCast(i + 1),
-                .name = try allocator.dupe(u8, if (i == 0) "main" else name),
-                .is_stopped = !self.process.is_running,
+        if (builtin.os.tag == .macos) {
+            // On macOS, use task_threads to enumerate
+            const task = self.process.getTask() catch {
+                const result = try allocator.alloc(types.ThreadInfo, 1);
+                result[0] = .{ .id = 1, .name = "main", .is_stopped = !self.process.is_running };
+                return result;
             };
+
+            var threads_ptr: std.c.mach_port_array_t = undefined;
+            var thread_count: std.c.mach_msg_type_number_t = undefined;
+            const kr = std.c.task_threads(task, &threads_ptr, &thread_count);
+            if (kr != 0) {
+                const result = try allocator.alloc(types.ThreadInfo, 1);
+                result[0] = .{ .id = 1, .name = "main", .is_stopped = !self.process.is_running };
+                return result;
+            }
+
+            const result = try allocator.alloc(types.ThreadInfo, thread_count);
+            for (0..thread_count) |i| {
+                var name_buf: [32]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "thread-{d}", .{i + 1}) catch "thread";
+                result[i] = .{
+                    .id = @intCast(i + 1),
+                    .name = try allocator.dupe(u8, if (i == 0) "main" else name),
+                    .is_stopped = !self.process.is_running,
+                };
+            }
+            return result;
         }
+
+        // Single thread on non-macOS for now
+        const result = try allocator.alloc(types.ThreadInfo, 1);
+        result[0] = .{ .id = 1, .name = "main", .is_stopped = !self.process.is_running };
         return result;
     }
 

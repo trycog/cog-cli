@@ -1,6 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const process_types = @import("process_types.zig");
+
+pub const WaitResult = process_types.WaitResult;
+pub const RegisterState = process_types.RegisterState;
+pub const FloatRegisterState = process_types.FloatRegisterState;
 
 // ── macOS Mach-based Process Control ────────────────────────────────────
 
@@ -99,19 +104,6 @@ const X86FloatState64 = extern struct {
     xmm: [16][2]u64,
     // Reserved (bytes 416-511)
     _reserved4: [6][2]u64,
-};
-
-/// FP/SIMD register state returned by readFloatRegisters.
-/// Each register is stored as two 64-bit values (low and high halves of 128-bit register).
-pub const FloatRegisterState = struct {
-    /// Register values: [i][0] = low 64 bits, [i][1] = high 64 bits
-    regs: [max_fp_regs][2]u64 = [_][2]u64{.{ 0, 0 }} ** max_fp_regs,
-    /// Number of valid registers in the array
-    count: u32 = 0,
-    /// Whether these are ARM NEON (v0-v31) or x86 XMM (xmm0-xmm15)
-    is_arm: bool = false,
-
-    pub const max_fp_regs = 32;
 };
 
 pub const MachProcessControl = struct {
@@ -795,38 +787,6 @@ pub const MachProcessControl = struct {
 
         kr = std.c.thread_set_state(thread, ARM_DEBUG_STATE64, @ptrCast(&state), ARM_DEBUG_STATE64_COUNT);
         if (kr != 0) return error.WriteDebugStateFailed;
-    }
-};
-
-pub const WaitResult = struct {
-    status: Status = .unknown,
-    exit_code: i32 = 0,
-    signal: i32 = 0,
-
-    pub const Status = enum {
-        stopped,
-        exited,
-        signaled,
-        unknown,
-    };
-};
-
-pub const RegisterState = struct {
-    gprs: [32]u64 = [_]u64{0} ** 32,
-    pc: u64 = 0,
-    sp: u64 = 0,
-    fp: u64 = 0,
-    flags: u64 = 0,
-
-    // Convenience aliases for backward compatibility
-    pub inline fn rip(self: RegisterState) u64 {
-        return self.pc;
-    }
-    pub inline fn rsp(self: RegisterState) u64 {
-        return self.sp;
-    }
-    pub inline fn rbp(self: RegisterState) u64 {
-        return self.fp;
     }
 };
 
