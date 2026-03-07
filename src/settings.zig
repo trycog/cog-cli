@@ -211,6 +211,12 @@ fn parseToolConfig(allocator: std.mem.Allocator, value: std.json.Value) !ToolCon
 }
 
 fn parseBrainConfig(allocator: std.mem.Allocator, value: std.json.Value) !BrainConfig {
+    // Flat string format: "file:.cog/brain.db" or "https://trycog.ai/user/brain"
+    if (value == .string) {
+        return .{ .url = try allocator.dupe(u8, value.string) };
+    }
+
+    // Legacy object format: {"url": "https://..."}
     if (value != .object) return error.InvalidSettings;
     const obj = value.object;
 
@@ -619,6 +625,32 @@ test "parse settings with memory brain" {
     const allocator = std.testing.allocator;
     const json =
         \\{"memory":{"brain":{"url":"https://trycog.ai/user/brain"}}}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.memory != null);
+    try std.testing.expect(s.memory.?.brain != null);
+    try std.testing.expectEqualStrings("https://trycog.ai/user/brain", s.memory.?.brain.?.url);
+}
+
+test "parse settings with memory brain flat string (file:)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"brain":"file:.cog/brain.db"}}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.memory != null);
+    try std.testing.expect(s.memory.?.brain != null);
+    try std.testing.expectEqualStrings("file:.cog/brain.db", s.memory.?.brain.?.url);
+}
+
+test "parse settings with memory brain flat string (https://)" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"brain":"https://trycog.ai/user/brain"}}
     ;
     const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
     defer s.deinit(allocator);
