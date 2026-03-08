@@ -846,6 +846,10 @@ pub fn freeExtension(allocator: std.mem.Allocator, ext: *const Extension) void {
                 // (for installed extensions, toDebugConfig copies launch_args_template to both).
                 // Only free launch_args_template to avoid double-free.
                 if (dap.launch_args_template) |l| allocator.free(l);
+                // program_field and args_field are heap-allocated when
+                // they differ from the comptime defaults.
+                if (!std.mem.eql(u8, dap.program_field, "program")) allocator.free(dap.program_field);
+                if (!std.mem.eql(u8, dap.args_field, "args")) allocator.free(dap.args_field);
                 for (dap.boundary_markers) |m| allocator.free(m);
                 if (dap.boundary_markers.len > 0) allocator.free(dap.boundary_markers);
             },
