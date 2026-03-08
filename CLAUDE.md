@@ -26,7 +26,15 @@ Update the version in the single source of truth:
 
 (`build.zig` reads the version from `build.zig.zon` via `@import`)
 
-### 3. Update CHANGELOG.md
+### 3. Review and update README.md
+
+Ensure the README accurately reflects the current state of the project:
+- New commands or features are documented
+- Removed or renamed features are cleaned up
+- Installation instructions are current
+- Examples and usage sections match the actual CLI interface
+
+### 4. Update CHANGELOG.md
 
 Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/):
 - Add a new `## [X.Y.Z] - YYYY-MM-DD` section below `## [Unreleased]` (or below the header if no Unreleased section exists)
@@ -34,10 +42,10 @@ Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/):
 - Add a link reference at the bottom: `[X.Y.Z]: https://github.com/trycog/cog-cli/releases/tag/vX.Y.Z`
 - Each entry should be a concise, user-facing description (not a commit message)
 
-### 4. Commit, tag, and push
+### 5. Commit, tag, and push
 
 ```sh
-git add build.zig.zon CHANGELOG.md
+git add build.zig.zon README.md CHANGELOG.md
 git commit -m "Release X.Y.Z"
 git tag vX.Y.Z
 git push && git push origin vX.Y.Z
