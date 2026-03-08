@@ -26,9 +26,9 @@ We built Cog to fix that. It's a single native binary that runs as an MCP server
 
 ### The numbers
 
-#### Memory
+#### Memory (hosted)
 
-We benchmarked Cog's memory recall against Sonnet 4.5 doing active code exploration across 114 questions about a production codebase. The code exploration baseline used no prior model knowledge and answered every question through real-time file reads, grep, and glob. Cog answered from a knowledge graph built by an exhaustive bootstrap prompt before the benchmark started.
+We benchmarked Cog's hosted memory recall against Sonnet 4.5 doing active code exploration across 114 questions about a production codebase. The code exploration baseline used no prior model knowledge and answered every question through real-time file reads, grep, and glob. Cog answered from a knowledge graph built by an exhaustive bootstrap prompt before the benchmark started. These benchmarks use the hosted brain on [trycog.ai](https://trycog.ai).
 
 | Metric | Cog | Code Exploration | Delta |
 |--------|-----|------------------|-------|
