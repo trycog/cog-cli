@@ -157,7 +157,6 @@ pub fn build(b: *std.Build) void {
     // Release step
     const release_step = b.step("release", "Build release tarballs");
     addRelease(b, release_step, .aarch64, .macos, "darwin-arm64");
-    addRelease(b, release_step, .x86_64, .macos, "darwin-x86_64");
     addRelease(b, release_step, .aarch64, .linux, "linux-arm64");
     addRelease(b, release_step, .x86_64, .linux, "linux-x86_64");
 }
