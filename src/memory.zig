@@ -926,7 +926,22 @@ fn toolConnectivity(mem_db: *MemoryDb) ![]const u8 {
 
     // Build adjacency: for each node, find connected nodes
     var visited = std.StringHashMap(bool).init(allocator);
-    defer visited.deinit();
+    defer {
+        // Free BFS-discovered keys (ids items are freed by their own defer)
+        var it = visited.iterator();
+        while (it.next()) |entry| {
+            // Check if this key is owned by the ids list
+            var owned_by_ids = false;
+            for (ids.items) |id| {
+                if (id.ptr == entry.key_ptr.*.ptr) {
+                    owned_by_ids = true;
+                    break;
+                }
+            }
+            if (!owned_by_ids) allocator.free(entry.key_ptr.*);
+        }
+        visited.deinit();
+    }
 
     var components: usize = 0;
     var largest: usize = 0;
