@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-03-08
+
+### Added
+
+- Local SQLite memory backend — `cog init` now offers Local (SQLite) vs Hosted (trycog.ai) as the memory backend
+- Local memory tools: learn, recall, associate, deprecate, refactor, update, connectivity, and more — all backed by a local `.cog/brain.db`
+- `mem:info` and `mem:upgrade` CLI commands
+- SQLite wrapper module and embedded SQLite 3.47.2
+- Debug log now writes diagnostic header (version, OS, arch, zig version, command line) on each invocation
+- Signal handlers capture SIGILL/SIGSEGV/SIGBUS/SIGABRT crashes with stack traces to `.cog/cog.log`
+- Containerfile for Alpine-based dev container with PostgreSQL, Elixir, Zig, and swap support
+
+### Changed
+
+- Debug log truncates on each command invocation instead of appending
+- Brain config uses flat string format (e.g. `"file:.cog/brain.db"`) instead of nested object
+- README clarifies memory benchmarks are for the hosted brain
+
+### Fixed
+
+- Memory leak in `toolConnectivity` BFS visited map
+- Release workflow includes changelog body in GitHub releases
+
 ## [0.7.4] - 2026-03-07
 
 ### Fixed
@@ -246,6 +269,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.8.0]: https://github.com/trycog/cog-cli/releases/tag/v0.8.0
 [0.7.4]: https://github.com/trycog/cog-cli/releases/tag/v0.7.4
 [0.7.3]: https://github.com/trycog/cog-cli/releases/tag/v0.7.3
 [0.7.2]: https://github.com/trycog/cog-cli/releases/tag/v0.7.2
