@@ -61,7 +61,7 @@ fn mainInner() !void {
         }
     }
     if (debug_flag) {
-        debug_log.initFromCwd(allocator);
+        debug_log.initFromCwd(allocator, version, args_list.items);
     }
     defer debug_log.deinit();
 
