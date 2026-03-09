@@ -301,6 +301,7 @@ fn addRelease(
     const release_target = b.resolveTargetQuery(.{
         .cpu_arch = cpu_arch,
         .os_tag = os_tag,
+        .cpu_model = .baseline,
     });
 
     const release_mod = b.createModule(.{
