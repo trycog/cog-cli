@@ -6,11 +6,11 @@ Code intelligence, persistent memory, and interactive debugging.
 
 ## Code Intelligence
 
-For any request to explore, analyze, understand, map, or explain code, use `cog_code_explore` or `cog_code_query`.
+For any request to explore, analyze, understand, map, or explain code, use `code_explore` or `code_query`.
 Do NOT use Grep or Glob for code exploration when the Cog index is available.
 
-- `cog_code_explore` — find symbols by name, return full definition bodies and file TOC
-- `cog_code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols)
+- `code_explore` — find symbols by name, return full definition bodies and file TOC
+- `code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols)
 - Include synonyms with `|`: `banner|header|splash`
 - Wildcard symbol patterns: `*init*`, `get*`, `Handle?`
 
@@ -18,16 +18,16 @@ Only fall back to Grep or Glob when the Cog index is unavailable, incomplete for
 
 ### Efficiency Rules
 
-- For repository-understanding, architecture-summary, or "tell me about this project" tasks: make exactly one initial `cog_code_explore` call with a batched list of likely entrypoint symbols.
-- Before making any follow-up code-intelligence call, first check whether the answer is already present in the prior `cog_code_explore` output (`file_symbols`, definition body, or referenced symbols).
-- If you need to look up multiple symbols, combine them into one `cog_code_explore({ queries: [...] })` call instead of making multiple single-symbol calls.
-- Do not explore by issuing repeated `cog_code_query(mode="symbols", file=...)` calls across multiple files.
-- Treat repeated `cog_code_query(mode="symbols")` calls across files as an invalid exploration pattern. Use it only for one already-identified file when a concrete ambiguity remains.
-- Use `cog_code_query(mode="symbols")` only after a specific file has already been identified as relevant.
-- Use `cog_code_query(mode="refs")` only as a targeted follow-up when a concrete ambiguity remains after the initial batched exploration.
-- Do not use `cog_code_query(mode="find")` as a step-by-step exploration strategy when the needed symbols can be batched into `cog_code_explore`.
+- For repository-understanding, architecture-summary, or "tell me about this project" tasks: make exactly one initial `code_explore` call with a batched list of likely entrypoint symbols.
+- Before making any follow-up code-intelligence call, first check whether the answer is already present in the prior `code_explore` output (`file_symbols`, definition body, or referenced symbols).
+- If you need to look up multiple symbols, combine them into one `code_explore({ queries: [...] })` call instead of making multiple single-symbol calls.
+- Do not explore by issuing repeated `code_query(mode="symbols", file=...)` calls across multiple files.
+- Treat repeated `code_query(mode="symbols")` calls across files as an invalid exploration pattern. Use it only for one already-identified file when a concrete ambiguity remains.
+- Use `code_query(mode="symbols")` only after a specific file has already been identified as relevant.
+- Use `code_query(mode="refs")` only as a targeted follow-up when a concrete ambiguity remains after the initial batched exploration.
+- Do not use `code_query(mode="find")` as a step-by-step exploration strategy when the needed symbols can be batched into `code_explore`.
 - Default budget for code-analysis tasks: 2-3 code-intelligence tool calls before responding.
-- Do not call `cog_mem_recall` for pure codebase summarization or architecture description unless memory is specifically needed to answer the question.
+- Do not call `mem_recall` for pure codebase summarization or architecture description unless memory is specifically needed to answer the question.
 
 ## Debugging
 
@@ -37,22 +37,22 @@ State your hypothesis before launching.
 <cog:mem>
 ## Memory
 
-`cog_mem_*` tools are MCP tools — call them directly, never via the Skill tool.
+`mem_*` tools are MCP tools — call them directly, never via the Skill tool.
 
-Before modifying unfamiliar code, use `cog_mem_recall` or the `cog-mem` sub-agent
+Before modifying unfamiliar code, use `mem_recall` or the `cog-mem` sub-agent
 to check for relevant context. Skip if nothing useful returns.
 
 Record knowledge as you work:
 
 | Trigger | Action |
 |---------|--------|
-| Learned how something works | `cog_mem_learn` — see quality guide below |
-| A relates to B | `cog_mem_associate` — use strong predicates |
-| Sequence A → B → C | `cog_mem_learn` with `chain_to` |
-| Hub: A connects to B, C, D | `cog_mem_learn` with `associations` |
-| Code changed for known concept | `cog_mem_refactor` |
-| Feature deleted | `cog_mem_deprecate` |
-| Term or definition wrong | `cog_mem_update` |
+| Learned how something works | `mem_learn` — see quality guide below |
+| A relates to B | `mem_associate` — use strong predicates |
+| Sequence A → B → C | `mem_learn` with `chain_to` |
+| Hub: A connects to B, C, D | `mem_learn` with `associations` |
+| Code changed for known concept | `mem_refactor` |
+| Feature deleted | `mem_deprecate` |
+| Term or definition wrong | `mem_update` |
 
 **Concept quality** — what you store determines what agents can recall later:
 - **term**: 2-5 words, specific and qualified. Bad: "Configuration". Good: "CLI Settings Loader".

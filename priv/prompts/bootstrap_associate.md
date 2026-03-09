@@ -14,11 +14,11 @@ The following file pairs share symbols (functions, types, structs) across file b
 
 ## 1. Find Corresponding Concepts
 
-For each file pair above, use `cog_mem_recall` to find the concepts that were stored from those files. The concept terms should relate to the shared symbols listed.
+For each file pair above, use `mem_recall` to find the concepts that were stored from those files. The concept terms should relate to the shared symbols listed.
 
 ## 2. Create Associations
 
-Use `cog_mem_bulk_associate` to link concepts across files based on the symbol dependencies.
+Use `mem_bulk_associate` to link concepts across files based on the symbol dependencies.
 
 ### Predicate Guide
 

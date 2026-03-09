@@ -10,7 +10,7 @@ Run each prompt in a fresh Claude Code session from `bench/debug/python/`.
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 01-logic-error/ is a meeting room scheduler that merges overlapping time intervals to determine the minimum number of rooms needed. When you run `python3 01-logic-error/main.py`, it should output "Rooms needed: 3" but instead outputs "Rooms needed: 6".
 
@@ -40,7 +40,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 02-state-mutation/ is an e-commerce order calculator with tiered discounts and shipping. When you run `python3 02-state-mutation/main.py`, the order total is wrong — it doesn't match expected_output.txt.
 
@@ -70,7 +70,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 03-crash/ loads configuration from defaults, environment overlays, and user overrides via recursive dict merging. When you run `python3 03-crash/main.py`, it should output "Config loaded: 12 settings applied" but instead crashes with an AttributeError.
 
@@ -100,7 +100,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 04-concurrency/ implements a 3-stage threaded data pipeline with bounded queues. Stage 2 sends feedback to Stage 1. When you run `python3 04-concurrency/main.py`, it should output "Processed 200 items" but instead hangs.
 
@@ -130,7 +130,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 05-silent-wrong/ computes a Pearson correlation matrix for a multi-variable dataset. When you run `python3 05-silent-wrong/main.py`, the correlation matrix values are incorrect — they don't match expected_output.txt.
 

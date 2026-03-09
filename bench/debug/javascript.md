@@ -10,7 +10,7 @@ Run each prompt in a fresh Claude Code session from `bench/debug/javascript/`.
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 01-logic-error/ is a math expression parser with operator precedence. When you run `node 01-logic-error/main.js`, it should output "2^3^2 = 512" (right-associative exponentiation: 2^(3^2) = 2^9) but instead outputs "2^3^2 = 64" (left-associative: (2^3)^2 = 64).
 
@@ -40,7 +40,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 02-state-mutation/ is an event system with middleware factories that enrich events before delivery to handlers. The emitter deep-clones events so each handler gets an independent copy. When you run `node 02-state-mutation/main.js`, it should output "OK: Handler B received clean event, no cross-handler leakage" but instead shows Handler B received metadata contaminated by Handler A's middleware.
 
@@ -70,7 +70,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 03-crash/ is an async connection pool with checkout/release lifecycle. When you run `node 03-crash/main.js`, it should complete all 50 operations but instead crashes with a TypeError after ~15 operations due to pool corruption.
 
@@ -100,7 +100,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 04-concurrency/ uses a WorkScheduler to partition paginated API data across two parallel workers. A shared cache deduplicates API calls. When you run `node 04-concurrency/main.js`, it should output "Processed 100 unique items" but instead outputs "Processed 200 items (100 unique)" — double the expected count.
 
@@ -130,7 +130,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 05-silent-wrong/ groups and pivots tabular sales data by year using a stats module for summation. When you run `node 05-silent-wrong/main.js`, it should output "Pivot: 2021=$1200 2022=$1500 2023=$1800 2024=$2100" but instead outputs "Pivot: 2021=$1200 2022=$2700 2023=$4500 2024=$6600" — values grow cumulatively instead of being independent per year.
 

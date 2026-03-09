@@ -21,7 +21,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does React's reconciliation work? What happens between calling setState and the DOM updating? Walk me through the key functions in the pipeline.
 
@@ -47,7 +47,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 I want to add a new built-in hook. What pattern do the existing hooks (useState, useEffect, useCallback) follow? Show me the implementation path from the public API through to the reconciler.
 
@@ -73,7 +73,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does React handle error boundaries? What's the mechanism for catching errors during rendering and propagating them to the nearest boundary?
 
@@ -99,7 +99,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does the fiber scheduler decide what work to do next? Explain the priority and lane system — what are the key data structures and functions involved?
 
@@ -125,7 +125,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 I need to understand how React's event system works so I can debug a bubbling issue. How do events get from the DOM through React's synthetic event system? What are the key modules and functions?
 

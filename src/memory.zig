@@ -47,161 +47,161 @@ pub const ToolDef = struct {
 
 pub const tool_definitions = [_]ToolDef{
     .{
-        .name = "cog_mem_learn",
+        .name = "mem_learn",
         .description = "Store a new concept in memory. Checks for duplicates before creating.",
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"string","description":"Short name for the concept (2-5 words)"},"definition":{"type":"string","description":"Clear definition (1-3 sentences)"},"associations":{"type":"array","items":{"type":"string"},"description":"Optional list of existing term names to associate with"},"chain_to":{"type":"string","description":"Optional term name to create a sequence link to"}},"required":["term","definition"]}
         ,
     },
     .{
-        .name = "cog_mem_recall",
+        .name = "mem_recall",
         .description = "Search memory by query. Returns matching concepts with 1-hop neighbors.",
         .input_schema =
         \\{"type":"object","properties":{"query":{"type":"string","description":"Search query (natural language or keywords)"},"limit":{"type":"number","description":"Max results (default 10)"}},"required":["query"]}
         ,
     },
     .{
-        .name = "cog_mem_get",
+        .name = "mem_get",
         .description = "Get a specific engram by its ID.",
         .input_schema =
         \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID"}},"required":["id"]}
         ,
     },
     .{
-        .name = "cog_mem_update",
+        .name = "mem_update",
         .description = "Update an existing engram's term or definition.",
         .input_schema =
         \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID to update"},"term":{"type":"string","description":"New term (optional)"},"definition":{"type":"string","description":"New definition (optional)"}},"required":["id"]}
         ,
     },
     .{
-        .name = "cog_mem_associate",
+        .name = "mem_associate",
         .description = "Create a directional link between two concepts.",
         .input_schema =
         \\{"type":"object","properties":{"source":{"type":"string","description":"Source term name or engram ID"},"target":{"type":"string","description":"Target term name or engram ID"},"relation":{"type":"string","description":"Relationship type (default: related_to)"},"weight":{"type":"number","description":"Link strength 0.0-1.0 (default: 1.0)"}},"required":["source","target"]}
         ,
     },
     .{
-        .name = "cog_mem_unlink",
+        .name = "mem_unlink",
         .description = "Remove a specific synapse by its ID.",
         .input_schema =
         \\{"type":"object","properties":{"id":{"type":"string","description":"Synapse UUID to remove"}},"required":["id"]}
         ,
     },
     .{
-        .name = "cog_mem_refactor",
+        .name = "mem_refactor",
         .description = "Update the definition of an existing concept found by term.",
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"string","description":"Term to find"},"definition":{"type":"string","description":"New definition"}},"required":["term","definition"]}
         ,
     },
     .{
-        .name = "cog_mem_deprecate",
+        .name = "mem_deprecate",
         .description = "Mark a concept as deprecated. Removes its links and sets it for expiry.",
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"string","description":"Term to deprecate"}},"required":["term"]}
         ,
     },
     .{
-        .name = "cog_mem_reinforce",
+        .name = "mem_reinforce",
         .description = "Promote a concept from short-term to long-term memory.",
         .input_schema =
         \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID to reinforce"}},"required":["id"]}
         ,
     },
     .{
-        .name = "cog_mem_flush",
+        .name = "mem_flush",
         .description = "Delete a specific short-term memory.",
         .input_schema =
         \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID to flush"}},"required":["id"]}
         ,
     },
     .{
-        .name = "cog_mem_list_short_term",
+        .name = "mem_list_short_term",
         .description = "List all short-term memories.",
         .input_schema =
         \\{"type":"object","properties":{"limit":{"type":"number","description":"Max results (default 50)"}},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_connections",
+        .name = "mem_connections",
         .description = "List connections for a concept.",
         .input_schema =
         \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID"},"direction":{"type":"string","description":"Filter: 'outgoing', 'incoming', or 'both' (default: both)"}},"required":["id"]}
         ,
     },
     .{
-        .name = "cog_mem_trace",
+        .name = "mem_trace",
         .description = "Find shortest path between two concepts in the memory graph.",
         .input_schema =
         \\{"type":"object","properties":{"from":{"type":"string","description":"Source term name or engram ID"},"to":{"type":"string","description":"Target term name or engram ID"},"max_depth":{"type":"number","description":"Maximum hops (default: 5)"}},"required":["from","to"]}
         ,
     },
     .{
-        .name = "cog_mem_stats",
+        .name = "mem_stats",
         .description = "Show memory statistics (counts, memory types).",
         .input_schema =
         \\{"type":"object","properties":{},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_orphans",
+        .name = "mem_orphans",
         .description = "List concepts with no connections.",
         .input_schema =
         \\{"type":"object","properties":{"limit":{"type":"number","description":"Max results (default 50)"}},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_connectivity",
+        .name = "mem_connectivity",
         .description = "Analyze graph connectivity (connected components).",
         .input_schema =
         \\{"type":"object","properties":{},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_list_terms",
+        .name = "mem_list_terms",
         .description = "List all terms in memory, sorted alphabetically.",
         .input_schema =
         \\{"type":"object","properties":{"limit":{"type":"number","description":"Max results (default 100)"}},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_bulk_learn",
+        .name = "mem_bulk_learn",
         .description = "Store multiple concepts in a single batch.",
         .input_schema =
         \\{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"term":{"type":"string"},"definition":{"type":"string"}},"required":["term","definition"]}}},"required":["items"]}
         ,
     },
     .{
-        .name = "cog_mem_bulk_associate",
+        .name = "mem_bulk_associate",
         .description = "Create multiple associations in a single batch.",
         .input_schema =
         \\{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"source":{"type":"string"},"target":{"type":"string"},"relation":{"type":"string"}},"required":["source","target"]}}},"required":["items"]}
         ,
     },
     .{
-        .name = "cog_mem_bulk_recall",
+        .name = "mem_bulk_recall",
         .description = "Search memory for multiple queries at once.",
         .input_schema =
         \\{"type":"object","properties":{"queries":{"type":"array","items":{"type":"string"},"description":"List of search queries"}},"required":["queries"]}
         ,
     },
     .{
-        .name = "cog_mem_stale",
+        .name = "mem_stale",
         .description = "List stale memories (not available in local mode).",
         .input_schema =
         \\{"type":"object","properties":{},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_verify",
+        .name = "mem_verify",
         .description = "Verify memory integrity.",
         .input_schema =
         \\{"type":"object","properties":{},"required":[]}
         ,
     },
     .{
-        .name = "cog_mem_meld",
+        .name = "mem_meld",
         .description = "Merge similar concepts (requires hosted brain).",
         .input_schema =
         \\{"type":"object","properties":{"ids":{"type":"array","items":{"type":"string"},"description":"Engram IDs to merge"}},"required":["ids"]}
@@ -216,8 +216,8 @@ pub fn callLocalTool(mem_db: *MemoryDb, tool_name: []const u8, arguments: ?json.
     const allocator = mem_db.allocator;
 
     // Strip cog_mem_ prefix to get the handler name
-    const suffix = if (std.mem.startsWith(u8, tool_name, "cog_mem_"))
-        tool_name["cog_mem_".len..]
+    const suffix = if (std.mem.startsWith(u8, tool_name, "mem_"))
+        tool_name["mem_".len..]
     else
         tool_name;
 
@@ -1528,7 +1528,7 @@ test "stale returns message" {
     defer db.close();
     try memory_schema.ensureSchema(&db);
     var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
-    const result = try callLocalTool(&mem, "cog_mem_stale", null);
+    const result = try callLocalTool(&mem, "mem_stale", null);
     defer std.testing.allocator.free(result);
     try std.testing.expect(result.len > 0);
 }
@@ -1538,7 +1538,7 @@ test "verify returns success" {
     defer db.close();
     try memory_schema.ensureSchema(&db);
     var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
-    const result = try callLocalTool(&mem, "cog_mem_verify", null);
+    const result = try callLocalTool(&mem, "mem_verify", null);
     defer std.testing.allocator.free(result);
     try std.testing.expect(result.len > 0);
 }

@@ -10,7 +10,7 @@ Run each prompt in a fresh Claude Code session from `bench/debug/rust/`.
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 01-logic-error/ implements Dijkstra's shortest path algorithm using a custom binary heap priority queue and a graph construction module. When you run `cd 01-logic-error && cargo run 2>/dev/null`, it should output "Shortest A->E: cost 7, path A -> B -> D -> E" but instead finds a suboptimal path with cost 10.
 
@@ -40,7 +40,7 @@ Then run this command to update the dashboard: bash ../../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 02-state-mutation/ is an LRU cache with HashMap + doubly linked list. When you run `cd 02-state-mutation && cargo run 2>/dev/null`, it should report all lookups correct but instead shows incorrect lookups and a lower hit rate due to linked list corruption.
 
@@ -70,7 +70,7 @@ Then run this command to update the dashboard: bash ../../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 03-crash/ detects file format (JSON/config/CSV) and parses accordingly. When you run `cd 03-crash && cargo run 2>/dev/null`, it should output "Parsed config: 5 values loaded" but instead panics unexpectedly.
 
@@ -100,7 +100,7 @@ Then run this command to update the dashboard: bash ../../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 04-concurrency/ is a 3-stage pipeline with bounded mpsc channels. Stage 2 sends feedback to Stage 1. When you run `cd 04-concurrency && cargo run 2>/dev/null`, it should output "Processed 500 records" but instead hangs.
 
@@ -130,7 +130,7 @@ Then run this command to update the dashboard: bash ../../collect.sh
 
 ### Debug variant
 ```
-You have access to the cog debugger via cog_debug_* MCP tools. Use the debugger to diagnose and fix the bug.
+You have access to the cog debugger via debug_* MCP tools. Use the debugger to diagnose and fix the bug.
 
 The program in 05-silent-wrong/ implements a variable-length integer codec (varint) with separate encoder and decoder modules. When you run `cd 05-silent-wrong && cargo run 2>/dev/null`, single-byte values (0-127) roundtrip correctly but multi-byte values decode to wrong values.
 

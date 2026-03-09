@@ -668,13 +668,13 @@ fn writeOpenCodeOverridePlugin(path: []const u8) !void {
         \\  "tool.definition": async (input, output) => {
         \\    if (input.toolID === "glob" || input.toolID === "grep") {
         \\      output.description =
-        \\        "Fallback only. Use cog_code_explore and cog_code_query for code exploration."
+        \\        "Fallback only. Use code_explore and code_query for code exploration."
         \\    }
         \\  },
         \\  "tool.execute.before": async (input) => {
         \\    if (input.tool === "glob" || input.tool === "grep") {
         \\      throw new Error(
-        \\        "Cog override policy: use cog_code_explore or cog_code_query. Glob and grep are disabled for OpenCode exploration workflows."
+        \\        "Cog override policy: use code_explore or code_query. Glob and grep are disabled for OpenCode exploration workflows."
         \\      )
         \\    }
         \\  },
@@ -695,7 +695,7 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
     } else if (std.mem.eql(u8, agent.id, "codex")) {
         try writeTomlAgent(allocator, agent_path, "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
-        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", "You are a code index exploration agent. Use cog_code_explore for symbol discovery and file structure, then use cog_code_query refs only when you need call sites. Read source only after the index tells you where to look. Do not use filename guessing or raw file search unless the Cog index is unavailable. Return concise summaries with file paths and line numbers.");
+        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", "You are a code index exploration agent. Use code_explore for symbol discovery and file structure, then use code_query refs only when you need call sites. Read source only after the index tells you where to look. Do not use filename guessing or raw file search unless the Cog index is unavailable. Return concise summaries with file paths and line numbers.");
     }
 }
 
@@ -719,7 +719,7 @@ pub fn configureMemAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Age
     } else if (std.mem.eql(u8, agent.id, "codex")) {
         try writeTomlAgent(allocator, mem_path, "cog-mem", "Memory sub-agent for recall, consolidation, and maintenance", build_options.mem_agent_body);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
-        try writeRooAgent(allocator, mem_path, "cog-mem", "Cog Memory", "You are a memory sub-agent for Cog's persistent associative knowledge graph. Search memory with cog_mem_recall, consolidate short-term memories with cog_mem_list_short_term and cog_mem_reinforce, and check brain health with cog_mem_stats. Return concise summaries with engram IDs.");
+        try writeRooAgent(allocator, mem_path, "cog-mem", "Cog Memory", "You are a memory sub-agent for Cog's persistent associative knowledge graph. Search memory with mem_recall, consolidate short-term memories with mem_list_short_term and mem_reinforce, and check brain health with mem_stats. Return concise summaries with engram IDs.");
     }
 }
 
@@ -1045,7 +1045,7 @@ test "writeOpenCodeOverridePlugin creates strict override plugin" {
             try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.definition\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.execute.before\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "input.tool === \"glob\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, content, "cog_code_explore or cog_code_query") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "code_explore or code_query") != null);
         }
     }.run);
 }

@@ -21,7 +21,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does a request flow through Gin from the HTTP listener to the response? Walk me through the key structs and methods in the pipeline.
 
@@ -47,7 +47,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 I want to write custom middleware for authentication. Show me how the middleware chain is structured — how do handlers get registered, how does Next() work, and how does abort short-circuit the chain?
 
@@ -73,7 +73,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does Gin's router match URL paths to handlers? What data structure does it use for route lookup, and how are path parameters like :id extracted?
 
@@ -99,7 +99,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does Gin handle JSON request body binding and validation? Walk me through what happens when I call c.ShouldBindJSON() — what are the key interfaces and implementations?
 
@@ -125,7 +125,7 @@ Then run this command to update the dashboard: bash ../collect.sh
 
 ### Traditional variant
 ```
-You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any cog_code_* MCP tools or the cog-code-query agent.
+You MUST answer using ONLY Grep, Read, and Glob tools. Do NOT use any code_* MCP tools or the cog-code-query agent.
 
 How does Gin handle panics during request processing? What's the recovery mechanism, and how can I customize error responses? Show me the relevant middleware and error types.
 

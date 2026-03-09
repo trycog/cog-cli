@@ -122,9 +122,9 @@ Your Agent  <->  MCP (stdio)  <->  cog mcp
 
 Tool families your agent discovers:
 
-- `cog_mem_*` for memory operations (when configured)
-- `cog_code_*` for code intelligence (query, explore, index status)
-- `cog_debug_*` for the debugger (36 tools: launch, breakpoints, stepping, inspection, and more)
+- `mem_*` for memory operations (when configured)
+- `code_*` for code intelligence (query, explore, index status)
+- `debug_*` for the debugger (36 tools: launch, breakpoints, stepping, inspection, and more)
 
 ### Sub-agents
 
@@ -198,7 +198,7 @@ This passes `--model` to the agent CLI, useful for choosing a faster or cheaper 
 
 <br>
 
-Your agent interacts with memory through MCP tools (`cog_mem_*`). These are discovered dynamically from your brain's remote MCP server — not CLI commands. The full set includes:
+Your agent interacts with memory through MCP tools (`mem_*`). These are discovered dynamically from your brain's remote MCP server — not CLI commands. The full set includes:
 
 **Read:** `recall`, `get`, `connections`, `trace`, `bulk_recall`, `list_short_term`, `stale`, `stats`, `orphans`, `connectivity`, `list_terms`
 
@@ -247,9 +247,9 @@ This runs entirely locally. No account required.
 
 | Tool | Description |
 |------|-------------|
-| `cog_code_explore` | Find symbols by name, return readable definition bodies, file outlines, and references in one response. Primary tool for code exploration. |
-| `cog_code_query` | Low-level index query with three modes: `find` (locate definitions), `refs` (find all references), `symbols` (list symbols in a file), all returned as concise plain text. |
-| `cog_code_status` | Check index availability and coverage. |
+| `code_explore` | Find symbols by name, return readable definition bodies, file outlines, and references in one response. Primary tool for code exploration. |
+| `code_query` | Low-level index query with three modes: `find` (locate definitions), `refs` (find all references), `symbols` (list symbols in a file), all returned as concise plain text. |
+| `code_status` | Check index availability and coverage. |
 
 ### Pattern matching
 

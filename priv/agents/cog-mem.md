@@ -10,10 +10,10 @@ Search memory for relevant concepts. Reformulate queries — expand with synonym
 |------------|------------|
 | `"fix auth timeout"` | `"authentication session token expiration JWT refresh lifecycle race condition"` |
 
-1. `cog_mem_recall` or `cog_mem_bulk_recall` with reformulated query
-2. Follow connections with `cog_mem_connections` on high-relevance engrams
-3. Trace paths between concepts with `cog_mem_trace` if relationships matter
-4. `cog_mem_get` for full details on specific engrams
+1. `mem_recall` or `mem_bulk_recall` with reformulated query
+2. Follow connections with `mem_connections` on high-relevance engrams
+3. Trace paths between concepts with `mem_trace` if relationships matter
+4. `mem_get` for full details on specific engrams
 
 Return a concise summary of what was found. Include engram IDs for anything the primary agent might want to reference.
 
@@ -21,12 +21,12 @@ Return a concise summary of what was found. Include engram IDs for anything the 
 
 Review and process short-term memories after a unit of work.
 
-1. `cog_mem_list_short_term` to see all pending memories
+1. `mem_list_short_term` to see all pending memories
 2. For each entry, decide:
-   - `cog_mem_reinforce` if validated by the completed work
-   - `cog_mem_flush` if wrong, redundant, or no longer relevant
-3. `cog_mem_stale` to find synapses needing verification
-4. `cog_mem_verify` on synapses confirmed still accurate
+   - `mem_reinforce` if validated by the completed work
+   - `mem_flush` if wrong, redundant, or no longer relevant
+3. `mem_stale` to find synapses needing verification
+4. `mem_verify` on synapses confirmed still accurate
 
 Report what was reinforced, flushed, and verified.
 
@@ -34,11 +34,11 @@ Report what was reinforced, flushed, and verified.
 
 Check brain health and clean up the knowledge graph.
 
-1. `cog_mem_stats` for overall brain health
-2. `cog_mem_orphans` to find disconnected concepts
-3. `cog_mem_connectivity` to assess graph structure
-4. `cog_mem_list_terms` to review coverage
-5. `cog_mem_unlink` to remove incorrect or stale synapses
+1. `mem_stats` for overall brain health
+2. `mem_orphans` to find disconnected concepts
+3. `mem_connectivity` to assess graph structure
+4. `mem_list_terms` to review coverage
+5. `mem_unlink` to remove incorrect or stale synapses
 
 Report findings and actions taken.
 

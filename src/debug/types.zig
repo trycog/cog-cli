@@ -480,13 +480,13 @@ pub const StopState = struct {
     /// IDs of breakpoints that were hit (from DAP stopped event hitBreakpointIds)
     hit_breakpoint_ids: []const u32 = &.{},
 
-    /// Max stack frames included in stop responses. Use cog_debug_stacktrace for more.
+    /// Max stack frames included in stop responses. Use debug_stacktrace for more.
     const max_stop_frames = 5;
-    /// Max local variables included in stop responses. Use cog_debug_inspect for more.
+    /// Max local variables included in stop responses. Use debug_inspect for more.
     const max_stop_locals = 10;
     /// Max output entries included in stop responses.
     const max_stop_output = 10;
-    /// Max length of variable values in stop responses. Use cog_debug_inspect for full values.
+    /// Max length of variable values in stop responses. Use debug_inspect for full values.
     const max_value_len = 200;
 
     pub fn jsonStringify(self: *const StopState, jw: anytype) !void {

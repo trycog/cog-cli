@@ -740,7 +740,7 @@ pub const DapProxy = struct {
                                     // Thread create/exit event
                                     self.queueNotification("debug/thread", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "loadedSource")) {
-                                    // Suppressed from poll_events — use cog_debug_loaded_sources instead.
+                                    // Suppressed from poll_events — use debug_loaded_sources instead.
                                 } else if (std.mem.eql(u8, evt.string, "process")) {
                                     // Process event
                                     self.queueNotification("debug/process", decoded.body);

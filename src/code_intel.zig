@@ -789,7 +789,7 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     {
         printErr("error: '");
         printErr(subcmd);
-        printErr("' has been removed from CLI. Use the MCP tools instead (cog_code_*).\n");
+        printErr("' has been removed from CLI. Use the MCP tools instead (code_*).\n");
         printErr("Run " ++ dim ++ "cog mcp --help" ++ reset ++ " for MCP server usage.\n");
         return error.Explained;
     }

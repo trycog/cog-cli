@@ -1,6 +1,6 @@
 # SWE-bench Debug Benchmark
 
-Measures whether cog's interactive debugger (`cog_debug_*` MCP tools) helps solve **real-world bugs** from [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified) — actual GitHub issues from projects like Django, sympy, and scikit-learn.
+Measures whether cog's interactive debugger (`debug_*` MCP tools) helps solve **real-world bugs** from [SWE-bench Verified](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified) — actual GitHub issues from projects like Django, sympy, and scikit-learn.
 
 Unlike `bench/debug/` which uses synthetic bugs, these are genuine issues where a debugger may provide meaningful advantage through runtime state inspection, breakpoints, and stepping.
 
@@ -8,7 +8,7 @@ Unlike `bench/debug/` which uses synthetic bugs, these are genuine issues where 
 
 - **5 hand-picked tasks** from SWE-bench Verified (debugger-friendly: wrong runtime behavior, state corruption, edge cases)
 - **Docker per task** for correct Python version + dependencies
-- **2 variants** per task: `debug` (cog_debug_* MCP) vs `traditional` (Read/Grep/Edit/Bash)
+- **2 variants** per task: `debug` (debug_* MCP) vs `traditional` (Read/Grep/Edit/Bash)
 - **Bind-mount architecture**: repo lives on host (Claude edits files directly), Docker provides Python env for running tests
 - **Verification via pytest**: FAIL_TO_PASS tests must pass after fix, PASS_TO_PASS must not regress
 

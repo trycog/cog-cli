@@ -1,11 +1,11 @@
 # Cog Debug Benchmark
 
-Measures whether cog's interactive debugger (`cog_debug_*` MCP tools) reduces time, turns, and token cost for diagnosing and fixing runtime bugs compared to traditional debugging (reading code, adding print statements, analyzing output).
+Measures whether cog's interactive debugger (`debug_*` MCP tools) reduces time, turns, and token cost for diagnosing and fixing runtime bugs compared to traditional debugging (reading code, adding print statements, analyzing output).
 
 ## Structure
 
 - **20 test programs** across 4 languages (5 per language), each with a specific bug
-- **2 variants** per test: `debug` (uses `cog_debug_*` tools) vs `traditional` (standard tools only)
+- **2 variants** per test: `debug` (uses `debug_*` tools) vs `traditional` (standard tools only)
 - **Verification**: after Claude fixes the code, the program is run and stdout compared to `expected_output.txt`
 - **Reset**: `git checkout` restores broken source between runs
 
