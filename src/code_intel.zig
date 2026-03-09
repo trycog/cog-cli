@@ -546,6 +546,10 @@ const MAX_BODY_LINES: usize = 30;
 const MAX_RELATED: usize = 5;
 const MAX_TOTAL_BYTES: usize = 51200; // 50KB
 const CONTEXT_BEFORE: usize = 3;
+const MAX_TEXT_MATCHES: usize = 24;
+const MAX_TEXT_REFS: usize = 24;
+const MAX_TEXT_FILE_SYMBOLS: usize = 20;
+const MAX_TEXT_SNIPPET_BYTES: usize = 3000;
 
 fn sameDirectory(path_a: []const u8, path_b: []const u8) bool {
     const dir_a = std.fs.path.dirname(path_a) orelse "";
@@ -2504,6 +2508,7 @@ pub fn codeQueryInner(allocator: std.mem.Allocator, params: QueryParams) ![]cons
 }
 
 pub fn codeQueryWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, params: QueryParams) ![]const u8 {
+    debug_log.log("codeQueryWithLoadedIndex: mode={s} name={?s} file={?s}", .{ @tagName(params.mode), params.name, params.file });
     return switch (params.mode) {
         .find => try queryFindInner(allocator, ci, params.name orelse return error.MissingName, params.kind, params.file),
         .refs => try queryRefsInner(allocator, ci, params.name orelse return error.MissingName, params.kind, params.file),
@@ -2519,6 +2524,7 @@ pub const ExploreQuery = struct {
 };
 
 pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, queries: []const ExploreQuery, context_lines: usize) ![]const u8 {
+    debug_log.log("codeExploreWithLoadedIndex: queries={d} context_lines={d}", .{ queries.len, context_lines });
     // Resolve the project root from .cog dir (strip trailing /.cog)
     const cog_dir = paths.findCogDir(allocator) catch return try allocator.dupe(u8, "[]");
     defer allocator.free(cog_dir);
@@ -2563,8 +2569,6 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
         if (br.*) |r| allocator.free(r.snippet);
     };
 
-    var total_bytes: usize = 0;
-
     for (0..n) |i| {
         const matches = &all_matches[i];
         if (matches.items.len == 0) continue;
@@ -2578,17 +2582,14 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
         // Read full definition body
         const body = readDefinitionBody(allocator, project_root, match.def.path, match.def.line, match.def.end_line, context_lines) catch null;
         if (body) |b| {
-            total_bytes += b.snippet.len;
             body_results[i] = b;
         }
     }
 
-    // Phase 5: Output JSON
+    // Phase 5: Output readable text
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-
-    try s.beginArray();
+    var w = &aw.writer;
 
     // Track files we've already emitted TOCs for (avoid duplicates across queries)
     var emitted_file_tocs: std.StringHashMapUnmanaged(void) = .empty;
@@ -2596,9 +2597,11 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
 
     // Primary results
     for (0..n) |i| {
+        if (i > 0) try w.writeAll("\n---\n\n");
+
         const matches = &all_matches[i];
         if (matches.items.len == 0) {
-            try writeExploreError(&s, queries[i].name, "Symbol not found");
+            try w.print("`{s}`\nStatus: Symbol not found\n", .{queries[i].name});
             continue;
         }
 
@@ -2606,73 +2609,65 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
         const match = matches.items[sel_idx];
 
         if (match.def.path.len == 0) {
-            try writeExploreError(&s, queries[i].name, "Symbol is external (no source file)");
+            try w.print("`{s}`\nStatus: Symbol is external (no source file)\n", .{queries[i].name});
             continue;
         }
 
-        try s.beginObject();
-        try s.objectField("name");
-        try s.write(if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol));
-        try s.objectField("kind");
-        try s.write(scip.kindName(match.def.kind));
-        try s.objectField("path");
-        try s.write(match.def.path);
-        try s.objectField("line");
-        try s.write(match.def.line);
-        if (match.def.end_line > match.def.line) {
-            try s.objectField("end_line");
-            try s.write(match.def.end_line);
+        const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+        try w.print("`{s}` ({s})\nLocation: `{s}:", .{ display_name, scip.kindName(match.def.kind), match.def.path });
+        try writeLineRange(w, match.def.line, match.def.end_line);
+        try w.writeAll("`\n");
+        if (retry_used[i]) {
+            try w.print("Matched with retry pattern `{s}`\n", .{retry_globs[i].?});
         }
+
         if (body_results[i]) |body| {
-            try s.objectField("snippet");
-            try s.write(body.snippet);
+            try w.writeAll("\nSnippet:\n");
+            try writeSnippetBlock(w, body.snippet, match.def.path, body.truncated);
         }
+
         // Emit references from SCIP cross-reference data
         if (match.def.end_line > match.def.line) {
             var refs = ci.findReferencesInRange(allocator, match.def.path, match.symbol, match.def.line, match.def.end_line);
             defer refs.deinit(allocator);
             if (refs.items.len > 0) {
-                try s.objectField("references");
-                try s.beginArray();
-                for (refs.items) |ref_name| {
-                    try s.write(ref_name);
+                try w.writeAll("\nReferenced symbols:\n");
+                const shown = @min(refs.items.len, MAX_TEXT_REFS);
+                for (refs.items[0..shown]) |ref_name| {
+                    try w.print("- `{s}`\n", .{ref_name});
                 }
-                try s.endArray();
+                if (refs.items.len > shown) {
+                    try w.print("- ... and {d} more\n", .{refs.items.len - shown});
+                }
             }
         }
+
         // Emit file_symbols TOC (once per unique file)
         if (!emitted_file_tocs.contains(match.def.path)) {
             emitted_file_tocs.put(allocator, match.def.path, {}) catch {};
             var toc = ci.getFileSymbolsTOC(allocator, match.def.path, &queried_symbols);
             defer toc.deinit(allocator);
             if (toc.items.len > 0) {
-                try s.objectField("file_symbols");
-                try s.beginArray();
-                for (toc.items) |entry| {
-                    try s.beginObject();
-                    try s.objectField("name");
-                    try s.write(entry.name);
-                    try s.objectField("kind");
-                    try s.write(scip.kindName(entry.kind));
-                    try s.objectField("line");
-                    try s.write(entry.line);
-                    if (entry.end_line > entry.line) {
-                        try s.objectField("end_line");
-                        try s.write(entry.end_line);
-                    }
-                    try s.endObject();
+                try w.print("\nFile outline for `{s}`:\n", .{match.def.path});
+                const shown = @min(toc.items.len, MAX_TEXT_FILE_SYMBOLS);
+                for (toc.items[0..shown]) |entry| {
+                    try w.print("- `{s}` ({s}) at `", .{ entry.name, scip.kindName(entry.kind) });
+                    try writeLineRange(w, entry.line, entry.end_line);
+                    try w.writeAll("`\n");
                 }
-                try s.endArray();
+                if (toc.items.len > shown) {
+                    try w.print("- ... and {d} more symbols\n", .{toc.items.len - shown});
+                }
             }
         }
-        if (retry_used[i]) {
-            try s.objectField("retry");
-            try s.write(retry_globs[i].?);
+
+        if (aw.writer.buffered().len >= MAX_TOTAL_BYTES) {
+            try w.writeAll("\nOutput truncated to stay within the explore tool budget. Narrow the query or ask follow-up questions for more detail.\n");
+            break;
         }
-        try s.endObject();
     }
 
-    try s.endArray();
+    debug_log.log("codeExploreWithLoadedIndex: emitted {d} bytes", .{aw.writer.buffered().len});
 
     return aw.toOwnedSlice();
 }
@@ -2923,31 +2918,20 @@ fn queryFindInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8
 
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-
-    try s.beginArray();
-    for (matches.items) |match| {
-        try s.beginObject();
-        try s.objectField("symbol");
-        try s.write(match.symbol);
-        try s.objectField("path");
-        try s.write(match.def.path);
-        try s.objectField("line");
-        try s.write(match.def.line);
-        try s.objectField("kind");
-        try s.write(scip.kindName(match.def.kind));
-        if (match.def.display_name.len > 0) {
-            try s.objectField("display_name");
-            try s.write(match.def.display_name);
+    const shown = @min(matches.items.len, MAX_TEXT_MATCHES);
+    try aw.writer.print("Matches for `{s}`:\n", .{name});
+    for (matches.items[0..shown]) |match| {
+        const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+        try aw.writer.print("- `{s}` ({s}) at `{s}:{d}`\n", .{ display_name, scip.kindName(match.def.kind), match.def.path, match.def.line });
+        if (match.def.documentation.len > 0 and match.def.documentation[0].len > 0) {
+            try aw.writer.print("  {s}\n", .{truncateInline(match.def.documentation[0], 160)});
         }
-        if (match.def.documentation.len > 0) {
-            try s.objectField("documentation");
-            try s.write(match.def.documentation[0]);
-        }
-        try s.endObject();
     }
-    try s.endArray();
+    if (matches.items.len > shown) {
+        try aw.writer.print("- ... and {d} more matches\n", .{matches.items.len - shown});
+    }
 
+    debug_log.log("queryFindInner: emitted {d} matches for {s}", .{ shown, name });
     return aw.toOwnedSlice();
 }
 
@@ -2959,42 +2943,37 @@ fn queryRefsInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8
     const match = matches.items[0];
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-    try s.beginObject();
-    try s.objectField("symbol");
-    try s.write(match.symbol);
-    try s.objectField("definition");
-    try s.beginObject();
-    try s.objectField("path");
-    try s.write(match.def.path);
-    try s.objectField("line");
-    try s.write(match.def.line);
-    try s.endObject();
-    try s.objectField("references");
-    try s.beginArray();
+    const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+    try aw.writer.print("References for `{s}` ({s})\n", .{ display_name, scip.kindName(match.def.kind) });
+    try aw.writer.print("Definition: `{s}:{d}`\n", .{ match.def.path, match.def.line });
+    try aw.writer.writeAll("\nReferences:\n");
 
     var total_refs: usize = 0;
+    var shown_refs: usize = 0;
     if (ci.symbol_to_refs.get(match.symbol)) |refs| {
         total_refs = refs.items.len;
         for (refs.items) |ref| {
             if (file_filter) |ff| {
                 if (!fileMatchesSuffix(ref.path, ff)) continue;
             }
-            try s.beginObject();
-            try s.objectField("path");
-            try s.write(ref.path);
-            try s.objectField("line");
-            try s.write(ref.line);
-            try s.objectField("roles");
-            try s.write(ref.roles);
-            try s.endObject();
+            if (shown_refs < MAX_TEXT_REFS) {
+                try aw.writer.print("- `{s}:{d}` roles={s}\n", .{ ref.path, ref.line, ref.roles });
+            }
+            shown_refs += 1;
         }
     }
 
-    try s.endArray();
-    try s.objectField("total_references");
-    try s.write(total_refs);
-    try s.endObject();
+    if (shown_refs == 0) {
+        try aw.writer.writeAll("- No references found\n");
+    } else if (shown_refs > MAX_TEXT_REFS) {
+        try aw.writer.print("- ... and {d} more references\n", .{shown_refs - MAX_TEXT_REFS});
+    }
+    if (file_filter) |ff| {
+        try aw.writer.print("\nFiltered by file suffix `{s}`.\n", .{ff});
+    }
+    try aw.writer.print("Total indexed references: {d}\n", .{total_refs});
+
+    debug_log.log("queryRefsInner: emitted {d} refs for {s}", .{ shown_refs, name });
     return aw.toOwnedSlice();
 }
 
@@ -3016,13 +2995,9 @@ fn querySymbolsInner(allocator: std.mem.Allocator, ci: *CodeIndex, file_path: []
 
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
-    try s.beginObject();
-    try s.objectField("path");
-    try s.write(doc.relative_path);
-    try s.objectField("symbols");
-    try s.beginArray();
+    try aw.writer.print("Symbols in `{s}`:\n", .{doc.relative_path});
 
+    var emitted: usize = 0;
     for (doc.symbols) |sym| {
         const k = scip.kindName(sym.kind);
         if (kind_filter) |kf| {
@@ -3035,29 +3010,66 @@ fn querySymbolsInner(allocator: std.mem.Allocator, ci: *CodeIndex, file_path: []
                 break;
             }
         }
-        try s.beginObject();
         const display = if (sym.display_name.len > 0) sym.display_name else scip.extractSymbolName(sym.symbol);
-        try s.objectField("name");
-        try s.write(display);
-        try s.objectField("kind");
-        try s.write(k);
-        try s.objectField("line");
-        try s.write(def_line);
-        if (sym.documentation.len > 0) {
-            try s.objectField("documentation");
-            const doc_str = sym.documentation[0];
-            if (doc_str.len > 200) {
-                try s.write(doc_str[0..200]);
-            } else {
-                try s.write(doc_str);
+        if (emitted < MAX_TEXT_MATCHES) {
+            try aw.writer.print("- `{s}` ({s}) at `{d}`\n", .{ display, k, def_line });
+            if (sym.documentation.len > 0 and sym.documentation[0].len > 0) {
+                try aw.writer.print("  {s}\n", .{truncateInline(sym.documentation[0], 160)});
             }
         }
-        try s.endObject();
+        emitted += 1;
     }
 
-    try s.endArray();
-    try s.endObject();
+    if (emitted == 0) {
+        try aw.writer.writeAll("- No matching symbols found\n");
+    } else if (emitted > MAX_TEXT_MATCHES) {
+        try aw.writer.print("- ... and {d} more symbols\n", .{emitted - MAX_TEXT_MATCHES});
+    }
+
+    debug_log.log("querySymbolsInner: emitted {d} symbols for {s}", .{ emitted, doc.relative_path });
     return aw.toOwnedSlice();
+}
+
+fn writeLineRange(writer: anytype, line: i32, end_line: i32) !void {
+    if (end_line > line) {
+        try writer.print("{d}-{d}", .{ line, end_line });
+    } else {
+        try writer.print("{d}", .{line});
+    }
+}
+
+fn truncateInline(text: []const u8, max_len: usize) []const u8 {
+    if (text.len <= max_len) return text;
+    return text[0..max_len];
+}
+
+fn writeSnippetBlock(writer: anytype, snippet: []const u8, path: []const u8, already_truncated: bool) !void {
+    const clipped_result = clipSnippet(snippet);
+    const snippet_text = clipped_result.text;
+    const clipped = clipped_result.clipped;
+    try writer.print("```{s}\n{s}```\n", .{ languageForPath(path), snippet_text });
+    if (already_truncated or clipped) {
+        try writer.writeAll("Snippet truncated. Narrow the query or read the file directly for the full body.\n");
+    }
+}
+
+fn clipSnippet(snippet: []const u8) struct { text: []const u8, clipped: bool } {
+    if (snippet.len <= MAX_TEXT_SNIPPET_BYTES) return .{ .text = snippet, .clipped = false };
+    return .{ .text = snippet[0..MAX_TEXT_SNIPPET_BYTES], .clipped = true };
+}
+
+fn languageForPath(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".zig")) return "zig";
+    if (std.mem.endsWith(u8, path, ".py")) return "python";
+    if (std.mem.endsWith(u8, path, ".rs")) return "rust";
+    if (std.mem.endsWith(u8, path, ".js")) return "javascript";
+    if (std.mem.endsWith(u8, path, ".ts")) return "ts";
+    if (std.mem.endsWith(u8, path, ".tsx")) return "tsx";
+    if (std.mem.endsWith(u8, path, ".jsx")) return "jsx";
+    if (std.mem.endsWith(u8, path, ".c")) return "c";
+    if (std.mem.endsWith(u8, path, ".cc") or std.mem.endsWith(u8, path, ".cpp")) return "cpp";
+    if (std.mem.endsWith(u8, path, ".h") or std.mem.endsWith(u8, path, ".hpp")) return "cpp";
+    return "text";
 }
 
 pub fn codeEditInner(allocator: std.mem.Allocator, file_path: []const u8, old_text: []const u8, new_text: []const u8) ![]const u8 {
@@ -4423,6 +4435,98 @@ test "readDefinitionBody: truncation at MAX_BODY_LINES" {
     defer allocator.free(result.snippet);
 
     try std.testing.expect(result.truncated);
+}
+
+test "queryFindInner returns readable text" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryFindInner(allocator, &ci, "init", null, null);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Matches for `init`:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`src/commands.zig:5`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`src/http.zig:8`") != null);
+}
+
+test "queryRefsInner returns readable text" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryRefsInner(allocator, &ci, "Settings", null, null);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "References for `Settings` (struct)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Definition: `src/settings.zig:3`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "roles=") != null);
+}
+
+test "querySymbolsInner returns readable text" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try querySymbolsInner(allocator, &ci, "src/commands.zig", null);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Symbols in `src/commands.zig`:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`init` (enum_member) at `5`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "`initBrain` (enum_member) at `20`") != null);
+}
+
+test "codeExploreWithLoadedIndex returns readable text" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var ci = try buildTestDisambiguationIndex(allocator);
+            defer deinitTestIndex(&ci, allocator);
+
+            try std.fs.cwd().makePath(".cog");
+            try std.fs.cwd().makePath("src");
+
+            {
+                const file = try std.fs.cwd().createFile("src/commands.zig", .{});
+                defer file.close();
+                try file.writeAll(
+                    \\const Settings = @import("settings.zig").Settings;
+                    \\
+                    \\pub fn bootstrap() void {}
+                    \\
+                    \\pub fn init() void {
+                    \\    const settings = Settings{};
+                    \\    _ = settings;
+                    \\}
+                    \\
+                    \\pub fn initBrain() void {
+                    \\    init();
+                    \\}
+                );
+            }
+
+            {
+                const file = try std.fs.cwd().createFile("src/settings.zig", .{});
+                defer file.close();
+                try file.writeAll(
+                    \\pub const Settings = struct {};
+                    \\
+                    \\pub fn load() Settings {
+                    \\    return .{};
+                    \\}
+                );
+            }
+
+            const result = try codeExploreWithLoadedIndex(allocator, &ci, &.{
+                .{ .name = "init" },
+                .{ .name = "Settings", .kind = "struct" },
+            }, 5);
+            defer allocator.free(result);
+
+            try std.testing.expect(std.mem.indexOf(u8, result, "`init`") != null);
+            try std.testing.expect(std.mem.indexOf(u8, result, "Snippet:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, result, "File outline for `src/commands.zig`:") != null);
+        }
+    }.run);
 }
 
 // ── discoverRelatedSymbols tests ─────────────────────────────────────────

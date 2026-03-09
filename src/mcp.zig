@@ -974,14 +974,14 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     // guides the agent to only use 5 direct memory tools; everything else
     // is accessed through sub-agents (code, debug, memory).
 
-    try writeToolDef(s, "cog_code_query", "Query the SCIP code index for symbol information. Use mode 'find' to locate where a symbol is defined, 'refs' to find all references to a symbol, or 'symbols' to list all symbols in a specific file.", &.{
+    try writeToolDef(s, "cog_code_query", "Query the SCIP code index for symbol information. Returns concise plain-text results that an agent can read directly: use mode 'find' to locate definitions, 'refs' to list references, or 'symbols' to outline a file.", &.{
         .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find' (locate a symbol's definition), 'refs' (find all references to a symbol), 'symbols' (list all symbols in a file)", .required = true },
         .{ .name = "name", .typ = "string", .desc = "Symbol name to search for (required for find and refs modes). Supports glob patterns: '*' (zero or more chars) and '?' (one char). Examples: '*init*', 'get*', 'Handle?'. Use '|' for alternation to search multiple names: 'banner|header|splash'", .required = false },
         .{ .name = "file", .typ = "string", .desc = "File path filter. Required for symbols mode. Optional for find/refs to scope results to a specific file.", .required = false },
         .{ .name = "kind", .typ = "string", .desc = "Filter results by symbol kind (e.g. function, class, method, variable)", .required = false },
     });
 
-    try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore", "Find multiple symbols by name and return full definition bodies with file table of contents. Combines find + read in a single call. Auto-retries failed lookups with glob patterns, reads compact function/struct bodies, and includes a file_symbols TOC listing every symbol in each matched file. Also includes references (symbols called within each function body).",
+    try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore", "Find multiple symbols by name and return readable plain-text summaries with definition bodies, referenced symbols, and per-file outlines. Combines find + read in a single call, auto-retries failed lookups with glob patterns, and keeps output compact enough for direct LLM consumption.",
         \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"}},"required":["queries"]}
     );
 
@@ -1285,6 +1285,7 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
     const args = arguments orelse return error.Explained;
 
     const mode_str = getStr(args, "mode") orelse return error.Explained;
+    debug_log_mod.log("callCodeQuery: mode={s}", .{mode_str});
     const mode: code_intel.QueryMode = if (std.mem.eql(u8, mode_str, "find"))
         .find
     else if (std.mem.eql(u8, mode_str, "refs"))
@@ -1313,6 +1314,7 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
 
     // Parse context_lines (default 15)
     const context_lines: usize = getInt(args, "context_lines") orelse 15;
+    debug_log_mod.log("callCodeExplore: context_lines={d}", .{context_lines});
 
     // Parse queries array
     const queries_val = if (args == .object) args.object.get("queries") else null;
@@ -1329,6 +1331,8 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
             .kind = getStr(item, "kind"),
         });
     }
+
+    debug_log_mod.log("callCodeExplore: parsed {d} queries", .{queries.items.len});
 
     if (queries.items.len == 0) return error.Explained;
 
