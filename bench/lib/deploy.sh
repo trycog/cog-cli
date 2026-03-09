@@ -61,26 +61,26 @@ AGENTEOF
 name: cog-debug
 description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
 tools:
-  - mcp__cog__cog_debug_launch
-  - mcp__cog__cog_debug_breakpoint
-  - mcp__cog__cog_debug_run
-  - mcp__cog__cog_debug_inspect
-  - mcp__cog__cog_debug_stacktrace
-  - mcp__cog__cog_debug_stop
-  - mcp__cog__cog_debug_threads
-  - mcp__cog__cog_debug_scopes
-  - mcp__cog__cog_debug_set_variable
-  - mcp__cog__cog_debug_watchpoint
-  - mcp__cog__cog_debug_exception_info
-  - mcp__cog__cog_debug_attach
-  - mcp__cog__cog_debug_restart
-  - mcp__cog__cog_debug_sessions
-  - mcp__cog__cog_debug_poll_events
-  - mcp__cog__cog_code_query
-  - mcp__cog__cog_code_explore
-  - mcp__cog__cog_code_status
-  - mcp__cog__cog_mem_recall
-  - mcp__cog__cog_mem_bulk_recall
+  - mcp__cog__debug_launch
+  - mcp__cog__debug_breakpoint
+  - mcp__cog__debug_run
+  - mcp__cog__debug_inspect
+  - mcp__cog__debug_stacktrace
+  - mcp__cog__debug_stop
+  - mcp__cog__debug_threads
+  - mcp__cog__debug_scopes
+  - mcp__cog__debug_set_variable
+  - mcp__cog__debug_watchpoint
+  - mcp__cog__debug_exception_info
+  - mcp__cog__debug_attach
+  - mcp__cog__debug_restart
+  - mcp__cog__debug_sessions
+  - mcp__cog__debug_poll_events
+  - mcp__cog__code_query
+  - mcp__cog__code_explore
+  - mcp__cog__code_status
+  - mcp__cog__mem_recall
+  - mcp__cog__mem_bulk_recall
   - Read
   - Bash
 mcpServers:
@@ -97,24 +97,24 @@ AGENTEOF
 name: cog-mem
 description: Memory sub-agent for recall, consolidation, and maintenance
 tools:
-  - mcp__cog__cog_mem_recall
-  - mcp__cog__cog_mem_bulk_recall
-  - mcp__cog__cog_mem_trace
-  - mcp__cog__cog_mem_connections
-  - mcp__cog__cog_mem_get
-  - mcp__cog__cog_mem_list_short_term
-  - mcp__cog__cog_mem_reinforce
-  - mcp__cog__cog_mem_flush
-  - mcp__cog__cog_mem_stale
-  - mcp__cog__cog_mem_verify
-  - mcp__cog__cog_mem_stats
-  - mcp__cog__cog_mem_orphans
-  - mcp__cog__cog_mem_connectivity
-  - mcp__cog__cog_mem_list_terms
-  - mcp__cog__cog_mem_unlink
-  - mcp__cog__cog_mem_meld
-  - mcp__cog__cog_mem_bulk_learn
-  - mcp__cog__cog_mem_bulk_associate
+  - mcp__cog__mem_recall
+  - mcp__cog__mem_bulk_recall
+  - mcp__cog__mem_trace
+  - mcp__cog__mem_connections
+  - mcp__cog__mem_get
+  - mcp__cog__mem_list_short_term
+  - mcp__cog__mem_reinforce
+  - mcp__cog__mem_flush
+  - mcp__cog__mem_stale
+  - mcp__cog__mem_verify
+  - mcp__cog__mem_stats
+  - mcp__cog__mem_orphans
+  - mcp__cog__mem_connectivity
+  - mcp__cog__mem_list_terms
+  - mcp__cog__mem_unlink
+  - mcp__cog__mem_meld
+  - mcp__cog__mem_bulk_learn
+  - mcp__cog__mem_bulk_associate
 mcpServers:
   - cog
 ---

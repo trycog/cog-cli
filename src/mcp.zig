@@ -23,7 +23,7 @@ var server_version: []const u8 = "0.0.0";
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 const RemoteTool = struct {
-    name: []const u8, // local name: "cog_mem_recall"
+    name: []const u8, // local name: "mem_recall"
     remote_name: []const u8, // server name: "cog_recall"
     description: []const u8,
     input_schema: []const u8, // raw JSON string
@@ -974,14 +974,14 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     // guides the agent to only use 5 direct memory tools; everything else
     // is accessed through sub-agents (code, debug, memory).
 
-    try writeToolDef(s, "cog_code_query", "Query the SCIP code index for targeted follow-up only. Returns concise plain-text results that an agent can read directly: use mode 'find' to locate definitions, 'refs' to list references, or 'symbols' to outline one already-identified file. Do not use repeated `symbols` or `find` calls as an exploration strategy when the work can be batched into `cog_code_explore`.", &.{
+    try writeToolDef(s, "code_query", "Query the SCIP code index for targeted follow-up only. Returns concise plain-text results that an agent can read directly: use mode 'find' to locate definitions, 'refs' to list references, or 'symbols' to outline one already-identified file. Do not use repeated `symbols` or `find` calls as an exploration strategy when the work can be batched into `cog_code_explore`.", &.{
         .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find' (locate a symbol's definition), 'refs' (find all references to a symbol), 'symbols' (list all symbols in a file)", .required = true },
         .{ .name = "name", .typ = "string", .desc = "Symbol name to search for (required for find and refs modes). Supports glob patterns: '*' (zero or more chars) and '?' (one char). Examples: '*init*', 'get*', 'Handle?'. Use '|' for alternation to search multiple names: 'banner|header|splash'", .required = false },
         .{ .name = "file", .typ = "string", .desc = "File path filter. Required for symbols mode. Optional for find/refs to scope results to a specific file.", .required = false },
         .{ .name = "kind", .typ = "string", .desc = "Filter results by symbol kind (e.g. function, class, method, variable)", .required = false },
     });
 
-    try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore", "Primary code exploration tool. Batch all candidate symbols into one call whenever possible and prefer a single batched call for repository summaries. Returns readable plain-text summaries with definition bodies, referenced symbols, and per-file outlines. Combines find + read in a single call, auto-retries failed lookups with glob patterns, and keeps output compact enough for direct LLM consumption.",
+    try writeToolDefWithSchemaJson(allocator, s, "code_explore", "Primary code exploration tool. Batch all candidate symbols into one call whenever possible and prefer a single batched call for repository summaries. Returns readable plain-text summaries with definition bodies, referenced symbols, and per-file outlines. Combines find + read in a single call, auto-retries failed lookups with glob patterns, and keeps output compact enough for direct LLM consumption.",
         \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"}},"required":["queries"]}
     );
 
@@ -1016,7 +1016,7 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
 
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
     // Debug tools have their own mutex (DebugServer.mutex) — no Runtime lock needed
-    if (std.mem.startsWith(u8, tool_name, "cog_debug_")) {
+    if (std.mem.startsWith(u8, tool_name, "debug_")) {
         return callDebugTool(runtime, tool_name, arguments);
     }
 
@@ -1025,14 +1025,14 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
     defer runtime.mutex.unlock();
 
     // Code tools
-    if (std.mem.eql(u8, tool_name, "cog_code_query")) {
+    if (std.mem.eql(u8, tool_name, "code_query")) {
         return callCodeQuery(runtime, arguments);
-    } else if (std.mem.eql(u8, tool_name, "cog_code_explore")) {
+    } else if (std.mem.eql(u8, tool_name, "code_explore")) {
         return callCodeExplore(runtime, arguments);
     }
 
     // Memory tools — local SQLite or remote MCP server
-    if (std.mem.startsWith(u8, tool_name, "cog_mem_")) {
+    if (std.mem.startsWith(u8, tool_name, "mem_")) {
         if (runtime.isLocalBrain()) {
             const mem_db = runtime.ensureMemoryDb() catch {
                 return runtime.allocator.dupe(u8, "Error: failed to open local memory database.");
@@ -1048,33 +1048,33 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
 
 // ── Remote MCP Proxy ────────────────────────────────────────────────────
 
-/// Prefix a remote tool suffix with "cog_mem_".
-/// e.g. prefixToolName(alloc, "recall") → "cog_mem_recall"
-///      prefixToolName(alloc, "bulk_recall") → "cog_mem_bulk_recall"
+/// Prefix a remote tool suffix with "mem_".
+/// e.g. prefixToolName(alloc, "recall") → "mem_recall"
+///      prefixToolName(alloc, "bulk_recall") → "mem_bulk_recall"
 fn prefixToolName(allocator: std.mem.Allocator, suffix: []const u8) ![]const u8 {
-    const prefix = "cog_mem_";
+    const prefix = "mem_";
     const buf = try allocator.alloc(u8, prefix.len + suffix.len);
     @memcpy(buf[0..prefix.len], prefix);
     @memcpy(buf[prefix.len..], suffix);
     return buf;
 }
 
-/// Rewrite cog_xxx tool name references in descriptions to cog_mem_xxx format.
-/// e.g. "use cog_reinforce to..." → "use cog_mem_reinforce to..."
-///      "multiple cog_bulk_recall calls" → "multiple cog_mem_bulk_recall calls"
+/// Rewrite cog_xxx tool name references in descriptions to mem_xxx format.
+/// e.g. "use cog_reinforce to..." → "use mem_reinforce to..."
+///      "multiple cog_bulk_recall calls" → "multiple mem_bulk_recall calls"
 fn rewriteToolReferences(allocator: std.mem.Allocator, desc: []const u8) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     const prefix = "cog_";
-    const replacement_prefix = "cog_mem_";
+    const replacement_prefix = "mem_";
     var i: usize = 0;
     while (i < desc.len) {
         if (desc.len - i >= prefix.len and std.mem.eql(u8, desc[i..][0..prefix.len], prefix)) {
             // Find end of tool name token (alphanumeric + underscore)
             var end = i + prefix.len;
             while (end < desc.len and (std.ascii.isAlphanumeric(desc[end]) or desc[end] == '_')) : (end += 1) {}
-            // Write cog_mem_ + the suffix
+            // Write mem_ + the suffix
             try buf.appendSlice(allocator, replacement_prefix);
             try buf.appendSlice(allocator, desc[i + prefix.len .. end]);
             i = end;
@@ -1145,7 +1145,7 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
         const cog_prefix = "cog_";
         if (!std.mem.startsWith(u8, remote_name, cog_prefix)) continue;
 
-        // Rename cog_snake_case → cog:mem.camelCase
+        // Rename cog_xxx → mem_xxx
         const suffix = remote_name[cog_prefix.len..];
         const local_name = try prefixToolName(allocator, suffix);
         errdefer allocator.free(local_name);
@@ -1743,5 +1743,5 @@ test "runtimeCallTool rejects code queries when index is unavailable" {
     const parsed = try json.parseFromSlice(json.Value, allocator, "{\"mode\":\"find\",\"name\":\"main\"}", .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.IndexUnavailable, runtimeCallTool(&runtime, "cog_code_query", parsed.value));
+    try std.testing.expectError(error.IndexUnavailable, runtimeCallTool(&runtime, "code_query", parsed.value));
 }
