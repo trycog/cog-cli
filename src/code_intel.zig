@@ -155,13 +155,18 @@ fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
 // ── Index location ──────────────────────────────────────────────────────
 
 /// Get the path to the index.scip file.
+fn getIndexPathQuiet(allocator: std.mem.Allocator) ![]const u8 {
+    const cog_dir = try paths.findCogDir(allocator);
+    defer allocator.free(cog_dir);
+    return std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir});
+}
+
+/// Get the path to the index.scip file and explain missing index state to CLI users.
 fn getIndexPath(allocator: std.mem.Allocator) ![]const u8 {
-    const cog_dir = paths.findCogDir(allocator) catch {
+    return getIndexPathQuiet(allocator) catch {
         printErr("error: no .cog directory found. Run " ++ dim ++ "cog code:index" ++ reset ++ " first.\n");
         return error.Explained;
     };
-    defer allocator.free(cog_dir);
-    return std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir});
 }
 
 // ── CodeIndex ───────────────────────────────────────────────────────────
@@ -742,7 +747,7 @@ pub const QueryIndexStatus = enum {
 };
 
 pub fn queryIndexStatusForRuntime(allocator: std.mem.Allocator) QueryIndexStatus {
-    const index_path = getIndexPath(allocator) catch {
+    const index_path = getIndexPathQuiet(allocator) catch {
         debug_log.log("queryIndexStatusForRuntime: missing .cog/index.scip", .{});
         return .unavailable;
     };

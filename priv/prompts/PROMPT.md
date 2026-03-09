@@ -19,9 +19,13 @@ Only fall back to Grep or Glob when the Cog index is unavailable, incomplete for
 ### Efficiency Rules
 
 - For repository-understanding, architecture-summary, or "tell me about this project" tasks: make exactly one initial `cog_code_explore` call with a batched list of likely entrypoint symbols.
+- Before making any follow-up code-intelligence call, first check whether the answer is already present in the prior `cog_code_explore` output (`file_symbols`, definition body, or referenced symbols).
+- If you need to look up multiple symbols, combine them into one `cog_code_explore({ queries: [...] })` call instead of making multiple single-symbol calls.
 - Do not explore by issuing repeated `cog_code_query(mode="symbols", file=...)` calls across multiple files.
+- Treat repeated `cog_code_query(mode="symbols")` calls across files as an invalid exploration pattern. Use it only for one already-identified file when a concrete ambiguity remains.
 - Use `cog_code_query(mode="symbols")` only after a specific file has already been identified as relevant.
 - Use `cog_code_query(mode="refs")` only as a targeted follow-up when a concrete ambiguity remains after the initial batched exploration.
+- Do not use `cog_code_query(mode="find")` as a step-by-step exploration strategy when the needed symbols can be batched into `cog_code_explore`.
 - Default budget for code-analysis tasks: 2-3 code-intelligence tool calls before responding.
 - Do not call `cog_mem_recall` for pure codebase summarization or architecture description unless memory is specifically needed to answer the question.
 

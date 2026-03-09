@@ -28,6 +28,8 @@ The only valid follow-up is `cog_code_query` with `refs` mode to find all call s
 
 Most tasks complete in 1 turn.
 
+Before any follow-up call, check whether the answer is already present in the first `cog_code_explore` result via the definition snippet, `file_symbols`, or referenced symbols.
+
 ### Repository summaries
 
 For "tell me about this project", architecture overviews, or repository summaries:
@@ -43,6 +45,9 @@ For "tell me about this project", architecture overviews, or repository summarie
 - Prefer `cog_code_explore` over `cog_code_query find` for locating symbols
 - Use `file_symbols` to understand what else exists in a file — do not make follow-up calls for symbols listed there
 - Do not use repeated per-file `symbols` queries as an exploration strategy
+- If you need more than one additional symbol lookup, stop and merge them into one batched `cog_code_explore` call
+- Invalid pattern: multiple single-symbol `cog_code_explore` calls when one batched call would work
+- Invalid pattern: repeated `cog_code_query(mode="symbols")` across different files for repository understanding
 - Keep the default budget to 2-3 code-intelligence calls before answering
 - Fall back to file or text search only when the Cog index is unavailable or the question is about raw strings/log lines
 
