@@ -731,6 +731,39 @@ pub fn loadIndexForRuntime(allocator: std.mem.Allocator) !CodeIndex {
     return loadIndex(allocator);
 }
 
+pub const QueryIndexStatus = enum {
+    ready,
+    unavailable,
+};
+
+pub fn queryIndexStatusForRuntime(allocator: std.mem.Allocator) QueryIndexStatus {
+    const index_path = getIndexPath(allocator) catch {
+        debug_log.log("queryIndexStatusForRuntime: missing .cog/index.scip", .{});
+        return .unavailable;
+    };
+    defer allocator.free(index_path);
+
+    const file = std.fs.openFileAbsolute(index_path, .{}) catch {
+        debug_log.log("queryIndexStatusForRuntime: index file not readable", .{});
+        return .unavailable;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch {
+        debug_log.log("queryIndexStatusForRuntime: failed to read index", .{});
+        return .unavailable;
+    };
+    defer allocator.free(data);
+
+    var index = scip.decode(allocator, data) catch {
+        debug_log.log("queryIndexStatusForRuntime: failed to decode index", .{});
+        return .unavailable;
+    };
+    defer scip.freeIndex(allocator, &index);
+
+    return .ready;
+}
+
 // ── Commands ────────────────────────────────────────────────────────────
 
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
@@ -797,20 +830,7 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 
     if (patterns.items.len == 0) {
-        const static_part = bold ++ "  cog code:index" ++ reset ++ " " ++ dim ++ "<pattern> [pattern...]" ++ reset ++ "\n"
-            ++ "\n"
-            ++ "  Specify one or more glob patterns to index.\n"
-            ++ "  Patterns can also be configured in " ++ dim ++ ".cog/settings.json" ++ reset ++ ":\n"
-            ++ dim ++ "    { \"code\": { \"index\": [\"**/*.ts\", \"**/*.go\"] } }" ++ reset ++ "\n"
-            ++ "\n"
-            ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-            ++ "    cog code:index \"**/*.ts\"       " ++ dim ++ "All .ts files recursively" ++ reset ++ "\n"
-            ++ "    cog code:index \"src/**/*.go\"   " ++ dim ++ "All .go files under src/" ++ reset ++ "\n"
-            ++ "    cog code:index src/main.zig   " ++ dim ++ "A single file" ++ reset ++ "\n"
-            ++ "\n"
-            ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n"
-            ++ comptime builtinExtensionList()
-            ++ "\n";
+        const static_part = bold ++ "  cog code:index" ++ reset ++ " " ++ dim ++ "<pattern> [pattern...]" ++ reset ++ "\n" ++ "\n" ++ "  Specify one or more glob patterns to index.\n" ++ "  Patterns can also be configured in " ++ dim ++ ".cog/settings.json" ++ reset ++ ":\n" ++ dim ++ "    { \"code\": { \"index\": [\"**/*.ts\", \"**/*.go\"] } }" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:index \"**/*.ts\"       " ++ dim ++ "All .ts files recursively" ++ reset ++ "\n" ++ "    cog code:index \"src/**/*.go\"   " ++ dim ++ "All .go files under src/" ++ reset ++ "\n" ++ "    cog code:index src/main.zig   " ++ dim ++ "A single file" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime builtinExtensionList() ++ "\n";
 
         const installed_block = listInstalledBlock(allocator);
         defer if (installed_block) |b| allocator.free(b);
@@ -1064,7 +1084,6 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const skipped = files.items.len - indexed_count;
         tui.progressFinish(indexed_count, total_symbols, skipped, index_path);
     }
-
 }
 
 /// Result from loading/decoding a SCIP index.
@@ -3231,103 +3250,6 @@ pub fn codeRenameInner(allocator: std.mem.Allocator, old_path: []const u8, new_p
     return aw.toOwnedSlice();
 }
 
-pub fn codeStatusInner(allocator: std.mem.Allocator) ![]const u8 {
-    const index_path = getIndexPath(allocator) catch {
-        var aw: Writer.Allocating = .init(allocator);
-        errdefer aw.deinit();
-        var st: Stringify = .{ .writer = &aw.writer };
-        try st.beginObject();
-        try st.objectField("exists");
-        try st.write(false);
-        try st.endObject();
-        return aw.toOwnedSlice();
-    };
-    defer allocator.free(index_path);
-
-    const file = std.fs.openFileAbsolute(index_path, .{}) catch {
-        var aw: Writer.Allocating = .init(allocator);
-        errdefer aw.deinit();
-        var st: Stringify = .{ .writer = &aw.writer };
-        try st.beginObject();
-        try st.objectField("exists");
-        try st.write(false);
-        try st.endObject();
-        return aw.toOwnedSlice();
-    };
-    defer file.close();
-
-    const data = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch return error.ReadFailed;
-    defer allocator.free(data);
-
-    var index = scip.decode(allocator, data) catch return error.DecodeFailed;
-    defer scip.freeIndex(allocator, &index);
-
-    var total_symbols: usize = 0;
-    for (index.documents) |doc| {
-        total_symbols += doc.symbols.len;
-    }
-    total_symbols += index.external_symbols.len;
-
-    var aw: Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    var st: Stringify = .{ .writer = &aw.writer };
-    try st.beginObject();
-    try st.objectField("exists");
-    try st.write(true);
-    try st.objectField("path");
-    try st.write(index_path);
-    try st.objectField("documents");
-    try st.write(index.documents.len);
-    try st.objectField("symbols");
-    try st.write(total_symbols);
-    if (index.metadata.tool_info.name.len > 0) {
-        try st.objectField("indexer");
-        try st.write(index.metadata.tool_info.name);
-    }
-    if (index.metadata.project_root.len > 0) {
-        try st.objectField("project_root");
-        try st.write(index.metadata.project_root);
-    }
-    try st.endObject();
-    return aw.toOwnedSlice();
-}
-
-pub fn codeStatusFromLoadedIndex(allocator: std.mem.Allocator, ci: *const CodeIndex) ![]const u8 {
-    var total_symbols: usize = 0;
-    for (ci.index.documents) |doc| {
-        total_symbols += doc.symbols.len;
-    }
-    total_symbols += ci.index.external_symbols.len;
-
-    const index_path = getIndexPath(allocator) catch null;
-    defer if (index_path) |p| allocator.free(p);
-
-    var aw: Writer.Allocating = .init(allocator);
-    errdefer aw.deinit();
-    var st: Stringify = .{ .writer = &aw.writer };
-    try st.beginObject();
-    try st.objectField("exists");
-    try st.write(true);
-    if (index_path) |p| {
-        try st.objectField("path");
-        try st.write(p);
-    }
-    try st.objectField("documents");
-    try st.write(ci.index.documents.len);
-    try st.objectField("symbols");
-    try st.write(total_symbols);
-    if (ci.index.metadata.tool_info.name.len > 0) {
-        try st.objectField("indexer");
-        try st.write(ci.index.metadata.tool_info.name);
-    }
-    if (ci.index.metadata.project_root.len > 0) {
-        try st.objectField("project_root");
-        try st.write(ci.index.metadata.project_root);
-    }
-    try st.endObject();
-    return aw.toOwnedSlice();
-}
-
 pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []const u8) ![]const u8 {
     var patterns_buf: std.ArrayListUnmanaged([]const u8) = .empty;
     defer patterns_buf.deinit(allocator);
@@ -4345,6 +4267,49 @@ fn testReadBodyFromContent(allocator: std.mem.Allocator, content: []const u8, de
     return readDefinitionBody(allocator, "/tmp", "cog_test_body.zig", def_line, def_end_line, fallback_context);
 }
 
+fn withTempCwd(comptime body: fn (std.mem.Allocator) anyerror!void) !void {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var original_cwd = std.fs.cwd().openDir(".", .{}) catch unreachable;
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+
+    tmp_dir.dir.setAsCwd() catch unreachable;
+    try body(allocator);
+}
+
+test "queryIndexStatusForRuntime returns unavailable without index" {
+    const allocator = std.testing.allocator;
+    var original_cwd = std.fs.cwd().openDir(".", .{}) catch unreachable;
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+
+    var root_dir = try std.fs.openDirAbsolute("/", .{});
+    defer root_dir.close();
+    try root_dir.setAsCwd();
+
+    try std.testing.expect(queryIndexStatusForRuntime(allocator) == .unavailable);
+}
+
+test "queryIndexStatusForRuntime returns unavailable for invalid index" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            std.fs.cwd().makeDir(".cog") catch {};
+            const file = try std.fs.cwd().createFile(".cog/index.scip", .{});
+            defer file.close();
+            try file.writeAll("not-a-valid-scip-index");
+
+            try std.testing.expect(queryIndexStatusForRuntime(allocator) == .unavailable);
+        }
+    }.run);
+}
+
 test "readDefinitionBody: function with enclosing_range" {
     const allocator = std.testing.allocator;
     const content =
@@ -4599,4 +4564,3 @@ test "auto-retry: glob retry finds partial match" {
     // Verify the found symbol is initBrain
     try std.testing.expect(std.mem.eql(u8, glob_match.items[0].def.display_name, "initBrain"));
 }
-

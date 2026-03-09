@@ -4,6 +4,7 @@ const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const agents_mod = @import("agents.zig");
 const build_options = @import("build_options");
+const debug_log = @import("debug_log.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -196,6 +197,7 @@ fn writeJsonAmp(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
+    debug_log.log("hooks.writeJsonOpenCode: path={s}", .{path});
     const existing = readCwdFile(allocator, path);
     defer if (existing) |e| allocator.free(e);
 
@@ -210,7 +212,7 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
             if (parsed.value == .object) {
                 var iter = parsed.value.object.iterator();
                 while (iter.next()) |entry| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, "mcp")) continue;
+                    if (std.mem.eql(u8, entry.key_ptr.*, "mcp") or std.mem.eql(u8, entry.key_ptr.*, "plugin")) continue;
                     try s.objectField(entry.key_ptr.*);
                     try s.write(entry.value_ptr.*);
                 }
@@ -220,6 +222,25 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
 
     try s.objectField("mcp");
     try s.beginObject();
+
+    if (existing) |content| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("mcp")) |mcp| {
+                    if (mcp == .object) {
+                        var iter = mcp.object.iterator();
+                        while (iter.next()) |entry| {
+                            if (std.mem.eql(u8, entry.key_ptr.*, "cog")) continue;
+                            try s.objectField(entry.key_ptr.*);
+                            try s.write(entry.value_ptr.*);
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    }
+
     try s.objectField("cog");
     try s.beginObject();
     try s.objectField("type");
@@ -231,6 +252,34 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
     try s.endArray();
     try s.endObject();
     try s.endObject();
+
+    try s.objectField("plugin");
+    try s.beginArray();
+
+    var already_has_plugin = false;
+    if (existing) |content| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("plugin")) |plugins| {
+                    if (plugins == .array) {
+                        for (plugins.array.items) |item| {
+                            if (item == .string and std.mem.eql(u8, item.string, "cog-override")) {
+                                already_has_plugin = true;
+                            }
+                            try s.write(item);
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    }
+
+    if (!already_has_plugin) {
+        try s.write("cog-override");
+    }
+
+    try s.endArray();
 
     try s.endObject();
 
@@ -276,16 +325,27 @@ fn printGlobalMcpInstructions(agent: agents_mod.Agent) void {
 // ── Tool Permissions ────────────────────────────────────────────────────
 
 pub fn configureToolPermissions(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
+    debug_log.log("hooks.configureToolPermissions: agent={s}", .{agent.id});
     if (std.mem.eql(u8, agent.id, "claude_code")) {
         try writeClaudePermissions(allocator);
     } else if (std.mem.eql(u8, agent.id, "gemini")) {
         try writeGeminiTrust(allocator, agent.mcp_path.?);
     } else if (std.mem.eql(u8, agent.id, "amp")) {
         try writeAmpPermissions(allocator, agent.mcp_path.?);
+    } else if (std.mem.eql(u8, agent.id, "opencode")) {
+        try writeOpenCodePermissions(allocator, agent.mcp_path.?);
+    }
+}
+
+pub fn configureOverridePlugin(agent: agents_mod.Agent) !void {
+    debug_log.log("hooks.configureOverridePlugin: agent={s}", .{agent.id});
+    if (std.mem.eql(u8, agent.id, "opencode")) {
+        try writeOpenCodeOverridePlugin(".opencode/plugin/cog-override.ts");
     }
 }
 
 fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
+    debug_log.log("hooks.writeClaudePermissions", .{});
     const path = ".claude/settings.json";
     try ensureDir(".claude");
 
@@ -375,6 +435,7 @@ fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
 }
 
 fn writeGeminiTrust(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
+    debug_log.log("hooks.writeGeminiTrust: path={s}", .{mcp_path});
     const existing = readCwdFile(allocator, mcp_path) orelse return;
     defer allocator.free(existing);
 
@@ -432,6 +493,7 @@ fn writeGeminiTrust(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
 }
 
 fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
+    debug_log.log("hooks.writeAmpPermissions: path={s}", .{mcp_path});
     const existing = readCwdFile(allocator, mcp_path) orelse return;
     defer allocator.free(existing);
 
@@ -501,6 +563,128 @@ fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void
     try writeCwdFile(mcp_path, new_content);
 }
 
+fn writeOpenCodePermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
+    debug_log.log("hooks.writeOpenCodePermissions: path={s}", .{mcp_path});
+    const existing = readCwdFile(allocator, mcp_path) orelse return;
+    defer allocator.free(existing);
+
+    const parsed = json.parseFromSlice(json.Value, allocator, existing, .{}) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+
+    var existing_permissions: ?json.Value = null;
+    var existing_cog_rule: ?json.Value = null;
+    var existing_glob_rule: ?json.Value = null;
+    var existing_grep_rule: ?json.Value = null;
+
+    if (parsed.value.object.get("permission")) |perms| {
+        existing_permissions = perms;
+        if (perms == .object) {
+            if (perms.object.get("cog_*")) |rule| {
+                existing_cog_rule = rule;
+            }
+            if (perms.object.get("glob")) |rule| {
+                existing_glob_rule = rule;
+            }
+            if (perms.object.get("grep")) |rule| {
+                existing_grep_rule = rule;
+            }
+        }
+    }
+
+    var iter = parsed.value.object.iterator();
+    while (iter.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "permission")) continue;
+        try s.objectField(entry.key_ptr.*);
+        try s.write(entry.value_ptr.*);
+    }
+
+    try s.objectField("permission");
+    if (existing_permissions) |perms| {
+        if (perms == .object) {
+            try s.beginObject();
+            var perms_iter = perms.object.iterator();
+            while (perms_iter.next()) |entry| {
+                try s.objectField(entry.key_ptr.*);
+                try s.write(entry.value_ptr.*);
+            }
+            if (existing_cog_rule == null) {
+                try s.objectField("cog_*");
+                try s.write("allow");
+            }
+            if (existing_glob_rule == null) {
+                try s.objectField("glob");
+                try s.write("deny");
+            }
+            if (existing_grep_rule == null) {
+                try s.objectField("grep");
+                try s.write("deny");
+            }
+            try s.endObject();
+        } else {
+            try s.beginObject();
+            try s.objectField("*");
+            try s.write(perms);
+            try s.objectField("cog_*");
+            try s.write("allow");
+            try s.objectField("glob");
+            try s.write("deny");
+            try s.objectField("grep");
+            try s.write("deny");
+            try s.endObject();
+        }
+    } else {
+        try s.beginObject();
+        try s.objectField("cog_*");
+        try s.write("allow");
+        try s.objectField("glob");
+        try s.write("deny");
+        try s.objectField("grep");
+        try s.write("deny");
+        try s.endObject();
+    }
+
+    try s.endObject();
+
+    const new_content = try aw.toOwnedSlice();
+    defer allocator.free(new_content);
+    try writeCwdFile(mcp_path, new_content);
+}
+
+fn writeOpenCodeOverridePlugin(path: []const u8) !void {
+    debug_log.log("hooks.writeOpenCodeOverridePlugin: path={s}", .{path});
+    if (std.fs.path.dirname(path)) |parent| {
+        try ensureDir(parent);
+    }
+
+    const content =
+        \\export default async () => ({
+        \\  "tool.definition": async (input, output) => {
+        \\    if (input.toolID === "glob" || input.toolID === "grep") {
+        \\      output.description =
+        \\        "Fallback only. Use cog_code_explore and cog_code_query for code exploration."
+        \\    }
+        \\  },
+        \\  "tool.execute.before": async (input) => {
+        \\    if (input.tool === "glob" || input.tool === "grep") {
+        \\      throw new Error(
+        \\        "Cog override policy: use cog_code_explore or cog_code_query. Glob and grep are disabled for OpenCode exploration workflows."
+        \\      )
+        \\    }
+        \\  },
+        \\})
+        \\
+    ;
+
+    try writeCwdFile(path, content);
+}
+
 // ── Agent File Deployment ────────────────────────────────────────────
 
 pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
@@ -511,7 +695,7 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
     } else if (std.mem.eql(u8, agent.id, "codex")) {
         try writeTomlAgent(allocator, agent_path, "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
-        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", "You are a code index exploration agent. Use cog_code_query to answer questions about code structure. Always follow this order: 1) find to locate definitions, 2) symbols to understand the file, 3) refs to see usage, 4) Read source only after you know where to look. Never guess filenames. Return concise summaries with file paths and line numbers.");
+        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", "You are a code index exploration agent. Use cog_code_explore for symbol discovery and file structure, then use cog_code_query refs only when you need call sites. Read source only after the index tells you where to look. Do not use filename guessing or raw file search unless the Cog index is unavailable. Return concise summaries with file paths and line numbers.");
     }
 }
 
@@ -709,7 +893,7 @@ test "writeJsonOpenCode merges root and rewrites mcp.cog" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             const existing =
-                \\{"theme":"default","mcp":{"other":{"type":"remote"},"cog":{"type":"local","command":["old"]}}}
+                \\{"theme":"default","plugin":["existing-plugin"],"mcp":{"other":{"type":"remote"},"cog":{"type":"local","command":["old"]}}}
             ;
             try writeCwdFile("opencode.json", existing);
 
@@ -728,14 +912,140 @@ test "writeJsonOpenCode merges root and rewrites mcp.cog" {
 
             const mcp = parsed.value.object.get("mcp") orelse return error.TestUnexpectedResult;
             try std.testing.expect(mcp == .object);
+            try std.testing.expect(mcp.object.get("other") != null);
             const cog = mcp.object.get("cog") orelse return error.TestUnexpectedResult;
             try std.testing.expect(cog == .object);
+
+            const plugins = parsed.value.object.get("plugin") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(plugins == .array);
+            try std.testing.expectEqual(@as(usize, 2), plugins.array.items.len);
+            try std.testing.expectEqualStrings("existing-plugin", plugins.array.items[0].string);
+            try std.testing.expectEqualStrings("cog-override", plugins.array.items[1].string);
 
             const command = cog.object.get("command") orelse return error.TestUnexpectedResult;
             try std.testing.expect(command == .array);
             try std.testing.expectEqual(@as(usize, 2), command.array.items.len);
             try std.testing.expectEqualStrings("cog", command.array.items[0].string);
             try std.testing.expectEqualStrings("mcp", command.array.items[1].string);
+        }
+    }.run);
+}
+
+test "writeJsonOpenCode is idempotent for plugin registration" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeJsonOpenCode(allocator, "opencode.json");
+            try writeJsonOpenCode(allocator, "opencode.json");
+
+            const updated = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(updated);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, updated, .{});
+            defer parsed.deinit();
+
+            const plugins = parsed.value.object.get("plugin") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(plugins == .array);
+            try std.testing.expectEqual(@as(usize, 1), plugins.array.items.len);
+            try std.testing.expectEqualStrings("cog-override", plugins.array.items[0].string);
+        }
+    }.run);
+}
+
+test "writeOpenCodePermissions adds cog allow rule" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const existing =
+                \\{"mcp":{"cog":{"type":"local","command":["cog","mcp"]}}}
+            ;
+            try writeCwdFile("opencode.json", existing);
+
+            try writeOpenCodePermissions(allocator, "opencode.json");
+
+            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const perms = parsed.value.object.get("permission") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(perms == .object);
+            const cog_rule = perms.object.get("cog_*") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(cog_rule == .string);
+            try std.testing.expectEqualStrings("allow", cog_rule.string);
+            try std.testing.expectEqualStrings("deny", perms.object.get("glob").?.string);
+            try std.testing.expectEqualStrings("deny", perms.object.get("grep").?.string);
+        }
+    }.run);
+}
+
+test "writeOpenCodePermissions preserves existing rules" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const existing =
+                \\{"permission":{"read":"ask"},"theme":"default"}
+            ;
+            try writeCwdFile("opencode.json", existing);
+
+            try writeOpenCodePermissions(allocator, "opencode.json");
+
+            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const theme = parsed.value.object.get("theme") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("default", theme.string);
+
+            const perms = parsed.value.object.get("permission") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(perms == .object);
+            try std.testing.expectEqualStrings("ask", perms.object.get("read").?.string);
+            try std.testing.expectEqualStrings("allow", perms.object.get("cog_*").?.string);
+            try std.testing.expectEqualStrings("deny", perms.object.get("glob").?.string);
+            try std.testing.expectEqualStrings("deny", perms.object.get("grep").?.string);
+        }
+    }.run);
+}
+
+test "writeOpenCodePermissions upgrades string permission" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const existing =
+                \\{"permission":"ask"}
+            ;
+            try writeCwdFile("opencode.json", existing);
+
+            try writeOpenCodePermissions(allocator, "opencode.json");
+
+            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const perms = parsed.value.object.get("permission") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(perms == .object);
+            try std.testing.expectEqualStrings("ask", perms.object.get("*").?.string);
+            try std.testing.expectEqualStrings("allow", perms.object.get("cog_*").?.string);
+            try std.testing.expectEqualStrings("deny", perms.object.get("glob").?.string);
+            try std.testing.expectEqualStrings("deny", perms.object.get("grep").?.string);
+        }
+    }.run);
+}
+
+test "writeOpenCodeOverridePlugin creates strict override plugin" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = allocator;
+            try writeOpenCodeOverridePlugin(".opencode/plugin/cog-override.ts");
+
+            const content = readCwdFile(std.testing.allocator, ".opencode/plugin/cog-override.ts") orelse return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(content);
+
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.definition\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.execute.before\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "input.tool === \"glob\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "cog_code_explore or cog_code_query") != null);
         }
     }.run);
 }

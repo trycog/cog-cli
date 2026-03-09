@@ -717,6 +717,7 @@ fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !v
             error.MissingName => "Missing required parameter: name",
             error.MissingFile => "Missing required parameter: file",
             error.NotConfigured => "Memory not configured. Run 'cog init' with memory enabled.",
+            error.IndexUnavailable => "Code index unavailable. Run 'cog code:index' before using Cog code tools.",
             error.Explained => "Operation failed (see stderr)",
             else => "Internal error",
         };
@@ -833,17 +834,6 @@ fn handleResourcesList(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
 
     try s.beginObject();
     try s.objectField("uri");
-    try s.write("cog://index/status");
-    try s.objectField("name");
-    try s.write("Code Index Status");
-    try s.objectField("description");
-    try s.write("Current code index status and symbol counts");
-    try s.objectField("mimeType");
-    try s.write("application/json");
-    try s.endObject();
-
-    try s.beginObject();
-    try s.objectField("uri");
     try s.write("cog://debug/tools");
     try s.objectField("name");
     try s.write("Debug Tool Catalog");
@@ -902,9 +892,7 @@ fn handleResourcesRead(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value
     var payload: []const u8 = undefined;
     const mime: []const u8 = "application/json";
 
-    if (std.mem.eql(u8, uri, "cog://index/status")) {
-        payload = callCodeStatus(runtime) catch try allocator.dupe(u8, "{\"exists\":false,\"error\":\"status_unavailable\"}");
-    } else if (std.mem.eql(u8, uri, "cog://debug/tools")) {
+    if (std.mem.eql(u8, uri, "cog://debug/tools")) {
         payload = try buildDebugToolsResourceJson(allocator);
     } else if (std.mem.eql(u8, uri, "cog://tools/catalog")) {
         payload = try buildToolCatalogResourceJson(runtime);
@@ -993,10 +981,7 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
         .{ .name = "kind", .typ = "string", .desc = "Filter results by symbol kind (e.g. function, class, method, variable)", .required = false },
     });
 
-    try writeToolDef(s, "cog_code_status", "Check whether the SCIP code index exists, how many files are indexed, and which languages are covered. Use this to verify the index is available before querying.", &.{});
-
-    try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore",
-        "Find multiple symbols by name and return full definition bodies with file table of contents. Combines find + read in a single call. Auto-retries failed lookups with glob patterns, reads compact function/struct bodies, and includes a file_symbols TOC listing every symbol in each matched file. Also includes references (symbols called within each function body).",
+    try writeToolDefWithSchemaJson(allocator, s, "cog_code_explore", "Find multiple symbols by name and return full definition bodies with file table of contents. Combines find + read in a single call. Auto-retries failed lookups with glob patterns, reads compact function/struct bodies, and includes a file_symbols TOC listing every symbol in each matched file. Also includes references (symbols called within each function body).",
         \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"}},"required":["queries"]}
     );
 
@@ -1042,8 +1027,6 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
     // Code tools
     if (std.mem.eql(u8, tool_name, "cog_code_query")) {
         return callCodeQuery(runtime, arguments);
-    } else if (std.mem.eql(u8, tool_name, "cog_code_status")) {
-        return callCodeStatus(runtime);
     } else if (std.mem.eql(u8, tool_name, "cog_code_explore")) {
         return callCodeExplore(runtime, arguments);
     }
@@ -1311,6 +1294,10 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
     else
         return error.Explained;
 
+    if (runtime.code_cache == null and code_intel.queryIndexStatusForRuntime(allocator) != .ready) {
+        return error.IndexUnavailable;
+    }
+
     const ci = try runtime.ensureCodeCache();
     return code_intel.codeQueryWithLoadedIndex(allocator, ci, .{
         .mode = mode,
@@ -1318,14 +1305,6 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
         .file = getStr(args, "file"),
         .kind = getStr(args, "kind"),
     });
-}
-
-fn callCodeStatus(runtime: *Runtime) ![]const u8 {
-    const allocator = runtime.allocator;
-    if (runtime.code_cache) |*ci| {
-        return code_intel.codeStatusFromLoadedIndex(allocator, ci);
-    }
-    return code_intel.codeStatusInner(allocator);
 }
 
 fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
@@ -1352,6 +1331,10 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
     }
 
     if (queries.items.len == 0) return error.Explained;
+
+    if (runtime.code_cache == null and code_intel.queryIndexStatusForRuntime(allocator) != .ready) {
+        return error.IndexUnavailable;
+    }
 
     const ci = try runtime.ensureCodeCache();
     return code_intel.codeExploreWithLoadedIndex(allocator, ci, queries.items, context_lines);
@@ -1720,4 +1703,41 @@ test "nextMessageFromBuffer returns null for incomplete JSON" {
     const msg = try nextMessageFromBuffer(allocator, &buf);
     try std.testing.expect(msg == null);
     try std.testing.expect(buf.items.len == partial.len);
+}
+
+fn testRuntime(allocator: std.mem.Allocator) Runtime {
+    return .{
+        .allocator = allocator,
+        .mem_config = null,
+        .brain_type = .none,
+        .mem_db = null,
+        .debug_server = DebugServer.init(allocator),
+        .code_cache = null,
+        .remote_tools = null,
+        .mcp_session_id = null,
+        .watcher = null,
+        .debug_tool_tier = .specialist,
+        .mutex = .{},
+    };
+}
+
+test "runtimeCallTool rejects code queries when index is unavailable" {
+    const allocator = std.testing.allocator;
+    var original_cwd = std.fs.cwd().openDir(".", .{}) catch unreachable;
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+
+    var root_dir = try std.fs.openDirAbsolute("/", .{});
+    defer root_dir.close();
+    try root_dir.setAsCwd();
+
+    var runtime = testRuntime(allocator);
+    defer runtime.deinit();
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, "{\"mode\":\"find\",\"name\":\"main\"}", .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.IndexUnavailable, runtimeCallTool(&runtime, "cog_code_query", parsed.value));
 }

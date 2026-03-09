@@ -190,6 +190,94 @@ pub const builtins = [_]Extension{
         .scip_indexer = js_scip_config,
         .debug = .{ .dap = js_dap_config },
     },
+    // MDX
+    .{
+        .name = "mdx",
+        .file_extensions = &.{".mdx"},
+        .language_names = &.{"mdx"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "mdx",
+            .query_source = @embedFile("queries/mdx.scm"),
+            .scip_name = "mdx",
+        } },
+    },
+    // Markdown
+    .{
+        .name = "markdown",
+        .file_extensions = &.{ ".md", ".markdown" },
+        .language_names = &.{"markdown"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "markdown",
+            .query_source = @embedFile("queries/markdown.scm"),
+            .scip_name = "markdown",
+        } },
+    },
+    // YAML
+    .{
+        .name = "yaml",
+        .file_extensions = &.{ ".yaml", ".yml" },
+        .language_names = &.{"yaml"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "yaml",
+            .query_source = @embedFile("queries/yaml.scm"),
+            .scip_name = "yaml",
+        } },
+    },
+    // TOML
+    .{
+        .name = "toml",
+        .file_extensions = &.{".toml"},
+        .language_names = &.{"toml"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "toml",
+            .query_source = @embedFile("queries/toml.scm"),
+            .scip_name = "toml",
+        } },
+    },
+    // reStructuredText
+    .{
+        .name = "rst",
+        .file_extensions = &.{".rst"},
+        .language_names = &.{"rst"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "rst",
+            .query_source = @embedFile("queries/rst.scm"),
+            .scip_name = "rst",
+        } },
+    },
+    // AsciiDoc
+    .{
+        .name = "asciidoc",
+        .file_extensions = &.{ ".adoc", ".asciidoc" },
+        .language_names = &.{"asciidoc"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "asciidoc",
+            .query_source = @embedFile("queries/asciidoc.scm"),
+            .scip_name = "asciidoc",
+        } },
+    },
+    // JSON
+    .{
+        .name = "json",
+        .file_extensions = &.{".json"},
+        .language_names = &.{"json"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "json",
+            .query_source = @embedFile("queries/json.scm"),
+            .scip_name = "json",
+        } },
+    },
+    // JSONC
+    .{
+        .name = "jsonc",
+        .file_extensions = &.{".jsonc"},
+        .language_names = &.{"jsonc"},
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "json",
+            .query_source = @embedFile("queries/json.scm"),
+            .scip_name = "jsonc",
+        } },
+    },
     // TypeScript
     .{
         .name = "typescript",
@@ -571,22 +659,24 @@ const AllocatedDebuggerConfig = struct {
             .native => .{ .native = .{
                 .boundary_markers = self.boundary_markers,
             } },
-            .dap => .{ .dap = .{
-                .adapter_command = self.adapter_command orelse "",
-                .adapter_args = self.adapter_args orelse &.{},
-                .transport = if (self.adapter_transport) |t|
-                    if (std.mem.eql(u8, t, "tcp")) .tcp else .stdio
-                else
-                    .stdio,
-                // launch_args from cog-extension.json flows into launch_extra_args_json
-                .launch_extra_args_json = self.launch_args_template,
-                .launch_args_template = self.launch_args_template,
-                .program_field = self.program_field orelse "program",
-                .args_field = self.args_field orelse "args",
-                .args_first_is_program = self.args_first_is_program,
-                .skip_entry_stop = self.skip_entry_stop,
-                .boundary_markers = self.boundary_markers,
-            } },
+            .dap => .{
+                .dap = .{
+                    .adapter_command = self.adapter_command orelse "",
+                    .adapter_args = self.adapter_args orelse &.{},
+                    .transport = if (self.adapter_transport) |t|
+                        if (std.mem.eql(u8, t, "tcp")) .tcp else .stdio
+                    else
+                        .stdio,
+                    // launch_args from cog-extension.json flows into launch_extra_args_json
+                    .launch_extra_args_json = self.launch_args_template,
+                    .launch_args_template = self.launch_args_template,
+                    .program_field = self.program_field orelse "program",
+                    .args_field = self.args_field orelse "args",
+                    .args_first_is_program = self.args_first_is_program,
+                    .skip_entry_stop = self.skip_entry_stop,
+                    .boundary_markers = self.boundary_markers,
+                },
+            },
         };
     }
 };

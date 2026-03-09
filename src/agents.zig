@@ -28,6 +28,12 @@ pub const McpFormat = enum {
     global_only,
 };
 
+pub const OverrideEnforcementLevel = enum {
+    hard,
+    medium,
+    soft,
+};
+
 pub const Agent = struct {
     id: []const u8,
     display_name: []const u8,
@@ -44,7 +50,16 @@ pub const Agent = struct {
     pub fn supportsToolPermissions(self: *const Agent) bool {
         return std.mem.eql(u8, self.id, "claude_code") or
             std.mem.eql(u8, self.id, "gemini") or
-            std.mem.eql(u8, self.id, "amp");
+            std.mem.eql(u8, self.id, "amp") or
+            std.mem.eql(u8, self.id, "opencode");
+    }
+
+    pub fn overrideEnforcementLevel(self: *const Agent) OverrideEnforcementLevel {
+        if (std.mem.eql(u8, self.id, "claude_code")) return .hard;
+        if (std.mem.eql(u8, self.id, "gemini") or
+            std.mem.eql(u8, self.id, "amp") or
+            std.mem.eql(u8, self.id, "opencode")) return .medium;
+        return .soft;
     }
 };
 
@@ -65,8 +80,6 @@ pub const agents = [_]Agent{
         \\description: Explore code structure using the Cog SCIP index
         \\tools:
         \\  - Read
-        \\  - Glob
-        \\  - Grep
         \\mcpServers:
         \\  - cog
         \\model: haiku
@@ -96,7 +109,6 @@ pub const agents = [_]Agent{
         \\  - mcp__cog__cog_debug_poll_events
         \\  - mcp__cog__cog_code_query
         \\  - mcp__cog__cog_code_explore
-        \\  - mcp__cog__cog_code_status
         \\  - mcp__cog__cog_mem_recall
         \\  - mcp__cog__cog_mem_bulk_recall
         \\  - Read
@@ -151,8 +163,6 @@ pub const agents = [_]Agent{
         \\description: Explore code structure using the Cog SCIP index
         \\tools:
         \\  - read_file
-        \\  - glob
-        \\  - search_file_content
         \\---
         \\
         ,
@@ -199,8 +209,8 @@ pub const agents = [_]Agent{
         \\name: cog-code-query
         \\description: Explore code structure using the Cog SCIP index
         \\tools:
+        \\  - cog/*
         \\  - read
-        \\  - search
         \\---
         \\
         ,
@@ -394,6 +404,11 @@ pub const agents = [_]Agent{
         \\---
         \\description: Explore code structure using the Cog SCIP index
         \\mode: subagent
+        \\permission:
+        \\  read: allow
+        \\  glob: deny
+        \\  grep: deny
+        \\  cog_*: allow
         \\tools:
         \\  write: false
         \\  edit: false
@@ -451,6 +466,7 @@ test "supportsToolPermissions" {
     try std.testing.expect(agents[0].supportsToolPermissions()); // claude_code
     try std.testing.expect(agents[1].supportsToolPermissions()); // gemini
     try std.testing.expect(agents[6].supportsToolPermissions()); // amp
+    try std.testing.expect(agents[9].supportsToolPermissions()); // opencode
 
     // Unsupported agents
     try std.testing.expect(!agents[2].supportsToolPermissions()); // copilot
@@ -459,7 +475,37 @@ test "supportsToolPermissions" {
     try std.testing.expect(!agents[5].supportsToolPermissions()); // codex
     try std.testing.expect(!agents[7].supportsToolPermissions()); // goose
     try std.testing.expect(!agents[8].supportsToolPermissions()); // roo
-    try std.testing.expect(!agents[9].supportsToolPermissions()); // opencode
+}
+
+test "overrideEnforcementLevel" {
+    try std.testing.expect(agents[0].overrideEnforcementLevel() == .hard);
+    try std.testing.expect(agents[1].overrideEnforcementLevel() == .medium);
+    try std.testing.expect(agents[6].overrideEnforcementLevel() == .medium);
+    try std.testing.expect(agents[9].overrideEnforcementLevel() == .medium);
+
+    try std.testing.expect(agents[2].overrideEnforcementLevel() == .soft);
+    try std.testing.expect(agents[3].overrideEnforcementLevel() == .soft);
+    try std.testing.expect(agents[4].overrideEnforcementLevel() == .soft);
+    try std.testing.expect(agents[5].overrideEnforcementLevel() == .soft);
+    try std.testing.expect(agents[7].overrideEnforcementLevel() == .soft);
+    try std.testing.expect(agents[8].overrideEnforcementLevel() == .soft);
+}
+
+test "code-query headers prefer cog-first exploration" {
+    const claude_header = agents[0].agent_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, claude_header, "Glob") == null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_header, "Grep") == null);
+
+    const gemini_header = agents[1].agent_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, gemini_header, "glob") == null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_header, "search_file_content") == null);
+
+    const copilot_header = agents[2].agent_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/*") != null);
+
+    const opencode_header = agents[9].agent_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, opencode_header, "glob: deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opencode_header, "grep: deny") != null);
 }
 
 test "mcp strategy coverage stays explicit" {

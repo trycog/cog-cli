@@ -317,7 +317,10 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const prompt_target = agent.prompt_target;
         var prompt_already_written = false;
         for (written_prompts[0..written_prompts_count]) |wt| {
-            if (wt == prompt_target) { prompt_already_written = true; break; }
+            if (wt == prompt_target) {
+                prompt_already_written = true;
+                break;
+            }
         }
         if (!prompt_already_written) {
             const filename = prompt_target.filename();
@@ -344,7 +347,10 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (agent.mcp_path) |mcp_path| {
             var mcp_already_written = false;
             for (written_mcp[0..written_mcp_count]) |wc| {
-                if (std.mem.eql(u8, wc, mcp_path)) { mcp_already_written = true; break; }
+                if (std.mem.eql(u8, wc, mcp_path)) {
+                    mcp_already_written = true;
+                    break;
+                }
             }
             if (!mcp_already_written) {
                 hooks_mod.configureMcp(allocator, agent) catch {};
@@ -370,6 +376,13 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             printErr("    ");
             tui.checkmark();
             printErr(" tool permissions\n");
+        }
+
+        if (std.mem.eql(u8, agent.id, "opencode")) {
+            hooks_mod.configureOverridePlugin(agent) catch {};
+            printErr("    ");
+            tui.checkmark();
+            printErr(" .opencode/plugin/cog-override.ts\n");
         }
 
         // d. Deploy agent file (dedup by path)

@@ -88,22 +88,24 @@ That's it. The interactive setup walks you through everything:
 2. **Agent selection**: pick which AI coding agents you use
 3. **Tool permissions**: optionally auto-allow all Cog tools so your agent doesn't prompt you on every call
 
-For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents, and optionally auto-allows tool permissions.
+For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents, and, where the host agent supports it, auto-allows Cog tool permissions.
 
 ### Supported agents
 
-| Agent | MCP Config | Sub-Agents | Tool Permissions |
-|-------|------------|:----------:|------------------|
-| Claude Code | `.mcp.json` | Yes | Auto-allow |
-| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow |
-| Amp | `.amp/settings.json` | Yes | Auto-allow |
-| Cursor | `.cursor/mcp.json` | Yes | |
-| OpenCode | `opencode.json` | Yes | |
-| GitHub Copilot | `.vscode/mcp.json` | | |
-| OpenAI Codex CLI | `.codex/config.toml` | | |
-| Roo Code | `.roo/mcp.json` | | |
-| Windsurf | Global config | | |
-| Goose | Global config | | |
+| Agent | MCP Config | Sub-Agents | Tool Permissions | Cog-First Override |
+|-------|------------|:----------:|------------------|--------------------|
+| Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist |
+| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium prompt + sub-agent scoping |
+| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium prompt + permission bootstrap |
+| Cursor | `.cursor/mcp.json` | Yes | | Soft prompt guidance |
+| OpenCode | `opencode.json` | Yes | Auto-allow | Medium prompt + sub-agent permissions |
+| GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft prompt guidance |
+| OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft prompt guidance |
+| Roo Code | `.roo/mcp.json` | Yes | | Soft prompt guidance |
+| Windsurf | Global config | Yes | | Soft prompt guidance |
+| Goose | Global config | Yes | | Soft prompt guidance |
+
+`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code can hard-scope the code-query sub-agent, Gemini/Amp/OpenCode can partially constrain tool use, and the remaining integrations rely on prompt-level steering because their current config surfaces do not support repo-local hard denies.
 
 ---
 

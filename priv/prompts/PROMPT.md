@@ -6,15 +6,24 @@ Code intelligence, persistent memory, and interactive debugging.
 
 ## Code Intelligence
 
-When you need a symbol definition, references, call sites, or type information:
-use `cog_code_explore` or `cog_code_query`. Do NOT use Grep or Glob for symbol lookups.
+For any request to explore, analyze, understand, map, or explain code, use `cog_code_explore` or `cog_code_query`.
+Do NOT use Grep or Glob for code exploration when the Cog index is available.
 
 - `cog_code_explore` — find symbols by name, return full definition bodies and file TOC
 - `cog_code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols)
 - Include synonyms with `|`: `banner|header|splash`
-- Glob patterns: `*init*`, `get*`, `Handle?`
+- Wildcard symbol patterns: `*init*`, `get*`, `Handle?`
 
-Only fall back to Grep for string literals, log messages, or non-symbol text patterns.
+Only fall back to Grep or Glob when the Cog index is unavailable, incomplete for the target code, or the task is about raw string literals, log messages, or other non-symbol text patterns.
+
+### Efficiency Rules
+
+- For repository-understanding, architecture-summary, or "tell me about this project" tasks: make exactly one initial `cog_code_explore` call with a batched list of likely entrypoint symbols.
+- Do not explore by issuing repeated `cog_code_query(mode="symbols", file=...)` calls across multiple files.
+- Use `cog_code_query(mode="symbols")` only after a specific file has already been identified as relevant.
+- Use `cog_code_query(mode="refs")` only as a targeted follow-up when a concrete ambiguity remains after the initial batched exploration.
+- Default budget for code-analysis tasks: 2-3 code-intelligence tool calls before responding.
+- Do not call `cog_mem_recall` for pure codebase summarization or architecture description unless memory is specifically needed to answer the question.
 
 ## Debugging
 

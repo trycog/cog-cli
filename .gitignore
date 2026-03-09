@@ -12,6 +12,7 @@ zig-out/
 .codex/
 .amp/
 .roo/
+.opencode/
 opencode.json
 
 # Build artifacts

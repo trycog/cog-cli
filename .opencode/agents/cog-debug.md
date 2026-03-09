@@ -14,7 +14,7 @@ Your input will contain:
 
 ### 1. Locate code
 
-Use `cog_code_explore` or `cog_code_query` to find the relevant source — function definitions, call sites, data flow. Identify where to set breakpoints. The `name` parameter supports `|` alternation to search synonyms in one query (e.g. `banner|header|splash`).
+Use `cog_code_explore` or `cog_code_query` to find the relevant source — function definitions, call sites, data flow. Identify where to set breakpoints.
 
 ### 2. Design experiment
 

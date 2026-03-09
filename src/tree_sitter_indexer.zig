@@ -12,14 +12,21 @@ const c = @cImport({
 // ── Language grammars (extern C functions) ───────────────────────────────
 
 extern fn tree_sitter_go() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_json() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_typescript() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_tsx() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_javascript() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_markdown() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_mdx() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_python() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_rst() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_java() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_rust() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_toml() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_c() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_cpp() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_yaml() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_asciidoc() callconv(.c) *c.TSLanguage;
 
 // ── Grammar lookup ──────────────────────────────────────────────────────
 
@@ -27,15 +34,32 @@ extern fn tree_sitter_cpp() callconv(.c) *c.TSLanguage;
 /// Returns null for unknown grammar names.
 pub fn getGrammar(name: []const u8) ?*c.TSLanguage {
     if (std.mem.eql(u8, name, "go")) return tree_sitter_go();
+    if (std.mem.eql(u8, name, "json")) return tree_sitter_json();
     if (std.mem.eql(u8, name, "typescript")) return tree_sitter_typescript();
     if (std.mem.eql(u8, name, "tsx")) return tree_sitter_tsx();
     if (std.mem.eql(u8, name, "javascript")) return tree_sitter_javascript();
+    if (std.mem.eql(u8, name, "markdown")) return tree_sitter_markdown();
+    if (std.mem.eql(u8, name, "mdx")) return tree_sitter_mdx();
     if (std.mem.eql(u8, name, "python")) return tree_sitter_python();
+    if (std.mem.eql(u8, name, "rst")) return tree_sitter_rst();
     if (std.mem.eql(u8, name, "java")) return tree_sitter_java();
     if (std.mem.eql(u8, name, "rust")) return tree_sitter_rust();
+    if (std.mem.eql(u8, name, "toml")) return tree_sitter_toml();
     if (std.mem.eql(u8, name, "c")) return tree_sitter_c();
     if (std.mem.eql(u8, name, "cpp")) return tree_sitter_cpp();
+    if (std.mem.eql(u8, name, "yaml")) return tree_sitter_yaml();
+    if (std.mem.eql(u8, name, "asciidoc")) return tree_sitter_asciidoc();
     return null;
+}
+
+fn isDocumentGrammar(name: []const u8) bool {
+    return std.mem.eql(u8, name, "markdown") or
+        std.mem.eql(u8, name, "mdx") or
+        std.mem.eql(u8, name, "yaml") or
+        std.mem.eql(u8, name, "toml") or
+        std.mem.eql(u8, name, "rst") or
+        std.mem.eql(u8, name, "asciidoc") or
+        std.mem.eql(u8, name, "json");
 }
 
 // ── SCIP Kind mapping ───────────────────────────────────────────────────
@@ -96,12 +120,12 @@ fn nodeInErrorContext(node: c.TSNode) bool {
 /// `if` can end up as identifier nodes inside fabricated definitions.
 fn isJsKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{
-        "if",       "else",     "for",       "while",     "do",
-        "switch",   "case",     "break",     "continue",  "return",
-        "throw",    "try",      "catch",     "finally",   "with",
-        "debugger", "delete",   "typeof",    "instanceof","void",
-        "in",       "of",       "new",       "yield",     "await",
-        "this",     "super",    "null",      "true",      "false",
+        "if",        "else",   "for",    "while",      "do",
+        "switch",    "case",   "break",  "continue",   "return",
+        "throw",     "try",    "catch",  "finally",    "with",
+        "debugger",  "delete", "typeof", "instanceof", "void",
+        "in",        "of",     "new",    "yield",      "await",
+        "this",      "super",  "null",   "true",       "false",
         "undefined",
     };
     for (&keywords) |kw| {
@@ -143,6 +167,9 @@ pub const Indexer = struct {
         config: extensions.TreeSitterConfig,
     ) !IndexFileResult {
         debug_log.log("indexFile: {s} grammar={s}", .{ relative_path, config.grammar_name });
+        if (isDocumentGrammar(config.grammar_name)) {
+            debug_log.log("indexFile: structured text indexing active for {s} scip={s}", .{ relative_path, config.scip_name });
+        }
         // Detect Flow-typed JS files and use TypeScript parser instead.
         // Flow's generic syntax (<T>) is invalid JS but valid TS, so the
         // TypeScript parser handles these files correctly. We keep the JS
@@ -232,6 +259,8 @@ pub const Indexer = struct {
             var def_node: ?c.TSNode = null;
             var def_kind: ?i32 = null;
 
+            if (match.capture_count == 0 or match.captures == null) continue;
+
             const captures: [*]const c.TSQueryCapture = match.captures;
             for (0..match.capture_count) |i| {
                 const capture = captures[i];
@@ -263,7 +292,8 @@ pub const Indexer = struct {
             const end_byte = c.ts_node_end_byte(name_n);
             if (start_byte >= source.len or end_byte > source.len or start_byte >= end_byte) continue;
 
-            const name_text = source[start_byte..end_byte];
+            const name_text = std.mem.trim(u8, source[start_byte..end_byte], " \t\r\n");
+            if (name_text.len == 0) continue;
 
             // Skip reserved keywords that appear as definitions due to
             // error recovery (e.g. Flow-typed JS misidentifying `if` as
@@ -407,14 +437,21 @@ fn findBuiltinConfig(name: []const u8) ?extensions.TreeSitterConfig {
 
 test "getGrammar" {
     try std.testing.expect(getGrammar("go") != null);
+    try std.testing.expect(getGrammar("json") != null);
     try std.testing.expect(getGrammar("typescript") != null);
     try std.testing.expect(getGrammar("tsx") != null);
     try std.testing.expect(getGrammar("javascript") != null);
+    try std.testing.expect(getGrammar("markdown") != null);
+    try std.testing.expect(getGrammar("mdx") != null);
     try std.testing.expect(getGrammar("python") != null);
+    try std.testing.expect(getGrammar("rst") != null);
     try std.testing.expect(getGrammar("java") != null);
     try std.testing.expect(getGrammar("rust") != null);
+    try std.testing.expect(getGrammar("toml") != null);
     try std.testing.expect(getGrammar("c") != null);
     try std.testing.expect(getGrammar("cpp") != null);
+    try std.testing.expect(getGrammar("yaml") != null);
+    try std.testing.expect(getGrammar("asciidoc") != null);
     try std.testing.expect(getGrammar("zig") == null);
     try std.testing.expect(getGrammar("ruby") == null);
 }
@@ -564,6 +601,293 @@ test "indexFile JavaScript" {
     }
     try std.testing.expect(found_greet);
     try std.testing.expect(found_greeter);
+}
+
+test "indexFile Markdown" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\# Cog CLI
+        \\
+        \\## Installation
+        \\
+        \\Install with Homebrew.
+        \\
+        \\### API Reference
+    ;
+
+    const config = findBuiltinConfig("markdown") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "README.md", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("markdown", doc.language);
+
+    var found_cog_cli = false;
+    var found_installation = false;
+    var found_api_reference = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "Cog CLI")) {
+            found_cog_cli = true;
+            try std.testing.expectEqual(@as(i32, 29), sym.kind);
+        }
+        if (std.mem.eql(u8, sym.display_name, "Installation")) {
+            found_installation = true;
+            try std.testing.expectEqual(@as(i32, 29), sym.kind);
+        }
+        if (std.mem.eql(u8, sym.display_name, "API Reference")) {
+            found_api_reference = true;
+            try std.testing.expectEqual(@as(i32, 29), sym.kind);
+        }
+    }
+    try std.testing.expect(found_cog_cli);
+    try std.testing.expect(found_installation);
+    try std.testing.expect(found_api_reference);
+}
+
+test "indexFile MDX" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\# Components
+        \\
+        \\export function Button() {
+        \\  return <button>Click</button>;
+        \\}
+        \\
+        \\## Usage
+    ;
+
+    const config = findBuiltinConfig("mdx") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "docs/button.mdx", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("mdx", doc.language);
+
+    var found_components = false;
+    var found_button = false;
+    var found_usage = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "Components")) found_components = true;
+        if (std.mem.eql(u8, sym.display_name, "Button")) found_button = true;
+        if (std.mem.eql(u8, sym.display_name, "Usage")) found_usage = true;
+    }
+    try std.testing.expect(found_components);
+    try std.testing.expect(found_button);
+    try std.testing.expect(found_usage);
+}
+
+test "indexFile YAML" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\server:
+        \\  host: localhost
+        \\  port: 8080
+    ;
+
+    const config = findBuiltinConfig("yaml") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "config.yaml", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("yaml", doc.language);
+
+    var found_server = false;
+    var found_host = false;
+    var found_port = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "server")) found_server = true;
+        if (std.mem.eql(u8, sym.display_name, "host")) found_host = true;
+        if (std.mem.eql(u8, sym.display_name, "port")) found_port = true;
+    }
+    try std.testing.expect(found_server);
+    try std.testing.expect(found_host);
+    try std.testing.expect(found_port);
+}
+
+test "indexFile TOML" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\title = "Cog"
+        \\
+        \\[tool.poetry]
+        \\name = "cog-cli"
+    ;
+
+    const config = findBuiltinConfig("toml") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "pyproject.toml", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("toml", doc.language);
+
+    var found_title = false;
+    var found_tool_poetry = false;
+    var found_name = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "title")) found_title = true;
+        if (std.mem.eql(u8, sym.display_name, "tool.poetry")) found_tool_poetry = true;
+        if (std.mem.eql(u8, sym.display_name, "name")) found_name = true;
+    }
+    try std.testing.expect(found_title);
+    try std.testing.expect(found_tool_poetry);
+    try std.testing.expect(found_name);
+}
+
+test "indexFile RST" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\Overview
+        \\========
+        \\
+        \\Install
+        \\-------
+    ;
+
+    const config = findBuiltinConfig("rst") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "guide.rst", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("rst", doc.language);
+
+    var found_overview = false;
+    var found_install = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "Overview")) found_overview = true;
+        if (std.mem.eql(u8, sym.display_name, "Install")) found_install = true;
+    }
+    try std.testing.expect(found_overview);
+    try std.testing.expect(found_install);
+}
+
+test "indexFile AsciiDoc" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\= Cog CLI
+        \\
+        \\== Install
+    ;
+
+    const config = findBuiltinConfig("asciidoc") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "guide.adoc", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("asciidoc", doc.language);
+
+    var found_cog_cli = false;
+    var found_install = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "Cog CLI")) found_cog_cli = true;
+        if (std.mem.eql(u8, sym.display_name, "Install")) found_install = true;
+    }
+    try std.testing.expect(found_cog_cli);
+    try std.testing.expect(found_install);
+}
+
+test "indexFile JSONC" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\{
+        \\  // comment
+        \\  "build": {
+        \\    "target": "release"
+        \\  }
+        \\}
+    ;
+
+    const config = findBuiltinConfig("jsonc") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "config.jsonc", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    try std.testing.expectEqualStrings("jsonc", doc.language);
+
+    var found_build = false;
+    var found_target = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "build")) found_build = true;
+        if (std.mem.eql(u8, sym.display_name, "target")) found_target = true;
+    }
+    try std.testing.expect(found_build);
+    try std.testing.expect(found_target);
 }
 
 test "indexFile TypeScript" {

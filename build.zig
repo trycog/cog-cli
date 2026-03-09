@@ -5,24 +5,37 @@ const version = zon.version;
 
 const tree_sitter_version = "v0.25.4";
 
+const GrammarRefKind = enum {
+    tag,
+    branch,
+};
+
 const GrammarSource = struct {
     name: []const u8,
     repo: []const u8,
-    tag: []const u8,
+    ref_name: []const u8,
     src_prefix: []const u8,
     has_scanner: bool,
+    ref_kind: GrammarRefKind = .tag,
 };
 
 const grammars = [_]GrammarSource{
-    .{ .name = "c", .repo = "tree-sitter/tree-sitter-c", .tag = "v0.24.1", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "cpp", .repo = "tree-sitter/tree-sitter-cpp", .tag = "v0.23.4", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "go", .repo = "tree-sitter/tree-sitter-go", .tag = "v0.25.0", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "java", .repo = "tree-sitter/tree-sitter-java", .tag = "v0.23.5", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "javascript", .repo = "tree-sitter/tree-sitter-javascript", .tag = "v0.25.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "python", .repo = "tree-sitter/tree-sitter-python", .tag = "v0.25.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "rust", .repo = "tree-sitter/tree-sitter-rust", .tag = "v0.24.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "typescript", .repo = "tree-sitter/tree-sitter-typescript", .tag = "v0.23.2", .src_prefix = "typescript/src", .has_scanner = true },
-    .{ .name = "tsx", .repo = "tree-sitter/tree-sitter-typescript", .tag = "v0.23.2", .src_prefix = "tsx/src", .has_scanner = true },
+    .{ .name = "c", .repo = "tree-sitter/tree-sitter-c", .ref_name = "v0.24.1", .src_prefix = "src", .has_scanner = false },
+    .{ .name = "cpp", .repo = "tree-sitter/tree-sitter-cpp", .ref_name = "v0.23.4", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "go", .repo = "tree-sitter/tree-sitter-go", .ref_name = "v0.25.0", .src_prefix = "src", .has_scanner = false },
+    .{ .name = "json", .repo = "tree-sitter/tree-sitter-json", .ref_name = "v0.24.8", .src_prefix = "src", .has_scanner = false },
+    .{ .name = "java", .repo = "tree-sitter/tree-sitter-java", .ref_name = "v0.23.5", .src_prefix = "src", .has_scanner = false },
+    .{ .name = "javascript", .repo = "tree-sitter/tree-sitter-javascript", .ref_name = "v0.25.0", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "markdown", .repo = "tree-sitter-grammars/tree-sitter-markdown", .ref_name = "v0.5.1", .src_prefix = "tree-sitter-markdown/src", .has_scanner = true },
+    .{ .name = "mdx", .repo = "srazzak/tree-sitter-mdx", .ref_name = "main", .src_prefix = "src", .has_scanner = true, .ref_kind = .branch },
+    .{ .name = "python", .repo = "tree-sitter/tree-sitter-python", .ref_name = "v0.25.0", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "rst", .repo = "stsewd/tree-sitter-rst", .ref_name = "v0.2.0", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "rust", .repo = "tree-sitter/tree-sitter-rust", .ref_name = "v0.24.0", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "toml", .repo = "tree-sitter-grammars/tree-sitter-toml", .ref_name = "v0.7.0", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "typescript", .repo = "tree-sitter/tree-sitter-typescript", .ref_name = "v0.23.2", .src_prefix = "typescript/src", .has_scanner = true },
+    .{ .name = "tsx", .repo = "tree-sitter/tree-sitter-typescript", .ref_name = "v0.23.2", .src_prefix = "tsx/src", .has_scanner = true },
+    .{ .name = "yaml", .repo = "tree-sitter-grammars/tree-sitter-yaml", .ref_name = "v0.7.2", .src_prefix = "src", .has_scanner = true },
+    .{ .name = "asciidoc", .repo = "cathaysia/tree-sitter-asciidoc", .ref_name = "v0.6.0", .src_prefix = "tree-sitter-asciidoc/src", .has_scanner = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -80,7 +93,7 @@ pub fn build(b: *std.Build) void {
     // Code-sign on macOS for debug server (task_for_pid requires debugger entitlement)
     // Runs after the install step so the installed binary gets the entitlement.
     const codesign = b.addSystemCommand(&.{
-        "codesign", "--entitlements", "debug-entitlements.plist", "-fs", "-",
+        "codesign",                    "--entitlements", "debug-entitlements.plist", "-fs", "-",
         b.getInstallPath(.bin, "cog"),
     });
     codesign.step.dependOn(b.getInstallStep());
@@ -170,14 +183,21 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(ts_include);
     mod.addIncludePath(ts_src);
     mod.addIncludePath(b.path("grammars/go"));
+    mod.addIncludePath(b.path("grammars/json"));
     mod.addIncludePath(b.path("grammars/java"));
     mod.addIncludePath(b.path("grammars/c"));
     mod.addIncludePath(b.path("grammars/typescript"));
     mod.addIncludePath(b.path("grammars/tsx"));
     mod.addIncludePath(b.path("grammars/javascript"));
+    mod.addIncludePath(b.path("grammars/markdown"));
+    mod.addIncludePath(b.path("grammars/mdx"));
     mod.addIncludePath(b.path("grammars/python"));
+    mod.addIncludePath(b.path("grammars/rst"));
     mod.addIncludePath(b.path("grammars/rust"));
+    mod.addIncludePath(b.path("grammars/toml"));
     mod.addIncludePath(b.path("grammars/cpp"));
+    mod.addIncludePath(b.path("grammars/yaml"));
+    mod.addIncludePath(b.path("grammars/asciidoc"));
 
     const c_flags = &[_][]const u8{ "-std=gnu11", "-fno-exceptions" };
 
@@ -189,20 +209,33 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
 
     // Grammar parsers (parser-only: Go, Java, C)
     mod.addCSourceFile(.{ .file = b.path("grammars/go/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/json/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/java/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/c/parser.c"), .flags = c_flags });
 
-    // Grammar parsers + scanners: TypeScript, TSX, JavaScript, Python, Rust, C++
+    // Grammar parsers + scanners: TypeScript, TSX, JavaScript, Markdown, MDX, Python, RST, Rust, TOML, YAML, AsciiDoc, C++
     mod.addCSourceFile(.{ .file = b.path("grammars/typescript/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/typescript/scanner.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/tsx/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/tsx/scanner.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/javascript/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/javascript/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/markdown/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/markdown/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/mdx/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/mdx/scanner.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/python/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/python/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/rst/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/rst/scanner.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/rust/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/rust/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/toml/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/toml/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/yaml/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/yaml/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/asciidoc/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/asciidoc/scanner.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/cpp/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/cpp/scanner.c"), .flags = c_flags });
 }
@@ -343,8 +376,38 @@ fn addDownloadCore(b: *std.Build) *std.Build.Step {
 }
 
 fn addDownloadGrammar(b: *std.Build, g: GrammarSource) *std.Build.Step {
+    const ref_path = switch (g.ref_kind) {
+        .tag => "tags",
+        .branch => "heads",
+    };
+    const extracted_name = switch (g.ref_kind) {
+        .tag => if (std.mem.startsWith(u8, g.ref_name, "v")) g.ref_name[1..] else g.ref_name,
+        .branch => g.ref_name,
+    };
     const scanner_cp = if (g.has_scanner)
         b.fmt("cp \"$EXTRACTED/{s}/scanner.c\" \"grammars/{s}/scanner.c\"\n", .{ g.src_prefix, g.name })
+    else
+        "";
+    const extra_cp = if (std.mem.eql(u8, g.name, "yaml"))
+        b.fmt(
+            "mkdir -p \"grammars/{s}\"\n" ++
+                "cp \"$EXTRACTED/{s}/schema.core.c\" \"grammars/{s}/schema.core.c\"\n" ++
+                "cp \"$EXTRACTED/{s}/schema.json.c\" \"grammars/{s}/schema.json.c\"\n" ++
+                "cp \"$EXTRACTED/{s}/schema.legacy.c\" \"grammars/{s}/schema.legacy.c\"\n",
+            .{ g.name, g.src_prefix, g.name, g.src_prefix, g.name, g.src_prefix, g.name },
+        )
+    else if (std.mem.eql(u8, g.name, "rst"))
+        b.fmt(
+            "mkdir -p \"grammars/{s}/tree_sitter_rst\"\n" ++
+                "cp -R \"$EXTRACTED/{s}/tree_sitter_rst/\"* \"grammars/{s}/tree_sitter_rst/\"\n",
+            .{ g.name, g.src_prefix, g.name },
+        )
+    else if (std.mem.eql(u8, g.name, "asciidoc"))
+        b.fmt(
+            "mkdir -p \"grammars/{s}/include\"\n" ++
+                "cp -R \"$EXTRACTED/{s}/include/\"* \"grammars/{s}/include/\"\n",
+            .{ g.name, g.src_prefix, g.name },
+        )
     else
         "";
 
@@ -352,33 +415,34 @@ fn addDownloadGrammar(b: *std.Build, g: GrammarSource) *std.Build.Step {
         \\set -e
         \\mkdir -p "grammars/{s}/tree_sitter"
         \\TMPDIR=$(mktemp -d)
-        \\curl -sL "https://github.com/{s}/archive/refs/tags/{s}.tar.gz" | tar xz -C "$TMPDIR"
+        \\curl -sL "https://github.com/{s}/archive/refs/{s}/{s}.tar.gz" | tar xz -C "$TMPDIR"
         \\REPO_NAME=$(echo "{s}" | sed 's|.*/||')
-        \\TAG_STRIPPED=$(echo "{s}" | sed 's/^v//')
-        \\EXTRACTED="$TMPDIR/$REPO_NAME-$TAG_STRIPPED"
+        \\EXTRACTED="$TMPDIR/$REPO_NAME-{s}"
         \\cp "$EXTRACTED/{s}/parser.c" "grammars/{s}/parser.c"
-        \\{s}cp "$EXTRACTED/{s}/tree_sitter/"*.h "grammars/{s}/tree_sitter/"
+        \\{s}{s}cp "$EXTRACTED/{s}/tree_sitter/"*.h "grammars/{s}/tree_sitter/"
         \\if [ -f "$EXTRACTED/tags.scm" ]; then cp "$EXTRACTED/tags.scm" "grammars/{s}/tags.scm"; fi
         \\if [ -f "$EXTRACTED/{s}/tags.scm" ]; then cp "$EXTRACTED/{s}/tags.scm" "grammars/{s}/tags.scm"; fi
         \\rm -rf "$TMPDIR"
         \\echo "Downloaded {s} grammar ({s})"
     , .{
-        g.name,        // mkdir target
-        g.repo,        // curl URL repo
-        g.tag,         // curl URL tag
-        g.repo,        // repo name extraction
-        g.tag,         // tag stripping
-        g.src_prefix,  // parser.c source
-        g.name,        // parser.c dest
-        scanner_cp,    // optional scanner copy
-        g.src_prefix,  // tree_sitter headers source
-        g.name,        // tree_sitter headers dest
-        g.name,        // tags.scm root check dest
-        g.src_prefix,  // tags.scm prefix -f check
-        g.src_prefix,  // tags.scm prefix cp source
-        g.name,        // tags.scm prefix check dest
-        g.name,        // echo name
-        g.tag,         // echo tag
+        g.name, // mkdir target
+        g.repo, // curl URL repo
+        ref_path, // archive ref path
+        g.ref_name, // archive ref name
+        g.repo, // repo name extraction
+        extracted_name, // extracted directory suffix
+        g.src_prefix, // parser.c source
+        g.name, // parser.c dest
+        scanner_cp, // optional scanner copy
+        extra_cp, // optional extra files
+        g.src_prefix, // tree_sitter headers source
+        g.name, // tree_sitter headers dest
+        g.name, // tags.scm root check dest
+        g.src_prefix, // tags.scm prefix -f check
+        g.src_prefix, // tags.scm prefix cp source
+        g.name, // tags.scm prefix check dest
+        g.name, // echo name
+        g.ref_name, // echo ref
     });
     const cmd = b.addSystemCommand(&.{ "sh", "-c", script });
     return &cmd.step;
