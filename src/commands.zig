@@ -30,6 +30,26 @@ fn printErr(msg: []const u8) void {
     w.interface.flush() catch {};
 }
 
+/// Returns true if the file should be written (new file, user said yes, or accept-all).
+/// Updates accept_all when the user picks 'a'.
+fn shouldWriteFile(path: []const u8, accept_all: *bool) bool {
+    if (!hooks_mod.fileExistsInCwd(path)) return true;
+    if (accept_all.*) {
+        debug_log.log("shouldWriteFile: accept_all for {s}", .{path});
+        return true;
+    }
+    const action = tui.confirmOverwrite(path) catch return false;
+    debug_log.log("shouldWriteFile: user chose {s} for {s}", .{ @tagName(action), path });
+    switch (action) {
+        .yes => return true,
+        .no => return false,
+        .all => {
+            accept_all.* = true;
+            return true;
+        },
+    }
+}
+
 fn findFlag(args: []const [:0]const u8, flag: []const u8) ?[:0]const u8 {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -293,6 +313,9 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const prompt_content = try processCogMemTags(allocator, build_options.prompt_md, setup_mem);
     defer allocator.free(prompt_content);
 
+    // Track overwrite-all consent for existing files
+    var accept_all = false;
+
     // Track which config files have been written (for dedup)
     var written_mcp: [16][]const u8 = undefined;
     var written_mcp_count: usize = 0;
@@ -379,10 +402,20 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         if (std.mem.eql(u8, agent.id, "opencode")) {
-            hooks_mod.configureOverridePlugin(agent) catch {};
-            printErr("    ");
-            tui.checkmark();
-            printErr(" .opencode/plugin/cog-override.ts\n");
+            const override_path = ".opencode/plugin/cog-override.ts";
+            if (shouldWriteFile(override_path, &accept_all)) {
+                hooks_mod.configureOverridePlugin(agent) catch {};
+                printErr("    ");
+                tui.checkmark();
+                printErr(" ");
+                printErr(override_path);
+                printErr("\n");
+            } else {
+                printErr("    ");
+                printErr(dim ++ "  skipped " ++ reset);
+                printErr(override_path);
+                printErr("\n");
+            }
         }
 
         // d. Deploy agent file (dedup by path)
@@ -395,12 +428,19 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
             }
             if (!agent_already_written) {
-                hooks_mod.configureAgentFile(allocator, agent) catch {};
-                printErr("    ");
-                tui.checkmark();
-                printErr(" ");
-                printErr(agent_path);
-                printErr("\n");
+                if (shouldWriteFile(agent_path, &accept_all)) {
+                    hooks_mod.configureAgentFile(allocator, agent) catch {};
+                    printErr("    ");
+                    tui.checkmark();
+                    printErr(" ");
+                    printErr(agent_path);
+                    printErr("\n");
+                } else {
+                    printErr("    ");
+                    printErr(dim ++ "  skipped " ++ reset);
+                    printErr(agent_path);
+                    printErr("\n");
+                }
                 if (written_agents_count < 32) {
                     written_agents[written_agents_count] = agent_path;
                     written_agents_count += 1;
@@ -429,12 +469,19 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     }
                 }
                 if (!debug_already_written) {
-                    hooks_mod.configureDebugAgentFile(allocator, agent) catch {};
-                    printErr("    ");
-                    tui.checkmark();
-                    printErr(" ");
-                    printErr(debug_path);
-                    printErr("\n");
+                    if (shouldWriteFile(debug_path, &accept_all)) {
+                        hooks_mod.configureDebugAgentFile(allocator, agent) catch {};
+                        printErr("    ");
+                        tui.checkmark();
+                        printErr(" ");
+                        printErr(debug_path);
+                        printErr("\n");
+                    } else {
+                        printErr("    ");
+                        printErr(dim ++ "  skipped " ++ reset);
+                        printErr(debug_path);
+                        printErr("\n");
+                    }
                     if (written_agents_count < 32) {
                         written_agents[written_agents_count] = debug_path;
                         written_agents_count += 1;
@@ -463,12 +510,19 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                         }
                     }
                     if (!mem_already_written) {
-                        hooks_mod.configureMemAgentFile(allocator, agent) catch {};
-                        printErr("    ");
-                        tui.checkmark();
-                        printErr(" ");
-                        printErr(mem_path);
-                        printErr("\n");
+                        if (shouldWriteFile(mem_path, &accept_all)) {
+                            hooks_mod.configureMemAgentFile(allocator, agent) catch {};
+                            printErr("    ");
+                            tui.checkmark();
+                            printErr(" ");
+                            printErr(mem_path);
+                            printErr("\n");
+                        } else {
+                            printErr("    ");
+                            printErr(dim ++ "  skipped " ++ reset);
+                            printErr(mem_path);
+                            printErr("\n");
+                        }
                         if (written_agents_count < 32) {
                             written_agents[written_agents_count] = mem_path;
                             written_agents_count += 1;

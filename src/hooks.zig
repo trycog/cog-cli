@@ -54,6 +54,12 @@ fn writeCwdFile(filename: []const u8, content: []const u8) !void {
     };
 }
 
+pub fn fileExistsInCwd(path: []const u8) bool {
+    const f = std.fs.cwd().openFile(path, .{}) catch return false;
+    f.close();
+    return true;
+}
+
 fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
     const f = std.fs.cwd().openFile(filename, .{}) catch return null;
     defer f.close();

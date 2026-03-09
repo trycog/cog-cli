@@ -954,6 +954,52 @@ fn multiSelectFallback(allocator: std.mem.Allocator, options: MultiSelectOptions
 
 // ── Confirm ─────────────────────────────────────────────────────────────
 
+pub const OverwriteAction = enum {
+    yes,
+    no,
+    all,
+};
+
+pub fn confirmOverwrite(path: []const u8) !OverwriteAction {
+    const fd = std.fs.File.stdin().handle;
+
+    if (!posix.isatty(fd)) {
+        return confirmOverwriteFallback(path);
+    }
+
+    stderrWrite("  " ++ cyan ++ "?" ++ reset ++ " Overwrite " ++ bold);
+    stderrWrite(path);
+    stderrWrite(reset ++ "? " ++ dim ++ "(y/N/a)" ++ reset ++ " ");
+
+    var term = try RawTerminal.enter(fd);
+    defer term.leave();
+
+    const event = try term.readInputEvent();
+    stderrWrite("\n");
+    return switch (event) {
+        .char => |c| if (c == 'y' or c == 'Y')
+            .yes
+        else if (c == 'a' or c == 'A')
+            .all
+        else
+            .no,
+        else => .no,
+    };
+}
+
+fn confirmOverwriteFallback(path: []const u8) !OverwriteAction {
+    stderrWrite("  ? Overwrite ");
+    stderrWrite(path);
+    stderrWrite("? (y/N/a) ");
+
+    var buf: [64]u8 = undefined;
+    const n = posix.read(std.fs.File.stdin().handle, &buf) catch return .no;
+    if (n == 0) return .no;
+    if (buf[0] == 'y' or buf[0] == 'Y') return .yes;
+    if (buf[0] == 'a' or buf[0] == 'A') return .all;
+    return .no;
+}
+
 pub fn confirm(prompt: []const u8) !bool {
     const fd = std.fs.File.stdin().handle;
 
