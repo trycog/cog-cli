@@ -49,6 +49,26 @@ const bold = "\x1B[1m";
 const dim = "\x1B[2m";
 const reset = "\x1B[0m";
 
+const ExternalIndexerProgress = struct {
+    indexed_count: *usize,
+    total_files: usize,
+    total_symbols: *usize,
+    show_progress: bool,
+
+    fn fileDone(self: *ExternalIndexerProgress, file_path: []const u8) void {
+        self.indexed_count.* += 1;
+        if (self.show_progress) {
+            tui.progressUpdate(self.indexed_count.*, self.total_files, self.total_symbols.*, file_path);
+        }
+    }
+};
+
+const ProgressEvent = union(enum) {
+    ignore: void,
+    file_done: []const u8,
+    file_error: []const u8,
+};
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn printStdout(text: []const u8) void {
@@ -1232,6 +1252,16 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (master_index.documents.len > 0) allocator.free(master_index.documents);
     master_index.documents = &.{};
 
+    var external_symbol_list: std.ArrayListUnmanaged(scip.SymbolInformation) = .empty;
+    defer {
+        for (external_symbol_list.items) |*sym| freeSymbolInformation(allocator, sym);
+        external_symbol_list.deinit(allocator);
+    }
+    try external_symbol_list.ensureTotalCapacity(allocator, master_index.external_symbols.len);
+    external_symbol_list.appendSliceAssumeCapacity(master_index.external_symbols);
+    if (master_index.external_symbols.len > 0) allocator.free(master_index.external_symbols);
+    master_index.external_symbols = &.{};
+
     // Tree-sitter per-file indexing
     var indexer = tree_sitter_indexer.Indexer.init();
     defer indexer.deinit();
@@ -1332,27 +1362,43 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    // Invoke external indexers per-file for unsupported languages
+    // Invoke external indexers in bulk for unsupported languages.
     for (0..num_unique) |ext_idx| {
         const scip_config = switch (unique_exts[ext_idx].indexer orelse continue) {
             .scip_binary => |sc| sc,
             .tree_sitter => continue,
         };
-        for (ext_files[ext_idx].items) |ext_file_path| {
-            if (show_progress) {
-                tui.progressUpdate(indexed_count, total_files, total_symbols, ext_file_path);
-            }
+        const batch_files = ext_files[ext_idx].items;
+        if (batch_files.len == 0) continue;
+        const progress_path = batch_files[batch_files.len - 1];
+        if (show_progress) {
+            tui.progressUpdate(indexed_count, total_files, total_symbols, progress_path);
+        }
 
-            const result = invokeIndexerForFile(allocator, ext_file_path, scip_config) catch continue;
+        debug_log.log("codeIndex: invoking bulk external indexer {s} for {d} files", .{ scip_config.command, batch_files.len });
+        const batch_start_count = indexed_count;
+        var progress_ctx = ExternalIndexerProgress{
+            .indexed_count = &indexed_count,
+            .total_files = total_files,
+            .total_symbols = &total_symbols,
+            .show_progress = show_progress,
+        };
+        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, &progress_ctx) catch continue;
 
-            backing_buffers.append(allocator, result.backing_data) catch {};
-            mergeDocumentList(allocator, &doc_list, result.doc);
-            indexed_count += 1;
-            total_symbols += result.doc.symbols.len;
+        backing_buffers.append(allocator, result.backing_data.?) catch {};
+        for (result.index.documents) |doc| {
+            mergeDocumentList(allocator, &doc_list, doc);
+            total_symbols += doc.symbols.len;
+        }
+        allocator.free(result.index.documents);
+        for (result.index.external_symbols) |sym| {
+            mergeExternalSymbolList(allocator, &external_symbol_list, sym);
+        }
+        allocator.free(result.index.external_symbols);
+        if (indexed_count == batch_start_count) indexed_count += batch_files.len;
 
-            if (show_progress) {
-                tui.progressUpdate(indexed_count, total_files, total_symbols, ext_file_path);
-            }
+        if (show_progress) {
+            tui.progressUpdate(indexed_count, total_files, total_symbols, progress_path);
         }
     }
 
@@ -1364,6 +1410,7 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     // Transfer documents back to master_index for encoding/freeing
     master_index.documents = try doc_list.toOwnedSlice(allocator);
+    master_index.external_symbols = try external_symbol_list.toOwnedSlice(allocator);
     // doc_list is now empty; its defer is a no-op
 
     // Encode and write the master index
@@ -1427,6 +1474,11 @@ fn emptyIndex() scip.Index {
         .documents = &.{},
         .external_symbols = &.{},
     };
+}
+
+fn freeSymbolInformation(allocator: std.mem.Allocator, sym: *scip.SymbolInformation) void {
+    allocator.free(sym.documentation);
+    allocator.free(sym.relationships);
 }
 
 /// Read a file's contents. Returns null on failure.
@@ -1733,46 +1785,169 @@ const DocumentResult = struct {
     backing_data: []const u8,
 };
 
-/// Invoke an indexer for a single file, decode the SCIP output, return the document.
-/// Caller must free backing_data after the document is no longer needed.
-fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, config: extensions.ScipBinaryConfig) !DocumentResult {
-    // Create temp file for SCIP output
+fn invokeIndexerWithSubstitutions(
+    allocator: std.mem.Allocator,
+    config: extensions.ScipBinaryConfig,
+    extra_subs: []const settings_mod.Substitution,
+    file_paths: ?[]const []const u8,
+    progress: ?*ExternalIndexerProgress,
+) !IndexResult {
     const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/cog-index-{d}.scip", .{std.crypto.random.int(u64)});
     defer allocator.free(tmp_path);
     defer std.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    // Substitute {file} and {output} in extension args
-    const subs: []const settings_mod.Substitution = &.{
-        .{ .key = "{file}", .value = file_path },
-        .{ .key = "{output}", .value = tmp_path },
-    };
-    const sub_args = try settings_mod.substituteArgs(allocator, config.args, subs);
-    defer settings_mod.freeSubstitutedArgs(allocator, sub_args);
+    const subs = try allocator.alloc(settings_mod.Substitution, extra_subs.len + 1);
+    defer allocator.free(subs);
+    @memcpy(subs[0..extra_subs.len], extra_subs);
+    subs[extra_subs.len] = .{ .key = "{output}", .value = tmp_path };
 
-    // Build full command
-    const full_args = try allocator.alloc([]const u8, 1 + sub_args.len);
+    var expanded_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (expanded_args.items) |arg| allocator.free(arg);
+        expanded_args.deinit(allocator);
+    }
+
+    for (config.args) |arg| {
+        if (std.mem.eql(u8, arg, "{files}")) {
+            const files = file_paths orelse return error.SubstitutionFailed;
+            for (files) |file_path| {
+                try expanded_args.append(allocator, try allocator.dupe(u8, file_path));
+            }
+            continue;
+        }
+
+        var current: []const u8 = try allocator.dupe(u8, arg);
+        errdefer allocator.free(current);
+        for (subs) |sub| {
+            const next = settings_mod.substitutePlaceholder(allocator, current, sub.key, sub.value) catch {
+                allocator.free(current);
+                return error.SubstitutionFailed;
+            };
+            allocator.free(current);
+            current = next;
+        }
+        try expanded_args.append(allocator, current);
+    }
+
+    const full_args = try allocator.alloc([]const u8, 1 + expanded_args.items.len);
     defer allocator.free(full_args);
     full_args[0] = config.command;
-    @memcpy(full_args[1..], sub_args);
+    @memcpy(full_args[1..], expanded_args.items);
 
-    // Run indexer (output goes to temp file, not stdout/stderr)
+    debug_log.log("invokeIndexerWithSubstitutions: spawning {s} with {d} args", .{ config.command, expanded_args.items.len });
     var child = std.process.Child.init(full_args, allocator);
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
     try child.spawn();
-    const term = try child.wait();
 
+    if (child.stderr) |stderr_file| {
+        try consumeIndexerProgress(allocator, stderr_file, progress);
+    }
+
+    const term = try child.wait();
     if (term.Exited != 0) return error.IndexerFailed;
 
-    // Read and decode the temp SCIP output
+    debug_log.log("invokeIndexerWithSubstitutions: reading {s}", .{tmp_path});
     const tmp_file = try std.fs.openFileAbsolute(tmp_path, .{});
     defer tmp_file.close();
     const tmp_data = try tmp_file.readToEndAlloc(allocator, 256 * 1024 * 1024);
 
-    var tmp_index = scip.decode(allocator, tmp_data) catch |err| {
+    const index = scip.decode(allocator, tmp_data) catch |err| {
         allocator.free(tmp_data);
         return err;
     };
+    if (index.documents.len == 0 and index.external_symbols.len == 0) {
+        var empty_index = index;
+        scip.freeIndex(allocator, &empty_index);
+        allocator.free(tmp_data);
+        return error.NoDocuments;
+    }
+
+    return .{ .index = index, .backing_data = tmp_data };
+}
+
+fn consumeIndexerProgress(
+    allocator: std.mem.Allocator,
+    stderr_file: std.fs.File,
+    progress: ?*ExternalIndexerProgress,
+) !void {
+    var read_buf: [4096]u8 = undefined;
+    var pending: std.ArrayListUnmanaged(u8) = .empty;
+    defer pending.deinit(allocator);
+
+    while (true) {
+        const n = try stderr_file.read(&read_buf);
+        if (n == 0) break;
+        try pending.appendSlice(allocator, read_buf[0..n]);
+
+        while (std.mem.indexOfScalar(u8, pending.items, '\n')) |idx| {
+            const line = pending.items[0..idx];
+            try handleIndexerProgressLine(allocator, line, progress);
+            std.mem.copyForwards(u8, pending.items[0 .. pending.items.len - (idx + 1)], pending.items[idx + 1 ..]);
+            pending.items.len -= idx + 1;
+        }
+    }
+
+    if (pending.items.len > 0) {
+        try handleIndexerProgressLine(allocator, pending.items, progress);
+    }
+}
+
+fn handleIndexerProgressLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    progress: ?*ExternalIndexerProgress,
+) !void {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0) return;
+
+    switch (try parseIndexerProgressEvent(allocator, trimmed)) {
+        .ignore => {},
+        .file_done => |file_path| {
+            defer allocator.free(file_path);
+            if (progress) |ctx| ctx.fileDone(file_path);
+        },
+        .file_error => |file_path| {
+            defer allocator.free(file_path);
+            if (progress) |ctx| ctx.fileDone(file_path);
+        },
+    }
+}
+
+fn parseIndexerProgressEvent(allocator: std.mem.Allocator, line: []const u8) !ProgressEvent {
+    const parsed = json.parseFromSlice(json.Value, allocator, line, .{}) catch {
+        debug_log.log("parseIndexerProgressEvent: ignoring non-json line", .{});
+        return .ignore;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return .ignore;
+    const obj = parsed.value.object;
+    const type_val = obj.get("type") orelse return .ignore;
+    const event_val = obj.get("event") orelse return .ignore;
+    if (type_val != .string or event_val != .string) return .ignore;
+    if (!std.mem.eql(u8, type_val.string, "progress")) return .ignore;
+
+    if (std.mem.eql(u8, event_val.string, "file_done") or std.mem.eql(u8, event_val.string, "file_error")) {
+        const path_val = obj.get("path") orelse return .ignore;
+        if (path_val != .string) return .ignore;
+        const path_copy = try allocator.dupe(u8, path_val.string);
+        if (std.mem.eql(u8, event_val.string, "file_done")) {
+            return .{ .file_done = path_copy };
+        }
+        return .{ .file_error = path_copy };
+    }
+
+    return .ignore;
+}
+
+/// Invoke an indexer for a single file, decode the SCIP output, return the document.
+/// Caller must free backing_data after the document is no longer needed.
+fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, config: extensions.ScipBinaryConfig) !DocumentResult {
+    const one_file = [_][]const u8{file_path};
+    const tmp_result = try invokeIndexerForFileList(allocator, &one_file, config, null);
+    var tmp_index = tmp_result.index;
+    const tmp_data = tmp_result.backing_data orelse unreachable;
 
     if (tmp_index.documents.len == 0) {
         scip.freeIndex(allocator, &tmp_index);
@@ -1780,18 +1955,26 @@ fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, con
         return error.NoDocuments;
     }
 
+    var picked_idx: usize = 0;
+    for (tmp_index.documents, 0..) |doc, i| {
+        if (std.mem.eql(u8, doc.relative_path, file_path)) {
+            picked_idx = i;
+            break;
+        }
+    }
+
     // Free everything except the first document (which we return)
-    for (tmp_index.documents[1..]) |*doc| {
+    for (tmp_index.documents, 0..) |*doc, i| {
+        if (i == picked_idx) continue;
         scip.freeDocument(allocator, doc);
     }
     for (tmp_index.external_symbols) |*sym| {
-        allocator.free(sym.documentation);
-        allocator.free(sym.relationships);
+        freeSymbolInformation(allocator, sym);
     }
     allocator.free(tmp_index.external_symbols);
 
-    // Take ownership of the first document
-    const doc = tmp_index.documents[0];
+    // Take ownership of the selected document
+    const doc = tmp_index.documents[picked_idx];
     allocator.free(tmp_index.documents);
 
     return .{
@@ -1805,48 +1988,22 @@ fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, con
     };
 }
 
+fn invokeIndexerForFileList(
+    allocator: std.mem.Allocator,
+    file_paths: []const []const u8,
+    config: extensions.ScipBinaryConfig,
+    progress: ?*ExternalIndexerProgress,
+) !IndexResult {
+    return invokeIndexerWithSubstitutions(allocator, config, &.{}, file_paths, progress);
+}
+
 /// Invoke an indexer for a project directory, decode the SCIP output, return the full index.
 /// Caller must free backing_data after the index is no longer needed.
 fn invokeProjectIndexer(allocator: std.mem.Allocator, target_path: []const u8, config: extensions.ScipBinaryConfig) !IndexResult {
-    // Create temp file for SCIP output
-    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/cog-index-{d}.scip", .{std.crypto.random.int(u64)});
-    defer allocator.free(tmp_path);
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
-
-    // Substitute {file} and {output} in extension args
     const subs: []const settings_mod.Substitution = &.{
         .{ .key = "{file}", .value = target_path },
-        .{ .key = "{output}", .value = tmp_path },
     };
-    const sub_args = try settings_mod.substituteArgs(allocator, config.args, subs);
-    defer settings_mod.freeSubstitutedArgs(allocator, sub_args);
-
-    // Build full command
-    const full_args = try allocator.alloc([]const u8, 1 + sub_args.len);
-    defer allocator.free(full_args);
-    full_args[0] = config.command;
-    @memcpy(full_args[1..], sub_args);
-
-    // Run indexer
-    var child = std.process.Child.init(full_args, allocator);
-    child.stderr_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    try child.spawn();
-    const term = try child.wait();
-
-    if (term.Exited != 0) return error.IndexerFailed;
-
-    // Read and decode the SCIP output
-    const tmp_file = try std.fs.openFileAbsolute(tmp_path, .{});
-    defer tmp_file.close();
-    const tmp_data = try tmp_file.readToEndAlloc(allocator, 256 * 1024 * 1024);
-
-    const index = scip.decode(allocator, tmp_data) catch |err| {
-        allocator.free(tmp_data);
-        return err;
-    };
-
-    return .{ .index = index, .backing_data = tmp_data };
+    return invokeIndexerWithSubstitutions(allocator, config, subs, null, null);
 }
 
 /// Merge a document into the master index (replace existing or append).
@@ -1861,6 +2018,21 @@ fn mergeDocumentList(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged
         }
     }
     list.append(allocator, new_doc) catch {};
+}
+
+fn mergeExternalSymbolList(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(scip.SymbolInformation),
+    new_sym: scip.SymbolInformation,
+) void {
+    for (list.items, 0..) |*sym, i| {
+        if (std.mem.eql(u8, sym.symbol, new_sym.symbol)) {
+            freeSymbolInformation(allocator, sym);
+            list.items[i] = new_sym;
+            return;
+        }
+    }
+    list.append(allocator, new_sym) catch {};
 }
 
 /// Merge a document into the master index (replace existing or append).
@@ -4096,6 +4268,16 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
     if (master_index.documents.len > 0) allocator.free(master_index.documents);
     master_index.documents = &.{};
 
+    var external_symbol_list: std.ArrayListUnmanaged(scip.SymbolInformation) = .empty;
+    defer {
+        for (external_symbol_list.items) |*sym| freeSymbolInformation(allocator, sym);
+        external_symbol_list.deinit(allocator);
+    }
+    try external_symbol_list.ensureTotalCapacity(allocator, master_index.external_symbols.len);
+    external_symbol_list.appendSliceAssumeCapacity(master_index.external_symbols);
+    if (master_index.external_symbols.len > 0) allocator.free(master_index.external_symbols);
+    master_index.external_symbols = &.{};
+
     var indexer = tree_sitter_indexer.Indexer.init();
     defer indexer.deinit();
 
@@ -4181,13 +4363,21 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
             .scip_binary => |sc| sc,
             .tree_sitter => continue,
         };
-        for (ext_files[ext_idx].items) |ext_file_path| {
-            const result = invokeIndexerForFile(allocator, ext_file_path, scip_config) catch continue;
-            backing_buffers.append(allocator, result.backing_data) catch {};
-            mergeDocumentList(allocator, &doc_list, result.doc);
-            indexed_count += 1;
-            total_symbols += result.doc.symbols.len;
+        const batch_files = ext_files[ext_idx].items;
+        if (batch_files.len == 0) continue;
+        debug_log.log("codeIndexInner: invoking bulk external indexer {s} for {d} files", .{ scip_config.command, batch_files.len });
+        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, null) catch continue;
+        backing_buffers.append(allocator, result.backing_data.?) catch {};
+        for (result.index.documents) |doc| {
+            mergeDocumentList(allocator, &doc_list, doc);
+            total_symbols += doc.symbols.len;
         }
+        allocator.free(result.index.documents);
+        for (result.index.external_symbols) |sym| {
+            mergeExternalSymbolList(allocator, &external_symbol_list, sym);
+        }
+        allocator.free(result.index.external_symbols);
+        indexed_count += batch_files.len;
     }
 
     for (0..num_unique) |ext_idx| {
@@ -4196,6 +4386,7 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
 
     // Transfer documents back to master_index for encoding/freeing
     master_index.documents = try doc_list.toOwnedSlice(allocator);
+    master_index.external_symbols = try external_symbol_list.toOwnedSlice(allocator);
 
     const encoded = scip_encode.encodeIndex(allocator, master_index) catch return error.EncodeFailed;
     defer allocator.free(encoded);
@@ -5155,6 +5346,57 @@ test "queryIndexStatusForRuntime returns unavailable for invalid index" {
             try std.testing.expect(queryIndexStatusForRuntime(allocator) == .unavailable);
         }
     }.run);
+}
+
+test "parseIndexerProgressEvent parses file_done event" {
+    const allocator = std.testing.allocator;
+    const line = "{\"type\":\"progress\",\"event\":\"file_done\",\"path\":\"lib/foo.ex\"}";
+    const event = try parseIndexerProgressEvent(allocator, line);
+    switch (event) {
+        .file_done => |path| {
+            defer allocator.free(path);
+            try std.testing.expectEqualStrings("lib/foo.ex", path);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseIndexerProgressEvent ignores non-json" {
+    const allocator = std.testing.allocator;
+    const event = try parseIndexerProgressEvent(allocator, "warning: hello");
+    try std.testing.expect(event == .ignore);
+}
+
+test "mergeExternalSymbolList replaces duplicates by symbol" {
+    const allocator = std.testing.allocator;
+
+    var list: std.ArrayListUnmanaged(scip.SymbolInformation) = .empty;
+    defer {
+        for (list.items) |*sym| freeSymbolInformation(allocator, sym);
+        list.deinit(allocator);
+    }
+
+    try list.append(allocator, .{
+        .symbol = "ext/Foo#",
+        .documentation = try allocator.dupe([]const u8, &.{"old"}),
+        .relationships = try allocator.alloc(scip.Relationship, 0),
+        .kind = 7,
+        .display_name = "Foo",
+        .enclosing_symbol = "",
+    });
+
+    mergeExternalSymbolList(allocator, &list, .{
+        .symbol = "ext/Foo#",
+        .documentation = try allocator.dupe([]const u8, &.{"new"}),
+        .relationships = try allocator.alloc(scip.Relationship, 0),
+        .kind = 17,
+        .display_name = "Foo",
+        .enclosing_symbol = "",
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqual(@as(i32, 17), list.items[0].kind);
+    try std.testing.expectEqualStrings("new", list.items[0].documentation[0]);
 }
 
 test "readDefinitionBody: function with enclosing_range" {

@@ -72,7 +72,7 @@ Create `cog-extension.json` in the repository root:
 {
   "name": "cog-zig",
   "extensions": [".zig", ".zon"],
-  "args": ["{file}", "--output", "{output}"],
+  "args": ["--output", "{output}", "{files}"],
   "build": "zig build -Doptimize=ReleaseFast && mkdir -p bin && cp zig-out/bin/cog-zig bin/cog-zig",
   "debugger": {
     "type": "native",
@@ -87,15 +87,24 @@ Create `cog-extension.json` in the repository root:
 |-------|------|-------------|
 | `name` | string | Extension name. Must match the binary filename in `bin/`. |
 | `extensions` | string[] | File extensions this extension handles. Include the leading dot. |
-| `args` | string[] | Arguments passed to the binary. Use `{file}` and `{output}` placeholders. |
+| `args` | string[] | Arguments passed to the binary. Use `{files}` plus `{output}` placeholders. `{files}` expands inline to one argv entry per matched file. |
 | `build` | string | Shell command to build the binary. Runs via `/bin/sh -c` in the repo directory. |
 
 ### Placeholders
 
 | Placeholder | Replaced With |
 |-------------|---------------|
-| `{file}` | Project root path (e.g., `/Users/me/project`) |
+| `{files}` | One argv entry per matched file path |
 | `{output}` | Temp file path for SCIP output (e.g., `/tmp/cog-index-12345.scip`) |
+
+Extensions can optionally report per-file bulk progress on `stderr` using
+newline-delimited JSON events while writing the final SCIP payload to
+`{output}`. Cog listens for these events and updates its indexing progress UI.
+
+```json
+{"type":"progress","event":"file_done","path":"lib/foo.ex"}
+{"type":"progress","event":"file_error","path":"lib/bar.ex"}
+```
 
 Cog invokes your binary as:
 
@@ -106,8 +115,12 @@ bin/<name> <args with placeholders substituted>
 For example, with the manifest above:
 
 ```
-bin/cog-zig /Users/me/project --output /tmp/cog-index-12345.scip
+bin/cog-zig --output /tmp/cog-index-12345.scip /Users/me/project/lib/a.ex /Users/me/project/lib/b.ex
 ```
+
+Cog invokes the extension once per language extension group and expands
+`{files}` inline on argv. The extension can then decide whether to process
+those files one-by-one or as a true batch inside a single process.
 
 ## SCIP Output
 
@@ -228,7 +241,7 @@ Add a `debugger` field to `cog-extension.json`:
 {
   "name": "cog-ruby",
   "extensions": [".rb", ".rake"],
-  "args": ["{file}", "--output", "{output}"],
+  "args": ["--output", "{output}", "{files}"],
   "build": "make install",
   "debugger": {
     "type": "dap",
@@ -377,7 +390,7 @@ These are built-in SCIP extension definitions. Cog invokes them as external proc
 
 - [ ] `cog-extension.json` in the repo root with `name`, `extensions`, `args`, `build`
 - [ ] `build` command produces an executable at `bin/<name>`
-- [ ] Binary accepts `{file}` and `{output}` arguments
+- [ ] Binary accepts `{files}` and `{output}` arguments
 - [ ] Binary writes valid SCIP protobuf to the output path
 - [ ] Binary exits 0 on success, non-zero on failure
 - [ ] Binary does not write to stdout or stderr (both are ignored by Cog)
@@ -451,7 +464,7 @@ The [cog-zig](https://github.com/bcardarella/cog-zig) extension demonstrates a c
 {
   "name": "cog-zig",
   "extensions": [".zig", ".zon"],
-  "args": ["{file}", "--output", "{output}"],
+  "args": ["--output", "{output}", "{files}"],
   "build": "zig build -Doptimize=ReleaseFast && mkdir -p bin && cp zig-out/bin/cog-zig bin/cog-zig",
   "debugger": {
     "type": "native",
