@@ -766,7 +766,7 @@ fn evalLocationImpl(
                 // The sub-expression should be evaluated with register values at function entry.
                 const sub_size = parser.readULEB128(expr, &pos) catch return .empty;
                 if (pos + @as(usize, @intCast(sub_size)) > expr.len) return .empty;
-                const sub_expr = expr[pos..pos + @as(usize, @intCast(sub_size))];
+                const sub_expr = expr[pos .. pos + @as(usize, @intCast(sub_size))];
                 pos += @intCast(sub_size);
                 // Use entry registers if available, fall back to current registers
                 const entry_regs = context.entry_regs orelse regs;
@@ -1948,7 +1948,7 @@ test "DW_OP_const_type pushes value to stack" {
         DW_OP_const_type,
         0x01, // type DIE offset (ULEB128)
         4, // size = 4 bytes
-        0x2A, 0x00, 0x00, 0x00, // value = 42 little-endian
+        0x2A,              0x00, 0x00, 0x00, // value = 42 little-endian
         DW_OP_stack_value,
     };
 
@@ -1987,7 +1987,9 @@ test "evalLocationListDwarf5 with DW_LLE_base_addressx" {
         0x00, // ULEB128 begin offset = 0
         0x80, 0x02, // ULEB128 end offset = 256 (0x100)
         0x03, // ULEB128 expr_len = 3
-        DW_OP_constu, 99, DW_OP_stack_value,
+        DW_OP_constu,
+        99,
+        DW_OP_stack_value,
         DW_LLE_end_of_list,
     };
 
@@ -2010,7 +2012,8 @@ test "evalLocationListDwarf5 with DW_LLE_startx_length" {
         0x00, // ULEB128 start_idx = 0
         0x80, 0x02, // ULEB128 length = 256 (0x100)
         0x02, // ULEB128 expr_len = 2
-        DW_OP_lit0, DW_OP_stack_value,
+        DW_OP_lit0,
+        DW_OP_stack_value,
         DW_LLE_end_of_list,
     };
 

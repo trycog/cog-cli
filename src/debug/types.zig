@@ -42,7 +42,7 @@ pub const StackFrame = struct {
 pub const Variable = struct {
     name: []const u8,
     value: []const u8,
-    @"type": []const u8 = "",
+    type: []const u8 = "",
     children_count: u32 = 0,
     variables_reference: u32 = 0,
     named_variables: ?u32 = null,
@@ -68,9 +68,9 @@ pub const Variable = struct {
         } else {
             try jw.write(self.value);
         }
-        if (self.@"type".len > 0) {
+        if (self.type.len > 0) {
             try jw.objectField("type");
-            try jw.write(self.@"type");
+            try jw.write(self.type);
         }
         try jw.objectField("variablesReference");
         try jw.write(self.variables_reference);
@@ -167,7 +167,7 @@ pub const ExceptionDetails = struct {
 };
 
 pub const ExceptionInfo = struct {
-    @"type": []const u8,
+    type: []const u8,
     message: []const u8,
     id: ?[]const u8 = null,
     break_mode: []const u8 = "unhandled",
@@ -176,7 +176,7 @@ pub const ExceptionInfo = struct {
     pub fn jsonStringify(self: *const ExceptionInfo, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("exceptionId");
-        try jw.write(self.@"type");
+        try jw.write(self.type);
         if (self.message.len > 0) {
             try jw.objectField("description");
             try jw.write(self.message);
@@ -817,7 +817,7 @@ pub const InspectRequest = struct {
 
 pub const InspectResult = struct {
     result: []const u8 = "",
-    @"type": []const u8 = "",
+    type: []const u8 = "",
     children: []const Variable = &.{},
     result_allocated: bool = false,
     children_allocated: bool = false,
@@ -828,13 +828,13 @@ pub const InspectResult = struct {
     pub fn deinit(self: *const InspectResult, allocator: std.mem.Allocator) void {
         if (self.result_allocated) {
             if (self.result.len > 0) allocator.free(self.result);
-            if (self.@"type".len > 0) allocator.free(self.@"type");
+            if (self.type.len > 0) allocator.free(self.type);
         }
         if (self.children_allocated) {
             for (self.children) |child| {
                 if (child.name.len > 0) allocator.free(child.name);
                 if (child.value.len > 0) allocator.free(child.value);
-                if (child.@"type".len > 0) allocator.free(child.@"type");
+                if (child.type.len > 0) allocator.free(child.type);
                 if (child.evaluate_name.len > 0) allocator.free(child.evaluate_name);
                 if (child.memory_reference.len > 0) allocator.free(child.memory_reference);
                 if (child.presentation_hint) |ph| {
@@ -852,9 +852,9 @@ pub const InspectResult = struct {
         try jw.beginObject();
         try jw.objectField("result");
         try jw.write(self.result);
-        if (self.@"type".len > 0) {
+        if (self.type.len > 0) {
             try jw.objectField("type");
-            try jw.write(self.@"type");
+            try jw.write(self.type);
         }
         if (self.children.len > 0) {
             try jw.objectField("children");
@@ -1082,7 +1082,6 @@ pub const VariableFilter = enum {
     }
 };
 
-
 pub const GotoTarget = struct {
     id: u32,
     label: []const u8,
@@ -1233,7 +1232,7 @@ test "Variable serializes with variablesReference" {
     const v = Variable{
         .name = "data",
         .value = "{...}",
-        .@"type" = "dict",
+        .type = "dict",
         .children_count = 3,
         .variables_reference = 7,
     };
@@ -1251,7 +1250,7 @@ test "Variable serializes with variablesReference" {
 test "StopState includes location and locals" {
     const allocator = std.testing.allocator;
     const locals = [_]Variable{
-        .{ .name = "x", .value = "42", .@"type" = "int" },
+        .{ .name = "x", .value = "42", .type = "int" },
     };
     const state = StopState{
         .stop_reason = .breakpoint,

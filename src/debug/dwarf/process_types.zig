@@ -1,7 +1,6 @@
 /// Platform-neutral types shared between process_mach.zig, process_ptrace.zig,
 /// and core_dump.zig. Extracted so that no file needs to transitively import
 /// macOS-only Mach headers just to use these data structures.
-
 /// FP/SIMD register state returned by readFloatRegisters.
 /// Each register is stored as two 64-bit values (low and high halves of 128-bit register).
 pub const FloatRegisterState = struct {

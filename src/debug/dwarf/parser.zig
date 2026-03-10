@@ -626,7 +626,6 @@ pub fn parseLineProgram(data: []const u8, allocator: std.mem.Allocator) ![]LineE
 }
 
 fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_files: bool, debug_line_str: ?[]const u8) !LineProgramResult {
-
     var pos: usize = 0;
     var entries: std.ArrayListUnmanaged(LineEntry) = .empty;
     errdefer entries.deinit(allocator);
@@ -4777,9 +4776,9 @@ test "parseAbbrevTable parses abbreviation declarations" {
     //   end: 0, 0
     // End: 0
     const data = [_]u8{
-        0x01,       // code = 1
-        0x11,       // tag = DW_TAG_compile_unit
-        0x01,       // has_children = yes
+        0x01, // code = 1
+        0x11, // tag = DW_TAG_compile_unit
+        0x01, // has_children = yes
         0x03, 0x08, // DW_AT_name, DW_FORM_string
         0x00, 0x00, // end of attributes
         0x00, // end of table
@@ -4800,14 +4799,15 @@ test "parseAbbrevTable parses abbreviation declarations" {
 test "parseAbbrevTable parses multiple entries" {
     const data = [_]u8{
         // Entry 1: compile_unit
-        0x01,       0x11, 0x01,
-        0x03,       0x08, // AT_name, FORM_string
-        0x00,       0x00,
+        0x01, 0x11, 0x01,
+        0x03, 0x08, // AT_name, FORM_string
+        0x00,
+        0x00,
         // Entry 2: subprogram
-        0x02,       0x2e, 0x00, // no children
-        0x03,       0x08, // AT_name, FORM_string
-        0x11,       0x01, // AT_low_pc, FORM_addr
-        0x00,       0x00,
+        0x02, 0x2e, 0x00, // no children
+        0x03, 0x08, // AT_name, FORM_string
+        0x11, 0x01, // AT_low_pc, FORM_addr
+        0x00, 0x00,
         // End
         0x00,
     };
@@ -4980,13 +4980,15 @@ test "parseCompilationUnit extracts variable declarations" {
         // Abbrev 1: compile_unit
         0x01, 0x11, 0x01, // code=1, tag=compile_unit, has_children=yes
         0x03, 0x08, // AT_name, FORM_string
-        0x00, 0x00,
+        0x00,
+        0x00,
         // Abbrev 2: base_type
         0x02, 0x24, 0x00, // code=2, tag=base_type, no_children
         0x03, 0x08, // AT_name, FORM_string
         0x3e, 0x0b, // AT_encoding, FORM_data1
         0x0b, 0x0b, // AT_byte_size, FORM_data1
-        0x00, 0x00,
+        0x00,
+        0x00,
         // Abbrev 3: variable
         0x03, 0x34, 0x00, // code=3, tag=variable, no_children
         0x03, 0x08, // AT_name, FORM_string
@@ -5160,12 +5162,14 @@ test "collectTypeDies collects class_type and union_type" {
         // Abbrev 1: compile_unit
         0x01, 0x11, 0x01, // code=1, tag=compile_unit, has_children=yes
         0x03, 0x08, // AT_name, FORM_string
-        0x00, 0x00,
+        0x00,
+        0x00,
         // Abbrev 2: class_type (0x02)
         0x02, 0x02, 0x00, // code=2, tag=class_type, no_children
         0x03, 0x08, // AT_name, FORM_string
         0x0b, 0x0b, // AT_byte_size, FORM_data1
-        0x00, 0x00,
+        0x00,
+        0x00,
         // Abbrev 3: union_type (0x17)
         0x03, 0x17, 0x00, // code=3, tag=union_type, no_children
         0x03, 0x08, // AT_name, FORM_string
@@ -5365,13 +5369,15 @@ test "parseInlinedSubroutines extracts inlined subroutine info from synthetic DW
         // Abbrev 1: compile_unit
         0x01, 0x11, 0x01, // code=1, tag=compile_unit, has_children=yes
         0x03, 0x08, // AT_name, FORM_string
-        0x00, 0x00,
+        0x00,
+        0x00,
         // Abbrev 2: subprogram
         0x02, 0x2e, 0x00, // code=2, tag=subprogram, no_children
         0x03, 0x08, // AT_name, FORM_string
         0x11, 0x01, // AT_low_pc, FORM_addr
         0x12, 0x01, // AT_high_pc, FORM_addr
-        0x00, 0x00,
+        0x00,
+        0x00,
         // Abbrev 3: inlined_subroutine
         0x03, 0x1d, 0x00, // code=3, tag=inlined_subroutine, no_children
         0x31, 0x13, // AT_abstract_origin, FORM_ref4

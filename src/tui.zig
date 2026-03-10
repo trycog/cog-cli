@@ -1040,9 +1040,9 @@ fn confirmFallback(prompt: []const u8) !bool {
 // ── Brain Name Validation ───────────────────────────────────────────────
 
 const reserved_brain_names = [_][]const u8{
-    "about", "activity", "admin", "analytics", "api", "edit", "export",
-    "history", "import", "integrations", "members", "new", "settings",
-    "sharing", "stats",
+    "about",   "activity", "admin",        "analytics", "api", "edit",     "export",
+    "history", "import",   "integrations", "members",   "new", "settings", "sharing",
+    "stats",
 };
 
 pub fn validateBrainName(input: []const u8) ?[]const u8 {

@@ -186,11 +186,52 @@ const RefInfo = struct {
     roles: []const u8,
 };
 
+const RelationshipInfo = struct {
+    symbol: []const u8,
+    kind: []const u8,
+};
+
+const RelationshipList = std.ArrayListUnmanaged(RelationshipInfo);
+
+const FileImport = struct {
+    label: []const u8,
+    symbol: []const u8,
+};
+
+const FileImportList = std.ArrayListUnmanaged(FileImport);
+
+const FileStat = struct {
+    path: []const u8,
+    symbol_count: usize,
+    import_count: usize,
+};
+
+const EntrypointStat = struct {
+    symbol: []const u8,
+    path: []const u8,
+    line: i32,
+    end_line: i32,
+    score: i32,
+};
+
+const SubsystemStat = struct {
+    name: []const u8,
+    file_count: usize,
+    import_count: usize,
+};
+
 pub const CodeIndex = struct {
     index: scip.Index,
     symbol_to_defs: std.StringHashMapUnmanaged(DefInfo),
     symbol_to_refs: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(RefInfo)),
     path_to_doc_idx: std.StringHashMapUnmanaged(usize),
+    symbol_to_parent: std.StringHashMapUnmanaged([]const u8),
+    parent_to_children: std.StringHashMapUnmanaged(RelationshipList),
+    symbol_to_relationships: std.StringHashMapUnmanaged(RelationshipList),
+    symbol_to_reverse_relationships: std.StringHashMapUnmanaged(RelationshipList),
+    file_to_imports: std.StringHashMapUnmanaged(FileImportList),
+    symbol_to_calls: std.StringHashMapUnmanaged(RelationshipList),
+    symbol_to_callers: std.StringHashMapUnmanaged(RelationshipList),
     /// Backing data buffer for zero-copy protobuf decoder. Must outlive the index.
     backing_data: ?[]const u8 = null,
 
@@ -198,6 +239,13 @@ pub const CodeIndex = struct {
         var symbol_to_defs: std.StringHashMapUnmanaged(DefInfo) = .empty;
         var symbol_to_refs: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(RefInfo)) = .empty;
         var path_to_doc_idx: std.StringHashMapUnmanaged(usize) = .empty;
+        var symbol_to_parent: std.StringHashMapUnmanaged([]const u8) = .empty;
+        var parent_to_children: std.StringHashMapUnmanaged(RelationshipList) = .empty;
+        var symbol_to_relationships: std.StringHashMapUnmanaged(RelationshipList) = .empty;
+        var symbol_to_reverse_relationships: std.StringHashMapUnmanaged(RelationshipList) = .empty;
+        var file_to_imports: std.StringHashMapUnmanaged(FileImportList) = .empty;
+        var symbol_to_calls: std.StringHashMapUnmanaged(RelationshipList) = .empty;
+        var symbol_to_callers: std.StringHashMapUnmanaged(RelationshipList) = .empty;
 
         for (index.documents, 0..) |doc, doc_idx| {
             try path_to_doc_idx.put(allocator, doc.relative_path, doc_idx);
@@ -225,6 +273,59 @@ pub const CodeIndex = struct {
                         .display_name = sym.display_name,
                         .documentation = sym.documentation,
                     });
+
+                    if (sym.enclosing_symbol.len > 0) {
+                        try symbol_to_parent.put(allocator, sym.symbol, sym.enclosing_symbol);
+                        const children_entry = try parent_to_children.getOrPut(allocator, sym.enclosing_symbol);
+                        if (!children_entry.found_existing) children_entry.value_ptr.* = .empty;
+                        try appendUniqueRelationship(allocator, children_entry.value_ptr, .{
+                            .symbol = sym.symbol,
+                            .kind = "contains",
+                        });
+                    }
+
+                    if (sym.relationships.len > 0) {
+                        const outgoing_entry = try symbol_to_relationships.getOrPut(allocator, sym.symbol);
+                        if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
+
+                        for (sym.relationships) |rel| {
+                            const rel_kind = scip.relationshipKind(rel);
+                            try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
+                                .symbol = rel.symbol,
+                                .kind = rel_kind,
+                            });
+
+                            if (std.mem.eql(u8, rel_kind, "calls")) {
+                                const calls_entry = try symbol_to_calls.getOrPut(allocator, sym.symbol);
+                                if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
+                                try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{
+                                    .symbol = rel.symbol,
+                                    .kind = "calls",
+                                });
+
+                                const callers_entry = try symbol_to_callers.getOrPut(allocator, rel.symbol);
+                                if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
+                                try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{
+                                    .symbol = sym.symbol,
+                                    .kind = "callers",
+                                });
+                            } else if (std.mem.eql(u8, rel_kind, "imports")) {
+                                const imports_entry = try file_to_imports.getOrPut(allocator, doc.relative_path);
+                                if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
+                                try appendUniqueImport(allocator, imports_entry.value_ptr, .{
+                                    .label = displayLabelForSymbol(rel.symbol, &symbol_to_defs),
+                                    .symbol = rel.symbol,
+                                });
+                            }
+
+                            const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
+                            if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
+                            try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{
+                                .symbol = sym.symbol,
+                                .kind = rel_kind,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -240,6 +341,33 @@ pub const CodeIndex = struct {
                     .line = occ.range.start_line,
                     .roles = scip.SymbolRole.describe(occ.symbol_roles),
                 });
+
+                if ((occ.symbol_roles & scip.SymbolRole.Import) != 0) {
+                    const imports_entry = try file_to_imports.getOrPut(allocator, doc.relative_path);
+                    if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
+                    try appendUniqueImport(allocator, imports_entry.value_ptr, .{
+                        .label = displayLabelForSymbol(occ.symbol, &symbol_to_defs),
+                        .symbol = occ.symbol,
+                    });
+                } else if (std.mem.startsWith(u8, occ.symbol, "cog/call/")) {
+                    const call_name = occ.symbol["cog/call/".len..];
+                    const caller_symbol = findEnclosingSymbolForOccurrence(doc, occ) orelse continue;
+                    const callee_symbol = resolveCallTarget(call_name, doc.relative_path, &symbol_to_defs) orelse continue;
+
+                    const calls_entry = try symbol_to_calls.getOrPut(allocator, caller_symbol);
+                    if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
+                    try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{
+                        .symbol = callee_symbol,
+                        .kind = "calls",
+                    });
+
+                    const callers_entry = try symbol_to_callers.getOrPut(allocator, callee_symbol);
+                    if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
+                    try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{
+                        .symbol = caller_symbol,
+                        .kind = "callers",
+                    });
+                }
             }
         }
 
@@ -254,13 +382,48 @@ pub const CodeIndex = struct {
                     .documentation = sym.documentation,
                 });
             }
+
+            if (sym.relationships.len > 0) {
+                const outgoing_entry = try symbol_to_relationships.getOrPut(allocator, sym.symbol);
+                if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
+                for (sym.relationships) |rel| {
+                    const rel_kind = scip.relationshipKind(rel);
+                    try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
+                        .symbol = rel.symbol,
+                        .kind = rel_kind,
+                    });
+
+                    if (std.mem.eql(u8, rel_kind, "calls")) {
+                        const calls_entry = try symbol_to_calls.getOrPut(allocator, sym.symbol);
+                        if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
+                        try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{ .symbol = rel.symbol, .kind = "calls" });
+
+                        const callers_entry = try symbol_to_callers.getOrPut(allocator, rel.symbol);
+                        if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
+                        try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{ .symbol = sym.symbol, .kind = "callers" });
+                    }
+
+                    const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
+                    if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
+                    try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{ .symbol = sym.symbol, .kind = rel_kind });
+                }
+            }
         }
+
+        debug_log.log("CodeIndex.build: defs={d} refs={d} imports={d} calls={d}", .{ symbol_to_defs.count(), symbol_to_refs.count(), file_to_imports.count(), symbol_to_calls.count() });
 
         return .{
             .index = index,
             .symbol_to_defs = symbol_to_defs,
             .symbol_to_refs = symbol_to_refs,
             .path_to_doc_idx = path_to_doc_idx,
+            .symbol_to_parent = symbol_to_parent,
+            .parent_to_children = parent_to_children,
+            .symbol_to_relationships = symbol_to_relationships,
+            .symbol_to_reverse_relationships = symbol_to_reverse_relationships,
+            .file_to_imports = file_to_imports,
+            .symbol_to_calls = symbol_to_calls,
+            .symbol_to_callers = symbol_to_callers,
         };
     }
 
@@ -272,8 +435,113 @@ pub const CodeIndex = struct {
         }
         self.symbol_to_refs.deinit(allocator);
         self.path_to_doc_idx.deinit(allocator);
+        self.symbol_to_parent.deinit(allocator);
+
+        var child_iter = self.parent_to_children.iterator();
+        while (child_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.parent_to_children.deinit(allocator);
+
+        var rel_iter = self.symbol_to_relationships.iterator();
+        while (rel_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.symbol_to_relationships.deinit(allocator);
+
+        var rev_iter = self.symbol_to_reverse_relationships.iterator();
+        while (rev_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.symbol_to_reverse_relationships.deinit(allocator);
+
+        var import_iter = self.file_to_imports.iterator();
+        while (import_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.file_to_imports.deinit(allocator);
+
+        var call_iter = self.symbol_to_calls.iterator();
+        while (call_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.symbol_to_calls.deinit(allocator);
+
+        var caller_iter = self.symbol_to_callers.iterator();
+        while (caller_iter.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+        }
+        self.symbol_to_callers.deinit(allocator);
         scip.freeIndex(allocator, &self.index);
         if (self.backing_data) |data| allocator.free(data);
+    }
+
+    fn appendUniqueRelationship(allocator: std.mem.Allocator, list: *RelationshipList, rel: RelationshipInfo) !void {
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing.symbol, rel.symbol) and std.mem.eql(u8, existing.kind, rel.kind)) {
+                return;
+            }
+        }
+        try list.append(allocator, rel);
+    }
+
+    fn appendUniqueImport(allocator: std.mem.Allocator, list: *FileImportList, item: FileImport) !void {
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, existing.label, item.label) and std.mem.eql(u8, existing.symbol, item.symbol)) {
+                return;
+            }
+        }
+        try list.append(allocator, item);
+    }
+
+    fn displayLabelForSymbol(symbol: []const u8, defs: *const std.StringHashMapUnmanaged(DefInfo)) []const u8 {
+        if (std.mem.startsWith(u8, symbol, "cog/import/")) {
+            return symbol["cog/import/".len..];
+        }
+        if (std.mem.startsWith(u8, symbol, "cog/call/")) {
+            return symbol["cog/call/".len..];
+        }
+        if (defs.get(symbol)) |def| {
+            if (def.display_name.len > 0) return def.display_name;
+        }
+        return scip.extractSymbolName(symbol);
+    }
+
+    fn findEnclosingSymbolForOccurrence(self_doc: scip.Document, occ: scip.Occurrence) ?[]const u8 {
+        for (self_doc.symbols) |sym| {
+            if (sym.symbol.len == 0) continue;
+            for (self_doc.occurrences) |candidate_occ| {
+                if (!std.mem.eql(u8, candidate_occ.symbol, sym.symbol)) continue;
+                if (!scip.SymbolRole.isDefinition(candidate_occ.symbol_roles)) continue;
+                const range = candidate_occ.enclosing_range orelse continue;
+                if (occ.range.start_line < range.start_line or occ.range.start_line > range.end_line) continue;
+                return sym.symbol;
+            }
+        }
+        return null;
+    }
+
+    fn resolveCallTarget(call_name: []const u8, caller_path: []const u8, defs: *const std.StringHashMapUnmanaged(DefInfo)) ?[]const u8 {
+        var best_symbol: ?[]const u8 = null;
+        var best_score: i32 = -1;
+        var iter = defs.iterator();
+        while (iter.next()) |entry| {
+            const symbol = entry.key_ptr.*;
+            const def = entry.value_ptr.*;
+            const display_name = if (def.display_name.len > 0) def.display_name else scip.extractSymbolName(symbol);
+            if (!std.mem.eql(u8, display_name, call_name)) continue;
+
+            var score: i32 = 0;
+            if (std.mem.eql(u8, def.path, caller_path)) score += 100;
+            if (!CodeIndex.pathIsTest(def.path)) score += 25;
+            score += @as(i32, @intCast(10 - @min(CodeIndex.countPathSeparators(def.path), 10)));
+
+            if (score > best_score) {
+                best_score = score;
+                best_symbol = symbol;
+            }
+        }
+        return best_symbol;
     }
 
     /// Find symbols matching a name (searches display_name and extracted name).
@@ -541,6 +809,34 @@ pub const CodeIndex = struct {
         std.mem.sortUnstable(FileTOCEntry, result.items, {}, SortCtx.lessThan);
 
         return result;
+    }
+
+    fn getFileImports(self: *const CodeIndex, file_path: []const u8) ?FileImportList {
+        return self.file_to_imports.get(file_path);
+    }
+
+    fn getChildren(self: *const CodeIndex, symbol: []const u8) ?RelationshipList {
+        return self.parent_to_children.get(symbol);
+    }
+
+    fn getParent(self: *const CodeIndex, symbol: []const u8) ?[]const u8 {
+        return self.symbol_to_parent.get(symbol);
+    }
+
+    fn getRelationships(self: *const CodeIndex, symbol: []const u8) ?RelationshipList {
+        return self.symbol_to_relationships.get(symbol);
+    }
+
+    fn getReverseRelationships(self: *const CodeIndex, symbol: []const u8) ?RelationshipList {
+        return self.symbol_to_reverse_relationships.get(symbol);
+    }
+
+    fn getCalls(self: *const CodeIndex, symbol: []const u8) ?RelationshipList {
+        return self.symbol_to_calls.get(symbol);
+    }
+
+    fn getCallers(self: *const CodeIndex, symbol: []const u8) ?RelationshipList {
+        return self.symbol_to_callers.get(symbol);
     }
 };
 
@@ -2497,13 +2793,19 @@ fn codeStatus(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
 // ── Public Inner API (for MCP server) ───────────────────────────────────
 
-pub const QueryMode = enum { find, refs, symbols };
+pub const QueryMode = enum { find, refs, symbols, imports, contains, calls, callers, overview };
+
+pub const QueryDirection = enum { incoming, outgoing, both };
+
+pub const OverviewScope = enum { symbol, file, repo };
 
 pub const QueryParams = struct {
     mode: QueryMode,
     name: ?[]const u8 = null,
     file: ?[]const u8 = null,
     kind: ?[]const u8 = null,
+    direction: QueryDirection = .outgoing,
+    scope: OverviewScope = .symbol,
 };
 
 pub fn codeQueryInner(allocator: std.mem.Allocator, params: QueryParams) ![]const u8 {
@@ -2514,11 +2816,16 @@ pub fn codeQueryInner(allocator: std.mem.Allocator, params: QueryParams) ![]cons
 }
 
 pub fn codeQueryWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, params: QueryParams) ![]const u8 {
-    debug_log.log("codeQueryWithLoadedIndex: mode={s} name={?s} file={?s}", .{ @tagName(params.mode), params.name, params.file });
+    debug_log.log("codeQueryWithLoadedIndex: mode={s} name={?s} file={?s} direction={s} scope={s}", .{ @tagName(params.mode), params.name, params.file, @tagName(params.direction), @tagName(params.scope) });
     return switch (params.mode) {
         .find => try queryFindInner(allocator, ci, params.name orelse return error.MissingName, params.kind, params.file),
         .refs => try queryRefsInner(allocator, ci, params.name orelse return error.MissingName, params.kind, params.file),
         .symbols => try querySymbolsInner(allocator, ci, params.file orelse return error.MissingFile, params.kind),
+        .imports => try queryImportsInner(allocator, ci, params.name, params.file, params.direction),
+        .contains => try queryContainsInner(allocator, ci, params.name, params.file, params.direction),
+        .calls => try queryCallsInner(allocator, ci, params.name orelse return error.MissingName),
+        .callers => try queryCallersInner(allocator, ci, params.name orelse return error.MissingName),
+        .overview => try queryOverviewInner(allocator, ci, params.name, params.file, params.scope),
     };
 }
 
@@ -2529,8 +2836,15 @@ pub const ExploreQuery = struct {
     kind: ?[]const u8 = null,
 };
 
-pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, queries: []const ExploreQuery, context_lines: usize) ![]const u8 {
-    debug_log.log("codeExploreWithLoadedIndex: queries={d} context_lines={d}", .{ queries.len, context_lines });
+pub const ExploreOptions = struct {
+    context_lines: usize = 15,
+    include_relationships: bool = false,
+    include_architecture: bool = false,
+    overview_scope: OverviewScope = .symbol,
+};
+
+pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, queries: []const ExploreQuery, options: ExploreOptions) ![]const u8 {
+    debug_log.log("codeExploreWithLoadedIndex: queries={d} context_lines={d} include_relationships={} include_architecture={} overview_scope={s}", .{ queries.len, options.context_lines, options.include_relationships, options.include_architecture, @tagName(options.overview_scope) });
     // Resolve the project root from .cog dir (strip trailing /.cog)
     const cog_dir = paths.findCogDir(allocator) catch return try allocator.dupe(u8, "[]");
     defer allocator.free(cog_dir);
@@ -2586,7 +2900,7 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
         queried_symbols.put(allocator, match.symbol, {}) catch {};
 
         // Read full definition body
-        const body = readDefinitionBody(allocator, project_root, match.def.path, match.def.line, match.def.end_line, context_lines) catch null;
+        const body = readDefinitionBody(allocator, project_root, match.def.path, match.def.line, match.def.end_line, options.context_lines) catch null;
         if (body) |b| {
             body_results[i] = b;
         }
@@ -2632,6 +2946,14 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
             try writeSnippetBlock(w, body.snippet, match.def.path, body.truncated);
         }
 
+        if (options.include_relationships or options.include_architecture) {
+            const overview_text = try queryOverviewInner(allocator, ci, display_name, null, .symbol);
+            defer allocator.free(overview_text);
+            try w.writeAll("\nArchitecture:\n");
+            try w.writeAll(overview_text);
+            try w.writeByte('\n');
+        }
+
         // Emit references from SCIP cross-reference data
         if (match.def.end_line > match.def.line) {
             var refs = ci.findReferencesInRange(allocator, match.def.path, match.symbol, match.def.line, match.def.end_line);
@@ -2674,6 +2996,13 @@ pub fn codeExploreWithLoadedIndex(allocator: std.mem.Allocator, ci: *CodeIndex, 
     }
 
     debug_log.log("codeExploreWithLoadedIndex: emitted {d} bytes", .{aw.writer.buffered().len});
+
+    if (options.include_architecture and options.overview_scope == .repo) {
+        const repo_overview = try queryOverviewInner(allocator, ci, null, null, .repo);
+        defer allocator.free(repo_overview);
+        try aw.writer.writeAll("\n---\n\n");
+        try aw.writer.writeAll(repo_overview);
+    }
 
     return aw.toOwnedSlice();
 }
@@ -2917,6 +3246,70 @@ fn discoverRelatedSymbols(
     return result;
 }
 
+fn resolveIndexedPath(ci: *CodeIndex, requested_path: []const u8) ?[]const u8 {
+    if (ci.path_to_doc_idx.contains(requested_path)) return requested_path;
+    var iter = ci.path_to_doc_idx.iterator();
+    while (iter.next()) |entry| {
+        const indexed_path = entry.key_ptr.*;
+        if (fileMatchesSuffix(indexed_path, requested_path)) return indexed_path;
+    }
+    return null;
+}
+
+fn resolveSymbolMatch(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8) !?CodeIndex.MatchEntry {
+    var matches = try ci.findSymbol(allocator, name, null, null);
+    defer matches.deinit(allocator);
+    if (matches.items.len == 0) return null;
+    return matches.items[0];
+}
+
+fn resolveSymbolMatchForCallGraph(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8, callers: bool) !?CodeIndex.MatchEntry {
+    var matches = try ci.findSymbol(allocator, name, null, null);
+    defer matches.deinit(allocator);
+    if (matches.items.len == 0) return null;
+
+    for (matches.items) |match| {
+        if (callers) {
+            if (ci.getCallers(match.symbol)) |rels| {
+                if (rels.items.len > 0) return match;
+            }
+        } else {
+            if (ci.getCalls(match.symbol)) |rels| {
+                if (rels.items.len > 0) return match;
+            }
+        }
+    }
+
+    return matches.items[0];
+}
+
+fn writeRelationshipList(writer: anytype, ci: *CodeIndex, relationships: []const RelationshipInfo, filter_kind: ?[]const u8) !usize {
+    var emitted: usize = 0;
+    for (relationships) |rel| {
+        if (filter_kind) |kind| {
+            if (!std.mem.eql(u8, rel.kind, kind)) continue;
+        }
+        const def = ci.symbol_to_defs.get(rel.symbol);
+        const display_name = if (def) |d|
+            if (d.display_name.len > 0) d.display_name else scip.extractSymbolName(rel.symbol)
+        else if (std.mem.startsWith(u8, rel.symbol, "cog/import/"))
+            rel.symbol["cog/import/".len..]
+        else
+            scip.extractSymbolName(rel.symbol);
+        try writer.print("- `{s}` [{s}]", .{ display_name, rel.kind });
+        if (def) |d| {
+            if (d.path.len > 0) {
+                try writer.writeAll(" `");
+                try writePathSpan(writer, d.path, d.line, d.end_line);
+                try writer.writeAll("`");
+            }
+        }
+        try writer.writeByte('\n');
+        emitted += 1;
+    }
+    return emitted;
+}
+
 fn queryFindInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8, kind_filter: ?[]const u8, file_filter: ?[]const u8) ![]const u8 {
     var matches = try ci.findSymbol(allocator, name, kind_filter, file_filter);
     defer matches.deinit(allocator);
@@ -2984,18 +3377,8 @@ fn queryRefsInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8
 
 fn querySymbolsInner(allocator: std.mem.Allocator, ci: *CodeIndex, file_path: []const u8, kind_filter: ?[]const u8) ![]const u8 {
     // Try exact match first
-    var doc_idx_opt = ci.path_to_doc_idx.get(file_path);
-    if (doc_idx_opt == null) {
-        var iter = ci.path_to_doc_idx.iterator();
-        while (iter.next()) |entry| {
-            const indexed_path = entry.key_ptr.*;
-            if (fileMatchesSuffix(indexed_path, file_path)) {
-                doc_idx_opt = entry.value_ptr.*;
-                break;
-            }
-        }
-    }
-    const doc_idx = doc_idx_opt orelse return try allocator.dupe(u8, "File not found in index");
+    const resolved_path = resolveIndexedPath(ci, file_path) orelse return try allocator.dupe(u8, "File not found in index");
+    const doc_idx = ci.path_to_doc_idx.get(resolved_path).?;
     const doc = ci.index.documents[doc_idx];
 
     var aw: Writer.Allocating = .init(allocator);
@@ -3031,6 +3414,388 @@ fn querySymbolsInner(allocator: std.mem.Allocator, ci: *CodeIndex, file_path: []
     }
 
     debug_log.log("querySymbolsInner: emitted {d} symbols for {s}", .{ emitted, doc.relative_path });
+    return aw.toOwnedSlice();
+}
+
+fn queryImportsInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: ?[]const u8, file_path: ?[]const u8, direction: QueryDirection) ![]const u8 {
+    const target_file = if (file_path) |fp|
+        resolveIndexedPath(ci, fp) orelse return try allocator.dupe(u8, "File not found in index")
+    else if (name) |n| blk: {
+        const match = (try resolveSymbolMatch(allocator, ci, n)) orelse return try allocator.dupe(u8, "Symbol not found");
+        break :blk match.def.path;
+    } else return error.MissingFile;
+
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try aw.writer.print("Imports for `{s}`\n", .{target_file});
+
+    var emitted: usize = 0;
+    if (direction == .outgoing or direction == .both) {
+        try aw.writer.writeAll("Outgoing:\n");
+        if (ci.getFileImports(target_file)) |imports| {
+            for (imports.items) |item| {
+                try aw.writer.print("- `{s}`\n", .{item.label});
+                emitted += 1;
+            }
+        }
+        if (emitted == 0) try aw.writer.writeAll("- No imports found\n");
+    }
+
+    if (direction == .incoming or direction == .both) {
+        if (direction == .both) try aw.writer.writeByte('\n');
+        try aw.writer.writeAll("Incoming:\n");
+        var incoming: usize = 0;
+        var iter = ci.file_to_imports.iterator();
+        while (iter.next()) |entry| {
+            for (entry.value_ptr.items) |item| {
+                if (std.mem.eql(u8, item.label, target_file) or std.mem.eql(u8, item.symbol, target_file)) {
+                    try aw.writer.print("- `{s}`\n", .{entry.key_ptr.*});
+                    incoming += 1;
+                    break;
+                }
+                if (std.mem.startsWith(u8, item.symbol, "cog/import/") and std.mem.eql(u8, item.symbol["cog/import/".len..], target_file)) {
+                    try aw.writer.print("- `{s}`\n", .{entry.key_ptr.*});
+                    incoming += 1;
+                    break;
+                }
+            }
+        }
+        if (incoming == 0) try aw.writer.writeAll("- No importers found\n");
+    }
+
+    return aw.toOwnedSlice();
+}
+
+fn queryContainsInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: ?[]const u8, file_path: ?[]const u8, direction: QueryDirection) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    if (file_path) |fp| {
+        const resolved_path = resolveIndexedPath(ci, fp) orelse return try allocator.dupe(u8, "File not found in index");
+        try aw.writer.print("Contains for `{s}`\n", .{resolved_path});
+        var excluded: std.StringHashMapUnmanaged(void) = .empty;
+        defer excluded.deinit(allocator);
+        var toc = ci.getFileSymbolsTOC(allocator, resolved_path, &excluded);
+        defer toc.deinit(allocator);
+        if (toc.items.len == 0) {
+            try aw.writer.writeAll("- No contained symbols found\n");
+        } else {
+            for (toc.items) |entry| {
+                try aw.writer.print("- `{s}` ({s}) `", .{ entry.name, scip.kindName(entry.kind) });
+                try writeLineRange(&aw.writer, entry.line, entry.end_line);
+                try aw.writer.writeAll("`\n");
+            }
+        }
+        return aw.toOwnedSlice();
+    }
+
+    const target_name = name orelse return error.MissingName;
+    const match = (try resolveSymbolMatch(allocator, ci, target_name)) orelse return try allocator.dupe(u8, "Symbol not found");
+    const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+    try aw.writer.print("Contains for `{s}` ({s})\n", .{ display_name, scip.kindName(match.def.kind) });
+
+    var emitted: usize = 0;
+    if (direction == .incoming or direction == .both) {
+        try aw.writer.writeAll("Parent:\n");
+        if (ci.getParent(match.symbol)) |parent_symbol| {
+            if (ci.symbol_to_defs.get(parent_symbol)) |parent_def| {
+                const parent_name = if (parent_def.display_name.len > 0) parent_def.display_name else scip.extractSymbolName(parent_symbol);
+                try aw.writer.print("- `{s}` ({s}) `", .{ parent_name, scip.kindName(parent_def.kind) });
+                try writePathSpan(&aw.writer, parent_def.path, parent_def.line, parent_def.end_line);
+                try aw.writer.writeAll("`\n");
+                emitted += 1;
+            }
+        }
+        if (emitted == 0) try aw.writer.writeAll("- No parent container found\n");
+    }
+
+    if (direction == .outgoing or direction == .both) {
+        if (direction == .both) try aw.writer.writeByte('\n');
+        try aw.writer.writeAll("Children:\n");
+        const before_children = emitted;
+        if (ci.getChildren(match.symbol)) |children| {
+            emitted += try writeRelationshipList(&aw.writer, ci, children.items, "contains");
+        }
+        if (emitted == before_children) try aw.writer.writeAll("- No contained symbols found\n");
+    }
+
+    return aw.toOwnedSlice();
+}
+
+fn queryCallsInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8) ![]const u8 {
+    const match = (try resolveSymbolMatchForCallGraph(allocator, ci, name, false)) orelse return try allocator.dupe(u8, "Symbol not found");
+    const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try aw.writer.print("Calls from `{s}` ({s})\n", .{ display_name, scip.kindName(match.def.kind) });
+    try aw.writer.print("Definition: `{s}:", .{match.def.path});
+    try writeLineRange(&aw.writer, match.def.line, match.def.end_line);
+    try aw.writer.writeAll("`\n\n");
+
+    if (ci.getCalls(match.symbol)) |rels| {
+        const emitted = try writeRelationshipList(&aw.writer, ci, rels.items, "calls");
+        if (emitted == 0) try aw.writer.writeAll("- No calls found\n");
+    } else {
+        try aw.writer.writeAll("- No calls found\n");
+    }
+    return aw.toOwnedSlice();
+}
+
+fn queryCallersInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: []const u8) ![]const u8 {
+    const match = (try resolveSymbolMatchForCallGraph(allocator, ci, name, true)) orelse return try allocator.dupe(u8, "Symbol not found");
+    const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    try aw.writer.print("Callers of `{s}` ({s})\n", .{ display_name, scip.kindName(match.def.kind) });
+    try aw.writer.print("Definition: `{s}:", .{match.def.path});
+    try writeLineRange(&aw.writer, match.def.line, match.def.end_line);
+    try aw.writer.writeAll("`\n\n");
+
+    if (ci.getCallers(match.symbol)) |rels| {
+        const emitted = try writeRelationshipList(&aw.writer, ci, rels.items, "callers");
+        if (emitted == 0) try aw.writer.writeAll("- No callers found\n");
+    } else {
+        try aw.writer.writeAll("- No callers found\n");
+    }
+    return aw.toOwnedSlice();
+}
+
+fn collectTopFilesByFanout(allocator: std.mem.Allocator, ci: *CodeIndex) !std.ArrayListUnmanaged(FileStat) {
+    var stats: std.ArrayListUnmanaged(FileStat) = .empty;
+    errdefer stats.deinit(allocator);
+
+    var iter = ci.path_to_doc_idx.iterator();
+    while (iter.next()) |entry| {
+        const path = entry.key_ptr.*;
+        const doc = ci.index.documents[entry.value_ptr.*];
+        try stats.append(allocator, .{
+            .path = path,
+            .symbol_count = doc.symbols.len,
+            .import_count = if (ci.getFileImports(path)) |imports| imports.items.len else 0,
+        });
+    }
+
+    const SortCtx = struct {
+        fn lessThan(_: void, a: FileStat, b: FileStat) bool {
+            if (a.import_count == b.import_count) return a.symbol_count > b.symbol_count;
+            return a.import_count > b.import_count;
+        }
+    };
+    std.mem.sortUnstable(FileStat, stats.items, {}, SortCtx.lessThan);
+    return stats;
+}
+
+fn countIncomingImports(ci: *CodeIndex, target_file: []const u8) usize {
+    var total: usize = 0;
+    var iter = ci.file_to_imports.iterator();
+    while (iter.next()) |entry| {
+        if (ci.getFileImports(entry.key_ptr.*)) |imports| {
+            for (imports.items) |item| {
+                if (std.mem.eql(u8, item.label, target_file)) {
+                    total += 1;
+                    break;
+                }
+                if (std.mem.startsWith(u8, item.symbol, "cog/import/") and std.mem.eql(u8, item.symbol["cog/import/".len..], target_file)) {
+                    total += 1;
+                    break;
+                }
+            }
+        }
+    }
+    return total;
+}
+
+fn collectEntrypoints(allocator: std.mem.Allocator, ci: *CodeIndex) !std.ArrayListUnmanaged(EntrypointStat) {
+    var stats: std.ArrayListUnmanaged(EntrypointStat) = .empty;
+    errdefer stats.deinit(allocator);
+
+    var iter = ci.symbol_to_defs.iterator();
+    while (iter.next()) |entry| {
+        const symbol = entry.key_ptr.*;
+        const def = entry.value_ptr.*;
+        if (def.path.len == 0) continue;
+        const name_text = if (def.display_name.len > 0) def.display_name else scip.extractSymbolName(symbol);
+
+        var score: i32 = 0;
+        if (std.mem.eql(u8, name_text, "main")) score += 100;
+        if (std.mem.eql(u8, name_text, "bootstrap") or std.mem.eql(u8, name_text, "run")) score += 35;
+        if (std.mem.endsWith(u8, def.path, "main.zig") or std.mem.endsWith(u8, def.path, "main.ts") or std.mem.endsWith(u8, def.path, "main.js")) score += 40;
+        if (!CodeIndex.pathIsTest(def.path)) score += 10;
+        if (ci.getCalls(symbol)) |calls| score += @as(i32, @intCast(@min(calls.items.len * 10, 40)));
+        score += @as(i32, @intCast(@min(countIncomingImports(ci, def.path) * 5, 25)));
+        if (score <= 0) continue;
+
+        try stats.append(allocator, .{
+            .symbol = symbol,
+            .path = def.path,
+            .line = def.line,
+            .end_line = def.end_line,
+            .score = score,
+        });
+    }
+
+    const SortCtx = struct {
+        fn lessThan(_: void, a: EntrypointStat, b: EntrypointStat) bool {
+            if (a.score == b.score) return std.mem.lessThan(u8, a.path, b.path);
+            return a.score > b.score;
+        }
+    };
+    std.mem.sortUnstable(EntrypointStat, stats.items, {}, SortCtx.lessThan);
+    return stats;
+}
+
+fn collectSubsystemStats(allocator: std.mem.Allocator, ci: *CodeIndex) !std.ArrayListUnmanaged(SubsystemStat) {
+    var subsystem_files: std.StringHashMapUnmanaged(usize) = .empty;
+    defer subsystem_files.deinit(allocator);
+    var subsystem_imports: std.StringHashMapUnmanaged(usize) = .empty;
+    defer subsystem_imports.deinit(allocator);
+
+    var iter = ci.path_to_doc_idx.iterator();
+    while (iter.next()) |entry| {
+        const path = entry.key_ptr.*;
+        const slash = std.mem.indexOfScalar(u8, path, '/') orelse continue;
+        const rest = path[slash + 1 ..];
+        const next = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+        const prefix = rest[0..next];
+
+        const files_gop = try subsystem_files.getOrPut(allocator, prefix);
+        if (!files_gop.found_existing) files_gop.value_ptr.* = 0;
+        files_gop.value_ptr.* += 1;
+
+        const imports_gop = try subsystem_imports.getOrPut(allocator, prefix);
+        if (!imports_gop.found_existing) imports_gop.value_ptr.* = 0;
+        imports_gop.value_ptr.* += if (ci.getFileImports(path)) |imports| imports.items.len else 0;
+    }
+
+    var result: std.ArrayListUnmanaged(SubsystemStat) = .empty;
+    errdefer result.deinit(allocator);
+    var files_iter = subsystem_files.iterator();
+    while (files_iter.next()) |entry| {
+        try result.append(allocator, .{
+            .name = entry.key_ptr.*,
+            .file_count = entry.value_ptr.*,
+            .import_count = subsystem_imports.get(entry.key_ptr.*) orelse 0,
+        });
+    }
+
+    const SortCtx = struct {
+        fn lessThan(_: void, a: SubsystemStat, b: SubsystemStat) bool {
+            if (a.file_count == b.file_count) {
+                if (a.import_count == b.import_count) return std.mem.lessThan(u8, a.name, b.name);
+                return a.import_count > b.import_count;
+            }
+            return a.file_count > b.file_count;
+        }
+    };
+    std.mem.sortUnstable(SubsystemStat, result.items, {}, SortCtx.lessThan);
+    return result;
+}
+
+fn writeSubsystemSummary(allocator: std.mem.Allocator, writer: anytype, ci: *CodeIndex) !void {
+    var stats = try collectSubsystemStats(allocator, ci);
+    defer stats.deinit(allocator);
+
+    try writer.writeAll("Subsystems:\n");
+    var emitted: usize = 0;
+    for (stats.items) |entry| {
+        try writer.print("- `{s}` ({d} files, {d} imports)\n", .{ entry.name, entry.file_count, entry.import_count });
+        emitted += 1;
+        if (emitted >= 8) break;
+    }
+    if (emitted == 0) try writer.writeAll("- No subsystem groupings inferred\n");
+}
+
+fn queryOverviewInner(allocator: std.mem.Allocator, ci: *CodeIndex, name: ?[]const u8, file_path: ?[]const u8, scope: OverviewScope) ![]const u8 {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    switch (scope) {
+        .repo => {
+            try aw.writer.writeAll("Repository overview\n");
+            try aw.writer.print("Files indexed: {d}\n", .{ci.index.documents.len});
+            try aw.writer.print("Symbols indexed: {d}\n", .{ci.symbol_to_defs.count()});
+
+            try aw.writer.writeByte('\n');
+            try aw.writer.writeAll("Probable entrypoints:\n");
+            var entrypoints = try collectEntrypoints(allocator, ci);
+            defer entrypoints.deinit(allocator);
+            var emitted_entrypoints: usize = 0;
+            for (entrypoints.items) |entry| {
+                try aw.writer.print("- `{s}` `", .{entry.path});
+                try writeLineRange(&aw.writer, entry.line, entry.end_line);
+                try aw.writer.print("` (score {d})\n", .{entry.score});
+                emitted_entrypoints += 1;
+                if (emitted_entrypoints >= 5) break;
+            }
+            if (emitted_entrypoints == 0) try aw.writer.writeAll("- No obvious entrypoints found\n");
+
+            try aw.writer.writeByte('\n');
+            try aw.writer.writeAll("Top files by import fan-out:\n");
+            var stats = try collectTopFilesByFanout(allocator, ci);
+            defer stats.deinit(allocator);
+            var top_count: usize = 0;
+            for (stats.items) |entry| {
+                try aw.writer.print("- `{s}` ({d} imports, {d} symbols)\n", .{ entry.path, entry.import_count, entry.symbol_count });
+                top_count += 1;
+                if (top_count >= 8) break;
+            }
+            if (top_count == 0) try aw.writer.writeAll("- No import relationships found\n");
+
+            try aw.writer.writeByte('\n');
+            try writeSubsystemSummary(allocator, &aw.writer, ci);
+        },
+        .file => {
+            const target_file = file_path orelse return error.MissingFile;
+            const resolved_path = resolveIndexedPath(ci, target_file) orelse return try allocator.dupe(u8, "File not found in index");
+            try aw.writer.print("File overview for `{s}`\n", .{resolved_path});
+            try aw.writer.writeByte('\n');
+            const imports_text = try queryImportsInner(allocator, ci, null, resolved_path, .outgoing);
+            defer allocator.free(imports_text);
+            try aw.writer.writeAll(imports_text);
+            try aw.writer.writeByte('\n');
+            const contains_text = try queryContainsInner(allocator, ci, null, resolved_path, .outgoing);
+            defer allocator.free(contains_text);
+            try aw.writer.writeAll(contains_text);
+        },
+        .symbol => {
+            const target_name = name orelse return error.MissingName;
+            const match = (try resolveSymbolMatch(allocator, ci, target_name)) orelse return try allocator.dupe(u8, "Symbol not found");
+            const display_name = if (match.def.display_name.len > 0) match.def.display_name else scip.extractSymbolName(match.symbol);
+            try aw.writer.print("Overview for `{s}` ({s})\n", .{ display_name, scip.kindName(match.def.kind) });
+            try aw.writer.print("Definition: `{s}:", .{match.def.path});
+            try writeLineRange(&aw.writer, match.def.line, match.def.end_line);
+            try aw.writer.writeAll("`\n");
+
+            try aw.writer.writeByte('\n');
+            const contains_text = try queryContainsInner(allocator, ci, target_name, null, .both);
+            defer allocator.free(contains_text);
+            try aw.writer.writeAll(contains_text);
+
+            if (ci.getRelationships(match.symbol)) |rels| {
+                try aw.writer.writeByte('\n');
+                try aw.writer.writeAll("Relationships:\n");
+                const emitted = try writeRelationshipList(&aw.writer, ci, rels.items, null);
+                if (emitted == 0) try aw.writer.writeAll("- No relationships found\n");
+            }
+
+            if (ci.getCalls(match.symbol)) |calls| {
+                try aw.writer.writeByte('\n');
+                try aw.writer.writeAll("Calls:\n");
+                const emitted = try writeRelationshipList(&aw.writer, ci, calls.items, "calls");
+                if (emitted == 0) try aw.writer.writeAll("- No calls found\n");
+            }
+
+            if (ci.getCallers(match.symbol)) |callers| {
+                try aw.writer.writeByte('\n');
+                try aw.writer.writeAll("Callers:\n");
+                const emitted = try writeRelationshipList(&aw.writer, ci, callers.items, "callers");
+                if (emitted == 0) try aw.writer.writeAll("- No callers found\n");
+            }
+        },
+    }
+
     return aw.toOwnedSlice();
 }
 
@@ -3970,18 +4735,20 @@ test "findSymbol with alternation" {
 /// File C (src/http.zig): defines init (function) — unrelated init
 fn buildTestDisambiguationIndex(allocator: std.mem.Allocator) !CodeIndex {
     // File A: src/commands.zig — defines init, initBrain, references Settings
-    var occ_a = try allocator.alloc(scip.Occurrence, 3);
+    var occ_a = try allocator.alloc(scip.Occurrence, 5);
     occ_a[0] = .{
         .range = .{ .start_line = 5, .start_char = 0, .end_line = 5, .end_char = 4 },
         .symbol = "proj/commands.zig/init().",
         .symbol_roles = scip.SymbolRole.Definition,
         .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 5, .start_char = 0, .end_line = 12, .end_char = 1 },
     };
     occ_a[1] = .{
         .range = .{ .start_line = 20, .start_char = 0, .end_line = 20, .end_char = 9 },
         .symbol = "proj/commands.zig/initBrain().",
         .symbol_roles = scip.SymbolRole.Definition,
         .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 20, .start_char = 0, .end_line = 22, .end_char = 1 },
     };
     occ_a[2] = .{
         .range = .{ .start_line = 10, .start_char = 4, .end_line = 10, .end_char = 12 },
@@ -3989,12 +4756,34 @@ fn buildTestDisambiguationIndex(allocator: std.mem.Allocator) !CodeIndex {
         .symbol_roles = 0, // reference, not definition
         .syntax_kind = 0,
     };
+    occ_a[3] = .{
+        .range = .{ .start_line = 1, .start_char = 18, .end_line = 1, .end_char = 30 },
+        .symbol = "cog/import/src/settings.zig",
+        .symbol_roles = scip.SymbolRole.Import,
+        .syntax_kind = 0,
+    };
+    occ_a[4] = .{
+        .range = .{ .start_line = 21, .start_char = 4, .end_line = 21, .end_char = 8 },
+        .symbol = "cog/call/init",
+        .symbol_roles = scip.SymbolRole.ReadAccess,
+        .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 20, .start_char = 0, .end_line = 22, .end_char = 1 },
+    };
 
     var sym_a = try allocator.alloc(scip.SymbolInformation, 2);
+    var init_relationships = try allocator.alloc(scip.Relationship, 1);
+    init_relationships[0] = .{
+        .symbol = "cog/import/src/settings.zig",
+        .is_reference = false,
+        .is_implementation = false,
+        .is_type_definition = false,
+        .is_definition = false,
+        .kind = "imports",
+    };
     sym_a[0] = .{
         .symbol = "proj/commands.zig/init().",
         .documentation = &.{},
-        .relationships = &.{},
+        .relationships = init_relationships,
         .kind = 12, // function
         .display_name = "init",
         .enclosing_symbol = "",
@@ -4015,12 +4804,14 @@ fn buildTestDisambiguationIndex(allocator: std.mem.Allocator) !CodeIndex {
         .symbol = "proj/settings.zig/Settings#",
         .symbol_roles = scip.SymbolRole.Definition,
         .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 3, .start_char = 0, .end_line = 31, .end_char = 1 },
     };
     occ_b[1] = .{
         .range = .{ .start_line = 30, .start_char = 0, .end_line = 30, .end_char = 4 },
         .symbol = "proj/settings.zig/load().",
         .symbol_roles = scip.SymbolRole.Definition,
         .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 30, .start_char = 0, .end_line = 31, .end_char = 1 },
     };
 
     var sym_b = try allocator.alloc(scip.SymbolInformation, 2);
@@ -4038,7 +4829,7 @@ fn buildTestDisambiguationIndex(allocator: std.mem.Allocator) !CodeIndex {
         .relationships = &.{},
         .kind = 12, // function
         .display_name = "load",
-        .enclosing_symbol = "",
+        .enclosing_symbol = "proj/settings.zig/Settings#",
     };
 
     // File C: src/http.zig — defines init (unrelated)
@@ -4048,6 +4839,7 @@ fn buildTestDisambiguationIndex(allocator: std.mem.Allocator) !CodeIndex {
         .symbol = "proj/http.zig/init().",
         .symbol_roles = scip.SymbolRole.Definition,
         .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 8, .start_char = 0, .end_line = 10, .end_char = 1 },
     };
 
     var sym_c = try allocator.alloc(scip.SymbolInformation, 1);
@@ -4098,6 +4890,9 @@ fn deinitTestIndex(ci: *CodeIndex, allocator: std.mem.Allocator) void {
     // Free occurrence and symbol arrays for each document
     for (ci.index.documents) |doc| {
         allocator.free(doc.occurrences);
+        for (doc.symbols) |sym| {
+            allocator.free(sym.relationships);
+        }
         allocator.free(doc.symbols);
     }
     ci.symbol_to_defs.deinit(allocator);
@@ -4107,6 +4902,37 @@ fn deinitTestIndex(ci: *CodeIndex, allocator: std.mem.Allocator) void {
     }
     ci.symbol_to_refs.deinit(allocator);
     ci.path_to_doc_idx.deinit(allocator);
+    ci.symbol_to_parent.deinit(allocator);
+    var child_iter = ci.parent_to_children.iterator();
+    while (child_iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    ci.parent_to_children.deinit(allocator);
+    var rel_iter = ci.symbol_to_relationships.iterator();
+    while (rel_iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    ci.symbol_to_relationships.deinit(allocator);
+    var rev_iter = ci.symbol_to_reverse_relationships.iterator();
+    while (rev_iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    ci.symbol_to_reverse_relationships.deinit(allocator);
+    var import_iter = ci.file_to_imports.iterator();
+    while (import_iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    ci.file_to_imports.deinit(allocator);
+    var call_iter = ci.symbol_to_calls.iterator();
+    while (call_iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    ci.symbol_to_calls.deinit(allocator);
+    var caller_iter = ci.symbol_to_callers.iterator();
+    while (caller_iter.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+    }
+    ci.symbol_to_callers.deinit(allocator);
     allocator.free(ci.index.documents);
 }
 
@@ -4455,8 +5281,8 @@ test "queryFindInner returns readable text" {
     defer allocator.free(result);
 
     try std.testing.expect(std.mem.indexOf(u8, result, "Matches for `init`:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "- `init` (enum_member) `src/commands.zig:5`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "- `init` (enum_member) `src/http.zig:8`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "- `init` (enum_member) `src/commands.zig:5-12`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "- `init` (enum_member) `src/http.zig:8-10`") != null);
 }
 
 test "queryRefsInner returns readable text" {
@@ -4528,15 +5354,79 @@ test "codeExploreWithLoadedIndex returns readable text" {
             const result = try codeExploreWithLoadedIndex(allocator, &ci, &.{
                 .{ .name = "init" },
                 .{ .name = "Settings", .kind = "struct" },
-            }, 5);
+            }, .{ .context_lines = 5, .include_architecture = true });
             defer allocator.free(result);
 
             try std.testing.expect(std.mem.indexOf(u8, result, "`init` (enum_member)") != null);
-            try std.testing.expect(std.mem.indexOf(u8, result, "`src/commands.zig:5`") != null);
+            try std.testing.expect(std.mem.indexOf(u8, result, "`src/commands.zig:5-12`") != null);
             try std.testing.expect(std.mem.indexOf(u8, result, "Snippet:") != null);
             try std.testing.expect(std.mem.indexOf(u8, result, "Nearby:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, result, "Architecture:") != null);
         }
     }.run);
+}
+
+test "queryImportsInner returns architecture text" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryImportsInner(allocator, &ci, null, "src/commands.zig", .both);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Imports for `src/commands.zig`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "src/settings.zig") != null);
+}
+
+test "queryContainsInner returns parent child relationships" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryContainsInner(allocator, &ci, "Settings", null, .both);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Parent:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Children:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "load") != null);
+}
+
+test "queryCallsInner returns outgoing call graph" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryCallsInner(allocator, &ci, "initBrain");
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Calls from `initBrain`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "init") != null);
+}
+
+test "queryCallersInner returns incoming call graph" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryCallersInner(allocator, &ci, "init");
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Callers of `init`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "initBrain") != null);
+}
+
+test "queryOverviewInner repo reports entrypoints and imports" {
+    const allocator = std.testing.allocator;
+    var ci = try buildTestDisambiguationIndex(allocator);
+    defer deinitTestIndex(&ci, allocator);
+
+    const result = try queryOverviewInner(allocator, &ci, null, null, .repo);
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Repository overview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "src/commands.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Subsystems:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "score") != null);
 }
 
 // ── discoverRelatedSymbols tests ─────────────────────────────────────────

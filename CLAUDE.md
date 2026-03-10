@@ -76,15 +76,31 @@ Code intelligence, persistent memory, and interactive debugging.
 
 ## Code Intelligence
 
-When you need a symbol definition, references, call sites, or type information:
-use `cog_code_explore` or `cog_code_query`. Do NOT use Grep or Glob for symbol lookups.
+For any request to explore, analyze, understand, map, or explain code, use `cog_code_explore` or `cog_code_query`.
+Do NOT use Grep or Glob for code exploration when the Cog index is available.
 
-- `cog_code_explore` — find symbols by name, return full definition bodies and file TOC
-- `cog_code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols)
+- `cog_code_explore` — find symbols by name, return full definition bodies, file TOC, and optional architecture summaries
+- `cog_code_query` — `find` (locate definitions), `refs` (find references), `symbols` (list file symbols), `imports` (module/file dependencies), `contains` (parent-child containment), `calls`/`callers` (approximate call graph), `overview` (symbol/file/repo architecture summary)
 - Include synonyms with `|`: `banner|header|splash`
-- Glob patterns: `*init*`, `get*`, `Handle?`
+- Wildcard symbol patterns: `*init*`, `get*`, `Handle?`
 
-Only fall back to Grep for string literals, log messages, or non-symbol text patterns.
+Only fall back to Grep or Glob when the Cog index is unavailable, incomplete for the target code, or the task is about raw string literals, log messages, or other non-symbol text patterns.
+
+### Efficiency Rules
+
+- For repository-understanding, architecture-summary, or "tell me about this project" tasks: make exactly one initial `cog_code_explore` call with a batched list of likely entrypoint symbols and set `include_architecture=true` with `overview_scope="repo"`.
+- Before making any follow-up code-intelligence call, first check whether the answer is already present in the prior `cog_code_explore` output (`file_symbols`, definition body, or referenced symbols).
+- If you need to look up multiple symbols, combine them into one `cog_code_explore({ queries: [...] })` call instead of making multiple single-symbol calls.
+- Do not explore by issuing repeated `cog_code_query(mode="symbols", file=...)` calls across multiple files.
+- Treat repeated `cog_code_query(mode="symbols")` calls across files as an invalid exploration pattern. Use it only for one already-identified file when a concrete ambiguity remains.
+- For repository-understanding tasks, do not issue repeated `cog_code_query(mode="overview"|"imports"|"contains"|"calls"|"callers", scope="file")` calls across multiple files. After the initial batched repo explore, allow at most one targeted file-scoped architecture follow-up when a single concrete ambiguity remains.
+- Use `cog_code_query(mode="symbols")` only after a specific file has already been identified as relevant.
+- Use `cog_code_query(mode="refs")` only as a targeted follow-up when a concrete ambiguity remains after the initial batched exploration.
+- If more than one additional symbol or file needs inspection, stop and merge that work into one batched `cog_code_explore({ queries: [...] })` call instead of chaining follow-up queries.
+- Prefer `cog_code_query(mode="imports"|"contains"|"calls"|"callers"|"overview")` over raw file reads when the question is architectural.
+- Do not use `cog_code_query(mode="find")` as a step-by-step exploration strategy when the needed symbols can be batched into `cog_code_explore`.
+- Default budget for code-analysis tasks: 2-3 code-intelligence tool calls before responding.
+- Do not call `cog_mem_recall` for pure codebase summarization or architecture description unless memory is specifically needed to answer the question.
 
 ## Debugging
 

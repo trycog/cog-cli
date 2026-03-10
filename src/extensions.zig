@@ -83,8 +83,18 @@ pub const IndexerType = enum { tree_sitter, scip_binary };
 
 pub const TreeSitterConfig = struct {
     grammar_name: []const u8,
+    /// Query capture contract for architecture-aware exploration (all optional):
+    /// - @reference.import for module/file imports
+    /// - @reference.call for function/method calls
+    /// - standard definition captures plus enclosing ranges enable containment
     query_source: []const u8,
     scip_name: []const u8,
+};
+
+pub const ArchitectureCapabilities = struct {
+    imports: bool = false,
+    calls: bool = false,
+    containment: bool = false,
 };
 
 pub const ScipBinaryConfig = struct {
@@ -108,6 +118,8 @@ pub const Extension = struct {
     indexer: ?IndexerConfig = null,
     /// Optional secondary SCIP indexer (external tool) for richer type info.
     scip_indexer: ?ScipBinaryConfig = null,
+    /// Architecture relationship coverage available from this extension.
+    architecture: ArchitectureCapabilities = .{},
     /// Debug configuration. Null if extension does not support debugging.
     debug: ?DebugConfig = null,
     /// Whether this is an installed (non-built-in) extension.
@@ -117,6 +129,24 @@ pub const Extension = struct {
     /// Build command for installed extensions.
     build: []const u8 = "",
 };
+
+fn querySourceHasCapture(query_source: []const u8, capture: []const u8) bool {
+    return std.mem.indexOf(u8, query_source, capture) != null;
+}
+
+pub fn validateArchitectureCapabilities(ext: Extension) bool {
+    if (!ext.architecture.imports and !ext.architecture.calls and !ext.architecture.containment) return true;
+    const indexer = ext.indexer orelse return false;
+    return switch (indexer) {
+        .tree_sitter => |ts| blk: {
+            if (ext.architecture.imports and !querySourceHasCapture(ts.query_source, "@reference.import")) break :blk false;
+            if (ext.architecture.calls and !querySourceHasCapture(ts.query_source, "@reference.call")) break :blk false;
+            if (ext.architecture.containment and std.mem.indexOf(u8, ts.query_source, "@definition.") == null) break :blk false;
+            break :blk true;
+        },
+        .scip_binary => true,
+    };
+}
 
 // ── Shared Debug Configs ────────────────────────────────────────────────
 
@@ -167,6 +197,7 @@ pub const builtins = [_]Extension{
             .scip_name = "go",
         } },
         .scip_indexer = .{ .command = "scip-go", .args = &.{ "{file}", "--output", "{output}" } },
+        .architecture = .{ .imports = true, .calls = true, .containment = true },
         .debug = .{ .dap = .{
             .adapter_command = "dlv",
             .adapter_args = &.{"dap"},
@@ -188,6 +219,7 @@ pub const builtins = [_]Extension{
             .scip_name = "javascript",
         } },
         .scip_indexer = js_scip_config,
+        .architecture = .{ .imports = true, .calls = true, .containment = true },
         .debug = .{ .dap = js_dap_config },
     },
     // MDX
@@ -289,6 +321,7 @@ pub const builtins = [_]Extension{
             .scip_name = "typescript",
         } },
         .scip_indexer = js_scip_config,
+        .architecture = .{ .imports = true, .calls = true, .containment = true },
         .debug = .{ .dap = js_dap_config },
     },
     // TSX
@@ -302,6 +335,7 @@ pub const builtins = [_]Extension{
             .scip_name = "tsx",
         } },
         .scip_indexer = js_scip_config,
+        .architecture = .{ .imports = true, .calls = true, .containment = true },
         .debug = .{ .dap = js_dap_config },
     },
     // Python
@@ -315,6 +349,7 @@ pub const builtins = [_]Extension{
             .scip_name = "python",
         } },
         .scip_indexer = .{ .command = "scip-python", .args = &.{ "index", "{file}", "--output", "{output}" } },
+        .architecture = .{ .imports = true, .calls = true, .containment = true },
         .debug = .{ .dap = .{
             .adapter_command = "python3",
             .adapter_args = &.{ "-m", "debugpy.adapter" },
@@ -1366,6 +1401,12 @@ test "isBuiltinSupported returns false for unknown extensions" {
     try std.testing.expect(!isBuiltinSupported(".zig"));
     try std.testing.expect(!isBuiltinSupported(".rb"));
     try std.testing.expect(!isBuiltinSupported(""));
+}
+
+test "architecture capability declarations match builtin query captures" {
+    for (builtins) |ext| {
+        try std.testing.expect(validateArchitectureCapabilities(ext));
+    }
 }
 
 // ── Manifest Parsing Tests ──────────────────────────────────────────────

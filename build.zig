@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "agent_body", @embedFile("priv/agents/cog-code-query.md"));
     build_options.addOption([]const u8, "debug_agent_body", @embedFile("priv/agents/cog-debug.md"));
     build_options.addOption([]const u8, "mem_agent_body", @embedFile("priv/agents/cog-mem.md"));
+    build_options.addOption([]const u8, "opencode_override_plugin", @embedFile("priv/plugins/opencode-cog-override.ts"));
     build_options.addOption([]const u8, "bootstrap_prompt", @embedFile("priv/prompts/bootstrap.md"));
     build_options.addOption([]const u8, "bootstrap_associate_prompt", @embedFile("priv/prompts/bootstrap_associate.md"));
     const build_options_mod = build_options.createModule();

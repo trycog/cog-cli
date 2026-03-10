@@ -1252,7 +1252,7 @@ pub const DapProxy = struct {
             try vars.append(allocator, .{
                 .name = name,
                 .value = value,
-                .@"type" = type_str,
+                .type = type_str,
                 .variables_reference = var_ref,
                 .children_count = if (var_ref > 0) 1 else 0,
                 .named_variables = named_vars,
@@ -2394,7 +2394,7 @@ pub const DapProxy = struct {
 
     fn proxyInspect(ctx: *anyopaque, allocator: std.mem.Allocator, request: InspectRequest) anyerror!InspectResult {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
-        if (!self.initialized or self.transport == .none) return .{ .result = "<not connected>", .@"type" = "" };
+        if (!self.initialized or self.transport == .none) return .{ .result = "<not connected>", .type = "" };
 
         // If variable_ref is provided, expand that variable's children via DAP variables request
         if (request.variable_ref) |var_ref| {
@@ -2412,18 +2412,18 @@ pub const DapProxy = struct {
                     const success = if (check.value.object.get("success")) |v| v == .bool and v.bool else false;
                     if (!success) {
                         const err_msg = if (check.value.object.get("message")) |v| if (v == .string) v.string else "variables request failed" else "variables request failed";
-                        return .{ .result = try allocator.dupe(u8, err_msg), .@"type" = "", .result_allocated = true, .is_error = true };
+                        return .{ .result = try allocator.dupe(u8, err_msg), .type = "", .result_allocated = true, .is_error = true };
                     }
                 }
 
                 // Parse using existing translateVariables
                 const children = translateVariables(allocator, resp) catch {
-                    return .{ .result = "<failed to expand variable>", .@"type" = "" };
+                    return .{ .result = "<failed to expand variable>", .type = "" };
                 };
 
                 return .{
                     .result = try std.fmt.allocPrint(allocator, "{d} children", .{children.len}),
-                    .@"type" = "",
+                    .type = "",
                     .children = children,
                     .result_allocated = true,
                     .children_allocated = true,
@@ -2433,7 +2433,7 @@ pub const DapProxy = struct {
 
         // If scope is provided, fetch variables for that scope
         if (request.scope) |scope_name| {
-            const fid: i64 = if (request.frame_id) |f| self.resolveFrameId(f) orelse return .{ .result = "", .@"type" = "" } else self.current_frame_id orelse return .{ .result = "", .@"type" = "" };
+            const fid: i64 = if (request.frame_id) |f| self.resolveFrameId(f) orelse return .{ .result = "", .type = "" } else self.current_frame_id orelse return .{ .result = "", .type = "" };
 
             // Get scopes for the frame
             const scopes_msg = try protocol.scopesRequest(allocator, self.nextSeq(), fid);
@@ -2461,9 +2461,9 @@ pub const DapProxy = struct {
                                         (std.mem.eql(u8, scope_name, "locals") and std.ascii.startsWithIgnoreCase(scope_name_val, "local")) or
                                         (std.mem.eql(u8, scope_name, "globals") and std.ascii.startsWithIgnoreCase(scope_name_val, "global")) or
                                         (std.mem.eql(u8, scope_name, "arguments") and
-                                        (std.ascii.eqlIgnoreCase(scope_name_val, "arguments") or
-                                        std.mem.indexOf(u8, scope_name_val, "arg") != null or
-                                        std.mem.indexOf(u8, scope_name_val, "Arg") != null)))
+                                            (std.ascii.eqlIgnoreCase(scope_name_val, "arguments") or
+                                                std.mem.indexOf(u8, scope_name_val, "arg") != null or
+                                                std.mem.indexOf(u8, scope_name_val, "Arg") != null)))
                                     {
                                         if (item.object.get("variablesReference")) |vr| {
                                             if (vr == .integer) {
@@ -2515,23 +2515,23 @@ pub const DapProxy = struct {
                 defer allocator.free(vars_resp);
 
                 const children = translateVariables(allocator, vars_resp) catch {
-                    return .{ .result = "<failed to list scope variables>", .@"type" = "" };
+                    return .{ .result = "<failed to list scope variables>", .type = "" };
                 };
 
                 return .{
                     .result = try std.fmt.allocPrint(allocator, "{d} variables", .{children.len}),
-                    .@"type" = "",
+                    .type = "",
                     .children = children,
                     .result_allocated = true,
                     .children_allocated = true,
                 };
             }
 
-            return .{ .result = try allocator.dupe(u8, "scope not found"), .@"type" = "", .result_allocated = true };
+            return .{ .result = try allocator.dupe(u8, "scope not found"), .type = "", .result_allocated = true };
         }
 
-        const expr = request.expression orelse return .{ .result = "", .@"type" = "" };
-        if (expr.len == 0) return .{ .result = "", .@"type" = "" };
+        const expr = request.expression orelse return .{ .result = "", .type = "" };
+        if (expr.len == 0) return .{ .result = "", .type = "" };
 
         // Send DAP evaluate request with context.
         // When no frame_id is specified, use the topmost frame from the last
@@ -2548,15 +2548,15 @@ pub const DapProxy = struct {
         const parsed = try json.parseFromSlice(json.Value, allocator, resp, .{});
         defer parsed.deinit();
 
-        if (parsed.value != .object) return .{ .result = "<invalid response>", .@"type" = "" };
+        if (parsed.value != .object) return .{ .result = "<invalid response>", .type = "" };
         const success = if (parsed.value.object.get("success")) |v| v == .bool and v.bool else false;
         if (!success) {
             const err_msg = if (parsed.value.object.get("message")) |v| if (v == .string) v.string else "<error>" else "<error>";
-            return .{ .result = try allocator.dupe(u8, err_msg), .@"type" = "", .result_allocated = true, .is_error = true };
+            return .{ .result = try allocator.dupe(u8, err_msg), .type = "", .result_allocated = true, .is_error = true };
         }
 
-        const body = parsed.value.object.get("body") orelse return .{ .result = "", .@"type" = "" };
-        if (body != .object) return .{ .result = "", .@"type" = "" };
+        const body = parsed.value.object.get("body") orelse return .{ .result = "", .type = "" };
+        if (body != .object) return .{ .result = "", .type = "" };
 
         const result_str = if (body.object.get("result")) |v| if (v == .string) try allocator.dupe(u8, v.string) else try allocator.dupe(u8, "") else try allocator.dupe(u8, "");
         const type_str = if (body.object.get("type")) |v| if (v == .string) try allocator.dupe(u8, v.string) else try allocator.dupe(u8, "") else try allocator.dupe(u8, "");
@@ -2577,7 +2577,7 @@ pub const DapProxy = struct {
                 if (translateVariables(allocator, vars_resp)) |children| {
                     return .{
                         .result = result_str,
-                        .@"type" = type_str,
+                        .type = type_str,
                         .children = children,
                         .result_allocated = true,
                         .children_allocated = true,
@@ -2586,7 +2586,7 @@ pub const DapProxy = struct {
             } else |_| {}
         }
 
-        return .{ .result = result_str, .@"type" = type_str, .result_allocated = true };
+        return .{ .result = result_str, .type = type_str, .result_allocated = true };
     }
 
     /// Write-only pause: builds and sends a pause request without reading
@@ -2923,14 +2923,14 @@ pub const DapProxy = struct {
         defer parsed.deinit();
 
         if (parsed.value != .object) return error.InvalidResponse;
-        const body = parsed.value.object.get("body") orelse return .{ .result = value, .@"type" = "" };
-        if (body != .object) return .{ .result = value, .@"type" = "" };
+        const body = parsed.value.object.get("body") orelse return .{ .result = value, .type = "" };
+        if (body != .object) return .{ .result = value, .type = "" };
 
         const result_val = if (body.object.get("value")) |v| if (v == .string) try allocator.dupe(u8, v.string) else try allocator.dupe(u8, value) else try allocator.dupe(u8, value);
         const type_val = if (body.object.get("type")) |v| if (v == .string) try allocator.dupe(u8, v.string) else try allocator.dupe(u8, "") else try allocator.dupe(u8, "");
         _ = type_val;
 
-        return .{ .result = result_val, .@"type" = "", .result_allocated = true };
+        return .{ .result = result_val, .type = "", .result_allocated = true };
     }
 
     fn proxyGoto(ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32) anyerror!StopState {
@@ -3263,12 +3263,12 @@ pub const DapProxy = struct {
         defer parsed.deinit();
 
         if (parsed.value != .object) return error.InvalidResponse;
-        const body = parsed.value.object.get("body") orelse return .{ .result = value, .@"type" = "" };
-        if (body != .object) return .{ .result = value, .@"type" = "" };
+        const body = parsed.value.object.get("body") orelse return .{ .result = value, .type = "" };
+        if (body != .object) return .{ .result = value, .type = "" };
 
         const result_val = if (body.object.get("value")) |v| (if (v == .string) try allocator.dupe(u8, v.string) else try allocator.dupe(u8, value)) else try allocator.dupe(u8, value);
 
-        return .{ .result = result_val, .@"type" = "", .result_allocated = true };
+        return .{ .result = result_val, .type = "", .result_allocated = true };
     }
 
     fn proxyRestartFrame(ctx: *anyopaque, allocator: std.mem.Allocator, frame_id: u32) anyerror!void {
@@ -3304,7 +3304,7 @@ pub const DapProxy = struct {
         const break_mode = if (body.object.get("breakMode")) |v| (if (v == .string) try allocator.dupe(u8, v.string) else "unhandled") else "unhandled";
 
         return .{
-            .@"type" = exc_id orelse "",
+            .type = exc_id orelse "",
             .message = description orelse "",
             .id = exc_id,
             .break_mode = break_mode,
@@ -3998,7 +3998,7 @@ test "DapProxy translates DAP variables response to Variable array" {
         for (vars) |v| {
             allocator.free(v.name);
             allocator.free(v.value);
-            allocator.free(v.@"type");
+            allocator.free(v.type);
         }
         allocator.free(vars);
     }
@@ -4006,7 +4006,7 @@ test "DapProxy translates DAP variables response to Variable array" {
     try std.testing.expectEqual(@as(usize, 2), vars.len);
     try std.testing.expectEqualStrings("x", vars[0].name);
     try std.testing.expectEqualStrings("42", vars[0].value);
-    try std.testing.expectEqualStrings("int", vars[0].@"type");
+    try std.testing.expectEqualStrings("int", vars[0].type);
     try std.testing.expectEqual(@as(u32, 0), vars[0].variables_reference);
 
     try std.testing.expectEqualStrings("data", vars[1].name);
@@ -4111,7 +4111,7 @@ test "DAP proxy inspect returns local variables" {
         for (vars) |v| {
             allocator.free(v.name);
             allocator.free(v.value);
-            allocator.free(v.@"type");
+            allocator.free(v.type);
         }
         allocator.free(vars);
     }
@@ -4119,7 +4119,7 @@ test "DAP proxy inspect returns local variables" {
     try std.testing.expectEqual(@as(usize, 1), vars.len);
     try std.testing.expectEqualStrings("result", vars[0].name);
     try std.testing.expectEqualStrings("7", vars[0].value);
-    try std.testing.expectEqualStrings("int", vars[0].@"type");
+    try std.testing.expectEqualStrings("int", vars[0].type);
 }
 
 test "DapProxy translates InspectRequest.expression to DAP evaluate" {

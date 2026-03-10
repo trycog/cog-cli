@@ -9,307 +9,54 @@ const reset = "\x1B[0m";
 // ── Setup ───────────────────────────────────────────────────────────────
 
 pub const init =
-    bold ++ "  cog init" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Interactive setup for the current directory. Optionally configures\n"
-    ++ "  memory, then sets up system prompts, MCP server, and hooks\n"
-    ++ "  for your selected AI coding agents.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog init " ++ dim ++ "[options]" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--host" ++ reset ++ " HOST             " ++ dim ++ "Server hostname (default: trycog.ai)" ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog init" ++ reset ++ "\n" ++ "\n" ++ "  Interactive setup for the current directory. Optionally configures\n" ++ "  memory, then sets up system prompts, MCP server, and hooks\n" ++ "  for your selected AI coding agents.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog init " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--host" ++ reset ++ " HOST             " ++ dim ++ "Server hostname (default: trycog.ai)" ++ reset ++ "\n" ++ "\n";
 
 // ── Code Intelligence ──────────────────────────────────────────────────
 
 pub const code_index =
-    bold ++ "  cog code:index" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Build a SCIP code index. Expands a glob pattern to match files,\n"
-    ++ "  resolves each to a language extension, invokes the indexer\n"
-    ++ "  per-file, and merges results into .cog/index.scip.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:index " ++ dim ++ "<pattern> [pattern...]" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Glob syntax" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "*" ++ reset ++ "                    " ++ dim ++ "Any characters except /" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "**" ++ reset ++ "                   " ++ dim ++ "Any path segments (recursive descent)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "?" ++ reset ++ "                    " ++ dim ++ "Any single character except /" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog code:index src/main.ts    " ++ dim ++ "Index a single file" ++ reset ++ "\n"
-    ++ "    cog code:index \"**/*.ts\"       " ++ dim ++ "All .ts files recursively" ++ reset ++ "\n"
-    ++ "    cog code:index \"src/**/*.go\"   " ++ dim ++ "All .go files under src/" ++ reset ++ "\n"
-    ++ "    cog code:index \"*.py\"          " ++ dim ++ ".py files in current dir only" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Built-in extensions" ++ reset ++ "\n"
-    ++ "    scip-go              " ++ dim ++ ".go" ++ reset ++ "\n"
-    ++ "    scip-typescript      " ++ dim ++ ".ts .tsx .js .jsx" ++ reset ++ "\n"
-    ++ "    scip-python          " ++ dim ++ ".py" ++ reset ++ "\n"
-    ++ "    scip-java            " ++ dim ++ ".java" ++ reset ++ "\n"
-    ++ "    rust-analyzer        " ++ dim ++ ".rs" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  " ++ dim ++ "Installed extensions (~/.config/cog/extensions/) override built-ins." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:index" ++ reset ++ "\n" ++ "\n" ++ "  Build a SCIP code index. Expands a glob pattern to match files,\n" ++ "  resolves each to a language extension, invokes the indexer\n" ++ "  per-file, and merges results into .cog/index.scip.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:index " ++ dim ++ "<pattern> [pattern...]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Glob syntax" ++ reset ++ "\n" ++ "    " ++ bold ++ "*" ++ reset ++ "                    " ++ dim ++ "Any characters except /" ++ reset ++ "\n" ++ "    " ++ bold ++ "**" ++ reset ++ "                   " ++ dim ++ "Any path segments (recursive descent)" ++ reset ++ "\n" ++ "    " ++ bold ++ "?" ++ reset ++ "                    " ++ dim ++ "Any single character except /" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:index src/main.ts    " ++ dim ++ "Index a single file" ++ reset ++ "\n" ++ "    cog code:index \"**/*.ts\"       " ++ dim ++ "All .ts files recursively" ++ reset ++ "\n" ++ "    cog code:index \"src/**/*.go\"   " ++ dim ++ "All .go files under src/" ++ reset ++ "\n" ++ "    cog code:index \"*.py\"          " ++ dim ++ ".py files in current dir only" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in extensions" ++ reset ++ "\n" ++ "    scip-go              " ++ dim ++ ".go" ++ reset ++ "\n" ++ "    scip-typescript      " ++ dim ++ ".ts .tsx .js .jsx" ++ reset ++ "\n" ++ "    scip-python          " ++ dim ++ ".py" ++ reset ++ "\n" ++ "    scip-java            " ++ dim ++ ".java" ++ reset ++ "\n" ++ "    rust-analyzer        " ++ dim ++ ".rs" ++ reset ++ "\n" ++ "\n" ++ "  " ++ dim ++ "Installed extensions (~/.config/cog/extensions/) override built-ins." ++ reset ++ "\n" ++ "\n";
 
 pub const code_query =
-    bold ++ "  cog code:query" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Unified code query command. Specify exactly one query mode.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:query --find <name|pattern> " ++ dim ++ "[--file FILE] [--kind KIND]" ++ reset ++ "\n"
-    ++ "    cog code:query --refs <name> " ++ dim ++ "[--file FILE] [--kind KIND]" ++ reset ++ "\n"
-    ++ "    cog code:query --symbols <file> " ++ dim ++ "[--kind KIND]" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Modes" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--find" ++ reset ++ " NAME            " ++ dim ++ "Find symbol definitions by name (ranked by relevance)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--refs" ++ reset ++ " NAME            " ++ dim ++ "Find all references to a symbol" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--symbols" ++ reset ++ " FILE         " ++ dim ++ "List symbols defined in a file" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--file" ++ reset ++ " FILE             " ++ dim ++ "Scope results to a specific file (find/refs)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--kind" ++ reset ++ " KIND             " ++ dim ++ "Filter by symbol kind (function, struct, method, type, etc.)" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Patterns" ++ reset ++ "\n"
-    ++ "    " ++ dim ++ "The name parameter supports glob patterns: * (zero or more chars), ? (one char)" ++ reset ++ "\n"
-    ++ "    " ++ dim ++ "Use | for alternation to search multiple names at once" ++ reset ++ "\n"
-    ++ "    " ++ dim ++ "Examples: '*init*', 'get*', 'Handle?', 'banner|header|splash'" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog code:query --find Server --kind struct\n"
-    ++ "    cog code:query --find '*init*'\n"
-    ++ "    cog code:query --find 'banner|header|splash'\n"
-    ++ "    cog code:query --find init --file commands.zig\n"
-    ++ "    cog code:query --refs Config\n"
-    ++ "    cog code:query --symbols src/main.zig\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:query" ++ reset ++ "\n" ++ "\n" ++ "  Unified code query command. Specify exactly one query mode.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:query --find <name|pattern> " ++ dim ++ "[--file FILE] [--kind KIND]" ++ reset ++ "\n" ++ "    cog code:query --refs <name> " ++ dim ++ "[--file FILE] [--kind KIND]" ++ reset ++ "\n" ++ "    cog code:query --symbols <file> " ++ dim ++ "[--kind KIND]" ++ reset ++ "\n" ++ "    cog code:query --imports <file|name> " ++ dim ++ "[--direction incoming|outgoing|both]" ++ reset ++ "\n" ++ "    cog code:query --contains <file|name> " ++ dim ++ "[--direction incoming|outgoing|both]" ++ reset ++ "\n" ++ "    cog code:query --calls <name>\n" ++ "    cog code:query --callers <name>\n" ++ "    cog code:query --overview <name|file> " ++ dim ++ "[--scope symbol|file|repo]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Modes" ++ reset ++ "\n" ++ "    " ++ bold ++ "--find" ++ reset ++ " NAME            " ++ dim ++ "Find symbol definitions by name (ranked by relevance)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--refs" ++ reset ++ " NAME            " ++ dim ++ "Find all references to a symbol" ++ reset ++ "\n" ++ "    " ++ bold ++ "--symbols" ++ reset ++ " FILE         " ++ dim ++ "List symbols defined in a file" ++ reset ++ "\n" ++ "    " ++ bold ++ "--imports" ++ reset ++ " TARGET        " ++ dim ++ "Show incoming/outgoing imports for a file or symbol" ++ reset ++ "\n" ++ "    " ++ bold ++ "--contains" ++ reset ++ " TARGET       " ++ dim ++ "Show parent/child containment for a file or symbol" ++ reset ++ "\n" ++ "    " ++ bold ++ "--calls" ++ reset ++ " NAME           " ++ dim ++ "Show approximate outgoing calls from a symbol" ++ reset ++ "\n" ++ "    " ++ bold ++ "--callers" ++ reset ++ " NAME         " ++ dim ++ "Show approximate incoming callers for a symbol" ++ reset ++ "\n" ++ "    " ++ bold ++ "--overview" ++ reset ++ " TARGET       " ++ dim ++ "Show architecture summary for a symbol, file, or repo" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--file" ++ reset ++ " FILE             " ++ dim ++ "Scope results to a specific file (find/refs)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--kind" ++ reset ++ " KIND             " ++ dim ++ "Filter by symbol kind (function, struct, method, type, etc.)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--direction" ++ reset ++ " DIR        " ++ dim ++ "Relationship direction: incoming, outgoing, both" ++ reset ++ "\n" ++ "    " ++ bold ++ "--scope" ++ reset ++ " SCOPE           " ++ dim ++ "Overview scope: symbol, file, repo" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Patterns" ++ reset ++ "\n" ++ "    " ++ dim ++ "The name parameter supports glob patterns: * (zero or more chars), ? (one char)" ++ reset ++ "\n" ++ "    " ++ dim ++ "Use | for alternation to search multiple names at once" ++ reset ++ "\n" ++ "    " ++ dim ++ "Examples: '*init*', 'get*', 'Handle?', 'banner|header|splash'" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:query --find Server --kind struct\n" ++ "    cog code:query --find '*init*'\n" ++ "    cog code:query --find 'banner|header|splash'\n" ++ "    cog code:query --find init --file commands.zig\n" ++ "    cog code:query --refs Config\n" ++ "    cog code:query --symbols src/main.zig\n" ++ "    cog code:query --imports src/main.zig --direction both\n" ++ "    cog code:query --contains Settings --direction both\n" ++ "    cog code:query --calls init\n" ++ "    cog code:query --callers Settings\n" ++ "    cog code:query --overview src/main.zig --scope file\n" ++ "    cog code:query --overview cog --scope repo\n" ++ "\n";
 
 pub const code_create =
-    bold ++ "  cog code:create" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Create a new file and add it to the SCIP index.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:create <file> " ++ dim ++ "[options]" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--content" ++ reset ++ " TEXT          " ++ dim ++ "Initial file content" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog code:create src/new.zig --content \"const std = @import(\\\"std\\\");\"\n"
-    ++ "\n"
-    ++ dim ++ "  Uses .cog/settings.json creator config if present, otherwise\n"
-    ++ "  built-in file creation." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:create" ++ reset ++ "\n" ++ "\n" ++ "  Create a new file and add it to the SCIP index.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:create <file> " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--content" ++ reset ++ " TEXT          " ++ dim ++ "Initial file content" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:create src/new.zig --content \"const std = @import(\\\"std\\\");\"\n" ++ "\n" ++ dim ++ "  Uses .cog/settings.json creator config if present, otherwise\n" ++ "  built-in file creation." ++ reset ++ "\n" ++ "\n";
 
 pub const code_delete =
-    bold ++ "  cog code:delete" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Delete a file and remove it from the SCIP index.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:delete <file>\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog code:delete src/old.zig\n"
-    ++ "\n"
-    ++ dim ++ "  Uses .cog/settings.json deleter config if present, otherwise\n"
-    ++ "  built-in file deletion." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:delete" ++ reset ++ "\n" ++ "\n" ++ "  Delete a file and remove it from the SCIP index.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:delete <file>\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:delete src/old.zig\n" ++ "\n" ++ dim ++ "  Uses .cog/settings.json deleter config if present, otherwise\n" ++ "  built-in file deletion." ++ reset ++ "\n" ++ "\n";
 
 pub const code_rename =
-    bold ++ "  cog code:rename" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Rename a file and update the SCIP index.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:rename <old-path> --to <new-path>\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--to" ++ reset ++ " PATH              " ++ dim ++ "New file path (required)" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog code:rename src/old.zig --to src/new.zig\n"
-    ++ "\n"
-    ++ dim ++ "  Uses .cog/settings.json renamer config if present, otherwise\n"
-    ++ "  built-in rename." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:rename" ++ reset ++ "\n" ++ "\n" ++ "  Rename a file and update the SCIP index.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:rename <old-path> --to <new-path>\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--to" ++ reset ++ " PATH              " ++ dim ++ "New file path (required)" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:rename src/old.zig --to src/new.zig\n" ++ "\n" ++ dim ++ "  Uses .cog/settings.json renamer config if present, otherwise\n" ++ "  built-in rename." ++ reset ++ "\n" ++ "\n";
 
 // ── Debug ─────────────────────────────────────────────────────────────
 
 pub const debug_serve =
-    bold ++ "  cog debug:serve" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Start the debug daemon. Listens on a Unix domain socket and\n"
-    ++ "  dispatches debug tool calls from debug:send.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog debug:serve\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Transport" ++ reset ++ "\n"
-    ++ "    Unix domain socket at /tmp/cog-debug-<uid>.sock.\n"
-    ++ "    Auto-started by debug:send commands when not running.\n"
-    ++ "\n"
-;
+    bold ++ "  cog debug:serve" ++ reset ++ "\n" ++ "\n" ++ "  Start the debug daemon. Listens on a Unix domain socket and\n" ++ "  dispatches debug tool calls from debug:send.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:serve\n" ++ "\n" ++ cyan ++ bold ++ "  Transport" ++ reset ++ "\n" ++ "    Unix domain socket at /tmp/cog-debug-<uid>.sock.\n" ++ "    Auto-started by debug:send commands when not running.\n" ++ "\n";
 
 pub const debug_dashboard =
-    bold ++ "  cog debug:dashboard" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Live debug session dashboard. Runs in a separate terminal and\n"
-    ++ "  shows real-time state from running debug servers.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog debug:dashboard\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Key Bindings" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "q" ++ reset ++ " / " ++ bold ++ "Ctrl+C" ++ reset ++ "            " ++ dim ++ "Quit" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "Up" ++ reset ++ " / " ++ bold ++ "Down" ++ reset ++ "              " ++ dim ++ "Switch focused session" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "Tab" ++ reset ++ "                   " ++ dim ++ "Cycle focus forward" ++ reset ++ "\n"
-    ++ "\n"
-    ++ dim ++ "  Communicates with the debug daemon via a Unix domain socket.\n"
-    ++ "  Multiple servers can push events to the same dashboard." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog debug:dashboard" ++ reset ++ "\n" ++ "\n" ++ "  Live debug session dashboard. Runs in a separate terminal and\n" ++ "  shows real-time state from running debug servers.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:dashboard\n" ++ "\n" ++ cyan ++ bold ++ "  Key Bindings" ++ reset ++ "\n" ++ "    " ++ bold ++ "q" ++ reset ++ " / " ++ bold ++ "Ctrl+C" ++ reset ++ "            " ++ dim ++ "Quit" ++ reset ++ "\n" ++ "    " ++ bold ++ "Up" ++ reset ++ " / " ++ bold ++ "Down" ++ reset ++ "              " ++ dim ++ "Switch focused session" ++ reset ++ "\n" ++ "    " ++ bold ++ "Tab" ++ reset ++ "                   " ++ dim ++ "Cycle focus forward" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  Communicates with the debug daemon via a Unix domain socket.\n" ++ "  Multiple servers can push events to the same dashboard." ++ reset ++ "\n" ++ "\n";
 
 pub const debug_sign =
-    bold ++ "  cog debug:sign" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Code-sign the cog binary with macOS debug entitlements.\n"
-    ++ "  Required for the debug server to attach to processes via\n"
-    ++ "  task_for_pid. No-op on Linux.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog debug:sign\n"
-    ++ "\n"
-    ++ dim ++ "  Called automatically by Homebrew on install and upgrade.\n"
-    ++ "  Run manually after building from source." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog debug:sign" ++ reset ++ "\n" ++ "\n" ++ "  Code-sign the cog binary with macOS debug entitlements.\n" ++ "  Required for the debug server to attach to processes via\n" ++ "  task_for_pid. No-op on Linux.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:sign\n" ++ "\n" ++ dim ++ "  Called automatically by Homebrew on install and upgrade.\n" ++ "  Run manually after building from source." ++ reset ++ "\n" ++ "\n";
 
 pub const debug_status =
-    bold ++ "  cog debug:status" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Check the status of the debug daemon. Reports whether the\n"
-    ++ "  daemon is running and lists active sessions.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog debug:status\n"
-    ++ "\n"
-;
+    bold ++ "  cog debug:status" ++ reset ++ "\n" ++ "\n" ++ "  Check the status of the debug daemon. Reports whether the\n" ++ "  daemon is running and lists active sessions.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:status\n" ++ "\n";
 
 pub const debug_kill =
-    bold ++ "  cog debug:kill" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Stop the debug daemon. Sends SIGTERM to the daemon process\n"
-    ++ "  and cleans up the socket and PID files.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog debug:kill\n"
-    ++ "\n"
-;
+    bold ++ "  cog debug:kill" ++ reset ++ "\n" ++ "\n" ++ "  Stop the debug daemon. Sends SIGTERM to the daemon process\n" ++ "  and cleans up the socket and PID files.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:kill\n" ++ "\n";
 
 // ── Memory ────────────────────────────────────────────────────────────
 
 pub const mem_bootstrap =
-    bold ++ "  cog mem:bootstrap" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Scan project files and populate the Cog knowledge graph. Processes\n"
-    ++ "  one file per agent invocation for maximum visibility and control.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog mem:bootstrap " ++ dim ++ "[options]" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--concurrency" ++ reset ++ " N       " ++ dim ++ "Parallel agent processes (default: 1)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--timeout" ++ reset ++ " N           " ++ dim ++ "Minutes per file before killing (default: 10)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--clean" ++ reset ++ "                " ++ dim ++ "Reset checkpoint and start fresh" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--debug" ++ reset ++ "                " ++ dim ++ "Show agent stderr output" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Model override" ++ reset ++ "\n"
-    ++ "    Set " ++ dim ++ "memory.model" ++ reset ++ " in .cog/settings.json to pass " ++ dim ++ "--model" ++ reset ++ "\n"
-    ++ "    to the agent CLI (e.g. use a faster model for bulk extraction).\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Resumability" ++ reset ++ "\n"
-    ++ "    Progress is saved to " ++ dim ++ ".cog/bootstrap-checkpoint.json" ++ reset ++ ".\n"
-    ++ "    Re-run the command to resume from where it left off.\n"
-    ++ "    Use " ++ dim ++ "--clean" ++ reset ++ " to discard the checkpoint and start over.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog mem:bootstrap                  " ++ dim ++ "Bootstrap with defaults" ++ reset ++ "\n"
-    ++ "    cog mem:bootstrap --concurrency 4  " ++ dim ++ "4 files processed in parallel" ++ reset ++ "\n"
-    ++ "    cog mem:bootstrap --clean           " ++ dim ++ "Start fresh" ++ reset ++ "\n"
-    ++ "\n"
-    ++ dim ++ "  Requires: an AI agent CLI and a SCIP index.\n"
-    ++ "  Run " ++ reset ++ bold ++ "cog code:index" ++ reset ++ dim ++ " first." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog mem:bootstrap" ++ reset ++ "\n" ++ "\n" ++ "  Scan project files and populate the Cog knowledge graph. Processes\n" ++ "  one file per agent invocation for maximum visibility and control.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog mem:bootstrap " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--concurrency" ++ reset ++ " N       " ++ dim ++ "Parallel agent processes (default: 1)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--timeout" ++ reset ++ " N           " ++ dim ++ "Minutes per file before killing (default: 10)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--clean" ++ reset ++ "                " ++ dim ++ "Reset checkpoint and start fresh" ++ reset ++ "\n" ++ "    " ++ bold ++ "--debug" ++ reset ++ "                " ++ dim ++ "Show agent stderr output" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Model override" ++ reset ++ "\n" ++ "    Set " ++ dim ++ "memory.model" ++ reset ++ " in .cog/settings.json to pass " ++ dim ++ "--model" ++ reset ++ "\n" ++ "    to the agent CLI (e.g. use a faster model for bulk extraction).\n" ++ "\n" ++ cyan ++ bold ++ "  Resumability" ++ reset ++ "\n" ++ "    Progress is saved to " ++ dim ++ ".cog/bootstrap-checkpoint.json" ++ reset ++ ".\n" ++ "    Re-run the command to resume from where it left off.\n" ++ "    Use " ++ dim ++ "--clean" ++ reset ++ " to discard the checkpoint and start over.\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog mem:bootstrap                  " ++ dim ++ "Bootstrap with defaults" ++ reset ++ "\n" ++ "    cog mem:bootstrap --concurrency 4  " ++ dim ++ "4 files processed in parallel" ++ reset ++ "\n" ++ "    cog mem:bootstrap --clean           " ++ dim ++ "Start fresh" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  Requires: an AI agent CLI and a SCIP index.\n" ++ "  Run " ++ reset ++ bold ++ "cog code:index" ++ reset ++ dim ++ " first." ++ reset ++ "\n" ++ "\n";
 
 // ── Extensions ────────────────────────────────────────────────────────
 
 pub const install =
-    bold ++ "  cog install" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Install a language extension from a git repository. Clones the\n"
-    ++ "  repo, reads cog-extension.json, runs the build command, and\n"
-    ++ "  verifies the binary.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog install <git-url>\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Manifest" ++ reset ++ dim ++ "  (cog-extension.json in repo root)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "name" ++ reset ++ "         " ++ dim ++ "Extension name (also the binary name)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "extensions" ++ reset ++ "   " ++ dim ++ "File extensions this indexer handles" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "build" ++ reset ++ "        " ++ dim ++ "Shell command to build the indexer" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "args" ++ reset ++ "         " ++ dim ++ "Args template with {file} and {output} placeholders" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog install https://github.com/example/scip-zig.git\n"
-    ++ "\n"
-    ++ dim ++ "  Extensions are installed to ~/.config/cog/extensions/<name>/.\n"
-    ++ "  Installed extensions override built-in indexers for shared file\n"
-    ++ "  extensions." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog install" ++ reset ++ "\n" ++ "\n" ++ "  Install a language extension from a git repository. Clones the\n" ++ "  repo, reads cog-extension.json, runs the build command, and\n" ++ "  verifies the binary.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog install <git-url>\n" ++ "\n" ++ cyan ++ bold ++ "  Manifest" ++ reset ++ dim ++ "  (cog-extension.json in repo root)" ++ reset ++ "\n" ++ "    " ++ bold ++ "name" ++ reset ++ "         " ++ dim ++ "Extension name (also the binary name)" ++ reset ++ "\n" ++ "    " ++ bold ++ "extensions" ++ reset ++ "   " ++ dim ++ "File extensions this indexer handles" ++ reset ++ "\n" ++ "    " ++ bold ++ "build" ++ reset ++ "        " ++ dim ++ "Shell command to build the indexer" ++ reset ++ "\n" ++ "    " ++ bold ++ "args" ++ reset ++ "         " ++ dim ++ "Args template with {file} and {output} placeholders" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog install https://github.com/example/scip-zig.git\n" ++ "\n" ++ dim ++ "  Extensions are installed to ~/.config/cog/extensions/<name>/.\n" ++ "  Installed extensions override built-in indexers for shared file\n" ++ "  extensions." ++ reset ++ "\n" ++ "\n";
 
 pub const code_edit =
-    bold ++ "  cog code:edit" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Edit a file using string replacement and re-index. Finds the\n"
-    ++ "  exact old text, replaces with new text, then rebuilds the SCIP\n"
-    ++ "  index to keep code intelligence current.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:edit <file> --old OLD --new NEW\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--old" ++ reset ++ " TEXT             " ++ dim ++ "Exact text to find (must be unique in file)" ++ reset ++ "\n"
-    ++ "    " ++ bold ++ "--new" ++ reset ++ " TEXT             " ++ dim ++ "Replacement text" ++ reset ++ "\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n"
-    ++ "    cog code:edit src/main.zig --old \"fn old()\" --new \"fn new()\"\n"
-    ++ "\n"
-    ++ dim ++ "  Uses .cog/settings.json editor config if present, otherwise\n"
-    ++ "  built-in string replacement." ++ reset ++ "\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:edit" ++ reset ++ "\n" ++ "\n" ++ "  Edit a file using string replacement and re-index. Finds the\n" ++ "  exact old text, replaces with new text, then rebuilds the SCIP\n" ++ "  index to keep code intelligence current.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:edit <file> --old OLD --new NEW\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--old" ++ reset ++ " TEXT             " ++ dim ++ "Exact text to find (must be unique in file)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--new" ++ reset ++ " TEXT             " ++ dim ++ "Replacement text" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog code:edit src/main.zig --old \"fn old()\" --new \"fn new()\"\n" ++ "\n" ++ dim ++ "  Uses .cog/settings.json editor config if present, otherwise\n" ++ "  built-in string replacement." ++ reset ++ "\n" ++ "\n";
 
 pub const code_status =
-    bold ++ "  cog code:status" ++ reset ++ "\n"
-    ++ "\n"
-    ++ "  Report the status of the SCIP code index. Shows whether an\n"
-    ++ "  index exists, document/symbol counts, and indexer info.\n"
-    ++ "\n"
-    ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n"
-    ++ "    cog code:status\n"
-    ++ "\n"
-;
+    bold ++ "  cog code:status" ++ reset ++ "\n" ++ "\n" ++ "  Report the status of the SCIP code index. Shows whether an\n" ++ "  index exists, document/symbol counts, and indexer info.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog code:status\n" ++ "\n";

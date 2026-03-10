@@ -179,6 +179,10 @@ pub fn encodeRelationship(allocator: std.mem.Allocator, rel: scip.Relationship) 
     try enc.writeBool(4, rel.is_type_definition);
     // field 5: is_definition
     try enc.writeBool(5, rel.is_definition);
+    // field 6: kind (Cog extension for richer architecture relationships)
+    if (rel.kind.len > 0) {
+        try enc.writeString(6, rel.kind);
+    }
 
     return enc.toOwnedSlice();
 }

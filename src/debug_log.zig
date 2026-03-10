@@ -35,7 +35,7 @@ pub fn init(cog_dir: []const u8, version: []const u8, args: []const [:0]const u8
             }
         }
         const end = @min(pos + arg.len, cmd_buf.len);
-        @memcpy(cmd_buf[pos..end], arg[0..end - pos]);
+        @memcpy(cmd_buf[pos..end], arg[0 .. end - pos]);
         pos = end;
     }
     log("command: {s}", .{cmd_buf[0..pos]});

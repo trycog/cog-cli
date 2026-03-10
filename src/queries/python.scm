@@ -12,3 +12,9 @@
       (attribute
         attribute: (identifier) @name)
   ]) @reference.call
+
+(import_statement
+  name: (dotted_name) @reference.import)
+
+(import_from_statement
+  module_name: (dotted_name) @reference.import)

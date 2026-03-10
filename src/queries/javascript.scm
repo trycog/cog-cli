@@ -118,6 +118,21 @@
 (new_expression
   constructor: (_) @name) @reference.class
 
+; ES module imports
+(import_statement
+  source: (string
+    (string_fragment) @reference.import))
+
+; CommonJS requires
+(
+  (call_expression
+    function: (identifier) @_require
+    arguments: (arguments
+      (string
+        (string_fragment) @reference.import)))
+  (#eq? @_require "require")
+)
+
 ; Exported constants
 (export_statement value: (assignment_expression left: (identifier) @name right: ([
  (number)

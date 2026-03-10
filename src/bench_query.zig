@@ -411,7 +411,10 @@ fn openrouterPost(allocator: std.mem.Allocator, api_key: []const u8, body: []con
         fn cb(ptr: [*]const u8, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
             const d: *WriteData = @ptrCast(@alignCast(userdata));
             const total = size * nmemb;
-            d.list.appendSlice(d.alloc, ptr[0..total]) catch { d.err = true; return 0; };
+            d.list.appendSlice(d.alloc, ptr[0..total]) catch {
+                d.err = true;
+                return 0;
+            };
             return total;
         }
     }.cb;
@@ -429,7 +432,10 @@ fn openrouterPost(allocator: std.mem.Allocator, api_key: []const u8, body: []con
     _ = curl_mod.curl_easy_getinfo(handle, curl_mod.CURLINFO_RESPONSE_CODE, &status_code);
 
     if (status_code != 200) {
-        const resp_body = write_data.list.toOwnedSlice(allocator) catch { write_data.list.deinit(allocator); return error.HttpError; };
+        const resp_body = write_data.list.toOwnedSlice(allocator) catch {
+            write_data.list.deinit(allocator);
+            return error.HttpError;
+        };
         defer allocator.free(resp_body);
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "  error: HTTP status {d}\n", .{status_code}) catch "  error: HTTP error\n";
@@ -895,7 +901,7 @@ fn ensureReactRepo(allocator: std.mem.Allocator) !void {
 
         // Spawn with inherited stderr so git progress is visible
         const argv: []const []const u8 = &.{
-            "git", "clone", "--depth", "1", "--branch", REACT_TAG,
+            "git",        "clone",        "--depth", "1", "--branch", REACT_TAG,
             "--progress", REACT_REPO_URL, REACT_DIR,
         };
         var child = std.process.Child.init(argv, allocator);

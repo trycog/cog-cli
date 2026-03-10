@@ -253,7 +253,6 @@ pub const DwarfEngine = struct {
                 if (isub.high_pc > 0) isub.high_pc -%= @intCast(@as(u64, @intCast(-slide)));
             }
         }
-
     }
 
     fn loadDebugInfo(self: *DwarfEngine, program: []const u8) !void {
@@ -377,7 +376,6 @@ pub const DwarfEngine = struct {
         self.loadFunctionInfoElf(&elf);
 
         self.elf_binary = elf;
-
     }
 
     fn loadFunctionInfo(self: *DwarfEngine, binary: *binary_macho.MachoBinary) void {
@@ -1442,7 +1440,7 @@ pub const DwarfEngine = struct {
                 return .{
                     .stop_reason = .exception,
                     .exception = .{
-                        .@"type" = signalName(@intCast(signal)),
+                        .type = signalName(@intCast(signal)),
                         .message = "Signal received",
                     },
                 };
@@ -1452,7 +1450,7 @@ pub const DwarfEngine = struct {
                 return .{
                     .stop_reason = .exception,
                     .exception = .{
-                        .@"type" = signalName(@intCast(signal)),
+                        .type = signalName(@intCast(signal)),
                         .message = "Fatal signal received",
                     },
                 };
@@ -2136,7 +2134,10 @@ pub const DwarfEngine = struct {
                     for (v.location_expr) |b| {
                         p3 += (std.fmt.bufPrint(buf3[p3..], "{x:0>2}", .{b}) catch "").len;
                     }
-                    if (p3 < buf3.len) { buf3[p3] = '\n'; p3 += 1; }
+                    if (p3 < buf3.len) {
+                        buf3[p3] = '\n';
+                        p3 += 1;
+                    }
                     file3.writeAll(buf3[0..p3]) catch {};
                 }
             }
@@ -2174,7 +2175,7 @@ pub const DwarfEngine = struct {
             try locals.append(self.allocator, .{
                 .name = v.name,
                 .value = value_owned,
-                .@"type" = v.type_name,
+                .type = v.type_name,
             });
         }
 
@@ -2347,7 +2348,7 @@ pub const DwarfEngine = struct {
             } else if (ref > 0) {
                 return .{
                     .result = try allocator.dupe(u8, "<invalid variable reference>"),
-                    .@"type" = "",
+                    .type = "",
                     .result_allocated = true,
                 };
             }
@@ -2355,7 +2356,7 @@ pub const DwarfEngine = struct {
 
         // 1. Read registers to get current PC
         const regs = self.process.readRegisters() catch {
-            return .{ .result = "<no process>", .@"type" = "" };
+            return .{ .result = "<no process>", .type = "" };
         };
 
         // 2. Find a debug binary with debug_info section (prefer dSYM, then main binary)
@@ -2366,14 +2367,14 @@ pub const DwarfEngine = struct {
             if (self.binary) |*bin| {
                 if (bin.sections.debug_info != null) break :blk bin;
             }
-            return .{ .result = "<no debug info>", .@"type" = "" };
+            return .{ .result = "<no debug info>", .type = "" };
         };
 
         // 3. Extract section data
-        const info_section = debug_binary.sections.debug_info orelse return .{ .result = "<no debug info>", .@"type" = "" };
-        const abbrev_section = debug_binary.sections.debug_abbrev orelse return .{ .result = "<no debug info>", .@"type" = "" };
-        const info_data = debug_binary.getSectionData(info_section) orelse return .{ .result = "<no debug info>", .@"type" = "" };
-        const abbrev_data = debug_binary.getSectionData(abbrev_section) orelse return .{ .result = "<no debug info>", .@"type" = "" };
+        const info_section = debug_binary.sections.debug_info orelse return .{ .result = "<no debug info>", .type = "" };
+        const abbrev_section = debug_binary.sections.debug_abbrev orelse return .{ .result = "<no debug info>", .type = "" };
+        const info_data = debug_binary.getSectionData(info_section) orelse return .{ .result = "<no debug info>", .type = "" };
+        const abbrev_data = debug_binary.getSectionData(abbrev_section) orelse return .{ .result = "<no debug info>", .type = "" };
         const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
         const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
         const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
@@ -2425,7 +2426,7 @@ pub const DwarfEngine = struct {
             self.cuHintForPC(target_pc),
             if (self.type_die_cache) |*tdc| tdc else null,
         ) catch {
-            return .{ .result = "<parse error>", .@"type" = "" };
+            return .{ .result = "<parse error>", .type = "" };
         };
         defer parser.freeScopedVariables(scoped, allocator);
 
@@ -2551,7 +2552,7 @@ pub const DwarfEngine = struct {
         }
 
         if (filtered_vars.len == 0) {
-            return .{ .result = "<no variables in scope>", .@"type" = "" };
+            return .{ .result = "<no variables in scope>", .type = "" };
         }
 
         // 9. Build register adapter
@@ -2587,7 +2588,7 @@ pub const DwarfEngine = struct {
     /// When no expression is given but scope is specified, return all variables in that scope
     fn buildScopeResult(self: *DwarfEngine, variables: []const parser.VariableInfo, regs: process_mod.RegisterState, frame_base_expr: []const u8, allocator: std.mem.Allocator) InspectResult {
         if (variables.len == 0) {
-            return .{ .result = "<no variables in scope>", .@"type" = "" };
+            return .{ .result = "<no variables in scope>", .type = "" };
         }
 
         // Build adapters
@@ -2644,14 +2645,14 @@ pub const DwarfEngine = struct {
             children.append(allocator, .{
                 .name = v.name,
                 .value = value_owned,
-                .@"type" = v.type_name,
+                .type = v.type_name,
             }) catch continue;
         }
 
         const scope_label = if (children.items.len > 0) "scope variables" else "<no variables in scope>";
         return .{
             .result = scope_label,
-            .@"type" = "scope",
+            .type = "scope",
             .children = children.toOwnedSlice(allocator) catch &.{},
         };
     }
@@ -2797,10 +2798,10 @@ pub const DwarfEngine = struct {
             const rhs_token = std.mem.trim(u8, expr_str[op_info.pos + op_info.len ..], " ");
 
             const lhs_val = resolveOperand(lhs_token, variables, reg_provider, frame_base, mem_reader) orelse {
-                return .{ .result = "<unknown variable>", .@"type" = "" };
+                return .{ .result = "<unknown variable>", .type = "" };
             };
             const rhs_val = resolveOperand(rhs_token, variables, reg_provider, frame_base, mem_reader) orelse {
-                return .{ .result = "<unknown variable>", .@"type" = "" };
+                return .{ .result = "<unknown variable>", .type = "" };
             };
 
             const result_val: i64 = switch (op_info.op) {
@@ -2811,10 +2812,10 @@ pub const DwarfEngine = struct {
             };
 
             var buf: [64]u8 = undefined;
-            const formatted = std.fmt.bufPrint(&buf, "{d}", .{result_val}) catch return .{ .result = "<format error>", .@"type" = "" };
-            const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .@"type" = "" };
-            const type_owned = allocator.dupe(u8, "int") catch return .{ .result = result_str, .@"type" = "", .result_allocated = true };
-            return .{ .result = result_str, .@"type" = type_owned, .result_allocated = true };
+            const formatted = std.fmt.bufPrint(&buf, "{d}", .{result_val}) catch return .{ .result = "<format error>", .type = "" };
+            const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .type = "" };
+            const type_owned = allocator.dupe(u8, "int") catch return .{ .result = result_str, .type = "", .result_allocated = true };
+            return .{ .result = result_str, .type = type_owned, .result_allocated = true };
         }
 
         // Single variable lookup
@@ -3199,7 +3200,7 @@ pub const DwarfEngine = struct {
         for (variables) |v| {
             if (std.mem.eql(u8, v.name, name)) {
                 if (v.location_expr.len == 0) {
-                    return .{ .result = "<optimized out>", .@"type" = v.type_name };
+                    return .{ .result = "<optimized out>", .type = v.type_name };
                 }
 
                 const loc = location.evalLocationWithMemory(v.location_expr, reg_provider, frame_base, mem_reader);
@@ -3211,47 +3212,47 @@ pub const DwarfEngine = struct {
                         std.mem.writeInt(u64, &raw, val, .little);
                         const effective_size = if (v.type_byte_size > 0) v.type_byte_size else 8;
                         const formatted = location.formatVariable(raw[0..effective_size], v.type_name, v.type_encoding, effective_size, &fmt_buf);
-                        const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .@"type" = "" };
-                        const type_owned = allocator.dupe(u8, v.type_name) catch return .{ .result = result_str, .@"type" = "", .result_allocated = true };
-                        return .{ .result = result_str, .@"type" = type_owned, .result_allocated = true };
+                        const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .type = "" };
+                        const type_owned = allocator.dupe(u8, v.type_name) catch return .{ .result = result_str, .type = "", .result_allocated = true };
+                        return .{ .result = result_str, .type = type_owned, .result_allocated = true };
                     },
                     .address => |addr| {
                         const size: usize = if (v.type_byte_size > 0) v.type_byte_size else 4;
                         const val = mem_reader.read(addr, size) orelse {
-                            return .{ .result = "<unreadable>", .@"type" = v.type_name };
+                            return .{ .result = "<unreadable>", .type = v.type_name };
                         };
                         var raw: [8]u8 = undefined;
                         std.mem.writeInt(u64, &raw, val, .little);
                         const formatted = location.formatVariable(raw[0..size], v.type_name, v.type_encoding, @intCast(size), &fmt_buf);
-                        const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .@"type" = "" };
-                        const type_owned = allocator.dupe(u8, v.type_name) catch return .{ .result = result_str, .@"type" = "", .result_allocated = true };
-                        return .{ .result = result_str, .@"type" = type_owned, .result_allocated = true };
+                        const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .type = "" };
+                        const type_owned = allocator.dupe(u8, v.type_name) catch return .{ .result = result_str, .type = "", .result_allocated = true };
+                        return .{ .result = result_str, .type = type_owned, .result_allocated = true };
                     },
                     .register => |reg| {
                         const val = reg_provider.read(reg) orelse {
-                            return .{ .result = "<unavailable>", .@"type" = v.type_name };
+                            return .{ .result = "<unavailable>", .type = v.type_name };
                         };
                         var raw: [8]u8 = undefined;
                         std.mem.writeInt(u64, &raw, val, .little);
                         const effective_size = if (v.type_byte_size > 0) v.type_byte_size else 8;
                         const formatted = location.formatVariable(raw[0..effective_size], v.type_name, v.type_encoding, effective_size, &fmt_buf);
-                        const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .@"type" = "" };
-                        const type_owned = allocator.dupe(u8, v.type_name) catch return .{ .result = result_str, .@"type" = "", .result_allocated = true };
-                        return .{ .result = result_str, .@"type" = type_owned, .result_allocated = true };
+                        const result_str = allocator.dupe(u8, formatted) catch return .{ .result = "<alloc error>", .type = "" };
+                        const type_owned = allocator.dupe(u8, v.type_name) catch return .{ .result = result_str, .type = "", .result_allocated = true };
+                        return .{ .result = result_str, .type = type_owned, .result_allocated = true };
                     },
                     .implicit_pointer => {
-                        return .{ .result = "<implicit pointer>", .@"type" = v.type_name };
+                        return .{ .result = "<implicit pointer>", .type = v.type_name };
                     },
                     .composite => {
-                        return .{ .result = "<composite>", .@"type" = v.type_name };
+                        return .{ .result = "<composite>", .type = v.type_name };
                     },
                     .empty => {
-                        return .{ .result = "<optimized out>", .@"type" = v.type_name };
+                        return .{ .result = "<optimized out>", .type = v.type_name };
                     },
                 }
             }
         }
-        return .{ .result = "<unknown variable>", .@"type" = "" };
+        return .{ .result = "<unknown variable>", .type = "" };
     }
 
     // ── Threads ──────────────────────────────────────────────────────
@@ -3640,7 +3641,7 @@ pub const DwarfEngine = struct {
             // Return new value
             const result_str = try allocator.dupe(u8, value);
             const type_owned = try allocator.dupe(u8, v.type_name);
-            return .{ .result = result_str, .@"type" = type_owned, .result_allocated = true };
+            return .{ .result = result_str, .type = type_owned, .result_allocated = true };
         }
 
         // Variable not found at current PC — try nearest line entry PC
@@ -3679,7 +3680,7 @@ pub const DwarfEngine = struct {
 
                     const result_str = try allocator.dupe(u8, value);
                     const type_owned = try allocator.dupe(u8, v.type_name);
-                    return .{ .result = result_str, .@"type" = type_owned, .result_allocated = true };
+                    return .{ .result = result_str, .type = type_owned, .result_allocated = true };
                 }
             }
         }
@@ -3971,7 +3972,9 @@ pub const DwarfEngine = struct {
             regs.pc +% @as(u64, @intCast(-self.aslr_slide));
 
         const scoped = parser.parseScopedVariables(
-            info_data, abbrev_data, str_data,
+            info_data,
+            abbrev_data,
+            str_data,
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
@@ -3980,7 +3983,8 @@ pub const DwarfEngine = struct {
                 .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
                 .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
             },
-            dwarf_pc, allocator,
+            dwarf_pc,
+            allocator,
             if (self.abbrev_cache) |*ac| ac else null,
             self.cuHintForPC(dwarf_pc),
             if (self.type_die_cache) |*tdc| tdc else null,
@@ -4441,7 +4445,7 @@ pub const DwarfEngine = struct {
         // For native debugging, exceptions are signals (SIGSEGV, SIGFPE, etc.)
         // We return a generic exception info based on what we know
         return .{
-            .@"type" = "signal",
+            .type = "signal",
             .message = "Process stopped by signal",
         };
     }

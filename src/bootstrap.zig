@@ -434,7 +434,7 @@ fn memInfo(allocator: std.mem.Allocator) !void {
 
             var buf: [256]u8 = undefined;
             const stats = std.fmt.bufPrint(&buf, "  {s}Engrams:{s}  {d} ({d} long-term, {d} short-term)\n  {s}Synapses:{s} {d}\n", .{
-                bold, reset, engrams, long_term, short_term,
+                bold, reset, engrams,  long_term, short_term,
                 bold, reset, synapses,
             }) catch return;
             printErr(stats);

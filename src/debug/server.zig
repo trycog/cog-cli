@@ -1311,7 +1311,6 @@ pub const DebugServer = struct {
         return .{ .ok = result };
     }
 
-
     fn toolInspect(self: *DebugServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };

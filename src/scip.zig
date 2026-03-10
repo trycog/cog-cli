@@ -17,7 +17,17 @@ pub const Relationship = struct {
     is_implementation: bool,
     is_type_definition: bool,
     is_definition: bool,
+    kind: []const u8 = "",
 };
+
+pub fn relationshipKind(rel: Relationship) []const u8 {
+    if (rel.kind.len > 0) return rel.kind;
+    if (rel.is_implementation) return "implements";
+    if (rel.is_type_definition) return "type_definition";
+    if (rel.is_definition) return "definition";
+    if (rel.is_reference) return "reference";
+    return "related";
+}
 
 pub const SymbolRole = struct {
     pub const Definition: i32 = 0x1;
@@ -395,6 +405,7 @@ fn decodeRelationship(data: []const u8) !Relationship {
         .is_implementation = false,
         .is_type_definition = false,
         .is_definition = false,
+        .kind = "",
     };
 
     while (dec.hasMore()) {
@@ -405,6 +416,7 @@ fn decodeRelationship(data: []const u8) !Relationship {
             3 => result.is_implementation = (try dec.readVarint()) != 0,
             4 => result.is_type_definition = (try dec.readVarint()) != 0,
             5 => result.is_definition = (try dec.readVarint()) != 0,
+            6 => result.kind = try dec.readString(),
             else => try dec.skipField(field.wire_type),
         }
     }
@@ -521,7 +533,7 @@ test "decode Document with occurrence" {
     const symbol = "pkg/Foo#bar.";
     // field 3 (symbol_roles) varint 1 (Definition): tag = (3<<3)|0 = 0x18
     const occ_data = [_]u8{
-        0x0A, 0x03, 0x0A, 0x05, 0x0F, // range packed [10, 5, 15]
+        0x0A, 0x03,       0x0A, 0x05, 0x0F, // range packed [10, 5, 15]
         0x12, symbol.len,
     } ++ symbol.* ++ [_]u8{
         0x18, 0x01, // symbol_roles = 1

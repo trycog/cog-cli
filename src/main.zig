@@ -166,21 +166,7 @@ fn mainInner() !void {
 }
 
 fn printHelp(allocator: std.mem.Allocator) void {
-    const static_help = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n"
-        ++ "\n"
-        ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n"
-        ++ "\n"
-        ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "install" ++ reset ++ "               " ++ dim ++ "Install a language extension from a git URL" ++ reset ++ "\n"
-        ++ "\n"
-        ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n"
-        ++ comptime code_intel.builtinExtensionList()
-        ++ "\n";
+    const static_help = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "install" ++ reset ++ "               " ++ dim ++ "Install a language extension from a git URL" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n";
 
     const footer = dim ++ "  Run 'cog <command> --help' for details on a specific command." ++ reset ++ "\n\n";
 
@@ -212,18 +198,7 @@ fn printCodeHelp() void {
 }
 
 fn printDebugHelp(allocator: std.mem.Allocator) void {
-    const static_debug = bold ++ "  cog debug" ++ reset ++ " — Debug daemon utilities\n"
-        ++ "\n"
-        ++ cyan ++ bold ++ "  Server" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "debug:serve" ++ reset ++ "           " ++ dim ++ "Start the debug daemon" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "debug:dashboard" ++ reset ++ "       " ++ dim ++ "Live debug session dashboard" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "debug:status" ++ reset ++ "          " ++ dim ++ "Check daemon status and active sessions" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "debug:kill" ++ reset ++ "            " ++ dim ++ "Stop the debug daemon" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "debug:sign" ++ reset ++ "            " ++ dim ++ "Code-sign binary with debug entitlements (macOS)" ++ reset ++ "\n"
-        ++ "\n"
-        ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n"
-        ++ comptime code_intel.builtinDebugExtensionList()
-        ++ "\n";
+    const static_debug = bold ++ "  cog debug" ++ reset ++ " — Debug daemon utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Server" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:serve" ++ reset ++ "           " ++ dim ++ "Start the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:dashboard" ++ reset ++ "       " ++ dim ++ "Live debug session dashboard" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:status" ++ reset ++ "          " ++ dim ++ "Check daemon status and active sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:kill" ++ reset ++ "            " ++ dim ++ "Stop the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:sign" ++ reset ++ "            " ++ dim ++ "Code-sign binary with debug entitlements (macOS)" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinDebugExtensionList() ++ "\n";
 
     const installed_block = code_intel.listInstalledDebugBlock(allocator);
     defer if (installed_block) |b| allocator.free(b);
@@ -244,13 +219,7 @@ fn printDebugHelp(allocator: std.mem.Allocator) void {
 
 fn printMemHelp() void {
     tui.header();
-    printErr(bold ++ "  cog mem" ++ reset ++ " — Memory utilities\n"
-        ++ "\n"
-        ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "mem:bootstrap" ++ reset ++ "         " ++ dim ++ "Scan project files and populate memory" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "mem:info" ++ reset ++ "              " ++ dim ++ "Show brain type, path, and memory stats" ++ reset ++ "\n"
-        ++ "    " ++ bold ++ "mem:upgrade" ++ reset ++ "           " ++ dim ++ "Instructions for migrating to hosted brain" ++ reset ++ "\n"
-        ++ "\n");
+    printErr(bold ++ "  cog mem" ++ reset ++ " — Memory utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:bootstrap" ++ reset ++ "         " ++ dim ++ "Scan project files and populate memory" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:info" ++ reset ++ "              " ++ dim ++ "Show brain type, path, and memory stats" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:upgrade" ++ reset ++ "           " ++ dim ++ "Instructions for migrating to hosted brain" ++ reset ++ "\n" ++ "\n");
 }
 
 fn printMcpHelp() void {

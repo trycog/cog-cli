@@ -612,7 +612,7 @@ pub const MachProcessControl = struct {
                 var data_cnt: std.c.mach_msg_type_number_t = undefined;
                 const read_kr = std.c.mach_vm_read(task, address, 4, &data_out, &data_cnt);
                 if (read_kr == 0 and data_cnt >= 4) {
-                    const magic = @as(*const u32, @alignCast(@ptrCast(@as([*]const u8, @ptrFromInt(data_out))))).*;
+                    const magic = @as(*const u32, @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(data_out))))).*;
                     _ = std.c.vm_deallocate(std.c.mach_task_self(), data_out, data_cnt);
                     if (magic == MH_MAGIC_64) {
                         return address;

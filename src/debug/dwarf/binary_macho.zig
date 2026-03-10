@@ -188,7 +188,7 @@ fn parseMachO(data: []const u8) !MachoBinary {
         if (offset + 8 > data.len) break;
 
         const cmd = std.mem.readInt(u32, data[offset..][0..4], .little);
-        const cmdsize = std.mem.readInt(u32, data[offset + 4..][0..4], .little);
+        const cmdsize = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little);
 
         if (cmdsize < 8) break;
 

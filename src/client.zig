@@ -131,7 +131,6 @@ pub fn post(
     debug_log.log("post: {s} -> status {d}", .{ url, result.status_code });
 
     if (result.status_code != 200 and result.status_code != 201) {
-
         if (json.parseFromSlice(json.Value, allocator, result.body, .{})) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {

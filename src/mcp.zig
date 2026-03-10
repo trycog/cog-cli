@@ -974,15 +974,17 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     // guides the agent to only use 5 direct memory tools; everything else
     // is accessed through sub-agents (code, debug, memory).
 
-    try writeToolDef(s, "code_query", "Query the SCIP code index for targeted follow-up only. Returns concise plain-text results that an agent can read directly: use mode 'find' to locate definitions, 'refs' to list references, or 'symbols' to outline one already-identified file. Do not use repeated `symbols` or `find` calls as an exploration strategy when the work can be batched into `cog_code_explore`.", &.{
-        .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find' (locate a symbol's definition), 'refs' (find all references to a symbol), 'symbols' (list all symbols in a file)", .required = true },
-        .{ .name = "name", .typ = "string", .desc = "Symbol name to search for (required for find and refs modes). Supports glob patterns: '*' (zero or more chars) and '?' (one char). Examples: '*init*', 'get*', 'Handle?'. Use '|' for alternation to search multiple names: 'banner|header|splash'", .required = false },
-        .{ .name = "file", .typ = "string", .desc = "File path filter. Required for symbols mode. Optional for find/refs to scope results to a specific file.", .required = false },
+    try writeToolDef(s, "code_query", "Targeted code index query tool. Use 'find', 'refs', and 'symbols' for precise symbol lookups; use 'imports', 'contains', 'calls', 'callers', and 'overview' for architecture-aware follow-up on files, symbols, or whole repositories.", &.{
+        .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'", .required = true },
+        .{ .name = "name", .typ = "string", .desc = "Symbol name to search for when the mode operates on a symbol. Supports glob patterns: '*' (zero or more chars), '?' (one char), and alternation with '|'.", .required = false },
+        .{ .name = "file", .typ = "string", .desc = "File path for file-scoped queries. Required for 'symbols' and 'overview' with scope='file'. Optional for other modes when you want to force file context.", .required = false },
         .{ .name = "kind", .typ = "string", .desc = "Filter results by symbol kind (e.g. function, class, method, variable)", .required = false },
+        .{ .name = "direction", .typ = "string", .desc = "Direction for relationship queries: 'incoming', 'outgoing', or 'both'", .required = false },
+        .{ .name = "scope", .typ = "string", .desc = "Overview scope: 'symbol', 'file', or 'repo'", .required = false },
     });
 
-    try writeToolDefWithSchemaJson(allocator, s, "code_explore", "Primary code exploration tool. Batch all candidate symbols into one call whenever possible and prefer a single batched call for repository summaries. Returns readable plain-text summaries with definition bodies, referenced symbols, and per-file outlines. Combines find + read in a single call, auto-retries failed lookups with glob patterns, and keeps output compact enough for direct LLM consumption.",
-        \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"}},"required":["queries"]}
+    try writeToolDefWithSchemaJson(allocator, s, "code_explore", "Primary code exploration tool. Batch all candidate symbols into one call whenever possible and prefer a single batched call for repository summaries. Returns readable plain-text summaries with definition bodies, per-file outlines, and optional architecture sections such as imports, containment, and overview data.",
+        \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"},"include_relationships":{"type":"boolean","description":"Include symbol-level relationship summaries such as containment and imports when available"},"include_architecture":{"type":"boolean","description":"Include architecture-oriented summaries. Recommended for repository overview tasks."},"overview_scope":{"type":"string","description":"Architecture summary scope: 'symbol', 'file', or 'repo'"}},"required":["queries"]}
     );
 
     // Memory tools: local definitions or remote discovery
@@ -1292,8 +1294,38 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
         .refs
     else if (std.mem.eql(u8, mode_str, "symbols"))
         .symbols
+    else if (std.mem.eql(u8, mode_str, "imports"))
+        .imports
+    else if (std.mem.eql(u8, mode_str, "contains"))
+        .contains
+    else if (std.mem.eql(u8, mode_str, "calls"))
+        .calls
+    else if (std.mem.eql(u8, mode_str, "callers"))
+        .callers
+    else if (std.mem.eql(u8, mode_str, "overview"))
+        .overview
     else
         return error.Explained;
+
+    const direction: code_intel.QueryDirection = if (getStr(args, "direction")) |dir|
+        if (std.mem.eql(u8, dir, "incoming"))
+            .incoming
+        else if (std.mem.eql(u8, dir, "both"))
+            .both
+        else
+            .outgoing
+    else
+        .outgoing;
+
+    const scope: code_intel.OverviewScope = if (getStr(args, "scope")) |scope_str|
+        if (std.mem.eql(u8, scope_str, "repo"))
+            .repo
+        else if (std.mem.eql(u8, scope_str, "file"))
+            .file
+        else
+            .symbol
+    else
+        .symbol;
 
     if (runtime.code_cache == null and code_intel.queryIndexStatusForRuntime(allocator) != .ready) {
         return error.IndexUnavailable;
@@ -1305,6 +1337,8 @@ fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
         .name = getStr(args, "name"),
         .file = getStr(args, "file"),
         .kind = getStr(args, "kind"),
+        .direction = direction,
+        .scope = scope,
     });
 }
 
@@ -1312,9 +1346,18 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
     const allocator = runtime.allocator;
     const args = arguments orelse return error.Explained;
 
-    // Parse context_lines (default 15)
-    const context_lines: usize = getInt(args, "context_lines") orelse 15;
-    debug_log_mod.log("callCodeExplore: context_lines={d}", .{context_lines});
+    const options = code_intel.ExploreOptions{
+        .context_lines = getInt(args, "context_lines") orelse 15,
+        .include_relationships = getBool(args, "include_relationships") orelse false,
+        .include_architecture = getBool(args, "include_architecture") orelse false,
+        .overview_scope = blk: {
+            const scope_str = getStr(args, "overview_scope") orelse break :blk .symbol;
+            if (std.mem.eql(u8, scope_str, "repo")) break :blk .repo;
+            if (std.mem.eql(u8, scope_str, "file")) break :blk .file;
+            break :blk .symbol;
+        },
+    };
+    debug_log_mod.log("callCodeExplore: context_lines={d} include_relationships={} include_architecture={} overview_scope={s}", .{ options.context_lines, options.include_relationships, options.include_architecture, @tagName(options.overview_scope) });
 
     // Parse queries array
     const queries_val = if (args == .object) args.object.get("queries") else null;
@@ -1341,7 +1384,7 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
     }
 
     const ci = try runtime.ensureCodeCache();
-    return code_intel.codeExploreWithLoadedIndex(allocator, ci, queries.items, context_lines);
+    return code_intel.codeExploreWithLoadedIndex(allocator, ci, queries.items, options);
 }
 
 // ── File Watcher Event Processing ───────────────────────────────────────
@@ -1416,6 +1459,13 @@ fn getInt(obj: json.Value, key: []const u8) ?usize {
     if (val != .integer) return null;
     if (val.integer < 0) return null;
     return @intCast(val.integer);
+}
+
+fn getBool(obj: json.Value, key: []const u8) ?bool {
+    if (obj != .object) return null;
+    const val = obj.object.get(key) orelse return null;
+    if (val != .bool) return null;
+    return val.bool;
 }
 
 const ToolParam = struct {

@@ -142,6 +142,32 @@ fn isFlowFile(source: []const u8) bool {
     return std.mem.indexOf(u8, header, "@flow") != null;
 }
 
+fn trimImportText(text: []const u8) []const u8 {
+    return std.mem.trim(u8, text, " \t\r\n\"'");
+}
+
+fn normalizeImportLabel(allocator: std.mem.Allocator, importer_path: []const u8, raw_label: []const u8) ![]const u8 {
+    if (raw_label.len == 0) return try allocator.dupe(u8, raw_label);
+    if (std.mem.startsWith(u8, raw_label, "./") or std.mem.startsWith(u8, raw_label, "../")) {
+        const base_dir = std.fs.path.dirname(importer_path) orelse ".";
+        return std.fs.path.resolve(allocator, &.{ base_dir, raw_label });
+    }
+    return try allocator.dupe(u8, raw_label);
+}
+
+fn pointContains(start_row: u32, start_col: u32, end_row: u32, end_col: u32, row: u32, col: u32) bool {
+    if (row < start_row or row > end_row) return false;
+    if (row == start_row and col < start_col) return false;
+    if (row == end_row and col > end_col) return false;
+    return true;
+}
+
+fn normalizeCallText(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const open_paren = std.mem.indexOfScalar(u8, trimmed, '(') orelse trimmed.len;
+    return std.mem.trim(u8, trimmed[0..open_paren], " \t\r\n");
+}
+
 pub const Indexer = struct {
     parser: *c.TSParser,
 
@@ -255,8 +281,36 @@ pub const Indexer = struct {
             kind: i32,
         };
 
+        const RawImport = struct {
+            label: []const u8,
+            start_point: c.TSPoint,
+            end_point: c.TSPoint,
+        };
+
+        const RawCall = struct {
+            name: []const u8,
+            start_point: c.TSPoint,
+            end_point: c.TSPoint,
+        };
+
+        const RawRelationship = struct {
+            from_idx: usize,
+            to_idx: ?usize = null,
+            target_symbol: ?[]const u8 = null,
+            kind: []const u8,
+        };
+
         var raw_defs: std.ArrayListUnmanaged(RawDef) = .empty;
         defer raw_defs.deinit(allocator);
+        var raw_imports: std.ArrayListUnmanaged(RawImport) = .empty;
+        defer {
+            for (raw_imports.items) |item| allocator.free(item.label);
+            raw_imports.deinit(allocator);
+        }
+        var raw_calls: std.ArrayListUnmanaged(RawCall) = .empty;
+        defer raw_calls.deinit(allocator);
+        var raw_relationships: std.ArrayListUnmanaged(RawRelationship) = .empty;
+        defer raw_relationships.deinit(allocator);
 
         var match: c.TSQueryMatch = undefined;
 
@@ -276,6 +330,57 @@ pub const Indexer = struct {
 
                 if (std.mem.eql(u8, cap_name, "name")) {
                     name_node = capture.node;
+                } else if (std.mem.startsWith(u8, cap_name, "reference.import")) {
+                    const import_start = c.ts_node_start_byte(capture.node);
+                    const import_end = c.ts_node_end_byte(capture.node);
+                    if (import_start < source.len and import_end <= source.len and import_start < import_end) {
+                        const raw_text = trimImportText(source[import_start..import_end]);
+                        if (raw_text.len > 0) {
+                            const normalized = normalizeImportLabel(allocator, relative_path, raw_text) catch continue;
+                            var seen_import = false;
+                            for (raw_imports.items) |existing| {
+                                if (std.mem.eql(u8, existing.label, normalized)) {
+                                    seen_import = true;
+                                    break;
+                                }
+                            }
+                            if (!seen_import) {
+                                try raw_imports.append(allocator, .{
+                                    .label = normalized,
+                                    .start_point = c.ts_node_start_point(capture.node),
+                                    .end_point = c.ts_node_end_point(capture.node),
+                                });
+                            } else {
+                                allocator.free(normalized);
+                            }
+                        }
+                    }
+                } else if (std.mem.startsWith(u8, cap_name, "reference.call")) {
+                    const call_start = c.ts_node_start_byte(capture.node);
+                    const call_end = c.ts_node_end_byte(capture.node);
+                    if (call_start < source.len and call_end <= source.len and call_start < call_end) {
+                        const call_text = normalizeCallText(source[call_start..call_end]);
+                        if (call_text.len > 0 and !isJsKeyword(call_text)) {
+                            var seen_call = false;
+                            const start_pt = c.ts_node_start_point(capture.node);
+                            for (raw_calls.items) |existing| {
+                                if (existing.start_point.row == start_pt.row and
+                                    existing.start_point.column == start_pt.column and
+                                    std.mem.eql(u8, existing.name, call_text))
+                                {
+                                    seen_call = true;
+                                    break;
+                                }
+                            }
+                            if (!seen_call) {
+                                try raw_calls.append(allocator, .{
+                                    .name = call_text,
+                                    .start_point = start_pt,
+                                    .end_point = c.ts_node_end_point(capture.node),
+                                });
+                            }
+                        }
+                    }
                 } else if (captureToScipKind(cap_name)) |kind| {
                     def_kind = kind;
                     def_node = capture.node;
@@ -341,6 +446,10 @@ pub const Indexer = struct {
         const OffsetPair = struct { sym: OffsetLen, name: OffsetLen };
         var offset_pairs = try allocator.alloc(OffsetPair, raw_defs.items.len);
         defer allocator.free(offset_pairs);
+        var import_offsets = try allocator.alloc(OffsetLen, raw_imports.items.len);
+        defer allocator.free(import_offsets);
+        var call_offsets = try allocator.alloc(OffsetLen, raw_calls.items.len);
+        defer allocator.free(call_offsets);
 
         for (raw_defs.items, 0..) |def, i| {
             // Write symbol ID: "local <path>:<N>"
@@ -366,11 +475,25 @@ pub const Indexer = struct {
             };
         }
 
+        for (raw_imports.items, 0..) |item, i| {
+            const sym_start = string_buf.items.len;
+            try string_buf.appendSlice(allocator, "cog/import/");
+            try string_buf.appendSlice(allocator, item.label);
+            import_offsets[i] = .{ .off = sym_start, .len = string_buf.items.len - sym_start };
+        }
+
+        for (raw_calls.items, 0..) |item, i| {
+            const sym_start = string_buf.items.len;
+            try string_buf.appendSlice(allocator, "cog/call/");
+            try string_buf.appendSlice(allocator, item.name);
+            call_offsets[i] = .{ .off = sym_start, .len = string_buf.items.len - sym_start };
+        }
+
         const string_data = try string_buf.toOwnedSlice(allocator);
         errdefer allocator.free(string_data);
 
         // Phase 3: Build occurrences and symbols using slices into string_data
-        var occurrences = try allocator.alloc(scip.Occurrence, raw_defs.items.len);
+        var occurrences = try allocator.alloc(scip.Occurrence, raw_defs.items.len + raw_imports.items.len + raw_calls.items.len);
         errdefer allocator.free(occurrences);
 
         var symbols = try allocator.alloc(scip.SymbolInformation, raw_defs.items.len);
@@ -385,6 +508,30 @@ pub const Indexer = struct {
         for (raw_defs.items, offset_pairs, 0..) |def, off, i| {
             const symbol_id = string_data[off.sym.off..][0..off.sym.len];
             const display_name = string_data[off.name.off..][0..off.name.len];
+            var enclosing_symbol: []const u8 = "";
+            var enclosing_index: ?usize = null;
+
+            var best_parent_span: u64 = std.math.maxInt(u64);
+            for (raw_defs.items, offset_pairs, 0..) |candidate, candidate_off, parent_idx| {
+                if (parent_idx == i) continue;
+                if (!pointContains(candidate.def_start_point.row, candidate.def_start_point.column, candidate.def_end_point.row, candidate.def_end_point.column, def.def_start_point.row, def.def_start_point.column)) continue;
+                if (!pointContains(candidate.def_start_point.row, candidate.def_start_point.column, candidate.def_end_point.row, candidate.def_end_point.column, def.def_end_point.row, def.def_end_point.column)) continue;
+                const row_span = @as(u64, candidate.def_end_point.row) - @as(u64, candidate.def_start_point.row);
+                const span = row_span * 10000 + @as(u64, candidate.def_end_point.column);
+                if (span < best_parent_span) {
+                    best_parent_span = span;
+                    enclosing_index = parent_idx;
+                    enclosing_symbol = string_data[candidate_off.sym.off..][0..candidate_off.sym.len];
+                }
+            }
+
+            if (enclosing_index) |parent_idx| {
+                try raw_relationships.append(allocator, .{
+                    .from_idx = parent_idx,
+                    .to_idx = i,
+                    .kind = "contains",
+                });
+            }
 
             occurrences[i] = .{
                 .range = .{
@@ -410,9 +557,138 @@ pub const Indexer = struct {
                 .relationships = try allocator.alloc(scip.Relationship, 0),
                 .kind = def.kind,
                 .display_name = display_name,
-                .enclosing_symbol = "",
+                .enclosing_symbol = enclosing_symbol,
             };
         }
+
+        for (raw_imports.items, import_offsets, 0..) |item, off, i| {
+            occurrences[raw_defs.items.len + i] = .{
+                .range = .{
+                    .start_line = @intCast(item.start_point.row),
+                    .start_char = @intCast(item.start_point.column),
+                    .end_line = @intCast(item.end_point.row),
+                    .end_char = @intCast(item.end_point.column),
+                },
+                .symbol = string_data[off.off..][0..off.len],
+                .symbol_roles = scip.SymbolRole.Import,
+                .syntax_kind = 0,
+                .enclosing_range = null,
+            };
+
+            var attached = false;
+            for (symbols, 0..) |sym, sym_idx| {
+                if (sym.enclosing_symbol.len != 0) continue;
+                try raw_relationships.append(allocator, .{
+                    .from_idx = sym_idx,
+                    .target_symbol = string_data[off.off..][0..off.len],
+                    .kind = "imports",
+                });
+                attached = true;
+            }
+            if (!attached) {
+                for (raw_defs.items, 0..) |_, candidate_idx| {
+                    try raw_relationships.append(allocator, .{
+                        .from_idx = candidate_idx,
+                        .target_symbol = string_data[off.off..][0..off.len],
+                        .kind = "imports",
+                    });
+                }
+            }
+        }
+
+        for (raw_calls.items, call_offsets, 0..) |item, off, i| {
+            var enclosing_range: ?scip.Range = null;
+            var best_parent_span: u64 = std.math.maxInt(u64);
+            var caller_idx: ?usize = null;
+            for (raw_defs.items, 0..) |candidate, candidate_idx| {
+                if (!pointContains(candidate.def_start_point.row, candidate.def_start_point.column, candidate.def_end_point.row, candidate.def_end_point.column, item.start_point.row, item.start_point.column)) continue;
+                const row_span = @as(u64, candidate.def_end_point.row) - @as(u64, candidate.def_start_point.row);
+                const span = row_span * 10000 + @as(u64, candidate.def_end_point.column);
+                if (span < best_parent_span) {
+                    best_parent_span = span;
+                    caller_idx = candidate_idx;
+                    enclosing_range = .{
+                        .start_line = @intCast(candidate.def_start_point.row),
+                        .start_char = @intCast(candidate.def_start_point.column),
+                        .end_line = @intCast(candidate.def_end_point.row),
+                        .end_char = @intCast(candidate.def_end_point.column),
+                    };
+                }
+            }
+
+            occurrences[raw_defs.items.len + raw_imports.items.len + i] = .{
+                .range = .{
+                    .start_line = @intCast(item.start_point.row),
+                    .start_char = @intCast(item.start_point.column),
+                    .end_line = @intCast(item.end_point.row),
+                    .end_char = @intCast(item.end_point.column),
+                },
+                .symbol = string_data[off.off..][0..off.len],
+                .symbol_roles = scip.SymbolRole.ReadAccess,
+                .syntax_kind = 0,
+                .enclosing_range = enclosing_range,
+            };
+
+            if (caller_idx) |from_idx| {
+                var target_idx: ?usize = null;
+                if (std.mem.indexOfScalar(u8, item.name, '.')) |dot_idx| {
+                    const suffix = item.name[dot_idx + 1 ..];
+                    for (raw_defs.items, 0..) |candidate, idx| {
+                        if (std.mem.eql(u8, candidate.name_text, suffix)) {
+                            target_idx = idx;
+                            break;
+                        }
+                    }
+                }
+                if (target_idx == null) {
+                    for (raw_defs.items, 0..) |candidate, idx| {
+                        if (std.mem.eql(u8, candidate.name_text, item.name)) {
+                            target_idx = idx;
+                            break;
+                        }
+                    }
+                }
+                if (target_idx) |to_idx| {
+                    try raw_relationships.append(allocator, .{
+                        .from_idx = from_idx,
+                        .to_idx = to_idx,
+                        .kind = "calls",
+                    });
+                }
+            }
+        }
+
+        var rel_counts = try allocator.alloc(usize, raw_defs.items.len);
+        defer allocator.free(rel_counts);
+        @memset(rel_counts, 0);
+        for (raw_relationships.items) |rel| {
+            rel_counts[rel.from_idx] += 1;
+        }
+
+        for (symbols, 0..) |*sym, i| {
+            const rel_count = rel_counts[i];
+            allocator.free(sym.relationships);
+            sym.relationships = try allocator.alloc(scip.Relationship, rel_count);
+            var rel_idx: usize = 0;
+            for (raw_relationships.items) |rel| {
+                if (rel.from_idx != i) continue;
+                const target_symbol = if (rel.to_idx) |to_idx| blk: {
+                    const target_off = offset_pairs[to_idx];
+                    break :blk string_data[target_off.sym.off..][0..target_off.sym.len];
+                } else rel.target_symbol.?;
+                sym.relationships[rel_idx] = .{
+                    .symbol = target_symbol,
+                    .is_reference = std.mem.eql(u8, rel.kind, "calls"),
+                    .is_implementation = false,
+                    .is_type_definition = false,
+                    .is_definition = std.mem.eql(u8, rel.kind, "contains"),
+                    .kind = rel.kind,
+                };
+                rel_idx += 1;
+            }
+        }
+
+        debug_log.log("indexFile: defs={d} imports={d} calls={d}", .{ raw_defs.items.len, raw_imports.items.len, raw_calls.items.len });
 
         return .{
             .doc = .{
@@ -607,6 +883,119 @@ test "indexFile JavaScript" {
     }
     try std.testing.expect(found_greet);
     try std.testing.expect(found_greeter);
+}
+
+test "indexFile TypeScript emits architecture relationships" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\import { helper } from "./helper";
+        \\
+        \\function outer() {
+        \\    function inner() {
+        \\        helper();
+        \\    }
+        \\    inner();
+        \\}
+    ;
+
+    const config = findBuiltinConfig("typescript") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/main.ts", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    var found_outer = false;
+    var found_inner = false;
+    var found_import_occurrence = false;
+    var found_call_occurrence = false;
+    var found_import_relationship = false;
+    var found_call_relationship = false;
+
+    for (doc.occurrences) |occ| {
+        if ((occ.symbol_roles & scip.SymbolRole.Import) != 0) found_import_occurrence = true;
+        if (std.mem.startsWith(u8, occ.symbol, "cog/call/")) found_call_occurrence = true;
+    }
+
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "outer")) {
+            found_outer = true;
+            for (sym.relationships) |rel| {
+                if (std.mem.eql(u8, rel.kind, "imports")) found_import_relationship = true;
+                if (std.mem.eql(u8, rel.kind, "calls")) found_call_relationship = true;
+            }
+        }
+        if (std.mem.eql(u8, sym.display_name, "inner")) {
+            found_inner = true;
+            try std.testing.expect(sym.enclosing_symbol.len > 0);
+            for (sym.relationships) |rel| {
+                if (std.mem.eql(u8, rel.kind, "calls")) found_call_relationship = true;
+            }
+        }
+    }
+
+    try std.testing.expect(found_outer);
+    try std.testing.expect(found_inner);
+    try std.testing.expect(found_import_occurrence);
+    try std.testing.expect(found_call_occurrence);
+    try std.testing.expect(found_import_relationship);
+    try std.testing.expect(found_call_relationship);
+}
+
+test "indexFile TSX emits import and call captures" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\import { Button } from "./button";
+        \\
+        \\export function App() {
+        \\    Button();
+        \\    return <Button />;
+        \\}
+    ;
+
+    const config = findBuiltinConfig("tsx") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/app.tsx", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    var found_app = false;
+    var saw_import_occurrence = false;
+    for (doc.occurrences) |occ| {
+        if ((occ.symbol_roles & scip.SymbolRole.Import) != 0) saw_import_occurrence = true;
+    }
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "App")) {
+            found_app = true;
+            var saw_import = false;
+            for (sym.relationships) |rel| {
+                if (std.mem.eql(u8, rel.kind, "imports")) saw_import = true;
+            }
+            try std.testing.expect(saw_import);
+        }
+    }
+
+    try std.testing.expect(found_app);
+    try std.testing.expect(saw_import_occurrence);
 }
 
 test "indexFile Markdown" {

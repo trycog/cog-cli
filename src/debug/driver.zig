@@ -403,7 +403,7 @@ pub const MockDriver = struct {
     }
 
     fn mockInspect(_: *anyopaque, _: std.mem.Allocator, _: InspectRequest) anyerror!InspectResult {
-        return .{ .result = "42", .@"type" = "int" };
+        return .{ .result = "42", .type = "int" };
     }
 
     fn mockStop(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {

@@ -714,24 +714,7 @@ pub fn buildMarkdownAgentContent(allocator: std.mem.Allocator, header: []const u
     return try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
 }
 
-pub const opencode_override_content =
-    \\export default async () => ({
-    \\  "tool.definition": async (input, output) => {
-    \\    if (input.toolID === "glob" || input.toolID === "grep") {
-    \\      output.description =
-    \\        "Fallback only. Use cog_code_explore and cog_code_query for code exploration."
-    \\    }
-    \\  },
-    \\  "tool.execute.before": async (input) => {
-    \\    if (input.tool === "glob" || input.tool === "grep") {
-    \\      throw new Error(
-    \\        "Cog override policy: use cog_code_explore or cog_code_query. Glob and grep are disabled for OpenCode exploration workflows."
-    \\      )
-    \\    }
-    \\  },
-    \\})
-    \\
-;
+pub const opencode_override_content = build_options.opencode_override_plugin;
 
 fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8, body: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
@@ -1054,7 +1037,9 @@ test "writeOpenCodeOverridePlugin creates strict override plugin" {
 
             try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.definition\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.execute.before\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, content, "input.tool === \"glob\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "blockedFallbackTools.has(input.tool)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "experimental.chat.system.transform") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "repeated file-scoped architecture queries") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "cog_code_explore or cog_code_query") != null);
         }
     }.run);
