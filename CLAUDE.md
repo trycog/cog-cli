@@ -107,12 +107,43 @@ Only fall back to Grep or Glob when the Cog index is unavailable, incomplete for
 Wrong output, unexpected state, or unclear crash: use the `cog-debug` sub-agent.
 State your hypothesis before launching.
 
+Use the debugger instead of adding print statements, `console.log`, temporary logging, or other IO-based runtime inspection.
+
+Prefer the debugger when:
+- you need to inspect runtime values, control flow, crash state, stack frames, or thread state
+- a failing test or wrong output cannot be explained from code inspection alone
+- you feel tempted to add logging just to see what happened at runtime
+
+Prefer static reasoning instead when the issue is clearly a syntax, type, import, config, or other non-runtime problem.
+
+Fast-stack exception: if the language stack recompiles or hot-reloads so quickly that a one-bit edit-run check is cheaper than opening a debug session, a quick edit-run is acceptable. Otherwise, use the debugger.
+
+Debugger workflow:
+1. Locate the relevant code with `cog_code_*` tools.
+2. State a `QUESTION`, `HYPOTHESIS`, and `TEST` command.
+3. Launch one debug session, set targeted breakpoints, run, and inspect observed values.
+4. Inspect after stepping; do not step blindly.
+5. Always stop the debug session when done.
+
 ## Memory
 
 `cog_mem_*` tools are MCP tools — call them directly, never via the Skill tool.
 
 Before modifying unfamiliar code, use `cog_mem_recall` or the `cog-mem` sub-agent
 to check for relevant context. Skip if nothing useful returns.
+
+Use memory as a deterministic workflow, not an optional hint:
+
+1. Before broad exploration or deep reasoning in unfamiliar code, query memory first.
+2. When you learn something new during the task, store it as short-term memory.
+3. When the user gives you new factual context or answers a question, store that as short-term memory when relevant.
+4. Before you finish, validate short-term memories and reinforce or flush them.
+5. Briefly report whether memory helped.
+
+Memory quality guardrails:
+- complete recall before using broad code-intel exploration in unfamiliar code; only lightweight orientation is acceptable first
+- store non-obvious, durable knowledge that would save future reasoning
+- do not store generic repo summaries or facts that are obvious from a quick README or file read unless they capture durable workflow or architectural conventions
 
 Record knowledge as you work:
 

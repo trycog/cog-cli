@@ -53,5 +53,7 @@ Report findings and actions taken.
 - Do not make code changes or suggest fixes - only operate on memory
 - Prefer strong predicates such as `requires`, `implies`, `contains`, `enables`, `is_component_of`
 - Avoid orphaned memories; add associations whenever you can justify them
+- Prefer non-obvious, durable implementation or workflow knowledge over generic project summaries
+- Do not record facts that are obvious from a quick README or file read unless they establish a durable convention the agent is likely to need again
 - If you are asked to consolidate, explicitly say which memories were reinforced, flushed, or left pending
 - Be concise - the primary agent needs actionable summaries, not raw tool output

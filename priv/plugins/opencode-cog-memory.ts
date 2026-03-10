@@ -24,13 +24,12 @@ const memoryConsolidationTools = new Set([
   "cog_mem_verify",
 ])
 
-const explorationTools = new Set([
+const orientationTools = new Set(["read", "list"])
+const deepExplorationTools = new Set([
   "cog_code_explore",
   "cog_code_query",
-  "read",
   "glob",
   "grep",
-  "list",
 ])
 
 const sessionState = new Map()
@@ -47,6 +46,7 @@ function getState(sessionID) {
       awaitingUserAnswer: false,
       pendingUserFact: false,
       helpfulReportRequired: false,
+      preRecallExplorationCount: 0,
     }
     sessionState.set(sessionID, state)
   }
@@ -97,7 +97,7 @@ export default async () => ({
 
     if (memoryWriteTools.has(input.toolID)) {
       output.description +=
-        " Store newly learned or user-provided facts as short-term memory first; validate them before reinforcing to long-term memory."
+        " Store newly learned or user-provided facts as short-term memory first; validate them before reinforcing to long-term memory. Do not store generic repo summaries or facts that are obvious from a quick README or file read unless they are durable workflow knowledge."
       return
     }
 
@@ -116,9 +116,13 @@ export default async () => ({
 
     if (!state.didRecall) {
       output.system.push(
-        "Before broad code exploration or deep reasoning in unfamiliar code, call cog_mem_recall or delegate to the cog-mem subagent first.",
+        "Before broad code exploration or deep reasoning in unfamiliar code, call cog_mem_recall or delegate to the cog-mem subagent first. A small amount of initial orientation via read/list is acceptable, but complete recall before using cog_code_explore, cog_code_query, glob, or grep.",
       )
     }
+
+    output.system.push(
+      "Only store memory when you learn something non-obvious and durable: implementation details, workflow knowledge, user-provided facts, or discoveries that would materially save future reasoning. Avoid generic repo-summary memories.",
+    )
 
     if (state.pendingUserFact) {
       output.system.push(
@@ -148,10 +152,19 @@ export default async () => ({
   },
   "tool.execute.before": async (input, output) => {
     const state = getState(input.sessionID)
-    if (!state.didRecall && explorationTools.has(input.tool)) {
+
+    if (!state.didRecall && deepExplorationTools.has(input.tool)) {
       throw new Error(
-        "Cog memory workflow: recall before exploration. Call cog_mem_recall, cog_mem_bulk_recall, or delegate to the cog-mem subagent before exploring unfamiliar code.",
+        "Cog memory workflow: complete memory recall before broad exploration. Call cog_mem_recall, cog_mem_bulk_recall, or delegate to the cog-mem subagent before using cog_code_explore, cog_code_query, glob, or grep.",
       )
+    }
+
+    if (!state.didRecall && orientationTools.has(input.tool)) {
+      if (state.preRecallExplorationCount >= 1) {
+        throw new Error(
+          "Cog memory workflow: use memory before continuing exploration. One initial orientation step is allowed, but after that call cog_mem_recall, cog_mem_bulk_recall, or delegate to the cog-mem subagent before exploring further.",
+        )
+      }
     }
 
     if (input.tool === "task") {
@@ -169,6 +182,7 @@ export default async () => ({
 
     if (memoryRecallTools.has(input.tool)) {
       markRecall(state)
+      state.preRecallExplorationCount = 0
       return
     }
 
@@ -191,8 +205,15 @@ export default async () => ({
       return
     }
 
+    if (!state.didRecall && orientationTools.has(input.tool)) {
+      state.preRecallExplorationCount += 1
+      state.helpfulReportRequired = true
+      return
+    }
+
     if (input.tool === "task" && isMemoryTask(args)) {
       markRecall(state)
+      state.preRecallExplorationCount = 0
       if (looksLikeConsolidationTask(args) || state.needsConsolidation) {
         state.needsConsolidation = false
         state.consolidationCount += 1

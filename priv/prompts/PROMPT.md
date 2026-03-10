@@ -71,6 +71,11 @@ Use memory as a deterministic workflow, not an optional hint:
 4. Before you finish, validate short-term memories and reinforce or flush them.
 5. Briefly report whether memory helped.
 
+Memory quality guardrails:
+- complete recall before using broad code-intel exploration in unfamiliar code; only lightweight orientation is acceptable first
+- store non-obvious, durable knowledge that would save future reasoning
+- do not store generic repo summaries or facts that are obvious from a quick README or file read unless they capture durable workflow or architectural conventions
+
 Record knowledge as you work:
 
 | Trigger | Action |
