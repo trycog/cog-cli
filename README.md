@@ -300,6 +300,7 @@ Under the hood, a local daemon communicates with debug adapters (DAP). The daemo
 ### Key capabilities
 
 - **Launch or attach** to processes with full breakpoint support (line, function, exception, conditional, data watchpoints)
+- **Text-first debug results** — most `cog_debug_*` tools now return readable summaries instead of JSON blobs embedded in MCP text output
 - **Step-over-inspect** — step repeatedly while evaluating expressions in a single call, reducing round trips
 - **Module launch mode** — debug by module name (e.g. `python -m pytest`) in addition to script path
 - **Synchronous or async** — `timeout_ms` controls whether the agent blocks for results or polls asynchronously

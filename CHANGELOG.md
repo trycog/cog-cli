@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-03-10
+
+### Changed
+
+- Most `cog_debug_*` MCP tools now return text-first summaries that agents can read directly instead of JSON embedded in MCP text responses
+- Cog-first OpenCode workflows now require memory recall before broad indexed or grep-based exploration, with stricter guidance around durable memory writes
+
+### Removed
+
+- `.opencode/` agent prompt files are no longer tracked in the repository; they remain generated and ignored local integration artifacts
+
+### Fixed
+
+- Debug MCP tool errors now surface as plain text instead of JSON objects wrapped inside text responses
+
 ## [0.12.0] - 2026-03-10
 
 ### Added
@@ -395,6 +410,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.0]: https://github.com/trycog/cog-cli/releases/tag/v0.2.0
 [0.1.0]: https://github.com/trycog/cog-cli/releases/tag/v0.1.0
 [0.0.1]: https://github.com/trycog/cog-cli/releases/tag/v0.0.1
+[1.0.0]: https://github.com/trycog/cog-cli/releases/tag/v1.0.0
 [0.12.0]: https://github.com/trycog/cog-cli/releases/tag/v0.12.0
 [0.11.0]: https://github.com/trycog/cog-cli/releases/tag/v0.11.0
 [0.10.2]: https://github.com/trycog/cog-cli/releases/tag/v0.10.2
