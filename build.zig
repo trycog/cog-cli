@@ -215,7 +215,11 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(b.path("grammars/yaml"));
     mod.addIncludePath(b.path("grammars/asciidoc"));
 
-    const c_flags = &[_][]const u8{ "-std=gnu11", "-fno-exceptions" };
+    // Disable Zig's UBSan for third-party C code: in ReleaseSafe Zig passes
+    // -fsanitize=undefined -fsanitize-trap=undefined to Clang, which causes
+    // trap instructions on technically-UB-but-works-in-practice C patterns
+    // common in tree-sitter's generated parsers.
+    const c_flags = &[_][]const u8{ "-std=gnu11", "-fno-exceptions", "-fno-sanitize=undefined" };
 
     // Tree-sitter core (unity build via lib.c)
     mod.addCSourceFile(.{

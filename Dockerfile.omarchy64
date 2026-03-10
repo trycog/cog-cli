@@ -1,46 +1,41 @@
-ARG TARGETPLATFORM=linux/amd64
 ARG ZIG_VERSION=0.15.2
-FROM archlinux:latest
+FROM debian:bookworm-slim
 
 ARG ZIG_VERSION
 ENV PATH="/opt/zig:${PATH}"
+ENV DEBIAN_FRONTEND=noninteractive
 
-# 1. Disable pacman sandbox (seccomp fails under x86 emulation on Apple Silicon)
-RUN sed -i 's/^DisableSandbox.*//' /etc/pacman.conf && \
-    echo 'DisableSandbox' >> /etc/pacman.conf
-
-# 2. Install all tools except Zig; use upstream Zig below
-RUN pacman -Syu --noconfirm && pacman -S --noconfirm \
+# 1. Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql \
     git \
     bash \
     curl \
-    xz \
-    base-devel \
-    linux-headers \
+    xz-utils \
+    build-essential \
+    ca-certificates \
     elixir \
-    && pacman -Scc --noconfirm
+    erlang-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# 2b. Install official Zig and remove distro Zig entirely
-RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
+# 2. Install official Zig (aarch64)
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz && \
     tar -xf /tmp/zig.tar.xz -C /opt && \
-    ln -sfn "/opt/zig-x86_64-linux-${ZIG_VERSION}" /opt/zig && \
-    rm -f /usr/bin/zig && \
-    ln -sfn /opt/zig/zig /usr/bin/zig && \
+    ln -sfn "/opt/zig-aarch64-linux-${ZIG_VERSION}" /opt/zig && \
     ln -sfn /opt/zig/zig /usr/local/bin/zig && \
     rm -f /tmp/zig.tar.xz
 
-# 2. Create swap file for memory-intensive builds
+# 3. Create swap file for memory-intensive builds
 RUN dd if=/dev/zero of=/swapfile bs=1M count=2048 && \
     chmod 600 /swapfile && mkswap /swapfile
 
-# 3. Create a wrapper script for the mounted cog binary
+# 4. Create a wrapper script for the mounted cog binary
 #    Mount the host's zig-out/bin directory to /opt/cog-bin at runtime:
 #      -v /path/to/cog-cli/zig-out/bin:/opt/cog-bin
 RUN printf '#!/bin/sh\nchmod +x /opt/cog-bin/cog 2>/dev/null\nexec /opt/cog-bin/cog "$@"\n' \
     > /usr/local/bin/cog && chmod +x /usr/local/bin/cog
 
-# 4. Embed the entrypoint script
+# 5. Embed the entrypoint script
 RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
 #!/bin/bash
 set -e
@@ -53,27 +48,24 @@ if [ ! -d "/var/lib/postgresql/data/pgdata" ]; then
     echo "First run: Initializing database..."
     mkdir -p /var/lib/postgresql/data/pgdata
     chown -R postgres:postgres /var/lib/postgresql/data
-    su - postgres -c "initdb -D /var/lib/postgresql/data/pgdata"
+    su - postgres -c "/usr/lib/postgresql/*/bin/initdb -D /var/lib/postgresql/data/pgdata"
 fi
 
 # Start Postgres in the background
 echo "Starting PostgreSQL..."
-su - postgres -c "pg_ctl start -D /var/lib/postgresql/data/pgdata -l /tmp/postgres.log"
+su - postgres -c "/usr/lib/postgresql/*/bin/pg_ctl start -D /var/lib/postgresql/data/pgdata -l /tmp/postgres.log"
 
 # Create the default DB
-su - postgres -c "psql -c 'CREATE DATABASE debug_db;'" || true
+su - postgres -c "/usr/lib/postgresql/*/bin/psql -c 'CREATE DATABASE debug_db;'" || true
 
 # Execute the user's command (Bash)
 exec "$@"
 EOF
 
-# 5. Disable Erlang JIT (BeamAsm fails under x86 emulation on Apple Silicon)
-ENV ERL_FLAGS="+JMsingle true"
-
 # 6. Create cog config directory
 RUN mkdir -p /root/.config/cog
 
-# 6. Final plumbing
+# 7. Final plumbing
 RUN chmod +x /usr/local/bin/entrypoint.sh
 RUN mkdir -p /run/postgresql && chown -R postgres:postgres /run/postgresql
 RUN git config --global --add safe.directory /src
