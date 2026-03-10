@@ -14,6 +14,7 @@ When the user says "release" (or similar), follow this procedure:
 ### 1. Determine the version
 
 - If the user specifies a version, use it.
+- Do not bump to `1.0.0` or any higher major version unless the user explicitly instructs you to make a `1.x` (or higher) release. When the project is still on `0.x`, default to the appropriate `0.x` bump even if the changes would normally look "major" under full SemVer.
 - Otherwise, analyze all commits since the last release tag (`git log <last-tag>..HEAD --oneline`) and apply [Semantic Versioning](https://semver.org/):
   - **patch** (0.0.x): bug fixes, build fixes, documentation, dependency updates
   - **minor** (0.x.0): new features, new commands, non-breaking enhancements
