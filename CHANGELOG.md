@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-03-10
+
+### Added
+
+- Bulk external indexer support via `{files}` argv expansion, letting language extensions process many files in one invocation
+- Structured external indexer progress events so `cog code:index` can advance file-by-file progress while bulk extension batches are still running
+
+### Changed
+
+- Extension indexing now groups files per indexer and invokes external SCIP tools in bulk instead of spawning one process per file
+- Extension author docs and CLI help now describe the bulk `{files}` contract and stderr progress event protocol
+
+### Fixed
+
+- Remove per-file parser recreation during indexing; tree-sitter parsers are designed to be reused across files via `ts_parser_set_language`, eliminating unnecessary allocation overhead on large projects
+
 ## [0.10.2] - 2026-03-10
 
 ### Fixed
@@ -368,6 +384,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.0]: https://github.com/trycog/cog-cli/releases/tag/v0.2.0
 [0.1.0]: https://github.com/trycog/cog-cli/releases/tag/v0.1.0
 [0.0.1]: https://github.com/trycog/cog-cli/releases/tag/v0.0.1
+[0.11.0]: https://github.com/trycog/cog-cli/releases/tag/v0.11.0
 [0.10.2]: https://github.com/trycog/cog-cli/releases/tag/v0.10.2
 [0.10.1]: https://github.com/trycog/cog-cli/releases/tag/v0.10.1
 [0.10.0]: https://github.com/trycog/cog-cli/releases/tag/v0.10.0
