@@ -71,6 +71,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "opencode_override_plugin", @embedFile("priv/plugins/opencode-cog-override.ts"));
     build_options.addOption([]const u8, "opencode_memory_plugin", @embedFile("priv/plugins/opencode-cog-memory.ts"));
     build_options.addOption([]const u8, "opencode_debug_plugin", @embedFile("priv/plugins/opencode-cog-debug.ts"));
+    build_options.addOption([]const u8, "claude_pretooluse_hook", @embedFile("priv/plugins/claude-cog-pretooluse.sh"));
+    build_options.addOption([]const u8, "gemini_before_tool_hook", @embedFile("priv/plugins/gemini-cog-before-tool.sh"));
+    build_options.addOption([]const u8, "amp_cog_plugin", @embedFile("priv/plugins/amp-cog.ts"));
     build_options.addOption([]const u8, "bootstrap_prompt", @embedFile("priv/prompts/bootstrap.md"));
     build_options.addOption([]const u8, "bootstrap_associate_prompt", @embedFile("priv/prompts/bootstrap_associate.md"));
     const build_options_mod = build_options.createModule();

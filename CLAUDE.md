@@ -15,11 +15,13 @@ When the user says "release" (or similar), follow this procedure:
 ### 1. Determine the version
 
 - If the user specifies a version, use it.
+- *MUST* read the current version from `build.zig.zon` first and treat that source-code version as the canonical baseline for the next release. Do not derive the baseline version from git tags, commit messages, or GitHub releases when they disagree with the source tree.
 - Do not bump to a new major version while the project is still on `0.x` unless the user explicitly instructs you to start a `1.x` (or higher) release. When the project is still on `0.x`, default to the appropriate `0.x` bump even if the changes would normally look "major" under full SemVer.
-- Otherwise, analyze all commits since the last release tag (`git log <last-tag>..HEAD --oneline`) and apply [Semantic Versioning](https://semver.org/):
+- Otherwise, analyze the unreleased commits since the last release commit/tag that matches the source-code version lineage and apply [Semantic Versioning](https://semver.org/):
   - **patch** (0.0.x): bug fixes, build fixes, documentation, dependency updates
   - **minor** (0.x.0): new features, new commands, non-breaking enhancements
   - **major** (x.0.0): breaking changes to CLI interface, config format, or public API
+- If tags or history suggest a higher version than `build.zig.zon`, treat that as drift to be corrected instead of as the next release baseline.
 
 ### 2. Update version string
 
@@ -140,7 +142,7 @@ Use memory as a deterministic workflow, not an optional hint:
 2. When you learn something new during the task, store it as short-term memory.
 3. When the user gives you new factual context or answers a question, store that as short-term memory when relevant.
 4. Before you finish, validate short-term memories and reinforce or flush them.
-5. If you used `cog_mem_*` tools during the task, briefly report whether memory helped. If you did not use memory tools, omit any memory note from the response.
+5. Mention Cog memory in the final response only if you directly used `cog_mem_*` tools or the `cog-mem` sub-agent during this task. Otherwise omit any memory note entirely.
 
 Memory quality guardrails:
 - complete recall before using broad code-intel exploration in unfamiliar code; only lightweight orientation is acceptable first

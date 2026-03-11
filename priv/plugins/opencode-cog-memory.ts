@@ -139,7 +139,7 @@ export default async () => ({
 
     if (state.usedMemory) {
       output.system.push(
-        "At the end of the task, briefly state whether Cog memory was helpful. If no cog_mem tools were used, omit any memory note.",
+        "At the end of the task, mention Cog memory only because this session directly used cog_mem tools. If no cog_mem tools or cog-mem subagent were used, omit any memory note entirely.",
       )
     }
   },

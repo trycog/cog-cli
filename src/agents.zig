@@ -357,6 +357,14 @@ pub const Agent = struct {
             return "Soft specialist tool scoping";
         }
 
+        if (std.mem.eql(u8, self.id, "claude_code")) {
+            return "Hard sub-agent allowlist + hooks";
+        }
+
+        if (std.mem.eql(u8, self.id, "gemini")) {
+            return "Medium hooks + sub-agent tool scoping";
+        }
+
         if (caps.code_query_enforcement == .config and
             caps.debug_enforcement == .config and
             caps.memory_enforcement == .config)
@@ -369,7 +377,7 @@ pub const Agent = struct {
             caps.memory_enforcement == .config)
         {
             if (std.mem.eql(u8, self.id, "amp")) {
-                return "Medium permission bootstrap + skills";
+                return "Medium permission bootstrap + skills + plugin";
             }
             return "Medium sub-agent tool scoping";
         }
@@ -985,13 +993,13 @@ test "support summaries stay capability-driven" {
     try std.testing.expectEqualStrings("Auto-allow", agents[0].toolPermissionsSummary());
     try std.testing.expectEqualStrings("", agents[2].toolPermissionsSummary());
 
-    try std.testing.expectEqualStrings("Hard sub-agent allowlist", agents[0].overrideSummary());
-    try std.testing.expectEqualStrings("Medium sub-agent tool scoping", agents[1].overrideSummary());
+    try std.testing.expectEqualStrings("Hard sub-agent allowlist + hooks", agents[0].overrideSummary());
+    try std.testing.expectEqualStrings("Medium hooks + sub-agent tool scoping", agents[1].overrideSummary());
     try std.testing.expectEqualStrings("Soft specialist tool scoping", agents[2].overrideSummary());
     try std.testing.expectEqualStrings("Soft workflow runbooks", agents[3].overrideSummary());
     try std.testing.expectEqualStrings("Soft prompt guidance + read-only specialists", agents[4].overrideSummary());
     try std.testing.expectEqualStrings("Soft shared-config specialist guidance", agents[5].overrideSummary());
-    try std.testing.expectEqualStrings("Medium permission bootstrap + skills", agents[6].overrideSummary());
+    try std.testing.expectEqualStrings("Medium permission bootstrap + skills + plugin", agents[6].overrideSummary());
     try std.testing.expectEqualStrings("Soft workflow runbooks", agents[7].overrideSummary());
     try std.testing.expectEqualStrings("Medium native mode groups", agents[8].overrideSummary());
     try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[9].overrideSummary());

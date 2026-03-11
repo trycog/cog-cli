@@ -370,7 +370,31 @@ const opencode_runtime_policy_assets = [_]RuntimePolicyAsset{
     .{ .path = ".opencode/plugin/cog-debug.ts", .content = opencode_debug_content },
 };
 
+const claude_runtime_policy_assets = [_]RuntimePolicyAsset{
+    .{ .path = ".claude/hooks/cog-pretooluse.sh", .content = claude_pretooluse_hook_content },
+};
+
+const gemini_runtime_policy_assets = [_]RuntimePolicyAsset{
+    .{ .path = ".gemini/hooks/cog-before-tool.sh", .content = gemini_before_tool_hook_content },
+};
+
+const amp_runtime_policy_assets = [_]RuntimePolicyAsset{
+    .{ .path = ".amp/plugins/cog.ts", .content = amp_cog_plugin_content },
+};
+
 pub fn runtimePolicyAssets(agent: agents_mod.Agent) []const RuntimePolicyAsset {
+    if (std.mem.eql(u8, agent.id, "claude_code")) {
+        return &claude_runtime_policy_assets;
+    }
+
+    if (std.mem.eql(u8, agent.id, "gemini")) {
+        return &gemini_runtime_policy_assets;
+    }
+
+    if (std.mem.eql(u8, agent.id, "amp")) {
+        return &amp_runtime_policy_assets;
+    }
+
     if (agent.capabilities().runtime_policy_plugins and std.mem.eql(u8, agent.id, "opencode")) {
         return &opencode_runtime_policy_assets;
     }
@@ -380,13 +404,22 @@ pub fn runtimePolicyAssets(agent: agents_mod.Agent) []const RuntimePolicyAsset {
 
 pub fn configureRuntimePolicyFile(agent: agents_mod.Agent, asset_path: []const u8) !void {
     debug_log.log("hooks.configureRuntimePolicyFile: agent={s} path={s}", .{ agent.id, asset_path });
-    if (!agent.capabilities().runtime_policy_plugins) return;
+    if (runtimePolicyAssets(agent).len == 0) return;
 
     for (runtimePolicyAssets(agent)) |asset| {
         if (std.mem.eql(u8, asset.path, asset_path)) {
             try writeRuntimePolicyAsset(asset.path, asset.content);
             return;
         }
+    }
+}
+
+pub fn configureRuntimePolicy(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
+    debug_log.log("hooks.configureRuntimePolicy: agent={s}", .{agent.id});
+    if (std.mem.eql(u8, agent.id, "claude_code")) {
+        try writeClaudeRuntimeHooks(allocator);
+    } else if (std.mem.eql(u8, agent.id, "gemini")) {
+        try writeGeminiRuntimeHooks(allocator, agent.mcp_path.?);
     }
 }
 
@@ -480,6 +513,129 @@ fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
     try writeCwdFile(path, new_content);
 }
 
+fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
+    debug_log.log("hooks.writeClaudeRuntimeHooks", .{});
+    const path = ".claude/settings.json";
+    try ensureDir(".claude/hooks");
+
+    const existing = readCwdFile(allocator, path);
+    defer if (existing) |e| allocator.free(e);
+
+    var parsed_holder: ?json.Parsed(json.Value) = null;
+    defer if (parsed_holder) |p| p.deinit();
+
+    var existing_hooks: ?json.Value = null;
+    if (existing) |content| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+            parsed_holder = parsed;
+            if (parsed.value == .object) {
+                existing_hooks = parsed.value.object.get("hooks");
+            }
+        } else |_| {}
+    }
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+
+    if (parsed_holder) |parsed| {
+        if (parsed.value == .object) {
+            var iter = parsed.value.object.iterator();
+            while (iter.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "hooks")) continue;
+                try s.objectField(entry.key_ptr.*);
+                try s.write(entry.value_ptr.*);
+            }
+        }
+    }
+
+    try s.objectField("hooks");
+    try s.beginObject();
+
+    var wrote_pretooluse = false;
+    if (existing_hooks) |hooks| {
+        if (hooks == .object) {
+            var iter = hooks.object.iterator();
+            while (iter.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "PreToolUse")) {
+                    wrote_pretooluse = true;
+                    try s.objectField("PreToolUse");
+                    try writeClaudePreToolUseHookArray(&s, entry.value_ptr.*);
+                } else {
+                    try s.objectField(entry.key_ptr.*);
+                    try s.write(entry.value_ptr.*);
+                }
+            }
+        }
+    }
+
+    if (!wrote_pretooluse) {
+        try s.objectField("PreToolUse");
+        try writeClaudePreToolUseHookArray(&s, null);
+    }
+
+    try s.endObject();
+    try s.endObject();
+
+    const new_content = try aw.toOwnedSlice();
+    defer allocator.free(new_content);
+    try writeCwdFile(path, new_content);
+}
+
+fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !void {
+    const command = "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-pretooluse.sh";
+    var already_has_group = false;
+
+    try s.beginArray();
+    if (existing_value) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                if (item == .object) {
+                    if (item.object.get("matcher")) |matcher| {
+                        if (matcher == .string and std.mem.eql(u8, matcher.string, "Grep|Glob|Bash")) {
+                            if (item.object.get("hooks")) |hooks| {
+                                if (hooks == .array) {
+                                    for (hooks.array.items) |hook| {
+                                        if (hook == .object) {
+                                            if (hook.object.get("command")) |existing_command| {
+                                                if (existing_command == .string and std.mem.eql(u8, existing_command.string, command)) {
+                                                    already_has_group = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                try s.write(item);
+            }
+        }
+    }
+
+    if (!already_has_group) {
+        try s.beginObject();
+        try s.objectField("matcher");
+        try s.write("Grep|Glob|Bash");
+        try s.objectField("hooks");
+        try s.beginArray();
+        try s.beginObject();
+        try s.objectField("type");
+        try s.write("command");
+        try s.objectField("command");
+        try s.write(command);
+        try s.objectField("timeout");
+        try s.write(30);
+        try s.endObject();
+        try s.endArray();
+        try s.endObject();
+    }
+
+    try s.endArray();
+}
+
 fn writeGeminiTrust(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
     debug_log.log("hooks.writeGeminiTrust: path={s}", .{mcp_path});
     const existing = readCwdFile(allocator, mcp_path) orelse return;
@@ -536,6 +692,115 @@ fn writeGeminiTrust(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
     const new_content = try aw.toOwnedSlice();
     defer allocator.free(new_content);
     try writeCwdFile(mcp_path, new_content);
+}
+
+fn writeGeminiRuntimeHooks(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
+    debug_log.log("hooks.writeGeminiRuntimeHooks: path={s}", .{mcp_path});
+    try ensureDir(".gemini/hooks");
+
+    const existing = readCwdFile(allocator, mcp_path) orelse return;
+    defer allocator.free(existing);
+
+    const parsed = json.parseFromSlice(json.Value, allocator, existing, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+
+    var wrote_before_tool = false;
+    var iter = parsed.value.object.iterator();
+    while (iter.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "hooks")) {
+            try s.objectField("hooks");
+            if (entry.value_ptr.* == .object) {
+                try s.beginObject();
+                var hooks_iter = entry.value_ptr.object.iterator();
+                while (hooks_iter.next()) |hook_entry| {
+                    if (std.mem.eql(u8, hook_entry.key_ptr.*, "BeforeTool")) {
+                        wrote_before_tool = true;
+                        try s.objectField("BeforeTool");
+                        try writeGeminiBeforeToolHookArray(&s, hook_entry.value_ptr.*);
+                    } else {
+                        try s.objectField(hook_entry.key_ptr.*);
+                        try s.write(hook_entry.value_ptr.*);
+                    }
+                }
+                if (!wrote_before_tool) {
+                    try s.objectField("BeforeTool");
+                    try writeGeminiBeforeToolHookArray(&s, null);
+                    wrote_before_tool = true;
+                }
+                try s.endObject();
+            } else {
+                try s.beginObject();
+                try s.objectField("BeforeTool");
+                try writeGeminiBeforeToolHookArray(&s, null);
+                wrote_before_tool = true;
+                try s.endObject();
+            }
+        } else {
+            try s.objectField(entry.key_ptr.*);
+            try s.write(entry.value_ptr.*);
+        }
+    }
+
+    if (!wrote_before_tool) {
+        try s.objectField("hooks");
+        try s.beginObject();
+        try s.objectField("BeforeTool");
+        try writeGeminiBeforeToolHookArray(&s, null);
+        try s.endObject();
+    }
+
+    try s.endObject();
+
+    const new_content = try aw.toOwnedSlice();
+    defer allocator.free(new_content);
+    try writeCwdFile(mcp_path, new_content);
+}
+
+fn writeGeminiBeforeToolHookArray(s: *Stringify, existing_value: ?json.Value) !void {
+    const hook_name = "cog-before-tool";
+    const command = "sh .gemini/hooks/cog-before-tool.sh";
+    var already_has_hook = false;
+
+    try s.beginArray();
+    if (existing_value) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                if (item == .object) {
+                    if (item.object.get("name")) |name| {
+                        if (name == .string and std.mem.eql(u8, name.string, hook_name)) {
+                            already_has_hook = true;
+                        }
+                    }
+                }
+                try s.write(item);
+            }
+        }
+    }
+
+    if (!already_has_hook) {
+        try s.beginObject();
+        try s.objectField("name");
+        try s.write(hook_name);
+        try s.objectField("type");
+        try s.write("command");
+        try s.objectField("command");
+        try s.write(command);
+        try s.objectField("matcher");
+        try s.write(".*");
+        try s.objectField("timeout");
+        try s.write(30);
+        try s.objectField("description");
+        try s.write("Prefer Cog code intelligence over raw file search when Cog MCP is configured");
+        try s.endObject();
+    }
+
+    try s.endArray();
 }
 
 fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
@@ -1072,6 +1337,9 @@ pub fn buildMarkdownAgentContent(allocator: std.mem.Allocator, header: []const u
 pub const opencode_override_content = build_options.opencode_override_plugin;
 pub const opencode_memory_content = build_options.opencode_memory_plugin;
 pub const opencode_debug_content = build_options.opencode_debug_plugin;
+pub const claude_pretooluse_hook_content = build_options.claude_pretooluse_hook;
+pub const gemini_before_tool_hook_content = build_options.gemini_before_tool_hook;
+pub const amp_cog_plugin_content = build_options.amp_cog_plugin;
 
 fn writeRuntimePolicyAsset(path: []const u8, content: []const u8) !void {
     debug_log.log("hooks.writeRuntimePolicyAsset: path={s}", .{path});
@@ -1544,11 +1812,68 @@ test "writeOpenCodeDebugPlugin creates debug workflow plugin" {
     }.run);
 }
 
+test "writeRuntimePolicyAsset creates Claude hook asset" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = allocator;
+            try writeRuntimePolicyAsset(".claude/hooks/cog-pretooluse.sh", claude_pretooluse_hook_content);
+
+            const content = readCwdFile(std.testing.allocator, ".claude/hooks/cog-pretooluse.sh") orelse return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(content);
+
+            try std.testing.expect(std.mem.indexOf(u8, content, "permissionDecision") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Use Cog code intelligence tools before raw file search") != null);
+        }
+    }.run);
+}
+
+test "writeRuntimePolicyAsset creates Gemini hook asset" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = allocator;
+            try writeRuntimePolicyAsset(".gemini/hooks/cog-before-tool.sh", gemini_before_tool_hook_content);
+
+            const content = readCwdFile(std.testing.allocator, ".gemini/hooks/cog-before-tool.sh") orelse return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(content);
+
+            try std.testing.expect(std.mem.indexOf(u8, content, "run_shell_command") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Cog policy") != null);
+        }
+    }.run);
+}
+
+test "writeRuntimePolicyAsset creates Amp plugin asset" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = allocator;
+            try writeRuntimePolicyAsset(".amp/plugins/cog.ts", amp_cog_plugin_content);
+
+            const content = readCwdFile(std.testing.allocator, ".amp/plugins/cog.ts") orelse return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(content);
+
+            try std.testing.expect(std.mem.indexOf(u8, content, "tool.call") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "hasCogWorkspaceConfig") != null);
+        }
+    }.run);
+}
+
 test "runtimePolicyAssets stay capability-driven" {
+    const claude_assets = runtimePolicyAssets(agents_mod.agents[0]);
+    try std.testing.expectEqual(@as(usize, 1), claude_assets.len);
+    try std.testing.expectEqualStrings(".claude/hooks/cog-pretooluse.sh", claude_assets[0].path);
+
+    const gemini_assets = runtimePolicyAssets(agents_mod.agents[1]);
+    try std.testing.expectEqual(@as(usize, 1), gemini_assets.len);
+    try std.testing.expectEqualStrings(".gemini/hooks/cog-before-tool.sh", gemini_assets[0].path);
+
+    const amp_assets = runtimePolicyAssets(agents_mod.agents[6]);
+    try std.testing.expectEqual(@as(usize, 1), amp_assets.len);
+    try std.testing.expectEqualStrings(".amp/plugins/cog.ts", amp_assets[0].path);
+
     const opencode_assets = runtimePolicyAssets(agents_mod.agents[9]);
     try std.testing.expectEqual(@as(usize, 3), opencode_assets.len);
     try std.testing.expectEqualStrings(".opencode/plugin/cog-override.ts", opencode_assets[0].path);
-    try std.testing.expectEqual(@as(usize, 0), runtimePolicyAssets(agents_mod.agents[0]).len);
+    try std.testing.expectEqual(@as(usize, 0), runtimePolicyAssets(agents_mod.agents[2]).len);
 }
 
 test "writeTomlMcp appends once and is idempotent" {
@@ -1650,6 +1975,50 @@ test "writeClaudePermissions is idempotent" {
     }.run);
 }
 
+test "writeClaudeRuntimeHooks adds pretooluse hook" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeClaudeRuntimeHooks(allocator);
+
+            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const hooks = parsed.value.object.get("hooks") orelse return error.TestUnexpectedResult;
+            const pretool = hooks.object.get("PreToolUse") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(pretool == .array);
+            try std.testing.expectEqual(@as(usize, 1), pretool.array.items.len);
+            try std.testing.expectEqualStrings("Grep|Glob|Bash", pretool.array.items[0].object.get("matcher").?.string);
+        }
+    }.run);
+}
+
+test "writeClaudeRuntimeHooks preserves existing hooks" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            std.fs.cwd().makeDir(".claude") catch {};
+            const existing =
+                \\{"hooks":{"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"echo keep"}]}]}}
+            ;
+            try writeCwdFile(".claude/settings.json", existing);
+
+            try writeClaudeRuntimeHooks(allocator);
+
+            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const hooks = parsed.value.object.get("hooks") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(hooks.object.get("PostToolUse") != null);
+            try std.testing.expect(hooks.object.get("PreToolUse") != null);
+        }
+    }.run);
+}
+
 test "writeGeminiTrust adds trust field to cog entry" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -1681,6 +2050,55 @@ test "writeGeminiTrust adds trust field to cog entry" {
 
             // Other server untouched
             try std.testing.expect(servers.object.get("other") != null);
+        }
+    }.run);
+}
+
+test "writeGeminiRuntimeHooks adds before tool hook" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            std.fs.cwd().makeDir(".gemini") catch {};
+            const existing =
+                \\{"mcpServers":{"cog":{"command":"cog","args":["mcp"]}}}
+            ;
+            try writeCwdFile(".gemini/settings.json", existing);
+
+            try writeGeminiRuntimeHooks(allocator, ".gemini/settings.json");
+
+            const content = readCwdFile(allocator, ".gemini/settings.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const hooks = parsed.value.object.get("hooks") orelse return error.TestUnexpectedResult;
+            const before = hooks.object.get("BeforeTool") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(before == .array);
+            try std.testing.expectEqualStrings("cog-before-tool", before.array.items[0].object.get("name").?.string);
+        }
+    }.run);
+}
+
+test "writeGeminiRuntimeHooks preserves existing hooks" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            std.fs.cwd().makeDir(".gemini") catch {};
+            const existing =
+                \\{"mcpServers":{"cog":{"command":"cog","args":["mcp"]}},"hooks":{"AfterTool":[{"name":"keep-me","type":"command","command":"echo keep"}]}}
+            ;
+            try writeCwdFile(".gemini/settings.json", existing);
+
+            try writeGeminiRuntimeHooks(allocator, ".gemini/settings.json");
+
+            const content = readCwdFile(allocator, ".gemini/settings.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const hooks = parsed.value.object.get("hooks") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(hooks.object.get("AfterTool") != null);
+            try std.testing.expect(hooks.object.get("BeforeTool") != null);
         }
     }.run);
 }

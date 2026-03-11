@@ -69,7 +69,7 @@ Use memory as a deterministic workflow, not an optional hint:
 2. When you learn something new during the task, store it as short-term memory.
 3. When the user gives you new factual context or answers a question, store that as short-term memory when relevant.
 4. Before you finish, validate short-term memories and reinforce or flush them.
-5. If you used `cog_mem_*` tools during the task, briefly report whether memory helped. If you did not use memory tools, omit any memory note from the response.
+5. Mention Cog memory in the final response only if you directly used `cog_mem_*` tools or the `cog-mem` sub-agent during this task. Otherwise omit any memory note entirely.
 
 Memory quality guardrails:
 - complete recall before using broad code-intel exploration in unfamiliar code; only lightweight orientation is acceptable first

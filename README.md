@@ -8,25 +8,15 @@
 
 **Memory, code intelligence, and debugging for AI agents.**
 
-[Install](#install) · [How It Works](#how-it-works) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Extensions](#extensions)
+[Benchmarks](#benchmarks) · [Install](#install) · [Setup](#setup) · [How It Works](#how-it-works) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Extensions](#extensions)
 
 </div>
 
 ---
 
-## Why Cog?
+## Benchmarks
 
-AI coding can feel fast but it's still limited by suboptimal methods and tooling. Your agent doesn't remember the architectural decisions from last week. It can't look up where a function is defined without grepping through your entire codebase. When something breaks it can't set a breakpoint, inspect a variable, or step through the code. It's stuck adding print statements and guessing.
-
-We built Cog to fix that. It's a single native binary that runs as an MCP server and gives your agent three capabilities it doesn't have on its own:
-
-1. **Persistent memory** that carries across sessions. Your agent learns your architecture, remembers past bugs, and builds knowledge that compounds over time. Memory can run locally (SQLite) or hosted on [trycog.ai](https://trycog.ai) for team sharing.
-2. **Structured code intelligence** that returns definitions, references, and symbols in one tool call instead of 15 rounds of grep and file reads.
-3. **An interactive debugger** your agent drives directly. Breakpoints, variable inspection, stepping through code. No more print statement debugging.
-
-### The numbers
-
-#### Memory (hosted)
+### Memory Recall Benchmark (hosted)
 
 We benchmarked Cog's hosted memory recall against Sonnet 4.5 doing active code exploration across 114 questions about a production codebase. The code exploration baseline used no prior model knowledge and answered every question through real-time file reads, grep, and glob. Cog answered from a knowledge graph built by an exhaustive bootstrap prompt before the benchmark started. These benchmarks use the hosted brain on [trycog.ai](https://trycog.ai).
 
@@ -41,7 +31,7 @@ We benchmarked Cog's hosted memory recall against Sonnet 4.5 doing active code e
 
 Cog answers nearly as many questions correctly while using 98.8% fewer tokens and finishing in less than half the time. The adequate answer rate is actually higher because memory recall surfaces connected context that code exploration misses.
 
-#### Code intelligence
+### Code Intelligence Benchmark
 
 We benchmarked Cog's code intelligence against standard agent tools (grep, glob, read) on the React codebase:
 
@@ -53,6 +43,18 @@ We benchmarked Cog's code intelligence against standard agent tools (grep, glob,
 | Find `Component` class | 14.3s, 5 calls, 7.4K tokens | 28.9s, 15 calls, 28.1K tokens | **2.0x faster** | **74%** |
 
 On average, **2.8x faster with 89% fewer tokens**.
+
+---
+
+## Why Cog?
+
+AI coding can feel fast but it's still limited by suboptimal methods and tooling. Your agent doesn't remember the architectural decisions from last week. It can't look up where a function is defined without grepping through your entire codebase. When something breaks it can't set a breakpoint, inspect a variable, or step through the code. It's stuck adding print statements and guessing.
+
+We built Cog to fix that. It's a single native binary that runs as an MCP server and gives your agent three capabilities it doesn't have on its own:
+
+1. **Persistent memory** that carries across sessions. Your agent learns your architecture, remembers past bugs, and builds knowledge that compounds over time. Memory can run locally (SQLite) or hosted on [trycog.ai](https://trycog.ai) for team sharing.
+2. **Structured code intelligence** that returns definitions, references, and symbols in one tool call instead of 15 rounds of grep and file reads.
+3. **An interactive debugger** your agent drives directly. Breakpoints, variable inspection, stepping through code. No more print statement debugging.
 
 ---
 
@@ -94,9 +96,9 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 
 | Agent | MCP Config | Sub-Agents | Tool Permissions | Cog-First Override |
 |-------|------------|:----------:|------------------|--------------------|
-| Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist |
-| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium sub-agent tool scoping |
-| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium permission bootstrap + skills |
+| Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist + hooks |
+| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium hooks + sub-agent tool scoping |
+| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium permission bootstrap + skills + plugin |
 | Cursor | `.cursor/mcp.json` | Yes | | Soft prompt guidance + read-only specialists |
 | OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions |
 | GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft specialist tool scoping |
@@ -105,7 +107,14 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 | Windsurf | Global config | Yes | | Soft workflow runbooks |
 | Goose | Global config | Yes | | Soft workflow runbooks |
 
-`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code can hard-scope the code-query sub-agent, Gemini/Amp/OpenCode can partially constrain tool use, Roo can now scope native mode groups, and Codex/Cursor use stronger specialist guidance where hard repo-local denies are not available.
+`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code now combines hard-scoped subagents with project hooks, Gemini adds repo-local hook enforcement on top of sub-agent tool scoping, Amp ships an experimental workspace plugin alongside permissions and skills, Roo can scope native mode groups, and Codex/Cursor use stronger specialist guidance where hard repo-local denies are not available.
+
+For hosts with runtime support, `cog init` also installs repo-local enforcement assets:
+
+- Claude Code: `.claude/hooks/cog-pretooluse.sh`
+- Gemini CLI: `.gemini/hooks/cog-before-tool.sh`
+- Amp: `.amp/plugins/cog.ts` (experimental)
+- OpenCode: `.opencode/plugin/*`
 
 ---
 
@@ -307,10 +316,6 @@ CLI commands for managing files with automatic index updates:
 | `cog code:create` | Create new files and add to index |
 | `cog code:delete` | Delete files and remove from index |
 | `cog code:rename` | Rename files and update index |
-
-### Built-in language support
-
-The matrix above covers all current built-in and repo-supported extension languages for code intelligence.
 
 ---
 

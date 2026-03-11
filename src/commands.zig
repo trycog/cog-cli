@@ -434,6 +434,8 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
         }
 
+        hooks_mod.configureRuntimePolicy(allocator, agent) catch {};
+
         // d. Deploy agent file (dedup by path)
         if (agent.agent_file_path) |agent_path| {
             var agent_already_written = false;
