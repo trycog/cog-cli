@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-03-11
+
+### Added
+
+- Repo-local Cog runtime enforcement assets for Claude Code, Gemini CLI, and Amp so supported hosts can activate Cog-first behavior only when the Cog MCP server is configured
+
+### Changed
+
+- The supported-agent setup docs now describe the stronger runtime enforcement model, including hook and plugin assets written by `cog init`
+- The README now leads with benchmark results and uses corrected top-level section links for Benchmarks, Setup, Memory, Code Intelligence, and Debug
+- Final response guidance now mentions Cog memory only when `cog_mem_*` tools or the `cog-mem` sub-agent were actually used during the task
+
 ## [0.14.0] - 2026-03-11
 
 ### Added
@@ -408,6 +420,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.15.0]: https://github.com/trycog/cog-cli/releases/tag/v0.15.0
 [0.14.0]: https://github.com/trycog/cog-cli/releases/tag/v0.14.0
 [0.8.2]: https://github.com/trycog/cog-cli/releases/tag/v0.8.2
 [0.8.1]: https://github.com/trycog/cog-cli/releases/tag/v0.8.1
