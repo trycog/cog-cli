@@ -34,6 +34,124 @@ pub const OverrideEnforcementLevel = enum {
     soft,
 };
 
+pub const SubAgentSupport = enum {
+    dedicated_files,
+    shared_config,
+    workflow_files,
+};
+
+pub const CapabilityLevel = enum {
+    none,
+    prompt_only,
+    config,
+    runtime,
+};
+
+pub const AgentCapabilities = struct {
+    repo_local_mcp: bool,
+    auto_tool_permissions: bool,
+    runtime_policy_plugins: bool,
+    dedicated_subagent_files: bool,
+    subagent_support: SubAgentSupport,
+    code_query_enforcement: CapabilityLevel,
+    debug_enforcement: CapabilityLevel,
+    memory_enforcement: CapabilityLevel,
+};
+
+const gemini_code_query_tools =
+    \\tools:
+    \\  - cog__code_explore
+    \\  - cog__code_query
+    \\  - read_file
+;
+
+const gemini_debug_tools =
+    \\tools:
+    \\  - cog__debug_launch
+    \\  - cog__debug_breakpoint
+    \\  - cog__debug_run
+    \\  - cog__debug_inspect
+    \\  - cog__debug_stacktrace
+    \\  - cog__debug_stop
+    \\  - cog__debug_sessions
+    \\  - cog__debug_scopes
+    \\  - cog__code_query
+    \\  - cog__code_explore
+    \\  - cog__mem_recall
+    \\  - cog__mem_bulk_recall
+    \\  - read_file
+    \\  - run_shell_command
+;
+
+const gemini_memory_tools =
+    \\tools:
+    \\  - cog__mem_recall
+    \\  - cog__mem_bulk_recall
+    \\  - cog__mem_trace
+    \\  - cog__mem_connections
+    \\  - cog__mem_get
+    \\  - cog__mem_list_short_term
+    \\  - cog__mem_reinforce
+    \\  - cog__mem_flush
+    \\  - cog__mem_stale
+    \\  - cog__mem_verify
+    \\  - cog__mem_stats
+    \\  - cog__mem_orphans
+    \\  - cog__mem_connectivity
+    \\  - cog__mem_list_terms
+    \\  - cog__mem_unlink
+    \\  - cog__mem_meld
+    \\  - cog__mem_bulk_learn
+    \\  - cog__mem_bulk_associate
+;
+
+const copilot_code_query_tools =
+    \\tools:
+    \\  - cog/code_explore
+    \\  - cog/code_query
+    \\  - read
+;
+
+const copilot_debug_tools =
+    \\tools:
+    \\  - cog/debug_launch
+    \\  - cog/debug_breakpoint
+    \\  - cog/debug_run
+    \\  - cog/debug_inspect
+    \\  - cog/debug_stacktrace
+    \\  - cog/debug_stop
+    \\  - cog/debug_sessions
+    \\  - cog/debug_scopes
+    \\  - cog/code_explore
+    \\  - cog/code_query
+    \\  - cog/mem_recall
+    \\  - cog/mem_bulk_recall
+    \\  - read
+    \\  - execute
+;
+
+const copilot_memory_tools =
+    \\tools:
+    \\  - cog/mem_recall
+    \\  - cog/mem_bulk_recall
+    \\  - cog/mem_trace
+    \\  - cog/mem_connections
+    \\  - cog/mem_get
+    \\  - cog/mem_list_short_term
+    \\  - cog/mem_reinforce
+    \\  - cog/mem_flush
+    \\  - cog/mem_stale
+    \\  - cog/mem_verify
+    \\  - cog/mem_stats
+    \\  - cog/mem_orphans
+    \\  - cog/mem_connectivity
+    \\  - cog/mem_list_terms
+    \\  - cog/mem_unlink
+    \\  - cog/mem_meld
+    \\  - cog/mem_bulk_learn
+    \\  - cog/mem_bulk_associate
+;
+
 pub const Agent = struct {
     id: []const u8,
     display_name: []const u8,
@@ -47,19 +165,226 @@ pub const Agent = struct {
     mem_file_path: ?[]const u8,
     mem_file_header: ?[]const u8,
 
+    pub fn capabilities(self: *const Agent) AgentCapabilities {
+        if (std.mem.eql(u8, self.id, "claude_code")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = true,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .config,
+                .debug_enforcement = .config,
+                .memory_enforcement = .config,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "gemini")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = true,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .config,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "copilot")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .prompt_only,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "windsurf")) {
+            return .{
+                .repo_local_mcp = false,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .workflow_files,
+                .code_query_enforcement = .prompt_only,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "cursor")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .prompt_only,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "codex")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = false,
+                .subagent_support = .shared_config,
+                .code_query_enforcement = .prompt_only,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "amp")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = true,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .config,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "goose")) {
+            return .{
+                .repo_local_mcp = false,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = true,
+                .subagent_support = .workflow_files,
+                .code_query_enforcement = .prompt_only,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "roo")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = false,
+                .dedicated_subagent_files = false,
+                .subagent_support = .shared_config,
+                .code_query_enforcement = .prompt_only,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .prompt_only,
+            };
+        }
+
+        if (std.mem.eql(u8, self.id, "opencode")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = true,
+                .runtime_policy_plugins = true,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .runtime,
+                .debug_enforcement = .runtime,
+                .memory_enforcement = .runtime,
+            };
+        }
+
+        unreachable;
+    }
+
     pub fn supportsToolPermissions(self: *const Agent) bool {
-        return std.mem.eql(u8, self.id, "claude_code") or
-            std.mem.eql(u8, self.id, "gemini") or
-            std.mem.eql(u8, self.id, "amp") or
-            std.mem.eql(u8, self.id, "opencode");
+        return self.capabilities().auto_tool_permissions;
     }
 
     pub fn overrideEnforcementLevel(self: *const Agent) OverrideEnforcementLevel {
-        if (std.mem.eql(u8, self.id, "claude_code")) return .hard;
-        if (std.mem.eql(u8, self.id, "gemini") or
-            std.mem.eql(u8, self.id, "amp") or
-            std.mem.eql(u8, self.id, "opencode")) return .medium;
+        const caps = self.capabilities();
+        if (caps.runtime_policy_plugins) return .medium;
+        if (caps.code_query_enforcement == .config and
+            caps.debug_enforcement == .config and
+            caps.memory_enforcement == .config) return .hard;
+        if (caps.code_query_enforcement == .config or
+            caps.debug_enforcement == .config or
+            caps.memory_enforcement == .config) return .medium;
         return .soft;
+    }
+
+    pub fn toolPermissionsSummary(self: *const Agent) []const u8 {
+        return if (self.capabilities().auto_tool_permissions) "Auto-allow" else "";
+    }
+
+    pub fn mcpConfigSummary(self: *const Agent) []const u8 {
+        return switch (self.mcp_format) {
+            .global_only => "Global config",
+            else => self.mcp_path orelse "",
+        };
+    }
+
+    pub fn subAgentsSummary(self: *const Agent) []const u8 {
+        return if (self.agent_file_path != null and self.debug_file_path != null and self.mem_file_path != null) "Yes" else "";
+    }
+
+    pub fn overrideSummary(self: *const Agent) []const u8 {
+        const caps = self.capabilities();
+
+        if (caps.runtime_policy_plugins) {
+            return "Medium runtime plugins + sub-agent permissions";
+        }
+
+        if (caps.subagent_support == .workflow_files) {
+            return "Soft workflow runbooks";
+        }
+
+        if (std.mem.eql(u8, self.id, "roo")) {
+            return "Medium native mode groups";
+        }
+
+        if (std.mem.eql(u8, self.id, "codex")) {
+            return "Soft shared-config specialist guidance";
+        }
+
+        if (std.mem.eql(u8, self.id, "cursor")) {
+            return "Soft prompt guidance + read-only specialists";
+        }
+
+        if (std.mem.eql(u8, self.id, "copilot")) {
+            return "Soft specialist tool scoping";
+        }
+
+        if (caps.code_query_enforcement == .config and
+            caps.debug_enforcement == .config and
+            caps.memory_enforcement == .config)
+        {
+            return "Hard sub-agent allowlist";
+        }
+
+        if (caps.code_query_enforcement == .config or
+            caps.debug_enforcement == .config or
+            caps.memory_enforcement == .config)
+        {
+            if (std.mem.eql(u8, self.id, "amp")) {
+                return "Medium permission bootstrap + skills";
+            }
+            return "Medium sub-agent tool scoping";
+        }
+
+        return "Soft prompt guidance";
+    }
+
+    pub fn supportMatrixRow(self: *const Agent, allocator: std.mem.Allocator) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "| {s} | `{s}` | {s} | {s} | {s} |", .{
+            self.display_name,
+            self.mcpConfigSummary(),
+            self.subAgentsSummary(),
+            self.toolPermissionsSummary(),
+            self.overrideSummary(),
+        });
     }
 };
 
@@ -157,41 +482,30 @@ pub const agents = [_]Agent{
         .mcp_path = ".gemini/settings.json",
         .mcp_format = .json_mcpServers,
         .agent_file_path = ".gemini/agents/cog-code-query.md",
-        .agent_file_header =
+        .agent_file_header = 
         \\---
         \\name: cog-code-query
         \\description: Explore code structure using the Cog SCIP index
-        \\tools:
-        \\  - read_file
+    ++ gemini_code_query_tools ++
         \\---
         \\
         ,
-        .debug_file_path = ".gemini/agents/cog-debug.md",
-        .debug_file_header =
+    .debug_file_path = ".gemini/agents/cog-debug.md",
+        .debug_file_header = 
         \\---
         \\name: cog-debug
         \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\tools:
-        \\  - cog__debug_launch
-        \\  - cog__debug_breakpoint
-        \\  - cog__debug_run
-        \\  - cog__debug_inspect
-        \\  - cog__debug_stacktrace
-        \\  - cog__debug_stop
-        \\  - cog__code_query
-        \\  - cog__code_explore
-        \\  - cog__mem_recall
-        \\  - read_file
-        \\  - run_shell_command
+    ++ gemini_debug_tools ++
         \\max_turns: 15
         \\---
         \\
         ,
-        .mem_file_path = ".gemini/agents/cog-mem.md",
-        .mem_file_header =
+    .mem_file_path = ".gemini/agents/cog-mem.md",
+        .mem_file_header = 
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
+    ++ gemini_memory_tools ++
         \\---
         \\
         ,
@@ -204,36 +518,30 @@ pub const agents = [_]Agent{
         .mcp_path = ".vscode/mcp.json",
         .mcp_format = .json_servers,
         .agent_file_path = ".github/agents/cog-code-query.agent.md",
-        .agent_file_header =
+        .agent_file_header = 
         \\---
         \\name: cog-code-query
         \\description: Explore code structure using the Cog SCIP index
-        \\tools:
-        \\  - cog/*
-        \\  - read
+    ++ copilot_code_query_tools ++
         \\---
         \\
         ,
-        .debug_file_path = ".github/agents/cog-debug.agent.md",
-        .debug_file_header =
+    .debug_file_path = ".github/agents/cog-debug.agent.md",
+        .debug_file_header = 
         \\---
         \\name: cog-debug
         \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\tools:
-        \\  - cog/*
-        \\  - read
-        \\  - execute
+    ++ copilot_debug_tools ++
         \\user-invokable: false
         \\---
         \\
         ,
-        .mem_file_path = ".github/agents/cog-mem.agent.md",
-        .mem_file_header =
+    .mem_file_path = ".github/agents/cog-mem.agent.md",
+        .mem_file_header = 
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
-        \\tools:
-        \\  - cog/*
+    ++ copilot_memory_tools ++
         \\user-invokable: false
         \\---
         \\
@@ -289,6 +597,7 @@ pub const agents = [_]Agent{
         \\---
         \\name: cog-debug
         \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\readonly: true
         \\---
         \\
         ,
@@ -297,6 +606,7 @@ pub const agents = [_]Agent{
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\readonly: true
         \\---
         \\
         ,
@@ -322,14 +632,15 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = ".amp/settings.json",
         .mcp_format = .json_amp,
-        .agent_file_path = ".agents/skills/cog-code-query.md",
+        .agent_file_path = ".agents/skills/cog-code-query/SKILL.md",
         .agent_file_header =
         \\---
+        \\name: cog-code-query
         \\description: Explore code structure using the Cog SCIP index
         \\---
         \\
         ,
-        .debug_file_path = ".agents/skills/cog-debug.md",
+        .debug_file_path = ".agents/skills/cog-debug/SKILL.md",
         .debug_file_header =
         \\---
         \\name: cog-debug
@@ -337,7 +648,7 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
-        .mem_file_path = ".agents/skills/cog-mem.md",
+        .mem_file_path = ".agents/skills/cog-mem/SKILL.md",
         .mem_file_header =
         \\---
         \\name: cog-mem
@@ -515,17 +826,79 @@ test "overrideEnforcementLevel" {
     try std.testing.expect(agents[8].overrideEnforcementLevel() == .soft);
 }
 
+test "capability model matches mcp strategy" {
+    for (agents) |agent| {
+        const caps = agent.capabilities();
+        try std.testing.expectEqual(agent.mcp_path != null, caps.repo_local_mcp);
+    }
+}
+
+test "capability model keeps subagent topology explicit" {
+    try std.testing.expect(agents[3].capabilities().subagent_support == .workflow_files); // windsurf
+    try std.testing.expect(agents[5].capabilities().subagent_support == .shared_config); // codex
+    try std.testing.expect(agents[8].capabilities().subagent_support == .shared_config); // roo
+    try std.testing.expect(agents[9].capabilities().subagent_support == .dedicated_files); // opencode
+    try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[6].agent_file_path.?); // amp
+    try std.testing.expectEqualStrings(".agents/skills/cog-debug/SKILL.md", agents[6].debug_file_path.?); // amp
+    try std.testing.expectEqualStrings(".agents/skills/cog-mem/SKILL.md", agents[6].mem_file_path.?); // amp
+
+    for (agents) |agent| {
+        const caps = agent.capabilities();
+        if (caps.subagent_support == .dedicated_files or caps.subagent_support == .workflow_files) {
+            try std.testing.expect(caps.dedicated_subagent_files);
+        } else {
+            try std.testing.expect(!caps.dedicated_subagent_files);
+        }
+    }
+}
+
+test "runtime policy plugins stay opencode-only" {
+    var runtime_plugin_agents: usize = 0;
+    for (agents) |agent| {
+        if (agent.capabilities().runtime_policy_plugins) {
+            runtime_plugin_agents += 1;
+            try std.testing.expectEqualStrings("opencode", agent.id);
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), runtime_plugin_agents);
+}
+
+test "tool permission support stays capability-driven" {
+    for (agents) |agent| {
+        try std.testing.expectEqual(agent.capabilities().auto_tool_permissions, agent.supportsToolPermissions());
+    }
+}
+
+test "enforcement level stays capability-driven" {
+    try std.testing.expect(agents[0].capabilities().code_query_enforcement == .config);
+    try std.testing.expect(agents[0].capabilities().debug_enforcement == .config);
+    try std.testing.expect(agents[0].capabilities().memory_enforcement == .config);
+
+    try std.testing.expect(agents[9].capabilities().code_query_enforcement == .runtime);
+    try std.testing.expect(agents[9].capabilities().debug_enforcement == .runtime);
+    try std.testing.expect(agents[9].capabilities().memory_enforcement == .runtime);
+
+    try std.testing.expect(agents[2].capabilities().code_query_enforcement == .prompt_only);
+    try std.testing.expect(agents[2].capabilities().debug_enforcement == .prompt_only);
+    try std.testing.expect(agents[2].capabilities().memory_enforcement == .prompt_only);
+}
+
 test "code-query headers prefer cog-first exploration" {
     const claude_header = agents[0].agent_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, claude_header, "Glob") == null);
     try std.testing.expect(std.mem.indexOf(u8, claude_header, "Grep") == null);
 
     const gemini_header = agents[1].agent_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, gemini_header, "cog__code_explore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_header, "cog__code_query") != null);
     try std.testing.expect(std.mem.indexOf(u8, gemini_header, "glob") == null);
     try std.testing.expect(std.mem.indexOf(u8, gemini_header, "search_file_content") == null);
 
     const copilot_header = agents[2].agent_file_header orelse unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/*") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/code_explore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/code_query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/*") == null);
 
     const opencode_header = agents[9].agent_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, opencode_header, "glob: deny") != null);
@@ -547,6 +920,49 @@ test "opencode debug header stays debugger-focused" {
     try std.testing.expect(std.mem.indexOf(u8, opencode_debug_header, "cog_*: allow") != null);
 }
 
+test "cursor specialist headers stay read-only" {
+    const cursor_debug_header = agents[4].debug_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, cursor_debug_header, "readonly: true") != null);
+
+    const cursor_mem_header = agents[4].mem_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, cursor_mem_header, "readonly: true") != null);
+}
+
+test "gemini specialist headers stay capability-aligned" {
+    try std.testing.expect(std.mem.eql(u8, gemini_code_query_tools,
+        \\tools:
+        \\  - cog__code_explore
+        \\  - cog__code_query
+        \\  - read_file
+    ));
+
+    const gemini_debug_header = agents[1].debug_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, gemini_debug_header, "cog__debug_sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_debug_header, "cog__mem_bulk_recall") != null);
+
+    const gemini_mem_header = agents[1].mem_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_bulk_associate") != null);
+}
+
+test "copilot specialist headers stay capability-aligned" {
+    try std.testing.expect(std.mem.eql(u8, copilot_code_query_tools,
+        \\tools:
+        \\  - cog/code_explore
+        \\  - cog/code_query
+        \\  - read
+    ));
+
+    const copilot_debug_header = agents[2].debug_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/debug_sessions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/mem_bulk_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/*") == null);
+
+    const copilot_mem_header = agents[2].mem_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_bulk_associate") != null);
+}
+
 test "mcp strategy coverage stays explicit" {
     var local_count: usize = 0;
     var global_only_count: usize = 0;
@@ -563,6 +979,42 @@ test "mcp strategy coverage stays explicit" {
 
     try std.testing.expectEqual(@as(usize, 8), local_count);
     try std.testing.expectEqual(@as(usize, 2), global_only_count);
+}
+
+test "support summaries stay capability-driven" {
+    try std.testing.expectEqualStrings("Auto-allow", agents[0].toolPermissionsSummary());
+    try std.testing.expectEqualStrings("", agents[2].toolPermissionsSummary());
+
+    try std.testing.expectEqualStrings("Hard sub-agent allowlist", agents[0].overrideSummary());
+    try std.testing.expectEqualStrings("Medium sub-agent tool scoping", agents[1].overrideSummary());
+    try std.testing.expectEqualStrings("Soft specialist tool scoping", agents[2].overrideSummary());
+    try std.testing.expectEqualStrings("Soft workflow runbooks", agents[3].overrideSummary());
+    try std.testing.expectEqualStrings("Soft prompt guidance + read-only specialists", agents[4].overrideSummary());
+    try std.testing.expectEqualStrings("Soft shared-config specialist guidance", agents[5].overrideSummary());
+    try std.testing.expectEqualStrings("Medium permission bootstrap + skills", agents[6].overrideSummary());
+    try std.testing.expectEqualStrings("Soft workflow runbooks", agents[7].overrideSummary());
+    try std.testing.expectEqualStrings("Medium native mode groups", agents[8].overrideSummary());
+    try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[9].overrideSummary());
+}
+
+test "support matrix helpers stay aligned" {
+    try std.testing.expectEqualStrings(".mcp.json", agents[0].mcpConfigSummary());
+    try std.testing.expectEqualStrings("Global config", agents[3].mcpConfigSummary());
+    try std.testing.expectEqualStrings("Yes", agents[9].subAgentsSummary());
+
+    const opencode_row = try agents[9].supportMatrixRow(std.testing.allocator);
+    defer std.testing.allocator.free(opencode_row);
+    try std.testing.expectEqualStrings(
+        "| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions |",
+        opencode_row,
+    );
+
+    const goose_row = try agents[7].supportMatrixRow(std.testing.allocator);
+    defer std.testing.allocator.free(goose_row);
+    try std.testing.expectEqualStrings(
+        "| Goose | `Global config` | Yes |  | Soft workflow runbooks |",
+        goose_row,
+    );
 }
 
 test "all agents have debug_file_path" {

@@ -6,6 +6,7 @@
 - All tests must pass, do not ignore failing tests that you believe are unreleated to your work. Only fix those failing tests after you've completed and validated your work. The last step of any job you do should be to ensure all tests pass.
 - *NEVER* attempt to launch the Zig documentation, it is a web app that you cannot access. Instead you *MUST* search the documentation on the ziglang website
 - All new features must include `debug_log.log()` calls at key decision points and IO boundaries (network calls, file operations, subprocess spawns, config resolution). These are no-ops when `--debug` is not active.
+- When improving Cog support for any one agent integration, proactively review all other supported agents and implement the same or the closest equivalent improvement everywhere their host capabilities allow. If an improvement cannot be replicated, document the host limitation and keep the support matrix aligned.
 
 ## Release Process
 

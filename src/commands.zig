@@ -418,19 +418,18 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             printErr(" tool permissions\n");
         }
 
-        if (std.mem.eql(u8, agent.id, "opencode")) {
-            const override_path = ".opencode/plugin/cog-override.ts";
-            if (shouldWriteFile(allocator, override_path, hooks_mod.opencode_override_content, &accept_all)) {
-                hooks_mod.configureOverridePlugin(agent) catch {};
+        for (hooks_mod.runtimePolicyAssets(agent)) |asset| {
+            if (shouldWriteFile(allocator, asset.path, asset.content, &accept_all)) {
+                hooks_mod.configureRuntimePolicyFile(agent, asset.path) catch {};
                 printErr("    ");
                 tui.checkmark();
                 printErr(" ");
-                printErr(override_path);
+                printErr(asset.path);
                 printErr("\n");
             } else {
                 printErr("    ");
                 printErr(dim ++ "  skipped " ++ reset);
-                printErr(override_path);
+                printErr(asset.path);
                 printErr("\n");
             }
         }

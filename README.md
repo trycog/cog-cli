@@ -95,17 +95,17 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 | Agent | MCP Config | Sub-Agents | Tool Permissions | Cog-First Override |
 |-------|------------|:----------:|------------------|--------------------|
 | Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist |
-| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium prompt + sub-agent scoping |
-| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium prompt + permission bootstrap |
-| Cursor | `.cursor/mcp.json` | Yes | | Soft prompt guidance |
-| OpenCode | `opencode.json` | Yes | Auto-allow | Medium prompt + sub-agent permissions |
-| GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft prompt guidance |
-| OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft prompt guidance |
-| Roo Code | `.roo/mcp.json` | Yes | | Soft prompt guidance |
-| Windsurf | Global config | Yes | | Soft prompt guidance |
-| Goose | Global config | Yes | | Soft prompt guidance |
+| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium sub-agent tool scoping |
+| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium permission bootstrap + skills |
+| Cursor | `.cursor/mcp.json` | Yes | | Soft prompt guidance + read-only specialists |
+| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions |
+| GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft specialist tool scoping |
+| OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft shared-config specialist guidance |
+| Roo Code | `.roo/mcp.json` | Yes | | Medium native mode groups |
+| Windsurf | Global config | Yes | | Soft workflow runbooks |
+| Goose | Global config | Yes | | Soft workflow runbooks |
 
-`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code can hard-scope the code-query sub-agent, Gemini/Amp/OpenCode can partially constrain tool use, and the remaining integrations rely on prompt-level steering because their current config surfaces do not support repo-local hard denies.
+`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code can hard-scope the code-query sub-agent, Gemini/Amp/OpenCode can partially constrain tool use, Roo can now scope native mode groups, and Codex/Cursor use stronger specialist guidance where hard repo-local denies are not available.
 
 ---
 
