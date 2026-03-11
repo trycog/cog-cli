@@ -330,6 +330,11 @@ fn addRelease(
     release_options.addOption([]const u8, "debug_agent_body", @embedFile("priv/agents/cog-debug.md"));
     release_options.addOption([]const u8, "mem_agent_body", @embedFile("priv/agents/cog-mem.md"));
     release_options.addOption([]const u8, "opencode_override_plugin", @embedFile("priv/plugins/opencode-cog-override.ts"));
+    release_options.addOption([]const u8, "opencode_memory_plugin", @embedFile("priv/plugins/opencode-cog-memory.ts"));
+    release_options.addOption([]const u8, "opencode_debug_plugin", @embedFile("priv/plugins/opencode-cog-debug.ts"));
+    release_options.addOption([]const u8, "claude_pretooluse_hook", @embedFile("priv/plugins/claude-cog-pretooluse.sh"));
+    release_options.addOption([]const u8, "gemini_before_tool_hook", @embedFile("priv/plugins/gemini-cog-before-tool.sh"));
+    release_options.addOption([]const u8, "amp_cog_plugin", @embedFile("priv/plugins/amp-cog.ts"));
     release_options.addOption([]const u8, "bootstrap_prompt", @embedFile("priv/prompts/bootstrap.md"));
     release_options.addOption([]const u8, "bootstrap_associate_prompt", @embedFile("priv/prompts/bootstrap_associate.md"));
     const release_options_mod = release_options.createModule();
