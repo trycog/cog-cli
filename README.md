@@ -243,6 +243,33 @@ SCIP-based code indexing powered by tree-sitter. Instead of your agent grepping 
 
 This runs entirely locally. No account required.
 
+### Language support
+
+| Language | Delivery | Notes |
+|----------|----------|-------|
+| Go | Built-in | Tree-sitter indexing in Cog; optional built-in SCIP/dlv integration when installed |
+| JavaScript | Built-in | Includes `.js`, `.jsx`, `.mjs`, `.cjs` |
+| TypeScript | Built-in | Includes `.ts`, `.mts` |
+| TSX | Built-in | JSX/TSX support |
+| Python | Built-in | Includes `.py`, `.pyi` |
+| Java | Built-in | Tree-sitter indexing plus optional SCIP indexing when installed |
+| Rust | Built-in | Tree-sitter indexing plus optional `rust-analyzer scip` when installed |
+| C | Built-in | Includes `.c`, `.h` |
+| C++ | Built-in | Includes `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` |
+| Markdown | Built-in | Includes `.md`, `.markdown` |
+| MDX | Built-in | `.mdx` |
+| YAML | Built-in | Includes `.yaml`, `.yml` |
+| TOML | Built-in | `.toml` |
+| JSON | Built-in | `.json` |
+| JSONC | Built-in | `.jsonc` via the built-in JSON grammar |
+| reStructuredText | Built-in | `.rst` |
+| AsciiDoc | Built-in | Includes `.adoc`, `.asciidoc` |
+| Zig | External extension | Supported via [`cog-zig`](https://github.com/trycog/cog-zig) |
+| Ruby | External extension | Supported via [`cog-ruby`](https://github.com/trycog/cog-ruby) |
+| Elixir | External extension | Supported via [`cog-elixir`](https://github.com/trycog/cog-elixir) |
+
+Built-in coverage comes from the bundled grammars and extension definitions in `src/extensions.zig`. Additional repo-supported languages are available through installable extensions in the [Extensions](#extensions) section.
+
 ### Tools
 
 | Tool | Description |
@@ -283,11 +310,7 @@ CLI commands for managing files with automatic index updates:
 
 ### Built-in language support
 
-- Source code: Go, TypeScript, TSX, JavaScript, Python, Java, Rust, C, C++
-- Docs/content: Markdown, MDX, reStructuredText, AsciiDoc
-- Config/data: YAML, TOML, JSON, JSONC
-
-Additional languages are supported through [extensions](#extensions).
+The matrix above covers all current built-in and repo-supported extension languages for code intelligence.
 
 ---
 
