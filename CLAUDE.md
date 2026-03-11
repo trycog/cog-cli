@@ -15,7 +15,7 @@ When the user says "release" (or similar), follow this procedure:
 ### 1. Determine the version
 
 - If the user specifies a version, use it.
-- Do not bump to `1.0.0` or any higher major version unless the user explicitly instructs you to make a `1.x` (or higher) release. When the project is still on `0.x`, default to the appropriate `0.x` bump even if the changes would normally look "major" under full SemVer.
+- Do not bump to a new major version while the project is still on `0.x` unless the user explicitly instructs you to start a `1.x` (or higher) release. When the project is still on `0.x`, default to the appropriate `0.x` bump even if the changes would normally look "major" under full SemVer.
 - Otherwise, analyze all commits since the last release tag (`git log <last-tag>..HEAD --oneline`) and apply [Semantic Versioning](https://semver.org/):
   - **patch** (0.0.x): bug fixes, build fixes, documentation, dependency updates
   - **minor** (0.x.0): new features, new commands, non-breaking enhancements
@@ -38,7 +38,7 @@ Ensure the README accurately reflects the current state of the project:
 
 ### 4. Update CHANGELOG.md
 
-Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/):
+Follow [Keep a Changelog](https://keepachangelog.com/):
 - Add a new `## [X.Y.Z] - YYYY-MM-DD` section below `## [Unreleased]` (or below the header if no Unreleased section exists)
 - Categorize changes under: Added, Changed, Deprecated, Removed, Fixed, Security
 - Add a link reference at the bottom: `[X.Y.Z]: https://github.com/trycog/cog-cli/releases/tag/vX.Y.Z`

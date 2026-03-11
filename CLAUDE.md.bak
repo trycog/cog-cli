@@ -31,7 +31,7 @@ Both files must be updated to the new version:
 
 ### 3. Update CHANGELOG.md
 
-Follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/):
+Follow [Keep a Changelog](https://keepachangelog.com/):
 - Add a new `## [X.Y.Z] - YYYY-MM-DD` section below `## [Unreleased]` (or below the header if no Unreleased section exists)
 - Categorize changes under: Added, Changed, Deprecated, Removed, Fixed, Security
 - Add a link reference at the bottom: `[X.Y.Z]: https://github.com/trycog/cog-cli/releases/tag/vX.Y.Z`

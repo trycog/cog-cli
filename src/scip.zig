@@ -449,7 +449,7 @@ pub fn freeIndex(allocator: std.mem.Allocator, index: *Index) void {
 // ── Symbol name extraction ──────────────────────────────────────────────
 
 /// Extract the short name from a fully qualified SCIP symbol string.
-/// For "scip-go gomod github.com/foo/bar v1.0.0 pkg/Server#Handle().",
+/// For "scip-go gomod github.com/foo/bar v0.9.0 pkg/Server#Handle().",
 /// returns "Handle".
 pub fn extractSymbolName(symbol: []const u8) []const u8 {
     if (symbol.len == 0) return symbol;
@@ -622,7 +622,7 @@ test "decode SymbolInformation with relationships" {
 }
 
 test "extractSymbolName method" {
-    const name = extractSymbolName("scip-go gomod github.com/foo/bar v1.0.0 pkg/Server#Handle().");
+    const name = extractSymbolName("scip-go gomod github.com/foo/bar v0.9.0 pkg/Server#Handle().");
     try std.testing.expectEqualStrings("Handle", name);
 }
 

@@ -2,10 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2026-03-11
+## [0.14.0] - 2026-03-11
 
 ### Added
 
@@ -408,7 +408,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
-[1.1.0]: https://github.com/trycog/cog-cli/releases/tag/v1.1.0
+[0.14.0]: https://github.com/trycog/cog-cli/releases/tag/v0.14.0
 [0.8.2]: https://github.com/trycog/cog-cli/releases/tag/v0.8.2
 [0.8.1]: https://github.com/trycog/cog-cli/releases/tag/v0.8.1
 [0.8.0]: https://github.com/trycog/cog-cli/releases/tag/v0.8.0
