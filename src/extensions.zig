@@ -1308,6 +1308,11 @@ fn readInstallMetadata(allocator: std.mem.Allocator, ext_dir: []const u8) !Insta
 }
 
 fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
+    std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+
     const parent_path = std.fs.path.dirname(path) orelse return error.FileNotFound;
     const child_name = std.fs.path.basename(path);
     var parent_dir = std.fs.openDirAbsolute(parent_path, .{}) catch |err| switch (err) {
@@ -1315,10 +1320,7 @@ fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
         else => return err,
     };
     defer parent_dir.close();
-    parent_dir.deleteTree(child_name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try parent_dir.deleteTree(child_name);
 }
 
 fn extractTarball(allocator: std.mem.Allocator, tarball_path: []const u8, output_dir: []const u8) !void {
