@@ -7,11 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-03-13
+
+### Added
+
+- Local memory now rejects obvious prompt-injection phrases and secret-like tokens during learn, update, refactor, and bulk learn operations
+- Memory recall responses now wrap stored definitions in `<stored-knowledge>` tags and cap oversized recall output so agents can consume recalled text more safely
+
 ### Changed
 
+- `cog init` agent selection menus now prioritize agents you choose most often instead of staying purely alphabetical
 - The extension installer is now namespaced under `cog ext:install` instead of the old top-level `cog install` command
 - `cog ext:install` now installs from GitHub release tarballs, using the latest stable release by default or an exact `--version` match when requested
 - `cog ext:update` now upgrades either all installed extensions or a named installed extension to the latest stable GitHub release available for each extension source
+- README now documents the safer handling of recalled and stored local memory content
+
+### Fixed
+
+- Extension installs now handle missing temporary directories when downloading release assets
 
 ## [0.15.0] - 2026-03-11
 
@@ -428,6 +441,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.16.0]: https://github.com/trycog/cog-cli/releases/tag/v0.16.0
 [0.15.0]: https://github.com/trycog/cog-cli/releases/tag/v0.15.0
 [0.14.0]: https://github.com/trycog/cog-cli/releases/tag/v0.14.0
 [0.8.2]: https://github.com/trycog/cog-cli/releases/tag/v0.8.2

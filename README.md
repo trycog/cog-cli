@@ -170,6 +170,8 @@ The system prompt we inject into your agent instructs it to follow a lifecycle:
 
 The result is an agent that gets better over time. It stops rediscovering the same solutions and starts building on what it already knows.
 
+Cog also hardens memory reads and writes: local memory rejects obvious prompt-injection phrases and secret-like tokens during learn/update operations, and recall output wraps stored definitions in `<stored-knowledge>` tags so agents can treat recalled text as data instead of fresh instructions.
+
 <details>
 <summary><strong>Bootstrap</strong></summary>
 
