@@ -20,6 +20,14 @@ case "$tool_name" in
       exit 2
     fi
     ;;
+  cog_mem_*|mcp__cog__mem_*)
+    if printf '%s' "$payload" | grep -Eq '"relation"[[:space:]]*:[[:space:]]*"related_to"'; then
+      printf '%s\n' "Cog memory quality: prefer a stronger predicate than related_to when a structural relationship exists." >&2
+    fi
+    if printf '%s' "$payload" | grep -Eq '"definition"[[:space:]]*:[[:space:]]*"[^"]{0,31}"'; then
+      printf '%s\n' "Cog memory quality: include rationale or constraints when storing durable memory, not only a short label." >&2
+    fi
+    ;;
 esac
 
 exit 0

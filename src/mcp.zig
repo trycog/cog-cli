@@ -13,6 +13,9 @@ const watcher_mod = @import("watcher.zig");
 const paths = @import("paths.zig");
 const debug_log_mod = @import("debug_log.zig");
 const memory_mod = @import("memory.zig");
+const repo_context_mod = @import("repo_context.zig");
+const session_context_mod = @import("session_context.zig");
+const memory_envelope_mod = @import("memory_envelope.zig");
 
 const Config = config_mod.Config;
 const DebugServer = debug_server_mod.DebugServer;
@@ -40,6 +43,9 @@ const Runtime = struct {
     code_cache: ?code_intel.CodeIndex = null,
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
+    session_contexts: std.StringHashMapUnmanaged(session_context_mod.SessionContext) = .empty,
+    remote_memory_capabilities: memory_envelope_mod.RemoteMemoryCapabilities = .{},
+    repo_context_cache: std.StringHashMapUnmanaged(repo_context_mod.RepoContext) = .empty,
     watcher: ?watcher_mod.Watcher = null,
     debug_tool_tier: ToolTier = .specialist,
     /// Protects code_cache, remote_tools, mcp_session_id, and mem_db from concurrent access.
@@ -60,6 +66,9 @@ const Runtime = struct {
             .code_cache = null,
             .remote_tools = null,
             .mcp_session_id = null,
+            .session_contexts = .empty,
+            .remote_memory_capabilities = .{},
+            .repo_context_cache = .empty,
             .watcher = watcher_mod.Watcher.init(allocator),
             .debug_tool_tier = debug_tool_tier,
         };
@@ -80,6 +89,19 @@ const Runtime = struct {
             }
             self.allocator.free(tools);
         }
+        self.remote_memory_capabilities.deinit(self.allocator);
+        var session_iter = self.session_contexts.iterator();
+        while (session_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.session_contexts.deinit(self.allocator);
+        var repo_iter = self.repo_context_cache.iterator();
+        while (repo_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.repo_context_cache.deinit(self.allocator);
         if (self.mcp_session_id) |sid| self.allocator.free(sid);
         self.debug_server.deinit();
     }
@@ -136,6 +158,52 @@ const Runtime = struct {
             old.deinit(self.allocator);
         }
         self.code_cache = fresh;
+    }
+
+    fn currentSessionKey(self: *const Runtime) []const u8 {
+        return self.mcp_session_id orelse "local-stdio-session";
+    }
+
+    fn ensureSessionContext(self: *Runtime) !*session_context_mod.SessionContext {
+        const key = self.currentSessionKey();
+        if (self.session_contexts.getPtr(key)) |ctx| return ctx;
+
+        const repo_ctx = try self.resolveRepoContext();
+        const workspace_root = try resolveWorkspaceRoot(self.allocator, repo_ctx.cwd);
+        defer self.allocator.free(workspace_root);
+        const host_agent_id = try detectHostAgentId(self.allocator, workspace_root);
+        defer self.allocator.free(host_agent_id);
+
+        const brain_url = if (self.mem_config) |cfg| cfg.brain_url else "file:.cog/brain.db";
+        const brain_parts = parseBrainIdentity(brain_url);
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const ctx = try session_context_mod.initSessionContext(
+            self.allocator,
+            key,
+            host_agent_id,
+            workspace_root,
+            brain_url,
+            if (brain_parts) |parts| parts.namespace else null,
+            if (brain_parts) |parts| parts.name else null,
+            repo_ctx,
+        );
+        try self.session_contexts.put(self.allocator, owned_key, ctx);
+        debug_log_mod.log("mcp.ensureSessionContext: created session={s}", .{key});
+        return self.session_contexts.getPtr(key).?;
+    }
+
+    fn resolveRepoContext(self: *Runtime) !*repo_context_mod.RepoContext {
+        const cwd = try std.fs.cwd().realpathAlloc(self.allocator, ".");
+        defer self.allocator.free(cwd);
+
+        if (self.repo_context_cache.getPtr(cwd)) |cached| return cached;
+        const resolved = try repo_context_mod.resolve(self.allocator, cwd);
+        const key = try self.allocator.dupe(u8, cwd);
+        errdefer self.allocator.free(key);
+        try self.repo_context_cache.put(self.allocator, key, resolved);
+        debug_log_mod.log("mcp.resolveRepoContext: cached cwd={s}", .{cwd});
+        return self.repo_context_cache.getPtr(cwd).?;
     }
 };
 
@@ -711,6 +779,10 @@ fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !v
 
     const arguments = if (p.object.get("arguments")) |a| (if (a == .object) a else null) else null;
 
+    runtime.mutex.lock();
+    _ = runtime.ensureSessionContext() catch {};
+    runtime.mutex.unlock();
+
     // Dispatch tool
     const tool_result = runtimeCallTool(runtime, tool_name, arguments) catch |err| {
         const err_msg = switch (err) {
@@ -1017,20 +1089,28 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
 }
 
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
-    // Debug tools have their own mutex (DebugServer.mutex) — no Runtime lock needed
-    if (std.mem.startsWith(u8, tool_name, "debug_")) {
-        return callDebugTool(runtime, tool_name, arguments);
-    }
-
-    // All other tools access shared Runtime state (code_cache, remote_tools, etc.)
+    // All non-debug tool paths access shared Runtime state.
     runtime.mutex.lock();
     defer runtime.mutex.unlock();
 
+    const session_ctx = try runtime.ensureSessionContext();
+
+    // Debug tools have their own mutex (DebugServer.mutex) — record context first.
+    if (std.mem.startsWith(u8, tool_name, "debug_")) {
+        const result = try callDebugTool(runtime, tool_name, arguments);
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
+    }
+
     // Code tools
     if (std.mem.eql(u8, tool_name, "code_query")) {
-        return callCodeQuery(runtime, arguments);
+        const result = try callCodeQuery(runtime, arguments);
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
     } else if (std.mem.eql(u8, tool_name, "code_explore")) {
-        return callCodeExplore(runtime, arguments);
+        const result = try callCodeExplore(runtime, arguments);
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
     }
 
     // Memory tools — local SQLite or remote MCP server
@@ -1039,9 +1119,13 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             const mem_db = runtime.ensureMemoryDb() catch {
                 return runtime.allocator.dupe(u8, "Error: failed to open local memory database.");
             };
-            return memory_mod.callLocalTool(mem_db, tool_name, arguments);
+            const result = try memory_mod.callLocalTool(mem_db, tool_name, arguments);
+            try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+            return result;
         } else {
-            return callRemoteMcpTool(runtime, tool_name, arguments);
+            const result = try callRemoteHostedTool(runtime, session_ctx, tool_name, arguments);
+            try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+            return result;
         }
     }
 
@@ -1089,6 +1173,56 @@ fn rewriteToolReferences(allocator: std.mem.Allocator, desc: []const u8) ![]cons
     return try buf.toOwnedSlice(allocator);
 }
 
+const BrainIdentity = struct {
+    namespace: []const u8,
+    name: []const u8,
+};
+
+fn parseBrainIdentity(brain_url: []const u8) ?BrainIdentity {
+    const https_prefix = "https://";
+    const http_prefix = "http://";
+    const rest = if (std.mem.startsWith(u8, brain_url, https_prefix))
+        brain_url[https_prefix.len..]
+    else if (std.mem.startsWith(u8, brain_url, http_prefix))
+        brain_url[http_prefix.len..]
+    else
+        return null;
+
+    const first_slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const path = rest[first_slash + 1 ..];
+    const second_slash = std.mem.indexOfScalar(u8, path, '/') orelse return null;
+    const namespace = path[0..second_slash];
+    const name = path[second_slash + 1 ..];
+    if (namespace.len == 0 or name.len == 0) return null;
+    return .{ .namespace = namespace, .name = name };
+}
+
+fn resolveWorkspaceRoot(allocator: std.mem.Allocator, fallback_cwd: []const u8) ![]const u8 {
+    const cog_dir = paths.findCogDir(allocator) catch return allocator.dupe(u8, fallback_cwd);
+    defer allocator.free(cog_dir);
+    const parent = std.fs.path.dirname(cog_dir) orelse return allocator.dupe(u8, fallback_cwd);
+    return allocator.dupe(u8, parent);
+}
+
+fn detectHostAgentId(allocator: std.mem.Allocator, workspace_root: []const u8) ![]const u8 {
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/.cog/client-context.json", .{workspace_root});
+    defer allocator.free(manifest_path);
+    const file = std.fs.openFileAbsolute(manifest_path, .{}) catch return allocator.dupe(u8, "unknown");
+    defer file.close();
+    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return allocator.dupe(u8, "unknown");
+    defer allocator.free(content);
+
+    const parsed = json.parseFromSlice(json.Value, allocator, content, .{}) catch return allocator.dupe(u8, "unknown");
+    defer parsed.deinit();
+    if (parsed.value != .object) return allocator.dupe(u8, "unknown");
+    const agents_val = parsed.value.object.get("selected_agents") orelse return allocator.dupe(u8, "unknown");
+    if (agents_val != .array or agents_val.array.items.len == 0) return allocator.dupe(u8, "unknown");
+    if (agents_val.array.items.len == 1 and agents_val.array.items[0] == .string) {
+        return allocator.dupe(u8, agents_val.array.items[0].string);
+    }
+    return allocator.dupe(u8, "multi-host");
+}
+
 fn discoverRemoteTools(runtime: *Runtime) !void {
     debug_log_mod.log("discoverRemoteTools: starting", .{});
     const allocator = runtime.allocator;
@@ -1124,6 +1258,19 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
     if (tools_val != .array) return error.InvalidResponse;
 
     const items = tools_val.array.items;
+    if (runtime.remote_tools) |tools| {
+        for (tools) |tool| {
+            allocator.free(tool.name);
+            allocator.free(tool.remote_name);
+            allocator.free(tool.description);
+            allocator.free(tool.input_schema);
+        }
+        allocator.free(tools);
+        runtime.remote_tools = null;
+    }
+    runtime.remote_memory_capabilities.deinit(allocator);
+    runtime.remote_memory_capabilities = .{};
+
     var tool_list: std.ArrayListUnmanaged(RemoteTool) = .empty;
     try tool_list.ensureTotalCapacity(allocator, @intCast(items.len));
     errdefer {
@@ -1143,9 +1290,13 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
         if (name_val != .string) continue;
         const remote_name = name_val.string;
 
+        try memory_envelope_mod.registerCapabilityTool(&runtime.remote_memory_capabilities, allocator, remote_name);
+
         // Only process cog_* tools
         const cog_prefix = "cog_";
         if (!std.mem.startsWith(u8, remote_name, cog_prefix)) continue;
+
+        if (std.mem.eql(u8, remote_name, "cog_assert_record") or std.mem.eql(u8, remote_name, "cog_memory_record") or std.mem.eql(u8, remote_name, "cog_assert_history") or std.mem.eql(u8, remote_name, "cog_rationale_trace") or std.mem.eql(u8, remote_name, "cog_structured_recall")) continue;
 
         // Rename cog_xxx → mem_xxx
         const suffix = remote_name[cog_prefix.len..];
@@ -1179,12 +1330,60 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
     runtime.remote_tools = try tool_list.toOwnedSlice(allocator);
     debugLog("Discovered {d} remote memory tools", .{runtime.remote_tools.?.len});
     debug_log_mod.log("discoverRemoteTools: found {d} tools", .{runtime.remote_tools.?.len});
+    debug_log_mod.log(
+        "discoverRemoteTools: enhanced_write={s} provenance={any} rationale_trace={any}",
+        .{
+            if (runtime.remote_memory_capabilities.preferred_write_tool) |value| value else "none",
+            runtime.remote_memory_capabilities.supports_provenance_envelopes,
+            runtime.remote_memory_capabilities.supports_rationale_trace,
+        },
+    );
+}
+
+fn callRemoteHostedTool(runtime: *Runtime, session_ctx: *session_context_mod.SessionContext, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    if (memory_envelope_mod.isWriteTool(tool_name) and memory_envelope_mod.supportsEnhancedWrite(&runtime.remote_memory_capabilities)) {
+        return callEnhancedRemoteHostedWrite(runtime, session_ctx, tool_name, arguments) catch |err| {
+            debug_log_mod.log("callRemoteHostedTool: enhanced write failed for {s}: {s}", .{ tool_name, @errorName(err) });
+            debug_log_mod.log("callRemoteHostedTool: falling back to legacy remote write path for {s}", .{tool_name});
+            return callRemoteMcpTool(runtime, tool_name, arguments);
+        };
+    }
+    return callRemoteMcpTool(runtime, tool_name, arguments);
+}
+
+fn callEnhancedRemoteHostedWrite(runtime: *Runtime, session_ctx: *session_context_mod.SessionContext, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    const allocator = runtime.allocator;
+    const cfg = runtime.mem_config orelse return error.NotConfigured;
+    const endpoint = try std.fmt.allocPrint(allocator, "{s}/mcp", .{cfg.brain_url});
+    defer allocator.free(endpoint);
+
+    var write_context = try session_context_mod.buildWriteContext(allocator, session_ctx, tool_name, arguments);
+    defer write_context.deinit(allocator);
+
+    const response = try memory_envelope_mod.callEnhancedRemoteWrite(
+        allocator,
+        endpoint,
+        cfg.api_key,
+        runtime.mcp_session_id,
+        &runtime.remote_memory_capabilities,
+        trimMemPrefix(tool_name),
+        arguments,
+        session_ctx,
+        &write_context,
+    );
+    defer allocator.free(response.body);
+    updateRemoteSessionId(runtime, response.session_id);
+    return parseRemoteToolTextResponse(allocator, response.body);
 }
 
 fn callRemoteMcpTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
     debug_log_mod.log("callRemoteMcpTool: {s}", .{tool_name});
     const allocator = runtime.allocator;
     const cfg = runtime.mem_config orelse return error.NotConfigured;
+
+    if (runtime.remote_tools == null) {
+        try discoverRemoteTools(runtime);
+    }
 
     // Find the matching remote tool
     const tools = runtime.remote_tools orelse return error.NotConfigured;
@@ -1201,63 +1400,40 @@ fn callRemoteMcpTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.
     const endpoint = try std.fmt.allocPrint(allocator, "{s}/mcp", .{cfg.brain_url});
     defer allocator.free(endpoint);
 
-    // Build JSON-RPC tools/call request
-    var aw: Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    const args_json = if (arguments) |args|
+        try client.writeJsonValue(allocator, args)
+    else
+        try allocator.dupe(u8, "{}");
+    defer allocator.free(args_json);
 
-    try s.beginObject();
-    try s.objectField("jsonrpc");
-    try s.write("2.0");
-    try s.objectField("id");
-    try s.write(@as(i64, 1));
-    try s.objectField("method");
-    try s.write("tools/call");
-    try s.objectField("params");
-    try s.beginObject();
-    try s.objectField("name");
-    try s.write(rname);
-    try s.objectField("arguments");
-    if (arguments) |args| {
-        try s.write(args);
-    } else {
-        try s.beginObject();
-        try s.endObject();
-    }
-    try s.endObject();
-    try s.endObject();
-
-    const body = try aw.toOwnedSlice();
-    defer allocator.free(body);
-
-    const response = client.mcpCall(allocator, endpoint, cfg.api_key, runtime.mcp_session_id, body) catch |err| {
+    const response = client.mcpCallTool(allocator, endpoint, cfg.api_key, runtime.mcp_session_id, rname, args_json) catch |err| {
         debugLog("MCP tool call failed for {s}: {s}", .{ tool_name, @errorName(err) });
         return error.Explained;
     };
     defer allocator.free(response.body);
 
     // Update session ID
-    if (response.session_id) |new_sid| {
-        if (runtime.mcp_session_id) |old_sid| allocator.free(old_sid);
+    updateRemoteSessionId(runtime, response.session_id);
+    return parseRemoteToolTextResponse(allocator, response.body);
+}
+
+fn updateRemoteSessionId(runtime: *Runtime, new_session_id: ?[]const u8) void {
+    if (new_session_id) |new_sid| {
+        if (runtime.mcp_session_id) |old_sid| runtime.allocator.free(old_sid);
         runtime.mcp_session_id = new_sid;
     }
+}
 
-    // Parse response: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"..."}]}}
-    const parsed = json.parseFromSlice(json.Value, allocator, response.body, .{}) catch {
-        return error.Explained;
-    };
+fn parseRemoteToolTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const parsed = json.parseFromSlice(json.Value, allocator, body, .{}) catch return error.Explained;
     defer parsed.deinit();
 
     const root = parsed.value;
     if (root != .object) return error.Explained;
-
-    // Check for MCP error
     if (root.object.get("error")) |err_val| {
         if (err_val == .object) {
             if (err_val.object.get("message")) |msg| {
-                if (msg == .string) {
-                    return allocator.dupe(u8, msg.string);
-                }
+                if (msg == .string) return allocator.dupe(u8, msg.string);
             }
         }
         return error.Explained;
@@ -1265,19 +1441,18 @@ fn callRemoteMcpTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.
 
     const result_val = root.object.get("result") orelse return error.Explained;
     if (result_val != .object) return error.Explained;
-
     const content_val = result_val.object.get("content") orelse return error.Explained;
     if (content_val != .array) return error.Explained;
-
-    // Extract text from first content item
     if (content_val.array.items.len == 0) return allocator.dupe(u8, "");
     const first = content_val.array.items[0];
     if (first != .object) return error.Explained;
-
     const text_val = first.object.get("text") orelse return error.Explained;
     if (text_val != .string) return error.Explained;
-
     return allocator.dupe(u8, text_val.string);
+}
+
+fn trimMemPrefix(tool_name: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, tool_name, "mem_")) tool_name[4..] else tool_name;
 }
 
 // ── Code Tool Handlers ──────────────────────────────────────────────────

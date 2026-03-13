@@ -32,6 +32,16 @@ const deepExplorationTools = new Set([
   "grep",
 ])
 
+const debugEvidenceTools = new Set([
+  "cog_debug_inspect",
+  "cog_debug_stacktrace",
+  "cog_debug_scopes",
+  "cog_debug_exception_info",
+  "cog_debug_loaded_sources",
+])
+
+const codeEvidenceTools = new Set(["cog_code_explore", "cog_code_query"])
+
 const sessionState = new Map()
 
 function getState(sessionID) {
@@ -44,10 +54,15 @@ function getState(sessionID) {
       needsConsolidation: false,
       consolidationCount: 0,
       learnedCount: 0,
-      awaitingUserAnswer: false,
-      pendingUserFact: false,
-      preRecallExplorationCount: 0,
-    }
+        awaitingUserAnswer: false,
+        pendingUserFact: false,
+        pendingRationale: false,
+        preRecallExplorationCount: 0,
+        recentSymbols: [],
+        recentFiles: [],
+        recentDebugSummary: "",
+        lastEvidenceKind: "",
+      }
     sessionState.set(sessionID, state)
   }
   return state
@@ -86,6 +101,47 @@ function markRecall(state) {
 function markDirty(state) {
   state.needsConsolidation = true
   state.usedMemory = true
+}
+
+function pushLimited(list, value, max = 5) {
+  if (!value) return
+  if (list.includes(value)) return
+  list.push(value)
+  if (list.length > max) list.shift()
+}
+
+function firstString(value) {
+  return typeof value === "string" && value.length > 0 ? value : ""
+}
+
+function rememberCodeTargets(state, args) {
+  if (Array.isArray(args.queries)) {
+    for (const query of args.queries) {
+      if (query && typeof query === "object" && typeof query.name === "string") {
+        pushLimited(state.recentSymbols, query.name, 6)
+      }
+    }
+  }
+
+  if (typeof args.name === "string") pushLimited(state.recentSymbols, args.name, 6)
+  if (typeof args.file === "string") pushLimited(state.recentFiles, args.file, 6)
+}
+
+function rememberDebugSummary(state, args) {
+  const parts = [firstString(args.file), firstString(args.expression), firstString(args.program)].filter(Boolean)
+  if (parts.length === 0) return
+  state.recentDebugSummary = parts.join(" :: ")
+}
+
+function weakRelation(args) {
+  return typeof args.relation === "string" && args.relation === "related_to"
+}
+
+function looksGenericDefinition(args) {
+  if (typeof args.definition !== "string") return false
+  const definition = args.definition.trim()
+  if (definition.length >= 32) return false
+  return !/because|why|constraint|invariant|reason|so that|workflow|architecture/i.test(definition)
 }
 
 export default async () => ({
@@ -131,6 +187,24 @@ export default async () => ({
       )
     }
 
+    if (state.pendingRationale) {
+      output.system.push(
+        "Recent context suggests a design reason or invariant. If you write memory, include the rationale or constraint instead of only the surface fact.",
+      )
+    }
+
+    if (state.recentSymbols.length > 0 || state.recentFiles.length > 0) {
+      output.system.push(
+        `Recent Cog evidence: symbols=${state.recentSymbols.join(", ") || "none"}; files=${state.recentFiles.join(", ") || "none"}. If you store memory from this work, keep the provenance anchored to that evidence.`,
+      )
+    }
+
+    if (state.recentDebugSummary) {
+      output.system.push(
+        `Recent debug evidence: ${state.recentDebugSummary}. If this reveals a durable bug pattern or invariant, preserve the trigger and why it matters.`,
+      )
+    }
+
     if (state.needsConsolidation) {
       output.system.push(
         "This session created or updated memory. Before you finish, validate short-term memories and reinforce or flush them, preferably via the cog-mem subagent.",
@@ -148,6 +222,7 @@ export default async () => ({
     if (state.awaitingUserAnswer) {
       state.awaitingUserAnswer = false
       state.pendingUserFact = true
+      state.pendingRationale = true
     }
   },
   "tool.execute.before": async (input, output) => {
@@ -175,6 +250,19 @@ export default async () => ({
         )
       }
     }
+
+    if (memoryWriteTools.has(input.tool)) {
+      const args = getArgs(output.args)
+      if (looksGenericDefinition(args)) {
+        output.metadata = output.metadata || {}
+      }
+      if (looksGenericDefinition(args) || weakRelation(args) || (state.pendingRationale && !/because|why|constraint|invariant|reason|workflow|architecture/i.test(String(args.definition || "")))) {
+        output.system = output.system || []
+        output.system.push(
+          "Cog memory quality: this write looks thin. Prefer durable wording with rationale, constraints, stronger predicates, and provenance from the recent code/debug evidence.",
+        )
+      }
+    }
   },
   "tool.execute.after": async (input) => {
     const state = getState(input.sessionID)
@@ -189,6 +277,7 @@ export default async () => ({
     if (memoryWriteTools.has(input.tool)) {
       state.learnedCount += 1
       state.pendingUserFact = false
+      state.pendingRationale = false
       markDirty(state)
       return
     }
@@ -207,6 +296,25 @@ export default async () => ({
 
     if (!state.didRecall && orientationTools.has(input.tool)) {
       state.preRecallExplorationCount += 1
+      return
+    }
+
+    if (codeEvidenceTools.has(input.tool)) {
+      rememberCodeTargets(state, args)
+      state.lastEvidenceKind = "code"
+      return
+    }
+
+    if (debugEvidenceTools.has(input.tool)) {
+      rememberDebugSummary(state, args)
+      state.pendingRationale = true
+      state.lastEvidenceKind = "debug"
+      return
+    }
+
+    if (input.tool === "cog_debug_launch") {
+      rememberDebugSummary(state, args)
+      state.lastEvidenceKind = "debug"
       return
     }
 

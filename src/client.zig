@@ -16,6 +16,42 @@ pub const McpResponse = struct {
     session_id: ?[]const u8,
 };
 
+pub fn mcpCallTool(
+    allocator: std.mem.Allocator,
+    endpoint: []const u8,
+    api_key: []const u8,
+    session_id: ?[]const u8,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+) !McpResponse {
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: json.Stringify = .{ .writer = &aw.writer };
+
+    const parsed_arguments = try json.parseFromSlice(json.Value, allocator, arguments_json, .{});
+    defer parsed_arguments.deinit();
+
+    try s.beginObject();
+    try s.objectField("jsonrpc");
+    try s.write("2.0");
+    try s.objectField("id");
+    try s.write(@as(i64, 1));
+    try s.objectField("method");
+    try s.write("tools/call");
+    try s.objectField("params");
+    try s.beginObject();
+    try s.objectField("name");
+    try s.write(tool_name);
+    try s.objectField("arguments");
+    try s.write(parsed_arguments.value);
+    try s.endObject();
+    try s.endObject();
+
+    const body = try aw.toOwnedSlice();
+    defer allocator.free(body);
+    return mcpCall(allocator, endpoint, api_key, session_id, body);
+}
+
 pub fn mcpCall(
     allocator: std.mem.Allocator,
     endpoint: []const u8,
@@ -405,4 +441,39 @@ test "parseResponse success with boolean data" {
     const text = try parseResponse(allocator, response);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("true", text);
+}
+
+test "mcpCallTool builds tools call body" {
+    const allocator = std.testing.allocator;
+    const args =
+        \\{"operation":"learn"}
+    ;
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: json.Stringify = .{ .writer = &aw.writer };
+    const parsed_arguments = try json.parseFromSlice(json.Value, allocator, args, .{});
+    defer parsed_arguments.deinit();
+    try s.beginObject();
+    try s.objectField("jsonrpc");
+    try s.write("2.0");
+    try s.objectField("id");
+    try s.write(@as(i64, 1));
+    try s.objectField("method");
+    try s.write("tools/call");
+    try s.objectField("params");
+    try s.beginObject();
+    try s.objectField("name");
+    try s.write("cog_memory_record");
+    try s.objectField("arguments");
+    try s.write(parsed_arguments.value);
+    try s.endObject();
+    try s.endObject();
+    const body = try aw.toOwnedSlice();
+    defer allocator.free(body);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("tools/call", parsed.value.object.get("method").?.string);
+    try std.testing.expectEqualStrings("cog_memory_record", parsed.value.object.get("params").?.object.get("name").?.string);
 }

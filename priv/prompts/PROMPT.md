@@ -75,6 +75,10 @@ Memory quality guardrails:
 - complete recall before using broad code-intel exploration in unfamiliar code; only lightweight orientation is acceptable first
 - store non-obvious, durable knowledge that would save future reasoning
 - do not store generic repo summaries or facts that are obvious from a quick README or file read unless they capture durable workflow or architectural conventions
+- when learning implementation details, prefer storing why plus what so recall preserves the design reason, not just the surface behavior
+- when the user explains a design decision, treat it as durable architectural context instead of collapsing it into a generic summary
+- when a constraint or invariant is given, store it explicitly as a constraint, invariant, or workflow rule
+- when something changes or is deprecated, preserve the old-to-new relationship when the available tools can express it
 
 Record knowledge as you work:
 

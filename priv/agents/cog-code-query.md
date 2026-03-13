@@ -47,6 +47,7 @@ For "tell me about this project", architecture overviews, or repository summarie
 - Use `cog_code_query(mode="contains")` to inspect parent/child ownership for one already-identified ambiguity
 - Use `cog_code_query(mode="calls"|"callers")` to inspect approximate call graph relationships for one already-identified ambiguity
 - Use `cog_code_query(mode="overview")` to summarize one already-identified symbol or file structurally
+- When the request is about architecture or rationale, prioritize artifacts that explain design intent such as ADRs, docs, config, tests, commit-linked docs, or comments after the index identifies the relevant area
 
 ## Rules
 - Never guess filenames — let `cog_code_explore` tell you

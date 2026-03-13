@@ -34,6 +34,26 @@ Report what was reinforced, flushed, and verified.
 
 Treat user-provided answers and newly learned implementation details as short-term memories that must be validated here before they become long-term.
 
+### Architecture rationale
+
+- Prefer memories that explain why a subsystem exists, why a boundary is enforced, or why a workflow rule matters.
+- When consolidating implementation details, keep the design reason attached so future recall can distinguish intent from incidental mechanics.
+
+### Constraints and invariants
+
+- Store explicit constraints, invariants, workflow rules, and unsupported combinations as their own durable knowledge.
+- If a user or the code establishes a must/never/always rule, preserve that wording instead of flattening it into a generic summary.
+
+### Historical change
+
+- When behavior changes, record the old-to-new relationship if the available tools support it.
+- Prefer deprecation, refactor, update, and association operations that preserve what changed and why.
+
+### Provenance-aware consolidation
+
+- Distinguish concept knowledge, workflow rules, rationale, and superseded historical knowledge.
+- If the source appears to come from code exploration, debugging, or a user explanation, keep that distinction explicit in your summary so the primary agent can choose the right memory operation.
+
 ### Maintenance
 
 Check brain health and clean up the knowledge graph.

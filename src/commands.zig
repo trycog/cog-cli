@@ -357,6 +357,9 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var written_agents: [32][]const u8 = undefined;
     var written_agents_count: usize = 0;
 
+    var installed_assets: [96][]const u8 = undefined;
+    var installed_assets_count: usize = 0;
+
     for (selected_agent_indices[0..selected_indices.len]) |idx| {
         const agent = agents_mod.agents[idx];
 
@@ -389,6 +392,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             printErr(" ");
             printErr(filename);
             printErr("\n");
+            appendUniquePath(&installed_assets, &installed_assets_count, filename);
             if (written_prompts_count < 4) {
                 written_prompts[written_prompts_count] = prompt_target;
                 written_prompts_count += 1;
@@ -412,6 +416,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     printErr(" ");
                     printErr(mcp_path);
                     printErr("\n");
+                    appendUniquePath(&installed_assets, &installed_assets_count, mcp_path);
                 }
                 if (written_mcp_count < 16) {
                     written_mcp[written_mcp_count] = mcp_path;
@@ -438,6 +443,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 printErr(" ");
                 printErr(asset.path);
                 printErr("\n");
+                appendUniquePath(&installed_assets, &installed_assets_count, asset.path);
             } else {
                 printErr("    ");
                 printErr(dim ++ "  skipped " ++ reset);
@@ -470,6 +476,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     printErr(" ");
                     printErr(agent_path);
                     printErr("\n");
+                    appendUniquePath(&installed_assets, &installed_assets_count, agent_path);
                 } else {
                     printErr("    ");
                     printErr(dim ++ "  skipped " ++ reset);
@@ -516,6 +523,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                         printErr(" ");
                         printErr(debug_path);
                         printErr("\n");
+                        appendUniquePath(&installed_assets, &installed_assets_count, debug_path);
                     } else {
                         printErr("    ");
                         printErr(dim ++ "  skipped " ++ reset);
@@ -562,6 +570,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                             printErr(" ");
                             printErr(mem_path);
                             printErr("\n");
+                            appendUniquePath(&installed_assets, &installed_assets_count, mem_path);
                         } else {
                             printErr("    ");
                             printErr(dim ++ "  skipped " ++ reset);
@@ -577,6 +586,13 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
         }
     }
+
+    try writeClientContextManifest(
+        allocator,
+        selected_agent_ids[0..selected_indices.len],
+        installed_assets[0..installed_assets_count],
+        setup_mem,
+    );
 
     // Ensure .cog/ is in .gitignore (only in git repos)
     ensureGitignore(allocator);
@@ -1063,6 +1079,60 @@ fn writeFreshMemoryBrain(s: *Stringify, brain_url: []const u8) !void {
     try s.endObject(); // memory
 }
 
+fn appendUniquePath(buffer: [][]const u8, count: *usize, path: []const u8) void {
+    for (buffer[0..count.*]) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    if (count.* < buffer.len) {
+        buffer[count.*] = path;
+        count.* += 1;
+    }
+}
+
+fn writeClientContextManifest(
+    allocator: std.mem.Allocator,
+    selected_agent_ids: []const []const u8,
+    installed_assets: []const []const u8,
+    setup_mem: bool,
+) !void {
+    debug_log.log("commands.writeClientContextManifest: agents={d} assets={d}", .{ selected_agent_ids.len, installed_assets.len });
+    std.fs.cwd().makeDir(".cog") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return error.Explained,
+    };
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
+    try s.beginObject();
+    try s.objectField("version");
+    try s.write(build_options.version);
+    try s.objectField("selected_agents");
+    try s.beginArray();
+    for (selected_agent_ids) |agent_id| try s.write(agent_id);
+    try s.endArray();
+    try s.objectField("installed_assets");
+    try s.beginArray();
+    for (installed_assets) |asset| try s.write(asset);
+    try s.endArray();
+    try s.objectField("features");
+    try s.beginObject();
+    try s.objectField("enhanced_memory_writes");
+    try s.write(setup_mem);
+    try s.objectField("rationale_capture_prompts");
+    try s.write(setup_mem);
+    try s.objectField("provenance_envelopes");
+    try s.write(setup_mem);
+    try s.endObject();
+    try s.endObject();
+
+    const content = try aw.toOwnedSlice();
+    defer allocator.free(content);
+    const with_newline = try std.fmt.allocPrint(allocator, "{s}\n", .{content});
+    defer allocator.free(with_newline);
+    try writeCwdFile(".cog/client-context.json", with_newline);
+}
+
 // ── System Prompt Setup ─────────────────────────────────────────────────
 
 fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
@@ -1410,4 +1480,45 @@ test "parseBrainUrl invalid empty parts" {
     try std.testing.expect(parseBrainUrl("https:///user/brain") == null);
     try std.testing.expect(parseBrainUrl("https://host//brain") == null);
     try std.testing.expect(parseBrainUrl("https://host/user/") == null);
+}
+
+test "appendUniquePath keeps first occurrence only" {
+    var buffer: [4][]const u8 = undefined;
+    var count: usize = 0;
+    appendUniquePath(&buffer, &count, "CLAUDE.md");
+    appendUniquePath(&buffer, &count, ".mcp.json");
+    appendUniquePath(&buffer, &count, "CLAUDE.md");
+
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("CLAUDE.md", buffer[0]);
+    try std.testing.expectEqualStrings(".mcp.json", buffer[1]);
+}
+
+test "writeClientContextManifest writes selected agents and features" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var original_cwd = std.fs.cwd().openDir(".", .{}) catch unreachable;
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+
+    try tmp_dir.dir.setAsCwd();
+    try writeClientContextManifest(allocator, &.{ "opencode", "claude_code" }, &.{ "AGENTS.md", ".mcp.json" }, true);
+
+    const content = readCwdFile(allocator, ".cog/client-context.json") orelse return error.TestUnexpectedResult;
+    defer allocator.free(content);
+    const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings(build_options.version, parsed.value.object.get("version").?.string);
+    const agents = parsed.value.object.get("selected_agents").?;
+    try std.testing.expectEqual(@as(usize, 2), agents.array.items.len);
+    try std.testing.expectEqualStrings("opencode", agents.array.items[0].string);
+
+    const features = parsed.value.object.get("features").?;
+    try std.testing.expect(features.object.get("enhanced_memory_writes").?.bool);
+    try std.testing.expect(features.object.get("provenance_envelopes").?.bool);
 }

@@ -90,24 +90,26 @@ That's it. The interactive setup walks you through everything:
 2. **Agent selection**: pick which AI coding agents you use
 3. **Tool permissions**: optionally auto-allow all Cog tools so your agent doesn't prompt you on every call
 
-For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents, and, where the host agent supports it, auto-allows Cog tool permissions. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
+For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents, installs runtime policy assets where the host supports them, and, where available, auto-allows Cog tool permissions. It also writes `.cog/client-context.json` so the local MCP runtime can identify the installed host integrations and compile richer hosted-memory context. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
 
 ### Supported agents
 
-| Agent | MCP Config | Sub-Agents | Tool Permissions | Cog-First Override |
-|-------|------------|:----------:|------------------|--------------------|
-| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium permission bootstrap + skills + plugin |
-| Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist + hooks |
-| Cursor | `.cursor/mcp.json` | Yes | | Soft prompt guidance + read-only specialists |
-| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium hooks + sub-agent tool scoping |
-| GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft specialist tool scoping |
-| Goose | Global config | Yes | | Soft workflow runbooks |
-| OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft shared-config specialist guidance |
-| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions |
-| Roo Code | `.roo/mcp.json` | Yes | | Medium native mode groups |
-| Windsurf | Global config | Yes | | Soft workflow runbooks |
+| Agent | MCP Config | Sub-Agents | Tool Permissions | Cog-First Override | Context Packaging | Memory Write Enrichment |
+|-------|------------|:----------:|------------------|--------------------|------------------|-------------------------|
+| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium permission bootstrap + skills + plugin | Yes | Hook/config reminders |
+| Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist + hooks | Yes | Hook/config reminders |
+| Cursor | `.cursor/mcp.json` | Yes | | Soft prompt guidance + read-only specialists | Yes | Prompt guidance |
+| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium hooks + sub-agent tool scoping | Yes | Hook/config reminders |
+| GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft specialist tool scoping | Yes | Prompt guidance |
+| Goose | Global config | Yes | | Soft workflow runbooks | Yes | Prompt guidance |
+| OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft shared-config specialist guidance | Yes | Prompt guidance |
+| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
+| Roo Code | `.roo/mcp.json` | Yes | | Medium native mode groups | Yes | Prompt guidance |
+| Windsurf | Global config | Yes | | Soft workflow runbooks | Yes | Prompt guidance |
 
 `cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code now combines hard-scoped subagents with project hooks, Gemini adds repo-local hook enforcement on top of sub-agent tool scoping, Amp ships an experimental workspace plugin alongside permissions and skills, Roo can scope native mode groups, and Codex/Cursor use stronger specialist guidance where hard repo-local denies are not available.
+
+Hosted memory writes now pass through a client-side context compiler in `cog-cli`. When the remote brain supports enriched write APIs, Cog attaches trusted local provenance such as workspace, repo identity, MCP session, host integration, recent code/debug evidence, and write-reason hints before sending the write upstream. Legacy hosted servers still receive the original tool calls unchanged.
 
 For hosts with runtime support, `cog init` also installs repo-local enforcement assets:
 
@@ -115,6 +117,22 @@ For hosts with runtime support, `cog init` also installs repo-local enforcement 
 - Gemini CLI: `.gemini/hooks/cog-before-tool.sh`
 - Amp: `.amp/plugins/cog.ts` (experimental)
 - OpenCode: `.opencode/plugin/*`
+
+### Host capability notes
+
+| Capability | What it means |
+|------------|---------------|
+| Policy enforcement | How strongly the host can steer or block non-Cog workflows |
+| Context packaging | Whether hosted memory writes get client-generated provenance from `cog-cli` |
+| Memory write enrichment | Whether the host also gets prompt, hook, or plugin guidance to encourage rationale-rich architectural memory |
+
+| Host class | Policy enforcement | Context packaging | Memory write enrichment |
+|-----------|--------------------|------------------|-------------------------|
+| Claude Code | Hard sub-agent scoping + advisory hook | Yes, via `cog-cli` hosted write envelopes | Hook advisories + scoped memory specialist |
+| Gemini CLI | Medium hook/config scoping | Yes, via `cog-cli` hosted write envelopes | Hook advisories + scoped memory specialist |
+| OpenCode | Medium runtime plugin enforcement | Yes, via `cog-cli` hosted write envelopes | Runtime plugin reminders + memory specialist |
+| Amp | Medium permissions + experimental plugin | Yes, via `cog-cli` hosted write envelopes | Plugin advisories + memory skill |
+| Cursor / Copilot / Codex / Goose / Windsurf / Roo | Prompt or workflow guidance only | Yes, via `cog-cli` hosted write envelopes | Prompt-level rationale and memory-quality guidance |
 
 ---
 
@@ -171,6 +189,8 @@ The system prompt we inject into your agent instructs it to follow a lifecycle:
 The result is an agent that gets better over time. It stops rediscovering the same solutions and starts building on what it already knows.
 
 Cog also hardens memory reads and writes: local memory rejects obvious prompt-injection phrases and secret-like tokens during learn/update operations, and recall output wraps stored definitions in `<stored-knowledge>` tags so agents can treat recalled text as data instead of fresh instructions.
+
+For hosted brains, Cog now prefers enriched memory writes that include provenance and session context. That metadata is compiled locally by `cog-cli`; canonical assertion semantics, rationale history, and retrieval behavior still live on the hosted brain.
 
 <details>
 <summary><strong>Bootstrap</strong></summary>

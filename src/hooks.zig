@@ -1267,7 +1267,7 @@ fn buildWorkflowSpecialistInstructions(allocator: std.mem.Allocator, agent_name:
             \\Workflow guidance:
             \\- This host uses workflow files rather than hard-scoped subagents.
             \\- Use Cog memory recall before broad unfamiliar exploration and consolidate durable findings before finishing.
-            \\- Keep responses concise and include engram IDs when memory changes.
+            \\- Keep responses concise, include engram IDs when memory changes, and capture rationale or invariants when they are part of the durable memory.
             \\
             \\{s}
         , .{body}),
@@ -1297,7 +1297,7 @@ fn buildPromptOnlySpecialistInstructions(allocator: std.mem.Allocator, agent_nam
             \\Host guidance:
             \\- {s} cannot hard-deny tools per specialist, so keep this role focused on Cog memory workflows.
             \\- Use memory recall before broad unfamiliar exploration.
-            \\- Keep recall and consolidation responses concise and include engram IDs when memory changes.
+            \\- Keep recall and consolidation responses concise, include engram IDs when memory changes, and preserve rationale or constraints when they are durable.
             \\
             \\{s}
         , .{ agent_name, body }),
@@ -1327,7 +1327,7 @@ fn buildConfigScopedSpecialistInstructions(allocator: std.mem.Allocator, agent_n
             \\Host guidance:
             \\- {s} provides config-level scoping for this memory specialist.
             \\- Use Cog memory recall before broad unfamiliar exploration and keep updates concise.
-            \\- Include engram IDs when memory changes.
+            \\- Include engram IDs when memory changes, and preserve provenance, rationale, or invariants when the source supports them.
             \\
             \\{s}
         , .{ agent_name, body }),
@@ -1816,6 +1816,22 @@ test "writeOpenCodeDebugPlugin creates debug workflow plugin" {
     }.run);
 }
 
+test "writeOpenCodeMemoryPlugin creates provenance-aware memory plugin" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = allocator;
+            try writeOpenCodeMemoryPlugin(".opencode/plugin/cog-memory.ts");
+
+            const content = readCwdFile(std.testing.allocator, ".opencode/plugin/cog-memory.ts") orelse return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(content);
+
+            try std.testing.expect(std.mem.indexOf(u8, content, "recentSymbols") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Recent Cog evidence") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
+        }
+    }.run);
+}
+
 test "writeRuntimePolicyAsset creates Claude hook asset" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -1827,6 +1843,7 @@ test "writeRuntimePolicyAsset creates Claude hook asset" {
 
             try std.testing.expect(std.mem.indexOf(u8, content, "permissionDecision") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "Use Cog code intelligence tools before raw file search") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
         }
     }.run);
 }
@@ -1842,6 +1859,7 @@ test "writeRuntimePolicyAsset creates Gemini hook asset" {
 
             try std.testing.expect(std.mem.indexOf(u8, content, "run_shell_command") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "Cog policy") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
         }
     }.run);
 }
@@ -1857,6 +1875,7 @@ test "writeRuntimePolicyAsset creates Amp plugin asset" {
 
             try std.testing.expect(std.mem.indexOf(u8, content, "tool.call") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "hasCogWorkspaceConfig") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
         }
     }.run);
 }

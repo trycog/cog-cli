@@ -2,6 +2,9 @@
 import type { PluginAPI } from '@ampcode/plugin'
 import { existsSync, readFileSync } from 'node:fs'
 
+const weakRelationPattern = /"relation"\s*:\s*"related_to"/i
+const shortDefinitionPattern = /"definition"\s*:\s*"[^"]{0,31}"/i
+
 function hasCogWorkspaceConfig(): boolean {
   if (!existsSync('.amp/settings.json')) return false
 
@@ -49,6 +52,16 @@ export default function registerCogPlugin(amp: PluginAPI) {
       const text = eventText(event)
       if (shellSearchPattern.test(text)) {
         throw new Error('Cog policy: use Cog code intelligence tools before shell search commands like grep, rg, find, or git grep when the Cog MCP server is configured.')
+      }
+    }
+
+    if (toolName.startsWith('cog_mem_') || toolName.includes('mem_')) {
+      const text = eventText(event)
+      if (weakRelationPattern.test(text)) {
+        process.stderr.write('Cog memory quality: prefer a stronger predicate than related_to when the relationship is directional or structural.\n')
+      }
+      if (shortDefinitionPattern.test(text)) {
+        process.stderr.write('Cog memory quality: include rationale or constraints when the memory is durable.\n')
       }
     }
   })

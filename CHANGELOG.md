@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-03-13
+
+### Added
+
+- Hosted memory writes now attach client-generated provenance, session context, repo identity, recent code/debug evidence, and write-reason hints when the remote brain exposes enriched write APIs
+- `cog init` now writes `.cog/client-context.json` so the local MCP runtime can identify installed host integrations and feature flags for hosted memory context packaging
+
+### Changed
+
+- The MCP runtime now tracks per-session code, debug, and question activity so hosted memory writes can distinguish user-provided facts, code exploration, and debugger-derived findings more reliably
+- Supported-agent docs and setup metadata now describe context packaging and memory-write enrichment capabilities across each host integration
+- Memory prompts, specialists, hooks, and runtime plugins now push agents to preserve rationale, constraints, provenance, and stronger relationship semantics in durable memory writes
+- Hosted and legacy remote MCP memory calls now share a dedicated `tools/call` client helper for cleaner request construction and fallback handling
+
 ## [0.16.0] - 2026-03-13
 
 ### Added
@@ -441,6 +455,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.17.0]: https://github.com/trycog/cog-cli/releases/tag/v0.17.0
 [0.16.0]: https://github.com/trycog/cog-cli/releases/tag/v0.16.0
 [0.15.0]: https://github.com/trycog/cog-cli/releases/tag/v0.15.0
 [0.14.0]: https://github.com/trycog/cog-cli/releases/tag/v0.14.0

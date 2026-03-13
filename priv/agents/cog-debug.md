@@ -45,6 +45,7 @@ Compare observed values to the hypothesis. Report what you found clearly:
 - **Values**: each expression = observed value (quote exactly)
 - **Verdict**: does the evidence support or refute the hypothesis?
 - **Root cause** (if identified): what's actually happening and why
+- If the root cause reveals a durable invariant, bug pattern, or architectural constraint, summarize it in wording that would be suitable for later memory storage, including the trigger and why it matters
 
 ### 5. Cleanup
 

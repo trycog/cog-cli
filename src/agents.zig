@@ -57,6 +57,8 @@ pub const AgentCapabilities = struct {
     code_query_enforcement: CapabilityLevel,
     debug_enforcement: CapabilityLevel,
     memory_enforcement: CapabilityLevel,
+    context_packaging: bool,
+    memory_write_enrichment: CapabilityLevel,
 };
 
 const gemini_code_query_tools =
@@ -177,6 +179,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .config,
                 .debug_enforcement = .config,
                 .memory_enforcement = .config,
+                .context_packaging = true,
+                .memory_write_enrichment = .config,
             };
         }
 
@@ -190,6 +194,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .config,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .config,
             };
         }
 
@@ -203,6 +209,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .prompt_only,
             };
         }
 
@@ -216,6 +224,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .prompt_only,
             };
         }
 
@@ -229,6 +239,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .prompt_only,
             };
         }
 
@@ -242,6 +254,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .prompt_only,
             };
         }
 
@@ -255,6 +269,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .config,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .config,
             };
         }
 
@@ -268,6 +284,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .prompt_only,
             };
         }
 
@@ -281,6 +299,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
+                .context_packaging = true,
+                .memory_write_enrichment = .prompt_only,
             };
         }
 
@@ -294,6 +314,8 @@ pub const Agent = struct {
                 .code_query_enforcement = .runtime,
                 .debug_enforcement = .runtime,
                 .memory_enforcement = .runtime,
+                .context_packaging = true,
+                .memory_write_enrichment = .runtime,
             };
         }
 
@@ -329,6 +351,19 @@ pub const Agent = struct {
 
     pub fn subAgentsSummary(self: *const Agent) []const u8 {
         return if (self.agent_file_path != null and self.debug_file_path != null and self.mem_file_path != null) "Yes" else "";
+    }
+
+    pub fn contextPackagingSummary(self: *const Agent) []const u8 {
+        return if (self.capabilities().context_packaging) "Yes" else "";
+    }
+
+    pub fn memoryEnrichmentSummary(self: *const Agent) []const u8 {
+        return switch (self.capabilities().memory_write_enrichment) {
+            .runtime => "Runtime reminders",
+            .config => "Hook/config reminders",
+            .prompt_only => "Prompt guidance",
+            .none => "",
+        };
     }
 
     pub fn overrideSummary(self: *const Agent) []const u8 {
@@ -387,12 +422,14 @@ pub const Agent = struct {
     }
 
     pub fn supportMatrixRow(self: *const Agent, allocator: std.mem.Allocator) ![]u8 {
-        return try std.fmt.allocPrint(allocator, "| {s} | `{s}` | {s} | {s} | {s} |", .{
+        return try std.fmt.allocPrint(allocator, "| {s} | `{s}` | {s} | {s} | {s} | {s} | {s} |", .{
             self.display_name,
             self.mcpConfigSummary(),
             self.subAgentsSummary(),
             self.toolPermissionsSummary(),
             self.overrideSummary(),
+            self.contextPackagingSummary(),
+            self.memoryEnrichmentSummary(),
         });
     }
 };
@@ -939,6 +976,15 @@ test "enforcement level stays capability-driven" {
     try std.testing.expect(agents[2].capabilities().code_query_enforcement == .prompt_only);
     try std.testing.expect(agents[2].capabilities().debug_enforcement == .prompt_only);
     try std.testing.expect(agents[2].capabilities().memory_enforcement == .prompt_only);
+
+    try std.testing.expect(agents[0].capabilities().memory_write_enrichment == .config);
+    try std.testing.expect(agents[6].capabilities().memory_write_enrichment == .config);
+    try std.testing.expect(agents[9].capabilities().memory_write_enrichment == .runtime);
+    try std.testing.expect(agents[2].capabilities().memory_write_enrichment == .prompt_only);
+
+    for (agents) |agent| {
+        try std.testing.expect(agent.capabilities().context_packaging);
+    }
 }
 
 test "code-query headers prefer cog-first exploration" {
@@ -1058,18 +1104,20 @@ test "support matrix helpers stay aligned" {
     try std.testing.expectEqualStrings(".mcp.json", agents[0].mcpConfigSummary());
     try std.testing.expectEqualStrings("Global config", agents[3].mcpConfigSummary());
     try std.testing.expectEqualStrings("Yes", agents[9].subAgentsSummary());
+    try std.testing.expectEqualStrings("Yes", agents[0].contextPackagingSummary());
+    try std.testing.expectEqualStrings("Runtime reminders", agents[9].memoryEnrichmentSummary());
 
     const opencode_row = try agents[9].supportMatrixRow(std.testing.allocator);
     defer std.testing.allocator.free(opencode_row);
     try std.testing.expectEqualStrings(
-        "| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions |",
+        "| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |",
         opencode_row,
     );
 
     const goose_row = try agents[7].supportMatrixRow(std.testing.allocator);
     defer std.testing.allocator.free(goose_row);
     try std.testing.expectEqualStrings(
-        "| Goose | `Global config` | Yes |  | Soft workflow runbooks |",
+        "| Goose | `Global config` | Yes |  | Soft workflow runbooks | Yes | Prompt guidance |",
         goose_row,
     );
 }
