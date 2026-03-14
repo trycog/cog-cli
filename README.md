@@ -94,7 +94,7 @@ That's it. The interactive setup walks you through everything:
 2. **Agent selection**: pick which AI coding agents you use
 3. **Tool permissions**: optionally auto-allow all Cog tools so your agent doesn't prompt you on every call
 
-For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents or the closest host-native specialist surface, installs runtime policy assets where the host supports them, and, where available, auto-allows Cog tool permissions. It also writes `.cog/client-context.json` so the local MCP runtime can identify the installed host integrations and compile richer hosted-memory context. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
+For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents or the closest host-native specialist surface, installs runtime policy assets where the host supports them, and, where available, auto-allows Cog tool permissions. It also writes `.cog/client-context.json` plus a local `.cog/.gitignore` for generated Cog artifacts, so the local MCP runtime can identify the installed host integrations and compile richer hosted-memory context without changing your repo-root ignore rules. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
 
 ### Supported agents
 
