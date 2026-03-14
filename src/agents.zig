@@ -220,7 +220,7 @@ pub const Agent = struct {
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
-                .subagent_support = .workflow_files,
+                .subagent_support = .dedicated_files,
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
@@ -234,8 +234,8 @@ pub const Agent = struct {
                 .repo_local_mcp = true,
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
-                .dedicated_subagent_files = true,
-                .subagent_support = .dedicated_files,
+                .dedicated_subagent_files = false,
+                .subagent_support = .shared_config,
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
@@ -280,7 +280,7 @@ pub const Agent = struct {
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
-                .subagent_support = .workflow_files,
+                .subagent_support = .dedicated_files,
                 .code_query_enforcement = .prompt_only,
                 .debug_enforcement = .prompt_only,
                 .memory_enforcement = .prompt_only,
@@ -373,8 +373,12 @@ pub const Agent = struct {
             return "Medium runtime plugins + sub-agent permissions";
         }
 
-        if (caps.subagent_support == .workflow_files) {
-            return "Soft workflow runbooks";
+        if (std.mem.eql(u8, self.id, "windsurf")) {
+            return "Soft skills + rules";
+        }
+
+        if (std.mem.eql(u8, self.id, "goose")) {
+            return "Soft skill guidance";
         }
 
         if (std.mem.eql(u8, self.id, "roo")) {
@@ -386,7 +390,7 @@ pub const Agent = struct {
         }
 
         if (std.mem.eql(u8, self.id, "cursor")) {
-            return "Soft prompt guidance + read-only specialists";
+            return "Soft AGENTS.md + rules";
         }
 
         if (std.mem.eql(u8, self.id, "copilot")) {
@@ -600,23 +604,26 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = null,
         .mcp_format = .global_only,
-        .agent_file_path = ".windsurf/workflows/cog-code-query.md",
+        .agent_file_path = ".windsurf/skills/cog-code-query/SKILL.md",
         .agent_file_header =
         \\---
+        \\name: cog-code-query
         \\description: Explore code structure using the Cog SCIP index
         \\---
         \\
         ,
-        .debug_file_path = ".windsurf/workflows/cog-debug.md",
+        .debug_file_path = ".windsurf/skills/cog-debug/SKILL.md",
         .debug_file_header =
         \\---
+        \\name: cog-debug
         \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
         \\---
         \\
         ,
-        .mem_file_path = ".windsurf/workflows/cog-mem.md",
+        .mem_file_path = ".windsurf/skills/cog-mem/SKILL.md",
         .mem_file_header =
         \\---
+        \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
@@ -629,33 +636,12 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = ".cursor/mcp.json",
         .mcp_format = .json_mcpServers,
-        .agent_file_path = ".cursor/agents/cog-code-query.md",
-        .agent_file_header =
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-        \\readonly: true
-        \\---
-        \\
-        ,
-        .debug_file_path = ".cursor/agents/cog-debug.md",
-        .debug_file_header =
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\readonly: true
-        \\---
-        \\
-        ,
-        .mem_file_path = ".cursor/agents/cog-mem.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-        \\readonly: true
-        \\---
-        \\
-        ,
+        .agent_file_path = null,
+        .agent_file_header = null,
+        .debug_file_path = null,
+        .debug_file_header = null,
+        .mem_file_path = null,
+        .mem_file_header = null,
     },
     // ── OpenAI Codex CLI ────────────────────────────────────────────
     .{
@@ -710,26 +696,26 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = null,
         .mcp_format = .global_only,
-        .agent_file_path = ".goose/cog-code-query.yaml",
+        .agent_file_path = ".goose/skills/cog-code-query/SKILL.md",
         .agent_file_header =
         \\---
-        \\title: cog-code-query
+        \\name: cog-code-query
         \\description: Explore code structure using the Cog SCIP index
         \\---
         \\
         ,
-        .debug_file_path = ".goose/cog-debug.yaml",
+        .debug_file_path = ".goose/skills/cog-debug/SKILL.md",
         .debug_file_header =
         \\---
-        \\title: cog-debug
+        \\name: cog-debug
         \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
         \\---
         \\
         ,
-        .mem_file_path = ".goose/cog-mem.yaml",
+        .mem_file_path = ".goose/skills/cog-mem/SKILL.md",
         .mem_file_header =
         \\---
-        \\title: cog-mem
+        \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
         \\---
         \\
@@ -928,13 +914,18 @@ test "capability model matches mcp strategy" {
 }
 
 test "capability model keeps subagent topology explicit" {
-    try std.testing.expect(agents[3].capabilities().subagent_support == .workflow_files); // windsurf
+    try std.testing.expect(agents[3].capabilities().subagent_support == .dedicated_files); // windsurf
+    try std.testing.expect(agents[4].capabilities().subagent_support == .shared_config); // cursor
     try std.testing.expect(agents[5].capabilities().subagent_support == .shared_config); // codex
+    try std.testing.expect(agents[7].capabilities().subagent_support == .dedicated_files); // goose
     try std.testing.expect(agents[8].capabilities().subagent_support == .shared_config); // roo
     try std.testing.expect(agents[9].capabilities().subagent_support == .dedicated_files); // opencode
+    try std.testing.expectEqualStrings(".windsurf/skills/cog-code-query/SKILL.md", agents[3].agent_file_path.?); // windsurf
+    try std.testing.expect(agents[4].agent_file_path == null); // cursor
     try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[6].agent_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-debug/SKILL.md", agents[6].debug_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-mem/SKILL.md", agents[6].mem_file_path.?); // amp
+    try std.testing.expectEqualStrings(".goose/skills/cog-code-query/SKILL.md", agents[7].agent_file_path.?); // goose
 
     for (agents) |agent| {
         const caps = agent.capabilities();
@@ -1023,12 +1014,10 @@ test "opencode debug header stays debugger-focused" {
     try std.testing.expect(std.mem.indexOf(u8, opencode_debug_header, "cog_*: allow") != null);
 }
 
-test "cursor specialist headers stay read-only" {
-    const cursor_debug_header = agents[4].debug_file_header orelse unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, cursor_debug_header, "readonly: true") != null);
-
-    const cursor_mem_header = agents[4].mem_file_header orelse unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, cursor_mem_header, "readonly: true") != null);
+test "cursor does not claim unsupported specialist files" {
+    try std.testing.expect(agents[4].agent_file_path == null);
+    try std.testing.expect(agents[4].debug_file_path == null);
+    try std.testing.expect(agents[4].mem_file_path == null);
 }
 
 test "gemini specialist headers stay capability-aligned" {
@@ -1091,11 +1080,11 @@ test "support summaries stay capability-driven" {
     try std.testing.expectEqualStrings("Hard sub-agent allowlist + hooks", agents[0].overrideSummary());
     try std.testing.expectEqualStrings("Medium hooks + sub-agent tool scoping", agents[1].overrideSummary());
     try std.testing.expectEqualStrings("Soft specialist tool scoping", agents[2].overrideSummary());
-    try std.testing.expectEqualStrings("Soft workflow runbooks", agents[3].overrideSummary());
-    try std.testing.expectEqualStrings("Soft prompt guidance + read-only specialists", agents[4].overrideSummary());
+    try std.testing.expectEqualStrings("Soft skills + rules", agents[3].overrideSummary());
+    try std.testing.expectEqualStrings("Soft AGENTS.md + rules", agents[4].overrideSummary());
     try std.testing.expectEqualStrings("Soft shared-config specialist guidance", agents[5].overrideSummary());
     try std.testing.expectEqualStrings("Medium permission bootstrap + skills + plugin", agents[6].overrideSummary());
-    try std.testing.expectEqualStrings("Soft workflow runbooks", agents[7].overrideSummary());
+    try std.testing.expectEqualStrings("Soft skill guidance", agents[7].overrideSummary());
     try std.testing.expectEqualStrings("Medium native mode groups", agents[8].overrideSummary());
     try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[9].overrideSummary());
 }
@@ -1103,6 +1092,7 @@ test "support summaries stay capability-driven" {
 test "support matrix helpers stay aligned" {
     try std.testing.expectEqualStrings(".mcp.json", agents[0].mcpConfigSummary());
     try std.testing.expectEqualStrings("Global config", agents[3].mcpConfigSummary());
+    try std.testing.expectEqualStrings("", agents[4].subAgentsSummary());
     try std.testing.expectEqualStrings("Yes", agents[9].subAgentsSummary());
     try std.testing.expectEqualStrings("Yes", agents[0].contextPackagingSummary());
     try std.testing.expectEqualStrings("Runtime reminders", agents[9].memoryEnrichmentSummary());
@@ -1117,19 +1107,23 @@ test "support matrix helpers stay aligned" {
     const goose_row = try agents[7].supportMatrixRow(std.testing.allocator);
     defer std.testing.allocator.free(goose_row);
     try std.testing.expectEqualStrings(
-        "| Goose | `Global config` | Yes |  | Soft workflow runbooks | Yes | Prompt guidance |",
+        "| Goose | `Global config` | Yes |  | Soft skill guidance | Yes | Prompt guidance |",
         goose_row,
     );
 }
 
-test "all agents have debug_file_path" {
+test "hosts that advertise specialist files have debug_file_path" {
     for (agents) |agent| {
-        try std.testing.expect(agent.debug_file_path != null);
+        if (agent.subAgentsSummary().len != 0) {
+            try std.testing.expect(agent.debug_file_path != null);
+        }
     }
 }
 
-test "all agents have mem_file_path" {
+test "hosts that advertise specialist files have mem_file_path" {
     for (agents) |agent| {
-        try std.testing.expect(agent.mem_file_path != null);
+        if (agent.subAgentsSummary().len != 0) {
+            try std.testing.expect(agent.mem_file_path != null);
+        }
     }
 }

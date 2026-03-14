@@ -365,9 +365,9 @@ pub const RuntimePolicyAsset = struct {
 };
 
 const opencode_runtime_policy_assets = [_]RuntimePolicyAsset{
-    .{ .path = ".opencode/plugin/cog-override.ts", .content = opencode_override_content },
-    .{ .path = ".opencode/plugin/cog-memory.ts", .content = opencode_memory_content },
-    .{ .path = ".opencode/plugin/cog-debug.ts", .content = opencode_debug_content },
+    .{ .path = ".opencode/plugins/cog-override.ts", .content = opencode_override_content },
+    .{ .path = ".opencode/plugins/cog-memory.ts", .content = opencode_memory_content },
+    .{ .path = ".opencode/plugins/cog-debug.ts", .content = opencode_debug_content },
 };
 
 const claude_runtime_policy_assets = [_]RuntimePolicyAsset{
@@ -1784,9 +1784,9 @@ test "writeOpenCodeOverridePlugin creates strict override plugin" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             _ = allocator;
-            try writeOpenCodeOverridePlugin(".opencode/plugin/cog-override.ts");
+            try writeOpenCodeOverridePlugin(".opencode/plugins/cog-override.ts");
 
-            const content = readCwdFile(std.testing.allocator, ".opencode/plugin/cog-override.ts") orelse return error.TestUnexpectedResult;
+            const content = readCwdFile(std.testing.allocator, ".opencode/plugins/cog-override.ts") orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.definition\"") != null);
@@ -1803,9 +1803,9 @@ test "writeOpenCodeDebugPlugin creates debug workflow plugin" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             _ = allocator;
-            try writeOpenCodeDebugPlugin(".opencode/plugin/cog-debug.ts");
+            try writeOpenCodeDebugPlugin(".opencode/plugins/cog-debug.ts");
 
-            const content = readCwdFile(std.testing.allocator, ".opencode/plugin/cog-debug.ts") orelse return error.TestUnexpectedResult;
+            const content = readCwdFile(std.testing.allocator, ".opencode/plugins/cog-debug.ts") orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "cog_debug_launch") != null);
@@ -1820,9 +1820,9 @@ test "writeOpenCodeMemoryPlugin creates provenance-aware memory plugin" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             _ = allocator;
-            try writeOpenCodeMemoryPlugin(".opencode/plugin/cog-memory.ts");
+            try writeOpenCodeMemoryPlugin(".opencode/plugins/cog-memory.ts");
 
-            const content = readCwdFile(std.testing.allocator, ".opencode/plugin/cog-memory.ts") orelse return error.TestUnexpectedResult;
+            const content = readCwdFile(std.testing.allocator, ".opencode/plugins/cog-memory.ts") orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "recentSymbols") != null);
@@ -1895,7 +1895,7 @@ test "runtimePolicyAssets stay capability-driven" {
 
     const opencode_assets = runtimePolicyAssets(agents_mod.agents[9]);
     try std.testing.expectEqual(@as(usize, 3), opencode_assets.len);
-    try std.testing.expectEqualStrings(".opencode/plugin/cog-override.ts", opencode_assets[0].path);
+    try std.testing.expectEqualStrings(".opencode/plugins/cog-override.ts", opencode_assets[0].path);
     try std.testing.expectEqual(@as(usize, 0), runtimePolicyAssets(agents_mod.agents[2]).len);
 }
 
@@ -2342,19 +2342,18 @@ test "buildConfigScopedSpecialistInstructions adds host guidance" {
     try std.testing.expect(std.mem.indexOf(u8, debug, "requested test loop") != null);
 }
 
-test "workflow agents get workflow-specific content" {
+test "skill-based prompt-only agents get host-specific content" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             try configureAgentFile(allocator, agents_mod.agents[3]); // windsurf
-            const windsurf = readCwdFile(allocator, ".windsurf/workflows/cog-code-query.md") orelse return error.TestUnexpectedResult;
+            const windsurf = readCwdFile(allocator, ".windsurf/skills/cog-code-query/SKILL.md") orelse return error.TestUnexpectedResult;
             defer allocator.free(windsurf);
-            try std.testing.expect(std.mem.indexOf(u8, windsurf, "inside Windsurf") != null);
+            try std.testing.expect(std.mem.indexOf(u8, windsurf, "Windsurf cannot hard-deny tools per specialist") != null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[7]); // goose
-            const goose = readCwdFile(allocator, ".goose/cog-mem.yaml") orelse return error.TestUnexpectedResult;
+            const goose = readCwdFile(allocator, ".goose/skills/cog-mem/SKILL.md") orelse return error.TestUnexpectedResult;
             defer allocator.free(goose);
-            try std.testing.expect(std.mem.indexOf(u8, goose, "workflow files rather than hard-scoped subagents") != null);
-            try std.testing.expect(std.mem.indexOf(u8, goose, "engr am IDs") == null);
+            try std.testing.expect(std.mem.indexOf(u8, goose, "Goose cannot hard-deny tools per specialist") != null);
             try std.testing.expect(std.mem.indexOf(u8, goose, "engram IDs") != null);
         }
     }.run);
@@ -2364,9 +2363,7 @@ test "prompt-only dedicated agents get host-specific content" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             try configureAgentFile(allocator, agents_mod.agents[4]); // cursor
-            const cursor = readCwdFile(allocator, ".cursor/agents/cog-code-query.md") orelse return error.TestUnexpectedResult;
-            defer allocator.free(cursor);
-            try std.testing.expect(std.mem.indexOf(u8, cursor, "Cursor cannot hard-deny tools per specialist") != null);
+            try std.testing.expect(readCwdFile(allocator, ".cursor/agents/cog-code-query.md") == null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[2]); // copilot
             const copilot = readCwdFile(allocator, ".github/agents/cog-mem.agent.md") orelse return error.TestUnexpectedResult;
