@@ -594,8 +594,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         setup_mem,
     );
 
-    // Ensure .cog/ is in .gitignore (only in git repos)
-    ensureGitignore(allocator);
+    try ensureCogGitignore(allocator);
 
     // Code-sign for debug server on macOS
     if (builtin.os.tag == .macos) {
@@ -1197,40 +1196,24 @@ fn updateFileWithPrompt(allocator: std.mem.Allocator, filename: []const u8, prom
     try writeCwdFile(filename, new_content);
 }
 
-fn ensureGitignore(allocator: std.mem.Allocator) void {
-    // Only act in git repos
-    std.fs.cwd().access(".git", .{}) catch return;
+fn ensureCogGitignore(allocator: std.mem.Allocator) !void {
+    _ = allocator;
+    debug_log.log("commands.ensureCogGitignore: ensuring .cog/.gitignore", .{});
 
-    const entry = ".cog/";
+    std.fs.cwd().makeDir(".cog") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return error.Explained,
+    };
 
-    const existing = readCwdFile(allocator, ".gitignore");
-    defer if (existing) |e| allocator.free(e);
+    const content =
+        \\*.db
+        \\*.scip
+        \\*.log
+        \\
+    ;
 
-    if (existing) |content| {
-        // Check if .cog/ is already listed
-        var lines = std.mem.splitScalar(u8, content, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-            if (std.mem.eql(u8, trimmed, entry)) return;
-        }
-        // Append
-        const new_content = std.fmt.allocPrint(allocator, "{s}{s}\n", .{
-            if (content.len > 0 and content[content.len - 1] != '\n') "\n" else "",
-            entry,
-        }) catch return;
-        defer allocator.free(new_content);
-
-        const file = std.fs.cwd().openFile(".gitignore", .{ .mode = .write_only }) catch return;
-        defer file.close();
-        file.seekFromEnd(0) catch return;
-        var buf: [4096]u8 = undefined;
-        var fw = file.writer(&buf);
-        fw.interface.writeAll(new_content) catch return;
-        fw.interface.flush() catch return;
-    } else {
-        // Create new .gitignore
-        writeCwdFile(".gitignore", entry ++ "\n") catch return;
-    }
+    debug_log.log("commands.ensureCogGitignore: writing .cog/.gitignore", .{});
+    try writeCwdFile(".cog/.gitignore", content);
 }
 
 fn signForDebug(allocator: std.mem.Allocator) void {
@@ -1521,4 +1504,48 @@ test "writeClientContextManifest writes selected agents and features" {
     const features = parsed.value.object.get("features").?;
     try std.testing.expect(features.object.get("enhanced_memory_writes").?.bool);
     try std.testing.expect(features.object.get("provenance_envelopes").?.bool);
+}
+
+test "ensureCogGitignore writes cog-local ignore patterns" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var original_cwd = std.fs.cwd().openDir(".", .{}) catch unreachable;
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+
+    try tmp_dir.dir.setAsCwd();
+    try ensureCogGitignore(allocator);
+
+    const content = readCwdFile(allocator, ".cog/.gitignore") orelse return error.TestUnexpectedResult;
+    defer allocator.free(content);
+
+    try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", content);
+    try std.testing.expect(readCwdFile(allocator, ".gitignore") == null);
+}
+
+test "ensureCogGitignore overwrites stale cog-local gitignore content" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var original_cwd = std.fs.cwd().openDir(".", .{}) catch unreachable;
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+
+    try tmp_dir.dir.setAsCwd();
+    try std.fs.cwd().makeDir(".cog");
+    try writeCwdFile(".cog/.gitignore", "old\n");
+
+    try ensureCogGitignore(allocator);
+
+    const content = readCwdFile(allocator, ".cog/.gitignore") orelse return error.TestUnexpectedResult;
+    defer allocator.free(content);
+
+    try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", content);
 }
