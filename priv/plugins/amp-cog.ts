@@ -24,6 +24,7 @@ const sessionState = {
   pendingLearning: false,
   pendingConsolidation: false,
   forcedContinuation: false,
+  memorySubagentActive: false,
 }
 
 function hasCogWorkspaceConfig(): boolean {
@@ -70,6 +71,7 @@ export default function registerCogPlugin(amp: PluginAPI) {
     sessionState.pendingLearning = false
     sessionState.pendingConsolidation = false
     sessionState.forcedContinuation = false
+    sessionState.memorySubagentActive = false
   })
 
   amp.on('tool.call', (event) => {
@@ -96,6 +98,12 @@ export default function registerCogPlugin(amp: PluginAPI) {
 
     if ((sessionState.pendingLearning || sessionState.pendingConsolidation) &&
         !memoryWriteTools.has(toolName) && !memoryReviewTools.has(toolName) && !memoryValidationTools.has(toolName)) {
+      // Code intelligence and LSP tools are read-only and legitimately needed
+      // by memory sub-agents during triage — allow them through with an advisory
+      if (deepExplorationTools.has(toolName) || toolName.startsWith('lsp_') || memoryRecallTools.has(toolName)) {
+        amp.logger.log('Cog memory workflow: remember to delegate to cog-mem-validate to store durable knowledge before finishing.')
+        return { action: 'allow' }
+      }
       return {
         action: 'reject-and-continue',
         message:

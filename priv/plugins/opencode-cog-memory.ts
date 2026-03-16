@@ -89,7 +89,8 @@ function getSubagentType(args) {
 }
 
 function isMemoryTask(args) {
-  return getSubagentType(args) === "cog-mem"
+  const st = getSubagentType(args)
+  return st === "cog-mem" || st === "cog-mem-validate"
 }
 
 function looksLikeRecallTask(args) {
@@ -250,7 +251,8 @@ export default async () => ({
     }
 
     if ((state.pendingLearning || state.pendingConsolidation) &&
-        !memoryWriteTools.has(input.tool) && !memoryConsolidationTools.has(input.tool)) {
+        !memoryWriteTools.has(input.tool) && !memoryConsolidationTools.has(input.tool) &&
+        !state.memoryTriageActive) {
       if (input.tool !== "task" || !isMemoryTask(getArgs(output.args))) {
         throw new Error(
           "Cog memory workflow: delegate to the cog-mem-validate sub-agent to learn durable knowledge and consolidate short-term memories. One subagent call — do not call memory tools directly.",
@@ -269,7 +271,6 @@ export default async () => ({
     if (input.tool === "task") {
       const args = getArgs(output.args)
       const memoryTask = isMemoryTask(args)
-      const consolidationTask = looksLikeConsolidationTask(args)
 
       if (state.memoryTriageActive && !memoryTask) {
         throw new Error(
@@ -277,7 +278,7 @@ export default async () => ({
         )
       }
 
-      if (memoryTask && !consolidationTask) {
+      if (memoryTask) {
         state.memoryTriageActive = true
       }
 
