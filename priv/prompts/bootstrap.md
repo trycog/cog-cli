@@ -47,7 +47,7 @@ Associations: "Bootstrap Abort Cascade" `requires` "Worker Thread Pool Distribut
 
 ## Associations
 
-Use `cog_mem_bulk_associate` to link concepts. **Predicate choice matters enormously for recall quality:**
+Use `cog_mem_associate` with an `items` array to link concepts in a single batch call. **Predicate choice matters enormously for recall quality:**
 
 **Prefer these** (strong signal during graph traversal):
 - `requires` — A depends on B to function
@@ -64,10 +64,10 @@ Every concept should have at least one association. Orphaned concepts are nearly
 ## How to Store
 
 1. Use `cog_mem_recall` with a query related to this file's domain to check what already exists.
-2. Use `cog_mem_bulk_learn` to store concepts:
+2. Use `cog_mem_learn` with an `items` array to store multiple concepts in a single batch call:
    - Each item needs `term` and `definition`
    - Set `memory_term` to `"long"` for permanent storage
-3. Use `cog_mem_bulk_associate` to create relationships between concepts, including links to concepts found via recall.
+3. Use `cog_mem_associate` with an `items` array to create relationships between concepts in a single batch call, including links to concepts found via recall.
 
 ## Rules
 

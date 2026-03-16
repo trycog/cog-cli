@@ -81,7 +81,6 @@ const gemini_debug_tools =
     \\  - cog__code_query
     \\  - cog__code_explore
     \\  - cog__mem_recall
-    \\  - cog__mem_bulk_recall
     \\  - read_file
     \\  - run_shell_command
 ;
@@ -89,10 +88,12 @@ const gemini_debug_tools =
 const gemini_memory_tools =
     \\tools:
     \\  - cog__mem_recall
-    \\  - cog__mem_bulk_recall
+    \\  - cog__code_explore
+    \\  - cog__code_query
     \\  - cog__mem_trace
     \\  - cog__mem_connections
     \\  - cog__mem_get
+    \\  - cog__mem_learn
     \\  - cog__mem_list_short_term
     \\  - cog__mem_reinforce
     \\  - cog__mem_flush
@@ -104,8 +105,37 @@ const gemini_memory_tools =
     \\  - cog__mem_list_terms
     \\  - cog__mem_unlink
     \\  - cog__mem_meld
-    \\  - cog__mem_bulk_learn
-    \\  - cog__mem_bulk_associate
+    \\  - cog__mem_associate
+    \\  - cog__mem_refactor
+    \\  - cog__mem_update
+    \\  - cog__mem_deprecate
+    \\  - read_file
+;
+
+const gemini_validate_tools =
+    \\tools:
+    \\  - cog__mem_learn
+    \\  - cog__mem_associate
+    \\  - cog__mem_refactor
+    \\  - cog__mem_update
+    \\  - cog__mem_deprecate
+    \\  - cog__mem_list_short_term
+    \\  - cog__mem_reinforce
+    \\  - cog__mem_flush
+    \\  - cog__mem_verify
+;
+
+const copilot_validate_tools =
+    \\tools:
+    \\  - cog/mem_learn
+    \\  - cog/mem_associate
+    \\  - cog/mem_refactor
+    \\  - cog/mem_update
+    \\  - cog/mem_deprecate
+    \\  - cog/mem_list_short_term
+    \\  - cog/mem_reinforce
+    \\  - cog/mem_flush
+    \\  - cog/mem_verify
 ;
 
 const copilot_code_query_tools =
@@ -128,7 +158,6 @@ const copilot_debug_tools =
     \\  - cog/code_explore
     \\  - cog/code_query
     \\  - cog/mem_recall
-    \\  - cog/mem_bulk_recall
     \\  - read
     \\  - execute
 ;
@@ -136,10 +165,12 @@ const copilot_debug_tools =
 const copilot_memory_tools =
     \\tools:
     \\  - cog/mem_recall
-    \\  - cog/mem_bulk_recall
+    \\  - cog/code_explore
+    \\  - cog/code_query
     \\  - cog/mem_trace
     \\  - cog/mem_connections
     \\  - cog/mem_get
+    \\  - cog/mem_learn
     \\  - cog/mem_list_short_term
     \\  - cog/mem_reinforce
     \\  - cog/mem_flush
@@ -151,8 +182,11 @@ const copilot_memory_tools =
     \\  - cog/mem_list_terms
     \\  - cog/mem_unlink
     \\  - cog/mem_meld
-    \\  - cog/mem_bulk_learn
-    \\  - cog/mem_bulk_associate
+    \\  - cog/mem_associate
+    \\  - cog/mem_refactor
+    \\  - cog/mem_update
+    \\  - cog/mem_deprecate
+    \\  - read
 ;
 
 pub const Agent = struct {
@@ -167,6 +201,8 @@ pub const Agent = struct {
     debug_file_header: ?[]const u8,
     mem_file_path: ?[]const u8,
     mem_file_header: ?[]const u8,
+    validate_file_path: ?[]const u8 = null,
+    validate_file_header: ?[]const u8 = null,
 
     pub fn capabilities(self: *const Agent) AgentCapabilities {
         if (std.mem.eql(u8, self.id, "claude_code")) {
@@ -263,14 +299,14 @@ pub const Agent = struct {
             return .{
                 .repo_local_mcp = true,
                 .auto_tool_permissions = true,
-                .runtime_policy_plugins = false,
+                .runtime_policy_plugins = true,
                 .dedicated_subagent_files = true,
                 .subagent_support = .dedicated_files,
-                .code_query_enforcement = .config,
+                .code_query_enforcement = .runtime,
                 .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .memory_enforcement = .runtime,
                 .context_packaging = true,
-                .memory_write_enrichment = .config,
+                .memory_write_enrichment = .runtime,
             };
         }
 
@@ -487,7 +523,6 @@ pub const agents = [_]Agent{
         \\  - mcp__cog__code_query
         \\  - mcp__cog__code_explore
         \\  - mcp__cog__mem_recall
-        \\  - mcp__cog__mem_bulk_recall
         \\  - Read
         \\  - Bash
         \\mcpServers:
@@ -500,13 +535,15 @@ pub const agents = [_]Agent{
         .mem_file_header =
         \\---
         \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\description: Memory sub-agent for recall-first triage, escalation, and consolidation
         \\tools:
         \\  - mcp__cog__mem_recall
-        \\  - mcp__cog__mem_bulk_recall
+        \\  - mcp__cog__code_explore
+        \\  - mcp__cog__code_query
         \\  - mcp__cog__mem_trace
         \\  - mcp__cog__mem_connections
         \\  - mcp__cog__mem_get
+        \\  - mcp__cog__mem_learn
         \\  - mcp__cog__mem_list_short_term
         \\  - mcp__cog__mem_reinforce
         \\  - mcp__cog__mem_flush
@@ -518,8 +555,31 @@ pub const agents = [_]Agent{
         \\  - mcp__cog__mem_list_terms
         \\  - mcp__cog__mem_unlink
         \\  - mcp__cog__mem_meld
-        \\  - mcp__cog__mem_bulk_learn
-        \\  - mcp__cog__mem_bulk_associate
+        \\  - mcp__cog__mem_associate
+        \\  - mcp__cog__mem_refactor
+        \\  - mcp__cog__mem_update
+        \\  - mcp__cog__mem_deprecate
+        \\  - Read
+        \\mcpServers:
+        \\  - cog
+        \\---
+        \\
+        ,
+        .validate_file_path = ".claude/agents/cog-mem-validate.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        \\tools:
+        \\  - mcp__cog__mem_learn
+        \\  - mcp__cog__mem_associate
+        \\  - mcp__cog__mem_refactor
+        \\  - mcp__cog__mem_update
+        \\  - mcp__cog__mem_deprecate
+        \\  - mcp__cog__mem_list_short_term
+        \\  - mcp__cog__mem_reinforce
+        \\  - mcp__cog__mem_flush
+        \\  - mcp__cog__mem_verify
         \\mcpServers:
         \\  - cog
         \\---
@@ -553,11 +613,20 @@ pub const agents = [_]Agent{
         \\
         ,
     .mem_file_path = ".gemini/agents/cog-mem.md",
-        .mem_file_header = 
+        .mem_file_header =
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
     ++ gemini_memory_tools ++
+        \\---
+        \\
+        ,
+    .validate_file_path = ".gemini/agents/cog-mem-validate.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+    ++ gemini_validate_tools ++
         \\---
         \\
         ,
@@ -589,11 +658,21 @@ pub const agents = [_]Agent{
         \\
         ,
     .mem_file_path = ".github/agents/cog-mem.agent.md",
-        .mem_file_header = 
+        .mem_file_header =
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
     ++ copilot_memory_tools ++
+        \\user-invokable: false
+        \\---
+        \\
+        ,
+    .validate_file_path = ".github/agents/cog-mem-validate.agent.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+    ++ copilot_validate_tools ++
         \\user-invokable: false
         \\---
         \\
@@ -627,6 +706,14 @@ pub const agents = [_]Agent{
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\---
+        \\
+        ,
+        .validate_file_path = ".windsurf/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
         \\---
         \\
         ,
@@ -690,6 +777,14 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .validate_file_path = ".agents/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        \\---
+        \\
+        ,
     },
     // ── Goose ───────────────────────────────────────────────────────
     .{
@@ -719,6 +814,14 @@ pub const agents = [_]Agent{
         \\---
         \\name: cog-mem
         \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\---
+        \\
+        ,
+        .validate_file_path = ".goose/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
         \\---
         \\
         ,
@@ -784,6 +887,26 @@ pub const agents = [_]Agent{
         .mem_file_header =
         \\---
         \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\mode: subagent
+        \\permission:
+        \\  read: deny
+        \\  glob: deny
+        \\  grep: deny
+        \\  list: deny
+        \\  bash: deny
+        \\  webfetch: deny
+        \\  task: deny
+        \\  cog_*: allow
+        \\tools:
+        \\  write: false
+        \\  edit: false
+        \\---
+        \\
+        ,
+        .validate_file_path = ".opencode/agents/cog-mem-validate.md",
+        .validate_file_header =
+        \\---
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
         \\mode: subagent
         \\permission:
         \\  read: deny
@@ -939,16 +1062,16 @@ test "capability model keeps subagent topology explicit" {
     }
 }
 
-test "runtime policy plugins stay opencode-only" {
+test "runtime policy plugins stay explicitly modeled" {
     var runtime_plugin_agents: usize = 0;
     for (agents) |agent| {
         if (agent.capabilities().runtime_policy_plugins) {
             runtime_plugin_agents += 1;
-            try std.testing.expectEqualStrings("opencode", agent.id);
+            try std.testing.expect(std.mem.eql(u8, agent.id, "amp") or std.mem.eql(u8, agent.id, "opencode"));
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 1), runtime_plugin_agents);
+    try std.testing.expectEqual(@as(usize, 2), runtime_plugin_agents);
 }
 
 test "tool permission support stays capability-driven" {
@@ -971,9 +1094,12 @@ test "enforcement level stays capability-driven" {
     try std.testing.expect(agents[2].capabilities().memory_enforcement == .prompt_only);
 
     try std.testing.expect(agents[0].capabilities().memory_write_enrichment == .config);
-    try std.testing.expect(agents[6].capabilities().memory_write_enrichment == .config);
+    try std.testing.expect(agents[6].capabilities().memory_write_enrichment == .runtime);
     try std.testing.expect(agents[9].capabilities().memory_write_enrichment == .runtime);
     try std.testing.expect(agents[2].capabilities().memory_write_enrichment == .prompt_only);
+
+    try std.testing.expect(agents[6].capabilities().code_query_enforcement == .runtime);
+    try std.testing.expect(agents[6].capabilities().memory_enforcement == .runtime);
 
     for (agents) |agent| {
         try std.testing.expect(agent.capabilities().context_packaging);
@@ -1010,6 +1136,14 @@ test "opencode mem header stays memory-only" {
     try std.testing.expect(std.mem.indexOf(u8, opencode_mem_header, "cog_*: allow") != null);
 }
 
+test "claude memory header supports recall-first escalation" {
+    const claude_mem_header = agents[0].mem_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, claude_mem_header, "mcp__cog__mem_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_mem_header, "mcp__cog__code_explore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_mem_header, "mcp__cog__mem_learn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_mem_header, "mcp__cog__mem_reinforce") != null);
+}
+
 test "opencode debug header stays debugger-focused" {
     const opencode_debug_header = agents[9].debug_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, opencode_debug_header, "read: allow") != null);
@@ -1034,11 +1168,13 @@ test "gemini specialist headers stay capability-aligned" {
 
     const gemini_debug_header = agents[1].debug_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, gemini_debug_header, "cog__debug_sessions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gemini_debug_header, "cog__mem_bulk_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_debug_header, "cog__mem_recall") != null);
 
     const gemini_mem_header = agents[1].mem_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_bulk_associate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__code_explore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_learn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_associate") != null);
 }
 
 test "copilot specialist headers stay capability-aligned" {
@@ -1051,12 +1187,14 @@ test "copilot specialist headers stay capability-aligned" {
 
     const copilot_debug_header = agents[2].debug_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/debug_sessions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/mem_bulk_recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/mem_recall") != null);
     try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/*") == null);
 
     const copilot_mem_header = agents[2].mem_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_bulk_associate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/code_explore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_learn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_associate") != null);
 }
 
 test "mcp strategy coverage stays explicit" {
@@ -1087,7 +1225,7 @@ test "support summaries stay capability-driven" {
     try std.testing.expectEqualStrings("Soft skills + rules", agents[3].overrideSummary());
     try std.testing.expectEqualStrings("Soft AGENTS.md + rules", agents[4].overrideSummary());
     try std.testing.expectEqualStrings("Soft shared-config specialist guidance", agents[5].overrideSummary());
-    try std.testing.expectEqualStrings("Medium permission bootstrap + skills + plugin", agents[6].overrideSummary());
+    try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[6].overrideSummary());
     try std.testing.expectEqualStrings("Soft skill guidance", agents[7].overrideSummary());
     try std.testing.expectEqualStrings("Medium native mode groups", agents[8].overrideSummary());
     try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[9].overrideSummary());
@@ -1099,6 +1237,7 @@ test "support matrix helpers stay aligned" {
     try std.testing.expectEqualStrings("", agents[4].subAgentsSummary());
     try std.testing.expectEqualStrings("Yes", agents[9].subAgentsSummary());
     try std.testing.expectEqualStrings("Yes", agents[0].contextPackagingSummary());
+    try std.testing.expectEqualStrings("Runtime reminders", agents[6].memoryEnrichmentSummary());
     try std.testing.expectEqualStrings("Runtime reminders", agents[9].memoryEnrichmentSummary());
 
     const opencode_row = try agents[9].supportMatrixRow(std.testing.allocator);

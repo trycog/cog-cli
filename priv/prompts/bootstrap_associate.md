@@ -18,7 +18,7 @@ For each file pair above, use `cog_mem_recall` to find the concepts that were st
 
 ## 2. Create Associations
 
-Use `cog_mem_bulk_associate` to link concepts across files based on the symbol dependencies.
+Use `cog_mem_associate` with an `items` array to link concepts across files based on the symbol dependencies in a single batch call.
 
 ### Predicate Guide
 

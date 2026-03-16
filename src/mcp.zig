@@ -1046,17 +1046,12 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     // guides the agent to only use 5 direct memory tools; everything else
     // is accessed through sub-agents (code, debug, memory).
 
-    try writeToolDef(s, "code_query", "Targeted code index query tool. Use 'find', 'refs', and 'symbols' for precise symbol lookups; use 'imports', 'contains', 'calls', 'callers', and 'overview' for architecture-aware follow-up on files, symbols, or whole repositories.", &.{
-        .{ .name = "mode", .typ = "string", .desc = "Query mode: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'", .required = true },
-        .{ .name = "name", .typ = "string", .desc = "Symbol name to search for when the mode operates on a symbol. Supports glob patterns: '*' (zero or more chars), '?' (one char), and alternation with '|'.", .required = false },
-        .{ .name = "file", .typ = "string", .desc = "File path for file-scoped queries. Required for 'symbols' and 'overview' with scope='file'. Optional for other modes when you want to force file context.", .required = false },
-        .{ .name = "kind", .typ = "string", .desc = "Filter results by symbol kind (e.g. function, class, method, variable)", .required = false },
-        .{ .name = "direction", .typ = "string", .desc = "Direction for relationship queries: 'incoming', 'outgoing', or 'both'", .required = false },
-        .{ .name = "scope", .typ = "string", .desc = "Overview scope: 'symbol', 'file', or 'repo'", .required = false },
-    });
+    try writeToolDefWithSchemaJson(allocator, s, "code_query", "Targeted code index query tool. ALWAYS use the 'queries' array to batch multiple queries into a single call — do NOT make sequential code_query calls when they can be combined. Modes: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', 'overview'. Flat parameters (mode, name, file, etc.) are only for genuinely single queries.",
+        \\{"type":"object","properties":{"queries":{"type":"array","description":"REQUIRED for multiple queries. Each entry specifies its own mode, name, file, kind, direction, and scope. Always combine sequential code_query calls into one batched call using this array.","items":{"type":"object","properties":{"mode":{"type":"string","description":"Query mode: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'"},"name":{"type":"string","description":"Symbol name (supports glob: '*', '?', '|')"},"file":{"type":"string","description":"File path for file-scoped queries"},"kind":{"type":"string","description":"Filter by symbol kind"},"direction":{"type":"string","description":"'incoming', 'outgoing', or 'both'"},"scope":{"type":"string","description":"Overview scope: 'symbol', 'file', or 'repo'"}},"required":["mode"]}},"mode":{"type":"string","description":"Query mode (single-query only — use 'queries' array for multiple): 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'"},"name":{"type":"string","description":"Symbol name (supports glob: '*', '?', '|')"},"file":{"type":"string","description":"File path for file-scoped queries"},"kind":{"type":"string","description":"Filter by symbol kind"},"direction":{"type":"string","description":"'incoming', 'outgoing', or 'both'"},"scope":{"type":"string","description":"Overview scope: 'symbol', 'file', or 'repo'"}}}
+    );
 
-    try writeToolDefWithSchemaJson(allocator, s, "code_explore", "Primary code exploration tool. Batch all candidate symbols into one call whenever possible and prefer a single batched call for repository summaries. Returns readable plain-text summaries with definition bodies, per-file outlines, and optional architecture sections such as imports, containment, and overview data.",
-        \\{"type":"object","properties":{"queries":{"type":"array","description":"List of symbol queries. Each finds a symbol and returns source code around its definition.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"},"include_relationships":{"type":"boolean","description":"Include symbol-level relationship summaries such as containment and imports when available"},"include_architecture":{"type":"boolean","description":"Include architecture-oriented summaries. Recommended for repository overview tasks."},"overview_scope":{"type":"string","description":"Architecture summary scope: 'symbol', 'file', or 'repo'"}},"required":["queries"]}
+    try writeToolDefWithSchemaJson(allocator, s, "code_explore", "Primary code exploration tool. ALWAYS put all candidate symbols into the 'queries' array in a single call — do NOT make sequential code_explore calls when they can be combined. Returns readable plain-text summaries with definition bodies, per-file outlines, and optional architecture sections such as imports, containment, and overview data.",
+        \\{"type":"object","properties":{"queries":{"type":"array","description":"REQUIRED. All symbol lookups MUST go into this single array. Do not split symbols across multiple code_explore calls.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"},"include_relationships":{"type":"boolean","description":"Include symbol-level relationship summaries such as containment and imports when available"},"include_architecture":{"type":"boolean","description":"Include architecture-oriented summaries. Recommended for repository overview tasks."},"overview_scope":{"type":"string","description":"Architecture summary scope: 'symbol', 'file', or 'repo'"}},"required":["queries"]}
     );
 
     // Memory tools: local definitions or remote discovery
@@ -1136,7 +1131,7 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
 
 /// Prefix a remote tool suffix with "mem_".
 /// e.g. prefixToolName(alloc, "recall") → "mem_recall"
-///      prefixToolName(alloc, "bulk_recall") → "mem_bulk_recall"
+///      prefixToolName(alloc, "learn") → "mem_learn"
 fn prefixToolName(allocator: std.mem.Allocator, suffix: []const u8) ![]const u8 {
     const prefix = "mem_";
     const buf = try allocator.alloc(u8, prefix.len + suffix.len);
@@ -1147,7 +1142,7 @@ fn prefixToolName(allocator: std.mem.Allocator, suffix: []const u8) ![]const u8 
 
 /// Rewrite cog_xxx tool name references in descriptions to mem_xxx format.
 /// e.g. "use cog_reinforce to..." → "use mem_reinforce to..."
-///      "multiple cog_bulk_recall calls" → "multiple mem_bulk_recall calls"
+///      "use cog_learn with items" → "use mem_learn with items"
 fn rewriteToolReferences(allocator: std.mem.Allocator, desc: []const u8) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -1449,63 +1444,85 @@ fn trimMemPrefix(tool_name: []const u8) []const u8 {
 
 // ── Code Tool Handlers ──────────────────────────────────────────────────
 
+fn parseMode(mode_str: []const u8) ?code_intel.QueryMode {
+    if (std.mem.eql(u8, mode_str, "find")) return .find;
+    if (std.mem.eql(u8, mode_str, "refs")) return .refs;
+    if (std.mem.eql(u8, mode_str, "symbols")) return .symbols;
+    if (std.mem.eql(u8, mode_str, "imports")) return .imports;
+    if (std.mem.eql(u8, mode_str, "contains")) return .contains;
+    if (std.mem.eql(u8, mode_str, "calls")) return .calls;
+    if (std.mem.eql(u8, mode_str, "callers")) return .callers;
+    if (std.mem.eql(u8, mode_str, "overview")) return .overview;
+    return null;
+}
+
+fn parseDirection(dir: []const u8) code_intel.QueryDirection {
+    if (std.mem.eql(u8, dir, "incoming")) return .incoming;
+    if (std.mem.eql(u8, dir, "both")) return .both;
+    return .outgoing;
+}
+
+fn parseScope(scope_str: []const u8) code_intel.OverviewScope {
+    if (std.mem.eql(u8, scope_str, "repo")) return .repo;
+    if (std.mem.eql(u8, scope_str, "file")) return .file;
+    return .symbol;
+}
+
+fn parseQueryParams(item: json.Value) ?code_intel.QueryParams {
+    const mode_str = getStr(item, "mode") orelse return null;
+    const mode = parseMode(mode_str) orelse return null;
+    return .{
+        .mode = mode,
+        .name = getStr(item, "name"),
+        .file = getStr(item, "file"),
+        .kind = getStr(item, "kind"),
+        .direction = if (getStr(item, "direction")) |dir| parseDirection(dir) else .outgoing,
+        .scope = if (getStr(item, "scope")) |s| parseScope(s) else .symbol,
+    };
+}
+
 fn callCodeQuery(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
     const allocator = runtime.allocator;
     const args = arguments orelse return error.Explained;
-
-    const mode_str = getStr(args, "mode") orelse return error.Explained;
-    debug_log_mod.log("callCodeQuery: mode={s}", .{mode_str});
-    const mode: code_intel.QueryMode = if (std.mem.eql(u8, mode_str, "find"))
-        .find
-    else if (std.mem.eql(u8, mode_str, "refs"))
-        .refs
-    else if (std.mem.eql(u8, mode_str, "symbols"))
-        .symbols
-    else if (std.mem.eql(u8, mode_str, "imports"))
-        .imports
-    else if (std.mem.eql(u8, mode_str, "contains"))
-        .contains
-    else if (std.mem.eql(u8, mode_str, "calls"))
-        .calls
-    else if (std.mem.eql(u8, mode_str, "callers"))
-        .callers
-    else if (std.mem.eql(u8, mode_str, "overview"))
-        .overview
-    else
-        return error.Explained;
-
-    const direction: code_intel.QueryDirection = if (getStr(args, "direction")) |dir|
-        if (std.mem.eql(u8, dir, "incoming"))
-            .incoming
-        else if (std.mem.eql(u8, dir, "both"))
-            .both
-        else
-            .outgoing
-    else
-        .outgoing;
-
-    const scope: code_intel.OverviewScope = if (getStr(args, "scope")) |scope_str|
-        if (std.mem.eql(u8, scope_str, "repo"))
-            .repo
-        else if (std.mem.eql(u8, scope_str, "file"))
-            .file
-        else
-            .symbol
-    else
-        .symbol;
 
     if (runtime.code_cache == null and code_intel.queryIndexStatusForRuntime(allocator) != .ready) {
         return error.IndexUnavailable;
     }
 
     const ci = try runtime.ensureCodeCache();
+
+    // Batch path: queries array
+    const queries_val = if (args == .object) args.object.get("queries") else null;
+    if (queries_val) |qv| {
+        if (qv == .array) {
+            var queries: std.ArrayListUnmanaged(code_intel.QueryParams) = .empty;
+            defer queries.deinit(allocator);
+
+            for (qv.array.items) |item| {
+                if (parseQueryParams(item)) |params| {
+                    try queries.append(allocator, params);
+                }
+            }
+
+            debug_log_mod.log("callCodeQuery: batch mode, parsed {d} queries", .{queries.items.len});
+            if (queries.items.len == 0) return error.Explained;
+
+            return code_intel.codeQueryBatchWithLoadedIndex(allocator, ci, queries.items);
+        }
+    }
+
+    // Single-query path: flat parameters
+    const mode_str = getStr(args, "mode") orelse return error.Explained;
+    debug_log_mod.log("callCodeQuery: mode={s}", .{mode_str});
+    const mode = parseMode(mode_str) orelse return error.Explained;
+
     return code_intel.codeQueryWithLoadedIndex(allocator, ci, .{
         .mode = mode,
         .name = getStr(args, "name"),
         .file = getStr(args, "file"),
         .kind = getStr(args, "kind"),
-        .direction = direction,
-        .scope = scope,
+        .direction = if (getStr(args, "direction")) |dir| parseDirection(dir) else .outgoing,
+        .scope = if (getStr(args, "scope")) |s| parseScope(s) else .symbol,
     });
 }
 

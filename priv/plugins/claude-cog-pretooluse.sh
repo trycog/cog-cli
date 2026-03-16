@@ -3,11 +3,26 @@ set -eu
 
 payload=$(cat)
 
+extract_string() {
+  key=$1
+  printf '%s' "$payload" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n 1
+}
+
+transcript_has() {
+  pattern=$1
+  transcript_path=$2
+  if [ -z "$transcript_path" ] || [ ! -f "$transcript_path" ]; then
+    return 1
+  fi
+  grep -q "$pattern" "$transcript_path"
+}
+
 if [ ! -f ".mcp.json" ] || ! grep -q '"cog"' ".mcp.json"; then
   exit 0
 fi
 
 tool_name=$(printf '%s' "$payload" | sed -n 's/.*"tool_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+transcript_path=$(extract_string transcript_path)
 
 deny() {
   reason=$1
@@ -20,6 +35,11 @@ advise() {
 }
 
 case "$tool_name" in
+  mcp__cog__code_explore)
+    if ! transcript_has 'mcp__cog__mem_recall' "$transcript_path"; then
+      advise "Cog memory workflow: if this is a prior-knowledge question rather than direct code tracing, use the cog-mem specialist first so it can check memory before broader exploration."
+    fi
+    ;;
   Grep|Glob)
     deny "Use Cog code intelligence tools before raw file search when the Cog MCP server is configured."
     ;;

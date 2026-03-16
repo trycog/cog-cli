@@ -376,6 +376,7 @@ const opencode_runtime_policy_assets = [_]RuntimePolicyAsset{
 
 const claude_runtime_policy_assets = [_]RuntimePolicyAsset{
     .{ .path = ".claude/hooks/cog-pretooluse.sh", .content = claude_pretooluse_hook_content },
+    .{ .path = ".claude/hooks/cog-stop-memory.sh", .content = claude_stop_memory_hook_content },
 };
 
 const gemini_runtime_policy_assets = [_]RuntimePolicyAsset{
@@ -584,6 +585,7 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
     try s.beginObject();
 
     var wrote_pretooluse = false;
+    var wrote_stop = false;
     if (existing_hooks) |hooks| {
         if (hooks == .object) {
             var iter = hooks.object.iterator();
@@ -592,6 +594,10 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
                     wrote_pretooluse = true;
                     try s.objectField("PreToolUse");
                     try writeClaudePreToolUseHookArray(&s, entry.value_ptr.*);
+                } else if (std.mem.eql(u8, entry.key_ptr.*, "Stop")) {
+                    wrote_stop = true;
+                    try s.objectField("Stop");
+                    try writeClaudeStopHookArray(&s, entry.value_ptr.*);
                 } else {
                     try s.objectField(entry.key_ptr.*);
                     try s.write(entry.value_ptr.*);
@@ -605,6 +611,11 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
         try writeClaudePreToolUseHookArray(&s, null);
     }
 
+    if (!wrote_stop) {
+        try s.objectField("Stop");
+        try writeClaudeStopHookArray(&s, null);
+    }
+
     try s.endObject();
     try s.endObject();
 
@@ -615,6 +626,7 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
 
 fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !void {
     const command = "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-pretooluse.sh";
+    const matcher_value = "Grep|Glob|Bash|mcp__cog__code_explore";
     var already_has_group = false;
 
     try s.beginArray();
@@ -623,7 +635,7 @@ fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !v
             for (value.array.items) |item| {
                 if (item == .object) {
                     if (item.object.get("matcher")) |matcher| {
-                        if (matcher == .string and std.mem.eql(u8, matcher.string, "Grep|Glob|Bash")) {
+                        if (matcher == .string and std.mem.eql(u8, matcher.string, matcher_value)) {
                             if (item.object.get("hooks")) |hooks| {
                                 if (hooks == .array) {
                                     for (hooks.array.items) |hook| {
@@ -648,7 +660,7 @@ fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !v
     if (!already_has_group) {
         try s.beginObject();
         try s.objectField("matcher");
-        try s.write("Grep|Glob|Bash");
+        try s.write(matcher_value);
         try s.objectField("hooks");
         try s.beginArray();
         try s.beginObject();
@@ -658,6 +670,56 @@ fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !v
         try s.write(command);
         try s.objectField("timeout");
         try s.write(30);
+        try s.endObject();
+        try s.endArray();
+        try s.endObject();
+    }
+
+    try s.endArray();
+}
+
+fn writeClaudeStopHookArray(s: *Stringify, existing_value: ?json.Value) !void {
+    debug_log.log("hooks.writeClaudeStopHookArray", .{});
+    const command = "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-stop-memory.sh";
+    var already_has_hook = false;
+
+    try s.beginArray();
+    if (existing_value) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                if (item == .object) {
+                    if (item.object.get("hooks")) |hooks| {
+                        if (hooks == .array) {
+                            for (hooks.array.items) |hook| {
+                                if (hook == .object) {
+                                    if (hook.object.get("command")) |existing_command| {
+                                        if (existing_command == .string and std.mem.eql(u8, existing_command.string, command)) {
+                                            already_has_hook = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                try s.write(item);
+            }
+        }
+    }
+
+    if (!already_has_hook) {
+        try s.beginObject();
+        try s.objectField("hooks");
+        try s.beginArray();
+        try s.beginObject();
+        try s.objectField("type");
+        try s.write("command");
+        try s.objectField("command");
+        try s.write(command);
+        try s.objectField("timeout");
+        try s.write(10);
+        try s.objectField("statusMessage");
+        try s.write("Verifying memory storage...");
         try s.endObject();
         try s.endArray();
         try s.endObject();
@@ -1233,7 +1295,28 @@ pub fn configureMemAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Age
         defer allocator.free(instructions);
         try writeTomlAgent(allocator, mem_path, "cog-mem", "Memory sub-agent for recall, consolidation, and maintenance", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
-        try writeRooAgent(allocator, mem_path, "cog-mem", "Cog Memory", "You are a memory sub-agent for Cog's persistent associative knowledge graph. Search memory with cog_mem_recall, consolidate short-term memories with cog_mem_list_short_term and cog_mem_reinforce, and check brain health with cog_mem_stats. Return concise summaries with engram IDs.");
+        try writeRooAgent(allocator, mem_path, "cog-mem", "Cog Memory", "You are a memory sub-agent for Cog's persistent associative knowledge graph. Start with cog_mem_recall, decide whether memory is sufficient, and only then escalate to cog_code_explore or cog_code_query if memory is insufficient. If exploration teaches something durable, write it back with cog_mem_learn. Before finishing, review short-term memory with cog_mem_list_short_term and validate it with cog_mem_reinforce, cog_mem_verify, or cog_mem_flush. Return concise summaries with engram IDs.");
+    }
+}
+
+pub fn configureValidateAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
+    const validate_path = agent.validate_file_path orelse return;
+    const caps = agent.capabilities();
+
+    if (caps.subagent_support == .workflow_files) {
+        const header = agent.validate_file_header orelse return;
+        const instructions = try buildWorkflowSpecialistInstructions(allocator, agent.display_name, .validate, build_options.validate_agent_body);
+        defer allocator.free(instructions);
+        try writeMarkdownAgent(allocator, validate_path, header, instructions);
+    } else if (caps.subagent_support == .dedicated_files) {
+        const header = agent.validate_file_header orelse return;
+        try writeMarkdownAgent(allocator, validate_path, header, build_options.validate_agent_body);
+    } else if (std.mem.eql(u8, agent.id, "codex")) {
+        const instructions = try buildCodexSpecialistInstructions(allocator, .validate, build_options.validate_agent_body);
+        defer allocator.free(instructions);
+        try writeTomlAgent(allocator, validate_path, "cog-mem-validate", "Post-task memory validation — learns durable knowledge and consolidates short-term memories", instructions);
+    } else if (std.mem.eql(u8, agent.id, "roo")) {
+        try writeRooAgent(allocator, validate_path, "cog-mem-validate", "Cog Memory Validate", "You are a post-task memory validation sub-agent. Store durable knowledge from the primary agent's exploration with cog_mem_learn, then consolidate short-term memories with cog_mem_list_short_term and cog_mem_reinforce or cog_mem_flush. Return concise summaries with engram IDs.");
     }
 }
 
@@ -1241,6 +1324,7 @@ const CodexSpecialistKind = enum {
     code_query,
     debug,
     memory,
+    validate,
 };
 
 fn buildCodexSpecialistInstructions(allocator: std.mem.Allocator, kind: CodexSpecialistKind, body: []const u8) ![]const u8 {
@@ -1262,9 +1346,17 @@ fn buildCodexSpecialistInstructions(allocator: std.mem.Allocator, kind: CodexSpe
         ,
         .memory =>
         \\Host guidance:
-        \\- Use Cog memory tools as the primary interface.
-        \\- Do not explore the repository or edit files from this specialist.
+        \\- Use this specialist as the primary retrieval-first path.
+        \\- Start with Cog memory recall, decide whether memory is sufficient, and escalate to Cog code exploration inside the specialist only when memory is insufficient.
+        \\- Do not edit files from this specialist.
         \\- Return concise recall or consolidation results that the main agent can act on.
+        \\
+        ,
+        .validate =>
+        \\Host guidance:
+        \\- This specialist handles the full learn-and-consolidate lifecycle in one call.
+        \\- Do not edit files or explore code from this specialist.
+        \\- Return concise summaries with engram IDs.
         \\
         ,
     };
@@ -1296,8 +1388,18 @@ fn buildWorkflowSpecialistInstructions(allocator: std.mem.Allocator, agent_name:
         .memory => try std.fmt.allocPrint(allocator,
             \\Workflow guidance:
             \\- This host uses workflow files rather than hard-scoped subagents.
-            \\- Use Cog memory recall before broad unfamiliar exploration and consolidate durable findings before finishing.
+            \\- Use this workflow as the retrieval-first triage path.
+            \\- Start with Cog memory recall, decide whether memory is sufficient, and only then escalate to Cog code exploration inside the workflow if memory is insufficient.
+            \\- Consolidate durable findings before finishing.
             \\- Keep responses concise, include engram IDs when memory changes, and capture rationale or invariants when they are part of the durable memory.
+            \\
+            \\{s}
+        , .{body}),
+        .validate => try std.fmt.allocPrint(allocator,
+            \\Workflow guidance:
+            \\- This host uses workflow files rather than hard-scoped subagents.
+            \\- This workflow handles the full learn-and-consolidate lifecycle in one call.
+            \\- Return concise summaries with engram IDs.
             \\
             \\{s}
         , .{body}),
@@ -1326,8 +1428,16 @@ fn buildPromptOnlySpecialistInstructions(allocator: std.mem.Allocator, agent_nam
         .memory => try std.fmt.allocPrint(allocator,
             \\Host guidance:
             \\- {s} cannot hard-deny tools per specialist, so keep this role focused on Cog memory workflows.
-            \\- Use memory recall before broad unfamiliar exploration.
+            \\- Use this specialist as the retrieval-first triage path: recall first, decide sufficiency, and only then escalate to Cog code exploration inside the specialist if memory is insufficient.
             \\- Keep recall and consolidation responses concise, include engram IDs when memory changes, and preserve rationale or constraints when they are durable.
+            \\
+            \\{s}
+        , .{ agent_name, body }),
+        .validate => try std.fmt.allocPrint(allocator,
+            \\Host guidance:
+            \\- {s} cannot hard-deny tools per specialist, so keep this role focused on memory validation.
+            \\- Handle the full learn-and-consolidate lifecycle in one call.
+            \\- Return concise summaries with engram IDs.
             \\
             \\{s}
         , .{ agent_name, body }),
@@ -1356,8 +1466,17 @@ fn buildConfigScopedSpecialistInstructions(allocator: std.mem.Allocator, agent_n
         .memory => try std.fmt.allocPrint(allocator,
             \\Host guidance:
             \\- {s} provides config-level scoping for this memory specialist.
-            \\- Use Cog memory recall before broad unfamiliar exploration and keep updates concise.
+            \\- Use this specialist as the retrieval-first triage path: recall first, decide sufficiency, and only then escalate to Cog code exploration inside the specialist if memory is insufficient.
+            \\- Keep updates concise.
             \\- Include engram IDs when memory changes, and preserve provenance, rationale, or invariants when the source supports them.
+            \\
+            \\{s}
+        , .{ agent_name, body }),
+        .validate => try std.fmt.allocPrint(allocator,
+            \\Host guidance:
+            \\- {s} provides config-level scoping for this validation specialist.
+            \\- Handle the full learn-and-consolidate lifecycle in one call.
+            \\- Return concise summaries with engram IDs.
             \\
             \\{s}
         , .{ agent_name, body }),
@@ -1372,6 +1491,7 @@ pub const opencode_override_content = build_options.opencode_override_plugin;
 pub const opencode_memory_content = build_options.opencode_memory_plugin;
 pub const opencode_debug_content = build_options.opencode_debug_plugin;
 pub const claude_pretooluse_hook_content = build_options.claude_pretooluse_hook;
+pub const claude_stop_memory_hook_content = build_options.claude_stop_memory_hook;
 pub const gemini_before_tool_hook_content = build_options.gemini_before_tool_hook;
 pub const amp_cog_plugin_content = build_options.amp_cog_plugin;
 
@@ -1861,6 +1981,10 @@ test "writeOpenCodeMemoryPlugin creates provenance-aware memory plugin" {
             try std.testing.expect(std.mem.indexOf(u8, content, "recentSymbols") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "Recent Cog evidence") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "pendingConsolidation") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "delegate to the cog-mem subagent") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "memoryTriageActive") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Do not launch Explore") != null);
         }
     }.run);
 }
@@ -1874,9 +1998,11 @@ test "writeRuntimePolicyAsset creates Claude hook asset" {
             const content = readCwdFile(std.testing.allocator, ".claude/hooks/cog-pretooluse.sh") orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
-            try std.testing.expect(std.mem.indexOf(u8, content, "permissionDecision") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "transcript_path") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "mcp__cog__code_explore") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "Use Cog code intelligence tools before raw file search") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "prior-knowledge question rather than direct code tracing") != null);
         }
     }.run);
 }
@@ -1907,16 +2033,20 @@ test "writeRuntimePolicyAsset creates Amp plugin asset" {
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "tool.call") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "tool.result") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "agent.end") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "hasCogWorkspaceConfig") != null);
-            try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory quality") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "pendingConsolidation") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "Cog memory workflow") != null);
         }
     }.run);
 }
 
 test "runtimePolicyAssets stay capability-driven" {
     const claude_assets = runtimePolicyAssets(agents_mod.agents[0]);
-    try std.testing.expectEqual(@as(usize, 1), claude_assets.len);
+    try std.testing.expectEqual(@as(usize, 2), claude_assets.len);
     try std.testing.expectEqualStrings(".claude/hooks/cog-pretooluse.sh", claude_assets[0].path);
+    try std.testing.expectEqualStrings(".claude/hooks/cog-stop-memory.sh", claude_assets[1].path);
 
     const gemini_assets = runtimePolicyAssets(agents_mod.agents[1]);
     try std.testing.expectEqual(@as(usize, 1), gemini_assets.len);
@@ -2075,9 +2205,13 @@ test "writeClaudeRuntimeHooks adds pretooluse hook" {
 
             const hooks = parsed.value.object.get("hooks") orelse return error.TestUnexpectedResult;
             const pretool = hooks.object.get("PreToolUse") orelse return error.TestUnexpectedResult;
+            const stop = hooks.object.get("Stop") orelse return error.TestUnexpectedResult;
             try std.testing.expect(pretool == .array);
+            try std.testing.expect(stop == .array);
             try std.testing.expectEqual(@as(usize, 1), pretool.array.items.len);
-            try std.testing.expectEqualStrings("Grep|Glob|Bash", pretool.array.items[0].object.get("matcher").?.string);
+            try std.testing.expectEqual(@as(usize, 1), stop.array.items.len);
+            try std.testing.expectEqualStrings("Grep|Glob|Bash|mcp__cog__code_explore", pretool.array.items[0].object.get("matcher").?.string);
+            try std.testing.expectEqualStrings("sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-stop-memory.sh", stop.array.items[0].object.get("hooks").?.array.items[0].object.get("command").?.string);
         }
     }.run);
 }
@@ -2102,6 +2236,44 @@ test "writeClaudeRuntimeHooks preserves existing hooks" {
             const hooks = parsed.value.object.get("hooks") orelse return error.TestUnexpectedResult;
             try std.testing.expect(hooks.object.get("PostToolUse") != null);
             try std.testing.expect(hooks.object.get("PreToolUse") != null);
+            try std.testing.expect(hooks.object.get("Stop") != null);
+        }
+    }.run);
+}
+
+test "writeClaudeRuntimeHooks is idempotent for stop hook" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeClaudeRuntimeHooks(allocator);
+            try writeClaudeRuntimeHooks(allocator);
+
+            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(content);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+            defer parsed.deinit();
+
+            const stop = parsed.value.object.get("hooks").?.object.get("Stop").?;
+            try std.testing.expect(stop == .array);
+            try std.testing.expectEqual(@as(usize, 1), stop.array.items.len);
+        }
+    }.run);
+}
+
+test "writeRuntimePolicyAsset creates Claude stop hook asset" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = allocator;
+            try writeRuntimePolicyAsset(".claude/hooks/cog-stop-memory.sh", claude_stop_memory_hook_content);
+
+            const content = readCwdFile(std.testing.allocator, ".claude/hooks/cog-stop-memory.sh") orelse return error.TestUnexpectedResult;
+            defer std.testing.allocator.free(content);
+
+            try std.testing.expect(std.mem.indexOf(u8, content, "stop_hook_active") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "transcript_path") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "mcp__cog__mem_learn") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "mcp__cog__mem_list_short_term") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "mcp__cog__mem_reinforce") != null);
         }
     }.run);
 }
@@ -2368,7 +2540,7 @@ test "buildCodexSpecialistInstructions adds host guidance" {
 
     const memory = try buildCodexSpecialistInstructions(std.testing.allocator, .memory, build_options.mem_agent_body);
     defer std.testing.allocator.free(memory);
-    try std.testing.expect(std.mem.indexOf(u8, memory, "Do not explore the repository or edit files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory, "Start with Cog memory recall") != null);
 }
 
 test "buildWorkflowSpecialistInstructions adds workflow guidance" {

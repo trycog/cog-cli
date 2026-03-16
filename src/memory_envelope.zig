@@ -38,8 +38,6 @@ pub fn isWriteTool(tool_name: []const u8) bool {
         std.mem.eql(u8, tool_name, "mem_refactor") or
         std.mem.eql(u8, tool_name, "mem_update") or
         std.mem.eql(u8, tool_name, "mem_deprecate") or
-        std.mem.eql(u8, tool_name, "mem_bulk_learn") or
-        std.mem.eql(u8, tool_name, "mem_bulk_associate") or
         std.mem.eql(u8, tool_name, "mem_reinforce") or
         std.mem.eql(u8, tool_name, "mem_flush");
 }
