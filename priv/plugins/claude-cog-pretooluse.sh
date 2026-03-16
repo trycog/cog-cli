@@ -35,6 +35,24 @@ advise() {
 }
 
 case "$tool_name" in
+  Agent)
+    # Extract subagent_type from tool_input
+    subagent_type=$(printf '%s' "$payload" | sed -n 's/.*"subagent_type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+
+    case "$subagent_type" in
+      cog-mem|cog-mem-validate)
+        # Memory sub-agents are always allowed
+        ;;
+      Explore|cog-code-query)
+        # Code exploration sub-agents must wait for memory recall
+        if ! transcript_has 'mcp__cog__mem_recall' "$transcript_path" && \
+           ! transcript_has '"subagent_type":"cog-mem"' "$transcript_path" && \
+           ! transcript_has '"subagent_type": "cog-mem"' "$transcript_path"; then
+          deny "Cog memory workflow: delegate to the cog-mem sub-agent first so it can check memory before launching code exploration. Launch cog-mem alone, wait for its result, then explore code only if memory was insufficient."
+        fi
+        ;;
+    esac
+    ;;
   mcp__cog__code_explore)
     if ! transcript_has 'mcp__cog__mem_recall' "$transcript_path"; then
       advise "Cog memory workflow: if this is a prior-knowledge question rather than direct code tracing, use the cog-mem specialist first so it can check memory before broader exploration."

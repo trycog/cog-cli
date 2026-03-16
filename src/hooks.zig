@@ -626,25 +626,30 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
 
 fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !void {
     const command = "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-pretooluse.sh";
-    const matcher_value = "Grep|Glob|Bash|mcp__cog__code_explore";
+    const matcher_value = "Grep|Glob|Bash|Agent|mcp__cog__code_explore";
     var already_has_group = false;
 
     try s.beginArray();
     if (existing_value) |value| {
         if (value == .array) {
             for (value.array.items) |item| {
+                // Detect our Cog hook group by command, regardless of matcher value.
+                // This lets us upgrade the matcher on re-init without duplicating.
+                var is_cog_group = false;
+                var has_current_matcher = false;
                 if (item == .object) {
                     if (item.object.get("matcher")) |matcher| {
                         if (matcher == .string and std.mem.eql(u8, matcher.string, matcher_value)) {
-                            if (item.object.get("hooks")) |hooks| {
-                                if (hooks == .array) {
-                                    for (hooks.array.items) |hook| {
-                                        if (hook == .object) {
-                                            if (hook.object.get("command")) |existing_command| {
-                                                if (existing_command == .string and std.mem.eql(u8, existing_command.string, command)) {
-                                                    already_has_group = true;
-                                                }
-                                            }
+                            has_current_matcher = true;
+                        }
+                    }
+                    if (item.object.get("hooks")) |hooks| {
+                        if (hooks == .array) {
+                            for (hooks.array.items) |hook| {
+                                if (hook == .object) {
+                                    if (hook.object.get("command")) |existing_command| {
+                                        if (existing_command == .string and std.mem.eql(u8, existing_command.string, command)) {
+                                            is_cog_group = true;
                                         }
                                     }
                                 }
@@ -652,7 +657,18 @@ fn writeClaudePreToolUseHookArray(s: *Stringify, existing_value: ?json.Value) !v
                         }
                     }
                 }
-                try s.write(item);
+
+                if (is_cog_group) {
+                    if (has_current_matcher) {
+                        // Already up-to-date — keep as-is
+                        already_has_group = true;
+                        try s.write(item);
+                    }
+                    // else: old matcher version — drop it, we'll write the updated group below
+                } else {
+                    // Not our group — preserve it
+                    try s.write(item);
+                }
             }
         }
     }
@@ -2210,7 +2226,7 @@ test "writeClaudeRuntimeHooks adds pretooluse hook" {
             try std.testing.expect(stop == .array);
             try std.testing.expectEqual(@as(usize, 1), pretool.array.items.len);
             try std.testing.expectEqual(@as(usize, 1), stop.array.items.len);
-            try std.testing.expectEqualStrings("Grep|Glob|Bash|mcp__cog__code_explore", pretool.array.items[0].object.get("matcher").?.string);
+            try std.testing.expectEqualStrings("Grep|Glob|Bash|Agent|mcp__cog__code_explore", pretool.array.items[0].object.get("matcher").?.string);
             try std.testing.expectEqualStrings("sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-stop-memory.sh", stop.array.items[0].object.get("hooks").?.array.items[0].object.get("command").?.string);
         }
     }.run);
