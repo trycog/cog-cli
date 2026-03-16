@@ -1290,8 +1290,6 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
         if (name_val != .string) continue;
         const remote_name = name_val.string;
 
-        try memory_envelope_mod.registerCapabilityTool(&runtime.remote_memory_capabilities, allocator, remote_name);
-
         // Only process cog_* tools
         const cog_prefix = "cog_";
         if (!std.mem.startsWith(u8, remote_name, cog_prefix)) continue;
