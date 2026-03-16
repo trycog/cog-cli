@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-03-16
+
+### Added
+
+- `cog-mem-validate` sub-agent for post-task memory validation, consolidation, and cleanup
+- Batch query support for `cog_code_query` — multiple queries can now be combined into a single `queries` array call
+- Claude Code stop-memory hook (`.claude/hooks/cog-stop-memory.sh`) to gate memory storage at conversation end
+- `cog init` now deploys the validate agent file for hosts with memory configured
+
+### Changed
+
+- `cog_code_query` and `cog_code_explore` tool descriptions now emphasize mandatory batching of multiple queries into a single call
+- Claude Code pre-tool-use hook matcher expanded to include `mcp__cog__code_explore`
+- Memory prompts updated with stronger memory gate guidance and IF-THEN recording rules
+- Simplified remote hosted tool proxy — all tools now route directly to the server without enhanced write path indirection
+
+### Removed
+
+- Enhanced write path and `registerCapabilityTool` capability tracking for remote memory — all remote calls now use the standard MCP proxy
+- Write tool routing through `cog_assert_record`
+
 ## [0.17.2] - 2026-03-14
 
 ### Changed
@@ -477,6 +498,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.18.0]: https://github.com/trycog/cog-cli/releases/tag/v0.18.0
 [0.17.2]: https://github.com/trycog/cog-cli/releases/tag/v0.17.2
 [0.17.1]: https://github.com/trycog/cog-cli/releases/tag/v0.17.1
 [0.17.0]: https://github.com/trycog/cog-cli/releases/tag/v0.17.0

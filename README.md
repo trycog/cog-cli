@@ -117,7 +117,7 @@ Hosted memory writes now pass through a client-side context compiler in `cog-cli
 
 For hosts with runtime support, `cog init` also installs repo-local enforcement assets:
 
-- Claude Code: `.claude/hooks/cog-pretooluse.sh`
+- Claude Code: `.claude/hooks/cog-pretooluse.sh`, `.claude/hooks/cog-stop-memory.sh`
 - Gemini CLI: `.gemini/hooks/cog-before-tool.sh`
 - Amp: `.amp/plugins/cog.ts` (experimental)
 - OpenCode: `.opencode/plugins/*`
@@ -165,6 +165,7 @@ For hosts that support specialist delegation surfaces, `cog init` deploys code-q
 - **cog-code-query** — code exploration via the SCIP index. Finds definitions, references, and symbols in a single call.
 - **cog-debug** — autonomous hypothesis-driven debugging. Sets breakpoints, inspects variables, steps through code, and reports findings.
 - **cog-mem** — memory lifecycle management. Handles recall, consolidation, and maintenance of your agent's knowledge graph.
+- **cog-mem-validate** — post-task memory validation. Consolidates short-term memories, reinforces validated knowledge, and flushes incorrect entries.
 
 These specialists keep the primary agent's context clean by offloading specialized work.
 
