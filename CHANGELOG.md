@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-03-16
+
+### Fixed
+
+- Removed conflicting prompt instruction that told agents to skip memory recall for architecture and summarization questions, causing agents to always attempt code exploration first and hit the pretooluse deny hook
+- Claude Code pretooluse hook now hard-denies `mcp__cog__code_explore` and `mcp__cog__code_query` before memory recall instead of only advising via stderr (which agents ignored)
+- Added `mcp__cog__code_query` to the Claude Code pretooluse hook matcher — it was previously unintercepted
+- Claude Code pretooluse hook now intercepts `Agent` tool calls and denies code exploration sub-agent launches (`Explore`, `cog-code-query`) before memory recall, preventing parallel recall + explore
+- OpenCode and Amp learning/consolidation gates no longer block basic tools like `Read` — only non-memory task launches are hard-blocked; other tools get advisory reminders
+- OpenCode memory plugin no longer blocks tool calls made by the `cog-mem` and `cog-mem-validate` sub-agents during triage
+- Hook matcher upgrade logic now detects old matchers by command string and replaces them instead of creating duplicate hook groups on re-init
+
 ## [0.18.0] - 2026-03-16
 
 ### Added
@@ -498,6 +510,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions workflow for automated releases and Homebrew tap updates
 - Homebrew installation via `trycog/tap/cog`
 
+[0.18.1]: https://github.com/trycog/cog-cli/releases/tag/v0.18.1
 [0.18.0]: https://github.com/trycog/cog-cli/releases/tag/v0.18.0
 [0.17.2]: https://github.com/trycog/cog-cli/releases/tag/v0.17.2
 [0.17.1]: https://github.com/trycog/cog-cli/releases/tag/v0.17.1
