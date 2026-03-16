@@ -98,17 +98,9 @@ export default function registerCogPlugin(amp: PluginAPI) {
 
     if ((sessionState.pendingLearning || sessionState.pendingConsolidation) &&
         !memoryWriteTools.has(toolName) && !memoryReviewTools.has(toolName) && !memoryValidationTools.has(toolName)) {
-      // Code intelligence and LSP tools are read-only and legitimately needed
-      // by memory sub-agents during triage — allow them through with an advisory
-      if (deepExplorationTools.has(toolName) || toolName.startsWith('lsp_') || memoryRecallTools.has(toolName)) {
-        amp.logger.log('Cog memory workflow: remember to delegate to cog-mem-validate to store durable knowledge before finishing.')
-        return { action: 'allow' }
-      }
-      return {
-        action: 'reject-and-continue',
-        message:
-          'Cog memory workflow: delegate to the cog-mem-validate sub-agent to learn durable knowledge and consolidate short-term memories. One subagent call — do not call memory tools directly.',
-      }
+      // Advisory only — don't block normal read/explore work.
+      // The agent.end hook handles hard enforcement at end of session.
+      amp.logger.log('Cog memory workflow: remember to delegate to cog-mem-validate to store durable knowledge before finishing.')
     }
 
     if (memoryWriteTools.has(toolName)) {

@@ -253,9 +253,18 @@ export default async () => ({
     if ((state.pendingLearning || state.pendingConsolidation) &&
         !memoryWriteTools.has(input.tool) && !memoryConsolidationTools.has(input.tool) &&
         !state.memoryTriageActive) {
-      if (input.tool !== "task" || !isMemoryTask(getArgs(output.args))) {
+      // Hard-block non-memory task launches — the agent should not start
+      // unrelated sub-agents without learning/consolidating first.
+      if (input.tool === "task" && !isMemoryTask(getArgs(output.args))) {
         throw new Error(
-          "Cog memory workflow: delegate to the cog-mem-validate sub-agent to learn durable knowledge and consolidate short-term memories. One subagent call — do not call memory tools directly.",
+          "Cog memory workflow: delegate to the cog-mem-validate sub-agent to learn durable knowledge and consolidate short-term memories before launching other work.",
+        )
+      }
+      // Advisory for all other tools — don't block normal read/explore work.
+      if (input.tool !== "task") {
+        output.system = output.system || []
+        output.system.push(
+          "Cog memory workflow: remember to delegate to the cog-mem-validate sub-agent to learn durable knowledge and consolidate short-term memories before finishing.",
         )
       }
     }
