@@ -25,6 +25,7 @@ pub const McpFormat = enum {
     json_servers,
     json_amp,
     json_mcp,
+    json_pi,
     toml,
     global_only,
 };
@@ -355,6 +356,21 @@ pub const Agent = struct {
             };
         }
 
+        if (std.mem.eql(u8, self.id, "pi")) {
+            return .{
+                .repo_local_mcp = true,
+                .auto_tool_permissions = false,
+                .runtime_policy_plugins = true,
+                .dedicated_subagent_files = true,
+                .subagent_support = .dedicated_files,
+                .code_query_enforcement = .runtime,
+                .debug_enforcement = .prompt_only,
+                .memory_enforcement = .runtime,
+                .context_packaging = true,
+                .memory_write_enrichment = .runtime,
+            };
+        }
+
         unreachable;
     }
 
@@ -404,6 +420,10 @@ pub const Agent = struct {
 
     pub fn overrideSummary(self: *const Agent) []const u8 {
         const caps = self.capabilities();
+
+        if (std.mem.eql(u8, self.id, "pi")) {
+            return "Medium extension hooks + skills";
+        }
 
         if (caps.runtime_policy_plugins) {
             return "Medium runtime plugins + sub-agent permissions";
@@ -924,6 +944,46 @@ pub const agents = [_]Agent{
         \\
         ,
     },
+    // ── Pi ──────────────────────────────────────────────────────────
+    .{
+        .id = "pi",
+        .display_name = "Pi",
+        .prompt_target = .agents_md,
+        .mcp_path = ".pi/mcp.json",
+        .mcp_format = .json_pi,
+        .agent_file_path = ".pi/skills/cog-code-query/SKILL.md",
+        .agent_file_header =
+        \\---
+        \\name: cog-code-query
+        \\description: Explore code structure using the Cog SCIP index
+        \\---
+        \\
+        ,
+        .debug_file_path = ".pi/skills/cog-debug/SKILL.md",
+        .debug_file_header =
+        \\---
+        \\name: cog-debug
+        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        \\---
+        \\
+        ,
+        .mem_file_path = ".pi/skills/cog-mem/SKILL.md",
+        .mem_file_header =
+        \\---
+        \\name: cog-mem
+        \\description: Memory sub-agent for recall, consolidation, and maintenance
+        \\---
+        \\
+        ,
+        .validate_file_path = ".pi/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header =
+        \\---
+        \\name: cog-mem-validate
+        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        \\---
+        \\
+        ,
+    },
 };
 
 pub const MenuEntry = struct {
@@ -973,7 +1033,7 @@ pub fn buildMenuEntries(allocator: std.mem.Allocator) ![agents.len]MenuEntry {
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "agent count" {
-    try std.testing.expectEqual(@as(usize, 10), agents.len);
+    try std.testing.expectEqual(@as(usize, 11), agents.len);
 }
 
 test "buildMenuEntries sorts alphabetically by default" {
@@ -981,7 +1041,7 @@ test "buildMenuEntries sorts alphabetically by default" {
     defer counts.deinit();
     const entries = buildMenuEntriesFromCounts(&counts);
     try std.testing.expectEqualStrings("Amp", entries[0].item.label);
-    try std.testing.expectEqualStrings("Windsurf", entries[9].item.label);
+    try std.testing.expectEqualStrings("Windsurf", entries[10].item.label);
 }
 
 test "buildMenuEntries prioritizes higher selection counts" {
@@ -1015,6 +1075,7 @@ test "supportsToolPermissions" {
     try std.testing.expect(!agents[5].supportsToolPermissions()); // codex
     try std.testing.expect(!agents[7].supportsToolPermissions()); // goose
     try std.testing.expect(!agents[8].supportsToolPermissions()); // roo
+    try std.testing.expect(!agents[10].supportsToolPermissions()); // pi
 }
 
 test "overrideEnforcementLevel" {
@@ -1029,6 +1090,7 @@ test "overrideEnforcementLevel" {
     try std.testing.expect(agents[5].overrideEnforcementLevel() == .soft);
     try std.testing.expect(agents[7].overrideEnforcementLevel() == .soft);
     try std.testing.expect(agents[8].overrideEnforcementLevel() == .soft);
+    try std.testing.expect(agents[10].overrideEnforcementLevel() == .medium); // pi
 }
 
 test "capability model matches mcp strategy" {
@@ -1045,12 +1107,16 @@ test "capability model keeps subagent topology explicit" {
     try std.testing.expect(agents[7].capabilities().subagent_support == .dedicated_files); // goose
     try std.testing.expect(agents[8].capabilities().subagent_support == .shared_config); // roo
     try std.testing.expect(agents[9].capabilities().subagent_support == .dedicated_files); // opencode
+    try std.testing.expect(agents[10].capabilities().subagent_support == .dedicated_files); // pi
     try std.testing.expectEqualStrings(".windsurf/skills/cog-code-query/SKILL.md", agents[3].agent_file_path.?); // windsurf
     try std.testing.expect(agents[4].agent_file_path == null); // cursor
     try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[6].agent_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-debug/SKILL.md", agents[6].debug_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-mem/SKILL.md", agents[6].mem_file_path.?); // amp
     try std.testing.expectEqualStrings(".goose/skills/cog-code-query/SKILL.md", agents[7].agent_file_path.?); // goose
+    try std.testing.expectEqualStrings(".pi/skills/cog-code-query/SKILL.md", agents[10].agent_file_path.?); // pi
+    try std.testing.expectEqualStrings(".pi/skills/cog-debug/SKILL.md", agents[10].debug_file_path.?); // pi
+    try std.testing.expectEqualStrings(".pi/skills/cog-mem/SKILL.md", agents[10].mem_file_path.?); // pi
 
     for (agents) |agent| {
         const caps = agent.capabilities();
@@ -1067,11 +1133,11 @@ test "runtime policy plugins stay explicitly modeled" {
     for (agents) |agent| {
         if (agent.capabilities().runtime_policy_plugins) {
             runtime_plugin_agents += 1;
-            try std.testing.expect(std.mem.eql(u8, agent.id, "amp") or std.mem.eql(u8, agent.id, "opencode"));
+            try std.testing.expect(std.mem.eql(u8, agent.id, "amp") or std.mem.eql(u8, agent.id, "opencode") or std.mem.eql(u8, agent.id, "pi"));
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 2), runtime_plugin_agents);
+    try std.testing.expectEqual(@as(usize, 3), runtime_plugin_agents);
 }
 
 test "tool permission support stays capability-driven" {
@@ -1100,6 +1166,11 @@ test "enforcement level stays capability-driven" {
 
     try std.testing.expect(agents[6].capabilities().code_query_enforcement == .runtime);
     try std.testing.expect(agents[6].capabilities().memory_enforcement == .runtime);
+
+    try std.testing.expect(agents[10].capabilities().code_query_enforcement == .runtime);
+    try std.testing.expect(agents[10].capabilities().debug_enforcement == .prompt_only);
+    try std.testing.expect(agents[10].capabilities().memory_enforcement == .runtime);
+    try std.testing.expect(agents[10].capabilities().memory_write_enrichment == .runtime);
 
     for (agents) |agent| {
         try std.testing.expect(agent.capabilities().context_packaging);
@@ -1211,7 +1282,7 @@ test "mcp strategy coverage stays explicit" {
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 8), local_count);
+    try std.testing.expectEqual(@as(usize, 9), local_count);
     try std.testing.expectEqual(@as(usize, 2), global_only_count);
 }
 
@@ -1229,6 +1300,7 @@ test "support summaries stay capability-driven" {
     try std.testing.expectEqualStrings("Soft skill guidance", agents[7].overrideSummary());
     try std.testing.expectEqualStrings("Medium native mode groups", agents[8].overrideSummary());
     try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[9].overrideSummary());
+    try std.testing.expectEqualStrings("Medium extension hooks + skills", agents[10].overrideSummary());
 }
 
 test "support matrix helpers stay aligned" {

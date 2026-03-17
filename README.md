@@ -108,10 +108,11 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 | Goose | Global config | Yes | | Soft skill guidance | Yes | Prompt guidance |
 | OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft shared-config specialist guidance | Yes | Prompt guidance |
 | OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
+| Pi | `.pi/mcp.json` | Yes | | Medium extension hooks + skills | Yes | Runtime reminders |
 | Roo Code | `.roo/mcp.json` | Yes | | Medium native mode groups | Yes | Prompt guidance |
 | Windsurf | Global config | Yes | | Soft skills + rules | Yes | Prompt guidance |
 
-`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code now combines hard-scoped subagents with project hooks and a memory-completion stop gate, Gemini adds repo-local hook enforcement on top of sub-agent tool scoping, Amp ships an experimental workspace plugin with runtime memory reminders, OpenCode uses runtime plugins for code, debug, and memory workflow enforcement, Windsurf and Goose use native skill folders, Roo can scope native mode groups, and Cursor falls back to AGENTS.md plus Cursor rules because Cursor does not currently expose a documented repo-local custom-subagent file format.
+`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code now combines hard-scoped subagents with project hooks and a memory-completion stop gate, Gemini adds repo-local hook enforcement on top of sub-agent tool scoping, Amp ships an experimental workspace plugin with runtime memory reminders, OpenCode uses runtime plugins for code, debug, and memory workflow enforcement, Pi uses its extension system with `tool_call` hooks for runtime enforcement plus skills for specialist delegation, Windsurf and Goose use native skill folders, Roo can scope native mode groups, and Cursor falls back to AGENTS.md plus Cursor rules because Cursor does not currently expose a documented repo-local custom-subagent file format.
 
 Hosted memory writes now pass through a client-side context compiler in `cog-cli`. When the remote brain supports enriched write APIs, Cog attaches trusted local provenance such as workspace, repo identity, MCP session, host integration, recent code/debug evidence, and write-reason hints before sending the write upstream. Legacy hosted servers still receive the original tool calls unchanged.
 
@@ -121,6 +122,7 @@ For hosts with runtime support, `cog init` also installs repo-local enforcement 
 - Gemini CLI: `.gemini/hooks/cog-before-tool.sh`
 - Amp: `.amp/plugins/cog.ts` (experimental)
 - OpenCode: `.opencode/plugins/*`
+- Pi: `.pi/extensions/cog.ts`
 
 ### Host capability notes
 
@@ -136,6 +138,7 @@ For hosts with runtime support, `cog init` also installs repo-local enforcement 
 | Gemini CLI | Medium hook/config scoping | Yes, via `cog-cli` hosted write envelopes | Hook advisories + scoped memory specialist |
 | OpenCode | Medium runtime plugin enforcement | Yes, via `cog-cli` hosted write envelopes | Runtime plugin reminders + memory specialist |
 | Amp | Medium permissions + experimental plugin | Yes, via `cog-cli` hosted write envelopes | Plugin advisories + memory skill |
+| Pi | Medium extension hook enforcement | Yes, via `cog-cli` hosted write envelopes | Extension advisories + memory skill |
 | Cursor / Copilot / Codex / Roo | Prompt or host-native guidance only | Yes, via `cog-cli` hosted write envelopes | Prompt-level rationale and memory-quality guidance |
 | Goose / Windsurf | Portable or host-native skills + prompt guidance | Yes, via `cog-cli` hosted write envelopes | Prompt-level rationale and memory-quality guidance |
 

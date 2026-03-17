@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "claude_stop_memory_hook", @embedFile("priv/plugins/claude-cog-stop-memory.sh"));
     build_options.addOption([]const u8, "gemini_before_tool_hook", @embedFile("priv/plugins/gemini-cog-before-tool.sh"));
     build_options.addOption([]const u8, "amp_cog_plugin", @embedFile("priv/plugins/amp-cog.ts"));
+    build_options.addOption([]const u8, "pi_cog_extension", @embedFile("priv/plugins/pi-cog.ts"));
     build_options.addOption([]const u8, "bootstrap_prompt", @embedFile("priv/prompts/bootstrap.md"));
     build_options.addOption([]const u8, "bootstrap_associate_prompt", @embedFile("priv/prompts/bootstrap_associate.md"));
     const build_options_mod = build_options.createModule();
@@ -339,6 +340,7 @@ fn addRelease(
     release_options.addOption([]const u8, "claude_stop_memory_hook", @embedFile("priv/plugins/claude-cog-stop-memory.sh"));
     release_options.addOption([]const u8, "gemini_before_tool_hook", @embedFile("priv/plugins/gemini-cog-before-tool.sh"));
     release_options.addOption([]const u8, "amp_cog_plugin", @embedFile("priv/plugins/amp-cog.ts"));
+    release_options.addOption([]const u8, "pi_cog_extension", @embedFile("priv/plugins/pi-cog.ts"));
     release_options.addOption([]const u8, "bootstrap_prompt", @embedFile("priv/prompts/bootstrap.md"));
     release_options.addOption([]const u8, "bootstrap_associate_prompt", @embedFile("priv/prompts/bootstrap_associate.md"));
     const release_options_mod = release_options.createModule();

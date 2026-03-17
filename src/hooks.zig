@@ -76,6 +76,7 @@ pub fn configureMcp(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void
         .json_servers => try writeJsonMcp(allocator, mcp_path, "servers"),
         .json_amp => try writeJsonAmp(allocator, mcp_path),
         .json_mcp => try writeJsonOpenCode(allocator, mcp_path),
+        .json_pi => try writeJsonPi(allocator, mcp_path),
         .toml => try writeTomlMcp(allocator, mcp_path),
         .global_only => printGlobalMcpInstructions(agent),
     }
@@ -152,6 +153,79 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
     try s.endObject();
 
     try s.endObject(); // close key object
+    try s.endObject(); // close root
+
+    const new_content = try aw.toOwnedSlice();
+    defer allocator.free(new_content);
+    try writeCwdFile(path, new_content);
+}
+
+fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
+    debug_log.log("hooks.writeJsonPi: path={s}", .{path});
+    if (std.fs.path.dirname(path)) |parent| {
+        try ensureDir(parent);
+    }
+
+    const existing = readCwdFile(allocator, path);
+    defer if (existing) |e| allocator.free(e);
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var s: Stringify = .{ .writer = &aw.writer };
+    try s.beginObject();
+
+    // Preserve existing top-level keys except mcpServers
+    if (existing) |content| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                var iter = parsed.value.object.iterator();
+                while (iter.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "mcpServers")) continue;
+                    try s.objectField(entry.key_ptr.*);
+                    try s.write(entry.value_ptr.*);
+                }
+            }
+        } else |_| {}
+    }
+
+    try s.objectField("mcpServers");
+    try s.beginObject();
+
+    // Preserve existing servers except cog
+    if (existing) |content| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("mcpServers")) |servers| {
+                    if (servers == .object) {
+                        var iter = servers.object.iterator();
+                        while (iter.next()) |entry| {
+                            if (std.mem.eql(u8, entry.key_ptr.*, "cog")) continue;
+                            try s.objectField(entry.key_ptr.*);
+                            try s.write(entry.value_ptr.*);
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    }
+
+    // Add cog server entry with directTools so Pi registers tools individually
+    // instead of routing through the mcp() proxy.
+    try s.objectField("cog");
+    try s.beginObject();
+    try s.objectField("command");
+    try s.write("cog");
+    try s.objectField("args");
+    try s.beginArray();
+    try s.write("mcp");
+    try s.endArray();
+    try s.objectField("directTools");
+    try s.write(true);
+    try s.endObject();
+
+    try s.endObject(); // close mcpServers
     try s.endObject(); // close root
 
     const new_content = try aw.toOwnedSlice();
@@ -387,6 +461,10 @@ const amp_runtime_policy_assets = [_]RuntimePolicyAsset{
     .{ .path = ".amp/plugins/cog.ts", .content = amp_cog_plugin_content },
 };
 
+const pi_runtime_policy_assets = [_]RuntimePolicyAsset{
+    .{ .path = ".pi/extensions/cog.ts", .content = pi_cog_extension_content },
+};
+
 pub fn runtimePolicyAssets(agent: agents_mod.Agent) []const RuntimePolicyAsset {
     if (std.mem.eql(u8, agent.id, "claude_code")) {
         return &claude_runtime_policy_assets;
@@ -398,6 +476,10 @@ pub fn runtimePolicyAssets(agent: agents_mod.Agent) []const RuntimePolicyAsset {
 
     if (std.mem.eql(u8, agent.id, "amp")) {
         return &amp_runtime_policy_assets;
+    }
+
+    if (std.mem.eql(u8, agent.id, "pi")) {
+        return &pi_runtime_policy_assets;
     }
 
     if (agent.capabilities().runtime_policy_plugins and std.mem.eql(u8, agent.id, "opencode")) {
@@ -1510,6 +1592,7 @@ pub const claude_pretooluse_hook_content = build_options.claude_pretooluse_hook;
 pub const claude_stop_memory_hook_content = build_options.claude_stop_memory_hook;
 pub const gemini_before_tool_hook_content = build_options.gemini_before_tool_hook;
 pub const amp_cog_plugin_content = build_options.amp_cog_plugin;
+pub const pi_cog_extension_content = build_options.pi_cog_extension;
 
 fn writeRuntimePolicyAsset(path: []const u8, content: []const u8) !void {
     debug_log.log("hooks.writeRuntimePolicyAsset: path={s}", .{path});
