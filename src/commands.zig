@@ -331,18 +331,8 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     try agent_usage.incrementCounts(allocator, selected_agent_ids[0..selected_indices.len]);
 
-    // Check if any selected agent supports tool permissions
-    const any_supports_perms = blk: {
-        for (selected_agent_indices[0..selected_indices.len]) |idx| {
-            if (agents_mod.agents[idx].supportsToolPermissions()) break :blk true;
-        }
-        break :blk false;
-    };
-
-    const allow_tools = if (any_supports_perms)
-        try tui.confirm("Allow all Cog tools without prompting?")
-    else
-        false;
+    // Tool permissions are installed automatically for agents that support them.
+    const allow_tools = true;
 
     // Process embedded PROMPT.md
     const prompt_content = try processCogMemTags(allocator, build_options.prompt_md, setup_mem);
