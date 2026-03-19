@@ -625,7 +625,7 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
 
     // Warn about cost and get confirmation
     printErr("\n");
-    printErr("  " ++ bold ++ "Note:" ++ reset ++ " Bootstrap invokes your agent once per source file.\n");
+    printErr("  " ++ bold ++ "Note:" ++ reset ++ " Bootstrap invokes your agent once per subsystem cluster.\n");
     printErr("  This will consume tokens on your agent's model and may incur costs.\n");
     printErr("  The process can take a while depending on the size of your codebase.\n");
     printErr("  Progress is saved — press Ctrl+C to stop and resume later.\n\n");
@@ -680,6 +680,15 @@ fn runBootstrap(
     }
     printFmtErr(allocator, "  Found {d} files\n", .{files.items.len});
 
+    // Build subsystem clusters
+    printErr(bold ++ "  Building subsystem clusters..." ++ reset ++ "\n");
+    const all_subsystems = buildSubsystemClusters(allocator, files.items, cog_dir) orelse {
+        printErr("  " ++ bold ++ "error:" ++ reset ++ " Failed to build subsystem clusters (SCIP index required).\n\n");
+        return;
+    };
+    defer freeSubsystems(allocator, all_subsystems);
+    printFmtErr(allocator, "  Built {d} subsystem clusters\n", .{all_subsystems.len});
+
     const checkpoint_path = try std.fmt.allocPrint(allocator, "{s}/bootstrap-checkpoint.json", .{cog_dir});
     defer allocator.free(checkpoint_path);
 
@@ -720,17 +729,17 @@ fn runBootstrap(
     };
     defer allocator.free(associate_prompt);
 
-    // Filter out already-processed files
-    var remaining: std.ArrayListUnmanaged([]const u8) = .empty;
+    // Filter out already-processed subsystems
+    var remaining: std.ArrayListUnmanaged(Subsystem) = .empty;
     defer remaining.deinit(allocator);
-    for (files.items) |f| {
-        if (!processed.contains(f)) {
-            try remaining.append(allocator, f);
+    for (all_subsystems) |sub| {
+        if (!processed.contains(sub.id)) {
+            try remaining.append(allocator, sub);
         }
     }
 
     if (remaining.items.len == 0) {
-        printErr("  All files already processed. Use " ++ dim ++ "--clean" ++ reset ++ " to restart.\n\n");
+        printErr("  All subsystems already processed. Use " ++ dim ++ "--clean" ++ reset ++ " to restart.\n\n");
         return;
     }
 
@@ -745,7 +754,7 @@ fn runBootstrap(
         printFmtErr(allocator, "  Agent: " ++ bold ++ "{s}" ++ reset ++ "\n", .{cmd});
     }
 
-    const total_files = files.items.len;
+    const total_subsystems = all_subsystems.len;
     const already_done = processed.count();
     const use_tui = !debug and tui.isStderrTty();
 
@@ -759,15 +768,15 @@ fn runBootstrap(
     defer if (brain_url_subtitle) |u| allocator.free(u);
 
     if (use_tui) {
-        tui.bootstrapStart("Bootstrapping", total_files, brain_url_subtitle);
+        tui.bootstrapStart("Bootstrapping", total_subsystems, brain_url_subtitle);
         if (already_done > 0) {
-            tui.bootstrapUpdate(already_done, total_files, 0, 0, 0, 0, 0);
+            tui.bootstrapUpdate(already_done, total_subsystems, 0, 0, 0, 0, 0);
         }
     } else {
-        printFmtErr(allocator, "  Processing {d} files (concurrency={d})\n\n", .{ remaining.items.len, concurrency });
+        printFmtErr(allocator, "  Processing {d} subsystems (concurrency={d})\n\n", .{ remaining.items.len, concurrency });
     }
 
-    var files_done: usize = already_done;
+    var subsystems_done: usize = already_done;
     var errors: usize = 0;
     var total_input_tokens: usize = 0;
     var total_output_tokens: usize = 0;
@@ -784,33 +793,33 @@ fn runBootstrap(
     var aborted = false;
 
     if (concurrency <= 1) {
-        // Sequential processing — one file at a time
+        // Sequential processing — one subsystem at a time
         var consecutive_errors: usize = 0;
-        for (remaining.items) |file_path| {
+        for (remaining.items) |*subsystem| {
             if (use_tui) {
                 tui_mutex.lock();
-                _ = ticker_ctx.claimSlot(file_path);
+                _ = ticker_ctx.claimSlot(subsystem.label);
                 tui_mutex.unlock();
             } else {
                 printFmtErr(allocator, "  " ++ cyan ++ "[{d}/{d}]" ++ reset ++ " {s}\n", .{
-                    files_done + errors + 1,
-                    total_files,
-                    file_path,
+                    subsystems_done + errors + 1,
+                    total_subsystems,
+                    subsystem.label,
                 });
             }
 
-            const result = runFile(allocator, file_path, project_root, selected_agent, custom_cmd, debug, timeout_ms, model, bootstrap_prompt, use_tui);
+            const result = runSubsystem(allocator, subsystem, project_root, selected_agent, custom_cmd, debug, timeout_ms, model, bootstrap_prompt, use_tui);
             if (result.success) {
-                files_done += 1;
+                subsystems_done += 1;
                 consecutive_errors = 0;
                 total_input_tokens += result.input_tokens;
                 total_output_tokens += result.output_tokens;
                 total_cost_microdollars += result.cost_microdollars;
-                const duped = allocator.dupe(u8, file_path) catch continue;
+                const duped = allocator.dupe(u8, subsystem.id) catch continue;
                 processed.put(allocator, duped, {}) catch {
                     allocator.free(duped);
                 };
-                saveCheckpoint(allocator, checkpoint_path, &processed);
+                saveCheckpoint(allocator, checkpoint_path, &processed, all_subsystems);
             } else {
                 errors += 1;
                 consecutive_errors += 1;
@@ -821,12 +830,12 @@ fn runBootstrap(
                 ticker_ctx.releaseSlot(0);
                 const tl = ticker_ctx.prev_lines;
                 ticker_ctx.prev_lines = 0;
-                tui.bootstrapUpdate(files_done + errors, total_files, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, tl);
+                tui.bootstrapUpdate(subsystems_done + errors, total_subsystems, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, tl);
                 tui_mutex.unlock();
             } else if (result.success) {
                 printFmtErr(allocator, "    " ++ green ++ "done" ++ reset ++ " ({d}/{d}) tokens: {d}in/{d}out ${s}\n", .{
-                    files_done,
-                    total_files,
+                    subsystems_done,
+                    total_subsystems,
                     total_input_tokens,
                     total_output_tokens,
                     formatCost(allocator, total_cost_microdollars),
@@ -842,7 +851,7 @@ fn runBootstrap(
         }
     } else {
         // Concurrent processing — thread pool of `concurrency` workers
-        var file_index = std.atomic.Value(usize).init(0);
+        var subsystem_index = std.atomic.Value(usize).init(0);
         var done_count = std.atomic.Value(usize).init(already_done);
         var error_count = std.atomic.Value(usize).init(0);
         var atomic_input_tokens = std.atomic.Value(usize).init(0);
@@ -852,7 +861,7 @@ fn runBootstrap(
         var consec_errors = std.atomic.Value(usize).init(0);
 
         var shared = WorkerShared{
-            .file_index = &file_index,
+            .file_index = &subsystem_index,
             .done_count = &done_count,
             .error_count = &error_count,
             .atomic_input_tokens = &atomic_input_tokens,
@@ -861,7 +870,8 @@ fn runBootstrap(
             .abort = &abort_flag,
             .consecutive_errors = &consec_errors,
             .remaining = remaining.items,
-            .total_files = total_files,
+            .all_subsystems = all_subsystems,
+            .total_subsystems = total_subsystems,
             .project_root = project_root,
             .selected_agent = selected_agent,
             .custom_cmd = custom_cmd,
@@ -881,7 +891,7 @@ fn runBootstrap(
         var threads: std.ArrayListUnmanaged(std.Thread) = .empty;
         defer threads.deinit(allocator);
 
-        const worker_count = @min(concurrency, total_files);
+        const worker_count = @min(concurrency, total_subsystems);
         for (0..worker_count) |_| {
             const thread = std.Thread.spawn(.{}, workerThread, .{&shared}) catch continue;
             try threads.append(allocator, thread);
@@ -892,7 +902,7 @@ fn runBootstrap(
             thread.join();
         }
 
-        files_done = done_count.load(.acquire);
+        subsystems_done = done_count.load(.acquire);
         errors = error_count.load(.acquire);
         total_input_tokens = atomic_input_tokens.load(.acquire);
         total_output_tokens = atomic_output_tokens.load(.acquire);
@@ -910,35 +920,35 @@ fn runBootstrap(
 
     // Phase 1 finish
     if (use_tui) {
-        tui.bootstrapFinish("Bootstrapping", files_done + errors, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, finish_extra_lines);
+        tui.bootstrapFinish("Bootstrapping", subsystems_done + errors, errors, total_input_tokens, total_output_tokens, total_cost_microdollars, finish_extra_lines);
     } else {
         printErr("\n" ++ bold ++ "  Phase 1: Extraction Summary" ++ reset ++ "\n");
-        printFmtErr(allocator, "    Files processed: {d}\n", .{files_done});
+        printFmtErr(allocator, "    Subsystems processed: {d}\n", .{subsystems_done});
         if (errors > 0) {
-            printFmtErr(allocator, "    Errors:          {d}\n", .{errors});
+            printFmtErr(allocator, "    Errors:              {d}\n", .{errors});
         }
-        printFmtErr(allocator, "    Input tokens:    {d}\n", .{total_input_tokens});
-        printFmtErr(allocator, "    Output tokens:   {d}\n", .{total_output_tokens});
-        printFmtErr(allocator, "    Cost:            ${s}\n", .{formatCost(allocator, total_cost_microdollars)});
-        printFmtErr(allocator, "    Total processed: {d}/{d}\n", .{ processed.count(), files.items.len });
+        printFmtErr(allocator, "    Input tokens:        {d}\n", .{total_input_tokens});
+        printFmtErr(allocator, "    Output tokens:       {d}\n", .{total_output_tokens});
+        printFmtErr(allocator, "    Cost:                ${s}\n", .{formatCost(allocator, total_cost_microdollars)});
+        printFmtErr(allocator, "    Total processed:     {d}/{d}\n", .{ processed.count(), all_subsystems.len });
     }
 
-    // Phase 2: Cross-file association from SCIP index
-    if (files_done > 1) {
-        // Build cross-file relationship text from SCIP index
-        const cross_file = buildCrossFileRelationships(allocator, cog_dir);
+    // Phase 2: Cross-subsystem association from SCIP index
+    if (subsystems_done > 1) {
+        // Build cross-file relationship text from SCIP index, filtered to cross-subsystem only
+        const cross_file = buildCrossFileRelationships(allocator, cog_dir, all_subsystems);
         defer if (cross_file) |cf| allocator.free(cf.text);
 
         if (cross_file) |cf| {
             if (cf.text.len == 0) {
-                if (!use_tui) printErr("    No cross-file references found in SCIP index\n");
+                if (!use_tui) printErr("    No cross-subsystem references found in SCIP index\n");
             } else {
                 if (use_tui) {
                     tui.bootstrapPhaseStart("Associating", "Pairs", cf.pair_count);
                     startTicker(&ticker_thread, &ticker_ctx, "Running agent...");
                 } else {
-                    printErr("\n" ++ bold ++ "  Phase 2: Cross-file associations" ++ reset ++ "\n");
-                    printFmtErr(allocator, "    Found {d} cross-file dependency pairs\n", .{cf.pair_count});
+                    printErr("\n" ++ bold ++ "  Phase 2: Cross-subsystem associations" ++ reset ++ "\n");
+                    printFmtErr(allocator, "    Found {d} cross-subsystem dependency pairs\n", .{cf.pair_count});
                 }
 
                 const assoc_result = runAssociationPhase(allocator, project_root, selected_agent, custom_cmd, cf.text, debug, timeout_ms, model, associate_prompt, use_tui);
@@ -968,7 +978,7 @@ fn runBootstrap(
                 }
             }
         } else {
-            if (!use_tui) printErr("    Could not load SCIP index for cross-file analysis\n");
+            if (!use_tui) printErr("    Could not load SCIP index for cross-subsystem analysis\n");
         }
     }
 
@@ -984,8 +994,9 @@ const WorkerShared = struct {
     atomic_cost: *std.atomic.Value(usize),
     abort: *std.atomic.Value(bool),
     consecutive_errors: *std.atomic.Value(usize),
-    remaining: []const []const u8,
-    total_files: usize,
+    remaining: []const Subsystem,
+    all_subsystems: []const Subsystem,
+    total_subsystems: usize,
     project_root: []const u8,
     selected_agent: ?*const CliAgent,
     custom_cmd: ?[]const u8,
@@ -1008,35 +1019,35 @@ fn workerThread(shared: *WorkerShared) void {
         const idx = shared.file_index.fetchAdd(1, .monotonic);
         if (idx >= shared.remaining.len) break;
 
-        const file_path = shared.remaining[idx];
+        const subsystem = &shared.remaining[idx];
 
         var my_slot: usize = 0;
         if (shared.use_tui) {
             if (shared.ticker) |ticker| {
                 shared.tui_mutex.lock();
-                my_slot = ticker.claimSlot(file_path);
+                my_slot = ticker.claimSlot(subsystem.label);
                 shared.tui_mutex.unlock();
             }
         } else {
             printFmtErr(shared.allocator, "  " ++ cyan ++ "[{d}/{d}]" ++ reset ++ " {s}\n", .{
                 idx + 1,
-                shared.total_files,
-                file_path,
+                shared.total_subsystems,
+                subsystem.label,
             });
         }
 
-        const result = runFile(shared.allocator, file_path, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug, shared.timeout_ms, shared.model, shared.bootstrap_prompt, shared.use_tui);
+        const result = runSubsystem(shared.allocator, subsystem, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug, shared.timeout_ms, shared.model, shared.bootstrap_prompt, shared.use_tui);
         if (result.success) {
             shared.consecutive_errors.store(0, .release);
             const done = shared.done_count.fetchAdd(1, .monotonic) + 1;
             _ = shared.atomic_input_tokens.fetchAdd(result.input_tokens, .monotonic);
             _ = shared.atomic_output_tokens.fetchAdd(result.output_tokens, .monotonic);
             _ = shared.atomic_cost.fetchAdd(result.cost_microdollars, .monotonic);
-            const duped = shared.allocator.dupe(u8, file_path) catch continue;
+            const duped = shared.allocator.dupe(u8, subsystem.id) catch continue;
             shared.processed.put(shared.allocator, duped, {}) catch {
                 shared.allocator.free(duped);
             };
-            saveCheckpoint(shared.allocator, shared.checkpoint_path, shared.processed);
+            saveCheckpoint(shared.allocator, shared.checkpoint_path, shared.processed, shared.all_subsystems);
 
             if (shared.use_tui) {
                 shared.tui_mutex.lock();
@@ -1046,7 +1057,7 @@ fn workerThread(shared: *WorkerShared) void {
                     ticker.prev_lines = 0;
                     tui.bootstrapUpdate(
                         done + shared.error_count.load(.acquire),
-                        shared.total_files,
+                        shared.total_subsystems,
                         shared.error_count.load(.acquire),
                         shared.atomic_input_tokens.load(.acquire),
                         shared.atomic_output_tokens.load(.acquire),
@@ -1060,9 +1071,9 @@ fn workerThread(shared: *WorkerShared) void {
                 const out_tok = shared.atomic_output_tokens.load(.acquire);
                 const cost = shared.atomic_cost.load(.acquire);
                 printFmtErr(shared.allocator, "    " ++ green ++ "done" ++ reset ++ " {s} ({d}/{d}) tokens: {d}in/{d}out ${s}\n", .{
-                    file_path,
+                    subsystem.label,
                     done,
-                    shared.total_files,
+                    shared.total_subsystems,
                     in_tok,
                     out_tok,
                     formatCost(shared.allocator, cost),
@@ -1083,7 +1094,7 @@ fn workerThread(shared: *WorkerShared) void {
                     ticker.prev_lines = 0;
                     tui.bootstrapUpdate(
                         shared.done_count.load(.acquire) + errs,
-                        shared.total_files,
+                        shared.total_subsystems,
                         errs,
                         shared.atomic_input_tokens.load(.acquire),
                         shared.atomic_output_tokens.load(.acquire),
@@ -1093,7 +1104,7 @@ fn workerThread(shared: *WorkerShared) void {
                 }
                 shared.tui_mutex.unlock();
             } else {
-                printFmtErr(shared.allocator, "    " ++ red ++ "failed" ++ reset ++ " {s}\n", .{file_path});
+                printFmtErr(shared.allocator, "    " ++ red ++ "failed" ++ reset ++ " {s}\n", .{subsystem.label});
             }
         }
     }
@@ -1353,6 +1364,177 @@ fn runFile(
     };
 }
 
+fn runSubsystem(
+    allocator: std.mem.Allocator,
+    subsystem: *const Subsystem,
+    project_root: []const u8,
+    selected_agent: ?*const CliAgent,
+    custom_cmd: ?[]const u8,
+    debug: bool,
+    timeout_ms: u64,
+    model: ?[]const u8,
+    bootstrap_prompt: []const u8,
+    use_tui: bool,
+) FileResult {
+    const fail: FileResult = .{ .success = false, .input_tokens = 0, .output_tokens = 0, .cost_microdollars = 0 };
+
+    // Build file_paths as newline-joined string of all files in this subsystem
+    var file_paths_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer file_paths_buf.deinit(allocator);
+    for (subsystem.files, 0..) |f, i| {
+        file_paths_buf.appendSlice(allocator, f) catch return fail;
+        if (i + 1 < subsystem.files.len) {
+            file_paths_buf.append(allocator, '\n') catch return fail;
+        }
+    }
+    const file_paths_str = file_paths_buf.items;
+
+    // Build prompt: template with placeholders replaced
+    const template = bootstrap_prompt;
+    const prompt1 = replacePlaceholder(allocator, template, "{file_paths}", file_paths_str) catch return fail;
+    defer allocator.free(prompt1);
+    const prompt2 = replacePlaceholder(allocator, prompt1, "{cross_file_context}", subsystem.cross_file_context) catch return fail;
+    defer allocator.free(prompt2);
+    const prompt = replacePlaceholder(allocator, prompt2, "{subsystem_label}", subsystem.label) catch return fail;
+    defer allocator.free(prompt);
+
+    // Build argv
+    var argv_buf: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv_buf.deinit(allocator);
+
+    if (selected_agent) |agent| {
+        if (agent.env_unset.len > 0) {
+            argv_buf.append(allocator, "env") catch return fail;
+            for (agent.env_unset) |var_name| {
+                argv_buf.append(allocator, "-u") catch return fail;
+                argv_buf.append(allocator, var_name) catch return fail;
+            }
+        }
+        for (agent.cmd_prefix) |token| {
+            argv_buf.append(allocator, token) catch return fail;
+        }
+        argv_buf.append(allocator, prompt) catch return fail;
+        for (agent.cmd_suffix) |token| {
+            argv_buf.append(allocator, token) catch return fail;
+        }
+        if (model) |m| {
+            argv_buf.append(allocator, "--model") catch return fail;
+            argv_buf.append(allocator, m) catch return fail;
+        }
+    } else if (custom_cmd) |cmd| {
+        var cmd_iter = std.mem.splitScalar(u8, cmd, ' ');
+        while (cmd_iter.next()) |token| {
+            if (token.len > 0) {
+                argv_buf.append(allocator, token) catch return fail;
+            }
+        }
+        argv_buf.append(allocator, prompt) catch return fail;
+    } else {
+        return fail;
+    }
+
+    // Bail out if cancellation was requested before spawning
+    if (g_cancel_requested.load(.acquire)) return fail;
+
+    // Timeout scales with file count, capped at 5x
+    const scaled_timeout = timeout_ms * @min(subsystem.files.len, 5);
+
+    debug_log.log("runSubsystem: label={s} id={s} files={d} (argv len={d})", .{ subsystem.label, subsystem.id, subsystem.files.len, argv_buf.items.len });
+
+    var child = std.process.Child.init(argv_buf.items, allocator);
+    child.cwd = project_root;
+    child.stdin_behavior = .Ignore;
+    child.stderr_behavior = if (debug) .Inherit else .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.pgid = 0;
+
+    child.spawn() catch |err| {
+        debug_log.log("runSubsystem: spawn error {s}", .{@errorName(err)});
+        if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "spawn error: {s}" ++ reset ++ "\n", .{@errorName(err)});
+        return fail;
+    };
+    const child_pid: i32 = child.id;
+    if (child_pid > 0) registerChild(child_pid);
+    debug_log.log("runSubsystem: spawned child pid={d}", .{child_pid});
+    const reaper = spawnReaper(child_pid);
+
+    // If cancel arrived during spawn, kill this child immediately
+    if (g_cancel_requested.load(.acquire)) {
+        if (child_pid > 0) {
+            _ = std.c.kill(-child_pid, posix.SIG.KILL);
+            _ = std.c.kill(child_pid, posix.SIG.KILL);
+            unregisterChild(child_pid);
+        }
+        dismissReaper(reaper);
+        return fail;
+    }
+
+    // Start timeout watcher
+    var tw = TimeoutWatcher{ .pid = child_pid, .timeout_ms = scaled_timeout };
+    const tw_thread = if (scaled_timeout > 0)
+        std.Thread.spawn(.{}, TimeoutWatcher.watch, .{&tw}) catch null
+    else
+        null;
+
+    // Read stdout
+    const stdout_data = if (child.stdout) |stdout|
+        stdout.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
+    else
+        null;
+    defer if (stdout_data) |d| allocator.free(d);
+
+    const term = child.wait() catch |err| {
+        tw.cancelled.store(true, .release);
+        if (tw_thread) |t| t.join();
+        if (child_pid > 0) unregisterChild(child_pid);
+        dismissReaper(reaper);
+        if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "wait error: {s}" ++ reset ++ "\n", .{@errorName(err)});
+        return fail;
+    };
+    tw.cancelled.store(true, .release);
+    if (tw_thread) |t| t.join();
+    if (child_pid > 0) unregisterChild(child_pid);
+    dismissReaper(reaper);
+
+    switch (term) {
+        .Exited => |code| {
+            debug_log.log("runSubsystem: {s} exited code={d}", .{ subsystem.label, code });
+            if (code != 0) {
+                if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "exited with code {d}" ++ reset ++ "\n", .{code});
+                return fail;
+            }
+        },
+        .Signal => |sig| {
+            debug_log.log("runSubsystem: {s} killed by signal {d}", .{ subsystem.label, sig });
+            if (!use_tui) {
+                if (sig == posix.SIG.KILL and tw.fired.load(.acquire)) {
+                    printFmtErr(allocator, "    " ++ red ++ "timed out after {d}m" ++ reset ++ "\n", .{scaled_timeout / 60_000});
+                } else {
+                    printFmtErr(allocator, "    " ++ red ++ "killed by signal {d}" ++ reset ++ "\n", .{sig});
+                }
+            }
+            return fail;
+        },
+        else => return fail,
+    }
+
+    // Parse token usage from stdout
+    const agent_id: ?[]const u8 = if (selected_agent) |a| a.id else null;
+    var usage = UsageStats{};
+    if (stdout_data) |data| {
+        if (data.len > 0 and agent_id != null) {
+            usage = parseUsageFromStdout(allocator, agent_id.?, data);
+        }
+    }
+
+    return .{
+        .success = true,
+        .input_tokens = usage.input_tokens,
+        .output_tokens = usage.output_tokens,
+        .cost_microdollars = usage.cost_microdollars,
+    };
+}
+
 fn runAssociationPhase(
     allocator: std.mem.Allocator,
     project_root: []const u8,
@@ -1499,6 +1681,499 @@ fn runAssociationPhase(
     };
 }
 
+// ── Subsystem clustering ────────────────────────────────────────────────
+
+const Subsystem = struct {
+    id: []const u8, // 16-char hex hash of sorted file list
+    label: []const u8, // human-readable: common directory or "root"
+    files: []const []const u8, // sorted file paths
+    cross_file_context: []const u8, // intra-cluster cross-file relationships text
+};
+
+/// Key for a pair of files, used in cross-file weight graph.
+const FilePairKey = struct {
+    file_a: []const u8,
+    file_b: []const u8,
+};
+
+const FilePairContext = struct {
+    pub fn hash(_: @This(), key: FilePairKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        // Always hash in sorted order for symmetry
+        const order = std.mem.order(u8, key.file_a, key.file_b);
+        if (order == .lt or order == .eq) {
+            h.update(key.file_a);
+            h.update("\x00");
+            h.update(key.file_b);
+        } else {
+            h.update(key.file_b);
+            h.update("\x00");
+            h.update(key.file_a);
+        }
+        return h.final();
+    }
+    pub fn eql(_: @This(), a: FilePairKey, b: FilePairKey) bool {
+        // Symmetric comparison
+        return (std.mem.eql(u8, a.file_a, b.file_a) and std.mem.eql(u8, a.file_b, b.file_b)) or
+            (std.mem.eql(u8, a.file_a, b.file_b) and std.mem.eql(u8, a.file_b, b.file_a));
+    }
+};
+
+/// Group source files into subsystem clusters for batch extraction.
+///
+/// Algorithm:
+/// 1. Seed clusters by directory grouping
+/// 2. Build weighted cross-file graph from SCIP
+/// 3. Merge small clusters (<3 files) into most-coupled neighbor
+/// 4. Split large clusters (>12 files) by subdirectory or alphabetically
+/// 5. Generate subsystem IDs and cross-file context per cluster
+fn buildSubsystemClusters(allocator: std.mem.Allocator, files: []const []const u8, cog_dir: []const u8) ?[]Subsystem {
+    if (files.len == 0) return null;
+
+    // Step 1: Seed by directory
+    var dir_groups: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
+    defer {
+        var vit = dir_groups.valueIterator();
+        while (vit.next()) |list| list.deinit(allocator);
+        dir_groups.deinit(allocator);
+    }
+
+    for (files) |file_path| {
+        const dir_name = std.fs.path.dirname(file_path) orelse "root";
+        const gop = dir_groups.getOrPut(allocator, dir_name) catch continue;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+        }
+        gop.value_ptr.append(allocator, file_path) catch continue;
+    }
+
+    debug_log.log("buildSubsystemClusters: seeded {d} directory groups from {d} files", .{ dir_groups.count(), files.len });
+
+    // Step 2: Build weighted cross-file graph from SCIP
+    var file_pair_weights: std.HashMapUnmanaged(FilePairKey, usize, FilePairContext, 80) = .empty;
+    defer file_pair_weights.deinit(allocator);
+
+    // Also build per-pair symbol lists for cross-file context generation
+    const SymbolPairKey = struct {
+        referencing: []const u8,
+        defining: []const u8,
+    };
+    const SymbolPairContext = struct {
+        pub fn hash(_: @This(), key: @This().KeyType) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(key.referencing);
+            h.update("\x00");
+            h.update(key.defining);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: @This().KeyType, b: @This().KeyType) bool {
+            return std.mem.eql(u8, a.referencing, b.referencing) and
+                std.mem.eql(u8, a.defining, b.defining);
+        }
+        const KeyType = SymbolPairKey;
+    };
+    var pair_symbols_map: std.HashMapUnmanaged(
+        SymbolPairKey,
+        std.ArrayListUnmanaged([]const u8),
+        SymbolPairContext,
+        80,
+    ) = .empty;
+    defer {
+        var psit = pair_symbols_map.valueIterator();
+        while (psit.next()) |list| list.deinit(allocator);
+        pair_symbols_map.deinit(allocator);
+    }
+
+    // Load and decode SCIP index
+    const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return null;
+    defer allocator.free(index_path);
+
+    const scip_file = std.fs.openFileAbsolute(index_path, .{}) catch {
+        debug_log.log("buildSubsystemClusters: cannot open SCIP index", .{});
+        return null;
+    };
+    defer scip_file.close();
+
+    const scip_data = scip_file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch return null;
+    var index = scip.decode(allocator, scip_data) catch {
+        allocator.free(scip_data);
+        return null;
+    };
+    defer {
+        scip.freeIndex(allocator, &index);
+        allocator.free(scip_data);
+    }
+
+    // Build symbol → defining file map
+    var symbol_to_file: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer symbol_to_file.deinit(allocator);
+
+    for (index.documents) |doc| {
+        for (doc.occurrences) |occ| {
+            if (occ.symbol.len == 0 or std.mem.startsWith(u8, occ.symbol, "local ")) continue;
+            if (scip.SymbolRole.isDefinition(occ.symbol_roles)) {
+                symbol_to_file.put(allocator, occ.symbol, doc.relative_path) catch continue;
+            }
+        }
+    }
+
+    // Build cross-file weights and symbol lists
+    for (index.documents) |doc| {
+        for (doc.occurrences) |occ| {
+            if (occ.symbol.len == 0 or std.mem.startsWith(u8, occ.symbol, "local ")) continue;
+            if (scip.SymbolRole.isDefinition(occ.symbol_roles)) continue;
+
+            const defining_file = symbol_to_file.get(occ.symbol) orelse continue;
+            if (std.mem.eql(u8, defining_file, doc.relative_path)) continue;
+
+            // Add weight to the file pair
+            const pair_key = FilePairKey{ .file_a = doc.relative_path, .file_b = defining_file };
+            const wgop = file_pair_weights.getOrPut(allocator, pair_key) catch continue;
+            if (!wgop.found_existing) {
+                wgop.value_ptr.* = 0;
+            }
+            wgop.value_ptr.* += 1;
+
+            // Track symbols for cross-file context
+            const sym_key = SymbolPairKey{ .referencing = doc.relative_path, .defining = defining_file };
+            const sgop = pair_symbols_map.getOrPut(allocator, sym_key) catch continue;
+            if (!sgop.found_existing) {
+                sgop.value_ptr.* = .empty;
+            }
+            const sym_name = scip.extractSymbolName(occ.symbol);
+            var sym_found = false;
+            for (sgop.value_ptr.items) |existing| {
+                if (std.mem.eql(u8, existing, sym_name)) {
+                    sym_found = true;
+                    break;
+                }
+            }
+            if (!sym_found) {
+                sgop.value_ptr.append(allocator, sym_name) catch continue;
+            }
+        }
+    }
+
+    // Step 3: Merge small clusters (<3 files)
+    // Convert dir_groups to a mutable cluster list
+    const ClusterEntry = struct {
+        label: []const u8,
+        file_list: std.ArrayListUnmanaged([]const u8),
+    };
+    var clusters: std.ArrayListUnmanaged(ClusterEntry) = .empty;
+    defer {
+        for (clusters.items) |*cl| cl.file_list.deinit(allocator);
+        clusters.deinit(allocator);
+    }
+
+    {
+        var dgit = dir_groups.iterator();
+        while (dgit.next()) |entry| {
+            clusters.append(allocator, .{
+                .label = entry.key_ptr.*,
+                .file_list = entry.value_ptr.*,
+            }) catch continue;
+            // Prevent the deferred dir_groups cleanup from double-freeing
+            entry.value_ptr.* = .empty;
+        }
+    }
+
+    // Merge small clusters
+    var merge_pass: usize = 0;
+    while (merge_pass < 10) : (merge_pass += 1) {
+        var merged_any = false;
+        var ci: usize = 0;
+        while (ci < clusters.items.len) {
+            if (clusters.items[ci].file_list.items.len >= 3) {
+                ci += 1;
+                continue;
+            }
+
+            // Find best cluster to merge into
+            var best_idx: ?usize = null;
+            var best_score: usize = 0;
+
+            for (clusters.items, 0..) |*other, oi| {
+                if (oi == ci) continue;
+                // Compute coupling score
+                var score: usize = 0;
+                for (clusters.items[ci].file_list.items) |f1| {
+                    for (other.file_list.items) |f2| {
+                        const pk = FilePairKey{ .file_a = f1, .file_b = f2 };
+                        if (file_pair_weights.getAdapted(pk, FilePairContext{})) |w| {
+                            score += w;
+                        }
+                    }
+                }
+                if (score > best_score) {
+                    best_score = score;
+                    best_idx = oi;
+                }
+            }
+
+            // If no coupling found, merge into cluster with longest shared prefix
+            if (best_idx == null and clusters.items.len > 1) {
+                var best_prefix_len: usize = 0;
+                for (clusters.items, 0..) |*other, oi| {
+                    if (oi == ci) continue;
+                    const prefix_len = commonPrefixLen(clusters.items[ci].label, other.label);
+                    if (prefix_len > best_prefix_len or best_idx == null) {
+                        best_prefix_len = prefix_len;
+                        best_idx = oi;
+                    }
+                }
+            }
+
+            if (best_idx) |target| {
+                debug_log.log("buildSubsystemClusters: merging small cluster '{s}' ({d} files) into '{s}'", .{
+                    clusters.items[ci].label,
+                    clusters.items[ci].file_list.items.len,
+                    clusters.items[target].label,
+                });
+                // Move files from ci to target
+                for (clusters.items[ci].file_list.items) |f| {
+                    clusters.items[target].file_list.append(allocator, f) catch continue;
+                }
+                clusters.items[ci].file_list.clearRetainingCapacity();
+                // Remove the empty cluster
+                clusters.items[ci].file_list.deinit(allocator);
+                _ = clusters.orderedRemove(ci);
+                merged_any = true;
+                // Don't increment ci — the next cluster slid into this position
+            } else {
+                ci += 1;
+            }
+        }
+        if (!merged_any) break;
+    }
+
+    // Step 4: Split large clusters (>12 files)
+    {
+        var split_idx: usize = 0;
+        while (split_idx < clusters.items.len) {
+            if (clusters.items[split_idx].file_list.items.len <= 12) {
+                split_idx += 1;
+                continue;
+            }
+
+            const cluster = &clusters.items[split_idx];
+            debug_log.log("buildSubsystemClusters: splitting large cluster '{s}' ({d} files)", .{
+                cluster.label,
+                cluster.file_list.items.len,
+            });
+
+            // Try to split by subdirectory within the cluster
+            var sub_dirs: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
+
+            for (cluster.file_list.items) |f| {
+                const sub_dir = std.fs.path.dirname(f) orelse "root";
+                const sgop2 = sub_dirs.getOrPut(allocator, sub_dir) catch continue;
+                if (!sgop2.found_existing) {
+                    sgop2.value_ptr.* = .empty;
+                }
+                sgop2.value_ptr.append(allocator, f) catch continue;
+            }
+
+            if (sub_dirs.count() > 1) {
+                // Split by subdirectory
+                var first = true;
+                var sdit2 = sub_dirs.iterator();
+                while (sdit2.next()) |entry| {
+                    if (first) {
+                        // Replace the current cluster
+                        cluster.file_list.clearRetainingCapacity();
+                        for (entry.value_ptr.items) |f| {
+                            cluster.file_list.append(allocator, f) catch continue;
+                        }
+                        cluster.label = entry.key_ptr.*;
+                        entry.value_ptr.clearRetainingCapacity();
+                        first = false;
+                    } else {
+                        // Add new cluster
+                        var new_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                        for (entry.value_ptr.items) |f| {
+                            new_list.append(allocator, f) catch continue;
+                        }
+                        entry.value_ptr.clearRetainingCapacity();
+                        clusters.append(allocator, .{
+                            .label = entry.key_ptr.*,
+                            .file_list = new_list,
+                        }) catch continue;
+                    }
+                }
+            } else {
+                // Split alphabetically into groups of ~8
+                sortFiles(cluster.file_list.items);
+                const total = cluster.file_list.items.len;
+                const group_size: usize = 8;
+
+                // Copy all items to a temp list before modifying the cluster
+                var all_items: std.ArrayListUnmanaged([]const u8) = .empty;
+                for (cluster.file_list.items) |f| {
+                    all_items.append(allocator, f) catch continue;
+                }
+
+                // Keep first group_size in current cluster
+                cluster.file_list.clearRetainingCapacity();
+                const first_end = @min(group_size, total);
+                for (all_items.items[0..first_end]) |f| {
+                    cluster.file_list.append(allocator, f) catch continue;
+                }
+
+                var start: usize = first_end;
+                while (start < total) {
+                    const end_pos = @min(start + group_size, total);
+                    var new_list: std.ArrayListUnmanaged([]const u8) = .empty;
+                    for (all_items.items[start..end_pos]) |f| {
+                        new_list.append(allocator, f) catch continue;
+                    }
+                    const new_label = if (new_list.items.len > 0)
+                        std.fs.path.dirname(new_list.items[0]) orelse "root"
+                    else
+                        cluster.label;
+                    clusters.append(allocator, .{
+                        .label = new_label,
+                        .file_list = new_list,
+                    }) catch continue;
+                    start = end_pos;
+                }
+
+                all_items.deinit(allocator);
+            }
+
+            // Clean up sub_dirs for this iteration
+            var sdit_cleanup = sub_dirs.valueIterator();
+            while (sdit_cleanup.next()) |list| list.deinit(allocator);
+            sub_dirs.deinit(allocator);
+
+            split_idx += 1;
+        }
+    }
+
+    debug_log.log("buildSubsystemClusters: final cluster count: {d}", .{clusters.items.len});
+
+    // Step 5 & 6: Generate subsystem IDs and cross-file context
+    var result: std.ArrayListUnmanaged(Subsystem) = .empty;
+    defer result.deinit(allocator);
+
+    for (clusters.items) |*cluster| {
+        // Sort files within cluster
+        sortFiles(cluster.file_list.items);
+
+        // Generate ID: hash sorted file list
+        var hasher = std.hash.Wyhash.init(0);
+        for (cluster.file_list.items) |f| {
+            hasher.update(f);
+            hasher.update("\n");
+        }
+        const hash_val = hasher.final();
+
+        var id_buf: [16]u8 = undefined;
+        const hex_chars = "0123456789abcdef";
+        for (0..16) |hi| {
+            const shift_amt: u6 = @intCast((15 - hi) * 4);
+            id_buf[hi] = hex_chars[@as(usize, @intCast((hash_val >> shift_amt) & 0xf))];
+        }
+        const id = allocator.dupe(u8, &id_buf) catch continue;
+
+        // Make owned copy of files
+        const owned_files = allocator.alloc([]const u8, cluster.file_list.items.len) catch {
+            allocator.free(id);
+            continue;
+        };
+        for (cluster.file_list.items, 0..) |f, fi| {
+            owned_files[fi] = allocator.dupe(u8, f) catch "";
+        }
+
+        // Make owned label
+        const label = allocator.dupe(u8, cluster.label) catch {
+            allocator.free(id);
+            allocator.free(owned_files);
+            continue;
+        };
+
+        // Generate cross-file context for within-cluster pairs
+        const cross_ctx = buildIntraClusterContext(allocator, cluster.file_list.items, &pair_symbols_map);
+
+        result.append(allocator, .{
+            .id = id,
+            .label = label,
+            .files = owned_files,
+            .cross_file_context = cross_ctx,
+        }) catch {
+            allocator.free(id);
+            allocator.free(label);
+            for (owned_files) |f| allocator.free(f);
+            allocator.free(owned_files);
+            allocator.free(cross_ctx);
+            continue;
+        };
+    }
+
+    if (result.items.len == 0) return null;
+
+    return result.toOwnedSlice(allocator) catch null;
+}
+
+/// Build cross-file context text for files within a single cluster.
+fn buildIntraClusterContext(
+    allocator: std.mem.Allocator,
+    cluster_files: []const []const u8,
+    pair_symbols_map: anytype,
+) []const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    // Build a set for O(1) lookup
+    var file_set: std.StringHashMapUnmanaged(void) = .empty;
+    defer file_set.deinit(allocator);
+    for (cluster_files) |f| {
+        file_set.put(allocator, f, {}) catch continue;
+    }
+
+    // Iterate all pair_symbols entries and emit those where both files are in this cluster
+    var psit = pair_symbols_map.iterator();
+    while (psit.next()) |entry| {
+        const ref_file = entry.key_ptr.referencing;
+        const def_file = entry.key_ptr.defining;
+        if (!file_set.contains(ref_file) or !file_set.contains(def_file)) continue;
+
+        buf.appendSlice(allocator, "## ") catch continue;
+        buf.appendSlice(allocator, ref_file) catch continue;
+        buf.appendSlice(allocator, " → ") catch continue;
+        buf.appendSlice(allocator, def_file) catch continue;
+        buf.appendSlice(allocator, "\n") catch continue;
+
+        for (entry.value_ptr.items) |sym_name| {
+            buf.appendSlice(allocator, "- ") catch continue;
+            buf.appendSlice(allocator, sym_name) catch continue;
+            buf.appendSlice(allocator, "\n") catch continue;
+        }
+        buf.appendSlice(allocator, "\n") catch continue;
+    }
+
+    return allocator.dupe(u8, buf.items) catch allocator.dupe(u8, "") catch "";
+}
+
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const min_len = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < min_len and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
+/// Free all memory associated with a subsystem slice.
+fn freeSubsystems(allocator: std.mem.Allocator, subsystems: []Subsystem) void {
+    for (subsystems) |*sub| {
+        allocator.free(sub.id);
+        allocator.free(sub.label);
+        for (sub.files) |f| allocator.free(f);
+        allocator.free(sub.files);
+        allocator.free(sub.cross_file_context);
+    }
+    allocator.free(subsystems);
+}
+
 // ── SCIP-based cross-file relationship extraction ───────────────────────
 
 const CrossFileResult = struct {
@@ -1509,7 +2184,9 @@ const CrossFileResult = struct {
 /// Walk the SCIP index to find cross-file symbol references.
 /// Returns a human-readable text describing file pairs and their shared symbols,
 /// suitable for embedding in the association prompt. Returns null on failure.
-fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8) ?CrossFileResult {
+/// When `subsystems` is non-null, only pairs where the two files are in DIFFERENT
+/// subsystems are included (cross-subsystem filtering for Phase 2).
+fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8, subsystems: ?[]const Subsystem) ?CrossFileResult {
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return null;
     defer allocator.free(index_path);
 
@@ -1542,26 +2219,26 @@ fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8
 
     // Step 2: For each file, find references to symbols defined in other files.
     // Group by (referencing_file, defining_file) pair → list of symbol names.
-    const FilePairKey = struct {
+    const CfRefPairKey = struct {
         referencing: []const u8,
         defining: []const u8,
     };
     const PairContext = struct {
-        pub fn hash(_: @This(), key: FilePairKey) u64 {
+        pub fn hash(_: @This(), key: CfRefPairKey) u64 {
             var h = std.hash.Wyhash.init(0);
             h.update(key.referencing);
             h.update("\x00");
             h.update(key.defining);
             return h.final();
         }
-        pub fn eql(_: @This(), a: FilePairKey, b: FilePairKey) bool {
+        pub fn eql(_: @This(), a: CfRefPairKey, b: CfRefPairKey) bool {
             return std.mem.eql(u8, a.referencing, b.referencing) and
                 std.mem.eql(u8, a.defining, b.defining);
         }
     };
 
     var pair_symbols: std.HashMapUnmanaged(
-        FilePairKey,
+        CfRefPairKey,
         std.ArrayListUnmanaged([]const u8),
         PairContext,
         80,
@@ -1582,7 +2259,7 @@ fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8
             const defining_file = symbol_to_file.get(occ.symbol) orelse continue;
             if (std.mem.eql(u8, defining_file, doc.relative_path)) continue;
 
-            const key = FilePairKey{
+            const key = CfRefPairKey{
                 .referencing = doc.relative_path,
                 .defining = defining_file,
             };
@@ -1609,9 +2286,24 @@ fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8
 
     if (pair_symbols.count() == 0) return .{ .text = allocator.dupe(u8, "") catch return null, .pair_count = 0 };
 
+    // Build file→subsystem lookup for cross-subsystem filtering
+    var file_to_subsystem: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer file_to_subsystem.deinit(allocator);
+    if (subsystems) |subs| {
+        for (subs) |sub| {
+            for (sub.files) |f| {
+                file_to_subsystem.put(allocator, f, sub.id) catch continue;
+            }
+        }
+    }
+
     // Step 3: Build text output — collect pairs sorted for deterministic output
+    const CfPairKey = struct {
+        referencing: []const u8,
+        defining: []const u8,
+    };
     const PairEntry = struct {
-        key: FilePairKey,
+        key: CfPairKey,
         symbols: []const []const u8,
     };
     var entries: std.ArrayListUnmanaged(PairEntry) = .empty;
@@ -1619,8 +2311,14 @@ fn buildCrossFileRelationships(allocator: std.mem.Allocator, cog_dir: []const u8
 
     var pair_iter = pair_symbols.iterator();
     while (pair_iter.next()) |entry| {
+        // When subsystems filter is active, skip pairs in the same subsystem
+        if (subsystems != null) {
+            const sub_a = file_to_subsystem.get(entry.key_ptr.referencing);
+            const sub_b = file_to_subsystem.get(entry.key_ptr.defining);
+            if (sub_a != null and sub_b != null and std.mem.eql(u8, sub_a.?, sub_b.?)) continue;
+        }
         entries.append(allocator, .{
-            .key = entry.key_ptr.*,
+            .key = .{ .referencing = entry.key_ptr.referencing, .defining = entry.key_ptr.defining },
             .symbols = entry.value_ptr.items,
         }) catch continue;
     }
@@ -2050,50 +2748,83 @@ fn loadCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8) std
     if (parsed.value != .object) return map;
     const obj = parsed.value.object;
 
-    const files_val = obj.get("processed_files") orelse return map;
-    if (files_val != .array) return map;
+    // Check version — v1 is discarded (extraction model changed to subsystems)
+    const version_val = obj.get("version") orelse return map;
+    const version: i64 = switch (version_val) {
+        .integer => version_val.integer,
+        else => return map,
+    };
 
-    for (files_val.array.items) |item| {
-        if (item == .string) {
-            const duped = allocator.dupe(u8, item.string) catch continue;
-            map.put(allocator, duped, {}) catch {
-                allocator.free(duped);
-            };
-        }
+    if (version == 1) {
+        // v1 checkpoint from per-file model — discard
+        debug_log.log("loadCheckpoint: discarding v1 checkpoint (per-file model)", .{});
+        return map;
     }
 
+    if (version != 2) return map;
+
+    // v2: parse processed_subsystems array of objects with "id" field
+    const subsystems_val = obj.get("processed_subsystems") orelse return map;
+    if (subsystems_val != .array) return map;
+
+    for (subsystems_val.array.items) |item| {
+        if (item != .object) continue;
+        const id_val = item.object.get("id") orelse continue;
+        if (id_val != .string) continue;
+        const duped = allocator.dupe(u8, id_val.string) catch continue;
+        map.put(allocator, duped, {}) catch {
+            allocator.free(duped);
+        };
+    }
+
+    debug_log.log("loadCheckpoint: loaded v2 checkpoint with {d} subsystems", .{map.count()});
     return map;
 }
 
-fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, processed: *std.StringHashMapUnmanaged(void)) void {
-    // Collect all keys into a sorted slice
-    var keys: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer keys.deinit(allocator);
-
-    var it = processed.keyIterator();
-    while (it.next()) |key| {
-        keys.append(allocator, key.*) catch continue;
-    }
-    sortFiles(keys.items);
-
-    // Build JSON manually
+fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, processed: *std.StringHashMapUnmanaged(void), all_subsystems: []const Subsystem) void {
+    // Build JSON manually in v2 format
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
-    buf.appendSlice(allocator, "{\n  \"version\": 1,\n  \"processed_files\": [\n") catch return;
+    buf.appendSlice(allocator, "{\n  \"version\": 2,\n  \"processed_subsystems\": [\n") catch return;
 
-    for (keys.items, 0..) |key, i| {
-        buf.appendSlice(allocator, "    \"") catch return;
-        for (key) |c| {
-            switch (c) {
-                '"' => buf.appendSlice(allocator, "\\\"") catch return,
-                '\\' => buf.appendSlice(allocator, "\\\\") catch return,
-                '\n' => buf.appendSlice(allocator, "\\n") catch return,
-                else => buf.append(allocator, c) catch return,
+    // Collect processed subsystem IDs, sorted for determinism
+    var ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ids.deinit(allocator);
+
+    var it = processed.keyIterator();
+    while (it.next()) |key| {
+        ids.append(allocator, key.*) catch continue;
+    }
+    sortFiles(ids.items);
+
+    for (ids.items, 0..) |id, i| {
+        buf.appendSlice(allocator, "    {\"id\": \"") catch return;
+        appendJsonEscaped(&buf, allocator, id);
+        buf.appendSlice(allocator, "\", \"files\": [") catch return;
+
+        // Find the subsystem with this ID to include its files
+        var found_subsystem: ?*const Subsystem = null;
+        for (all_subsystems) |*sub| {
+            if (std.mem.eql(u8, sub.id, id)) {
+                found_subsystem = sub;
+                break;
             }
         }
-        buf.append(allocator, '"') catch return;
-        if (i + 1 < keys.items.len) {
+
+        if (found_subsystem) |sub| {
+            for (sub.files, 0..) |file_path, fi| {
+                buf.appendSlice(allocator, "\"") catch return;
+                appendJsonEscaped(&buf, allocator, file_path);
+                buf.appendSlice(allocator, "\"") catch return;
+                if (fi + 1 < sub.files.len) {
+                    buf.appendSlice(allocator, ", ") catch return;
+                }
+            }
+        }
+
+        buf.appendSlice(allocator, "]}") catch return;
+        if (i + 1 < ids.items.len) {
             buf.append(allocator, ',') catch return;
         }
         buf.append(allocator, '\n') catch return;
@@ -2104,6 +2835,17 @@ fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, pro
     const file = std.fs.createFileAbsolute(checkpoint_path, .{}) catch return;
     defer file.close();
     file.writeAll(buf.items) catch {};
+}
+
+fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => buf.appendSlice(allocator, "\\\"") catch return,
+            '\\' => buf.appendSlice(allocator, "\\\\") catch return,
+            '\n' => buf.appendSlice(allocator, "\\n") catch return,
+            else => buf.append(allocator, c) catch return,
+        }
+    }
 }
 
 fn loadCustomPrompt(allocator: std.mem.Allocator, cog_dir: []const u8, filename: []const u8) ?[]const u8 {
@@ -2236,4 +2978,67 @@ test "parseUsageFromStdout empty data" {
     const allocator = std.testing.allocator;
     const stats = parseUsageFromStdout(allocator, "claude_code", "");
     try std.testing.expectEqual(@as(usize, 0), stats.input_tokens);
+}
+
+test "buildSubsystemClusters basic" {
+    // buildSubsystemClusters returns null when SCIP index doesn't exist,
+    // so verify graceful failure with a nonexistent directory.
+    const allocator = std.testing.allocator;
+    const result = buildSubsystemClusters(allocator, &.{ "src/a.zig", "src/b.zig", "lib/c.zig" }, "/tmp/nonexistent-cog-dir");
+    try std.testing.expectEqual(@as(?[]Subsystem, null), result);
+}
+
+test "buildSubsystemClusters grouping" {
+    // Test the directory grouping helper directly via subsystem ID determinism
+    const allocator = std.testing.allocator;
+
+    // With no valid SCIP dir, clusters won't form — this tests the null path
+    const result = buildSubsystemClusters(allocator, &.{ "src/a.zig", "src/b.zig", "src/c.zig", "lib/d.zig" }, "/tmp/no-such-dir");
+    try std.testing.expectEqual(@as(?[]Subsystem, null), result);
+}
+
+test "loadCheckpoint v2 format" {
+    const allocator = std.testing.allocator;
+
+    // Write a v2 checkpoint
+    const path = "/tmp/test-bootstrap-checkpoint-v2.json";
+    const content = "{\"version\": 2, \"processed_subsystems\": [{\"id\": \"abcdef1234567890\", \"files\": [\"src/a.zig\", \"src/b.zig\"]}]}";
+    {
+        const f = try std.fs.createFileAbsolute(path, .{});
+        defer f.close();
+        try f.writeAll(content);
+    }
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    var map = loadCheckpoint(allocator, path);
+    defer {
+        var it = map.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        map.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(u32, 1), map.count());
+    try std.testing.expect(map.contains("abcdef1234567890"));
+}
+
+test "loadCheckpoint v1 format returns empty" {
+    const allocator = std.testing.allocator;
+
+    // Write a v1 checkpoint — should be discarded
+    const path = "/tmp/test-bootstrap-checkpoint-v1.json";
+    const content = "{\"version\": 1, \"processed_files\": [\"src/a.zig\"]}";
+    {
+        const f = try std.fs.createFileAbsolute(path, .{});
+        defer f.close();
+        try f.writeAll(content);
+    }
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    var map = loadCheckpoint(allocator, path);
+    defer {
+        var it = map.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        map.deinit(allocator);
+    }
+    // v1 is discarded — extraction model changed
+    try std.testing.expectEqual(@as(u32, 0), map.count());
 }

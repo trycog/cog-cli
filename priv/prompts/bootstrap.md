@@ -1,49 +1,65 @@
 You are bootstrapping a persistent knowledge graph for a codebase.
 
-Read the file below and extract the concepts an AI agent would need to understand how this code works — the kind of understanding that gets lost when a context window resets.
+You are looking at a **subsystem** — a cluster of related source files that work together. Read all the files listed below and extract the architectural knowledge an AI agent would need to understand how this subsystem works — the kind of understanding that gets lost when a context window resets.
 
 # Guiding Principle
 
-You are building a knowledge graph that replaces expensive code exploration. An agent should be able to understand how a module works, what it's responsible for, and how it connects to the rest of the system by querying memory — without reading the source. Capture the architectural and conceptual knowledge that comes from reading and reasoning about code, so agents don't have to.
+The codebase already has a code intelligence index that can look up any symbol definition, reference, or call graph. Memory does NOT need to duplicate what the index provides. Instead, capture knowledge that cannot be derived from reading the code:
+
+- **Why** something was built this way, not **what** it does
+- Design decisions and their tradeoffs
+- Constraints and invariants that break if violated
+- How data flows across file boundaries within this subsystem
+- Workflow rules and ordering requirements
 
 Fewer, high-quality concepts beat comprehensive coverage. Noisy concepts crowd out useful ones during recall.
 
 # What to Extract
 
-Not every dimension applies to every file. Skip any that don't add value.
+Think at the **subsystem level**, not the file level. These files were grouped together because they share dependencies and work as a unit. Ask yourself:
 
-1. **Purpose & Role** — What does this file own that nothing else does? Key entry points and their contracts.
+1. **Subsystem Responsibility** — What does this group of files own that nothing else in the codebase does? What is the boundary?
 2. **Design Decisions** — Why this approach? What tradeoffs were made? Look for comments with "because", "instead of", "tradeoff", "workaround".
-3. **Constraints & Invariants** — Ordering requirements, assumptions, validation boundaries, things that break if changed.
-4. **Data Flow & State** — Only when non-trivial: state machines, lifecycle transitions, complex transformations.
+3. **Constraints & Invariants** — Ordering requirements, assumptions, validation boundaries, concurrency rules, things that break if changed.
+4. **Cross-File Patterns** — How do these files collaborate? What data flows between them? What are the key integration points?
+
+Skip any dimension that doesn't add value. Not every subsystem has interesting constraints or design decisions.
 
 ## Volume
 
-- Most files: 2-4 concepts
-- Complex core modules: 5-8 concepts
-- If you're extracting more than 8, step back — you're inventorying, not capturing understanding
+- Target: **2-5 concepts** for the entire subsystem
+- If you're extracting more than 5, step back — you're inventorying, not capturing understanding
+- One concept that captures a cross-cutting design decision is worth more than five that describe individual files
+
+## Anti-Patterns — Do NOT Do These
+
+- Do NOT create one concept per file
+- Do NOT describe what individual functions or methods do — the code index handles that
+- Do NOT mirror the file structure (e.g., "Config Module", "Utils Module")
+- Do NOT store function signatures, parameter lists, or return types
+- Do NOT create concepts that could be answered by a simple code search
 
 ## Concepts
 
-1. **term** — 2-5 words, specific and qualified. Must be unique across the codebase. Bad: "Configuration". Good: "CLI Settings Loader" or "Bootstrap Checkpoint Format".
-2. **definition** — 1-3 sentences. Explain WHY, not just WHAT. Include specific technical terms, function names, and patterns — these drive keyword search during recall.
-3. **category** — One of: `core-mechanism`, `api-surface`, `design-decision`, `constraint`, `data-flow`, `error-handling`, `configuration`
+1. **term** — 2-5 words, specific and qualified. Must be unique across the codebase. Bad: "Configuration". Good: "Settings Resolution Chain" or "Bootstrap Cooperative Cancellation".
+2. **definition** — 1-3 sentences. Explain WHY, not just WHAT. Include specific technical terms and patterns — these drive keyword search during recall.
+3. **category** — One of: `design-decision`, `constraint`, `data-flow`, `architecture`, `error-handling`, `configuration`
 
 ## Example
 
-For a file implementing a worker thread pool with atomic job distribution:
+For a subsystem of 5 files implementing the bootstrap pipeline (worker pool, file processing, checkpointing, TUI progress):
 
 ```
-term: "Worker Thread Pool Distribution"
-definition: "workerThread() claims files via atomic fetchAdd on a shared index, enabling lock-free parallel processing. Each worker runs runFile() independently and reports results through atomic counters. The abort flag provides cooperative cancellation — workers check it at loop top before claiming the next file."
-category: core-mechanism
-
-term: "Bootstrap Abort Cascade"
-definition: "After 5 consecutive agent failures (max_consecutive_errors), the abort flag is set to stop all workers. This prevents runaway cost when the API is rate-limited or the agent is misconfigured. Workers exit cleanly on next iteration."
+term: "Bootstrap Cooperative Cancellation"
+definition: "Workers check an atomic abort flag at loop top before claiming the next file. After 5 consecutive agent failures, the abort flag cascades to all workers. This prevents runaway cost when the API is down. The reaper process handles orphaned children on SIGKILL."
 category: constraint
+
+term: "Bootstrap Checkpoint Resume"
+definition: "Progress is saved per-file to a JSON checkpoint after each successful extraction. On restart, already-processed files are skipped. The checkpoint is auto-cleared when the brain is empty (detected via cog_stats API call) to prevent stale state after a brain reset."
+category: design-decision
 ```
 
-Associations: "Bootstrap Abort Cascade" `requires` "Worker Thread Pool Distribution"
+Note: these concepts describe cross-cutting design patterns, not individual functions.
 
 ## Associations
 
@@ -63,18 +79,23 @@ Every concept should have at least one association. Orphaned concepts are nearly
 
 ## How to Store
 
-1. Use `cog_mem_recall` with a query related to this file's domain to check what already exists.
-2. Use `cog_mem_learn` with an `items` array to store multiple concepts in a single batch call:
+1. Use `cog_mem_recall` with a query related to this subsystem's domain to check what already exists.
+2. Use `cog_mem_learn` with an `items` array to store all concepts in a single batch call:
    - Each item needs `term` and `definition`
    - Set `memory_term` to `"long"` for permanent storage
-3. Use `cog_mem_associate` with an `items` array to create relationships between concepts in a single batch call, including links to concepts found via recall.
+3. Use `cog_mem_associate` with an `items` array to create relationships in a single batch call, including links to concepts found via recall.
 
 ## Rules
 
 - Do NOT store: secrets, credentials, PII, or trivial implementation details
-- Process the ENTIRE file, do not skip sections
 - When in doubt, leave it out — a missing concept can be added later, but noise degrades every future recall
 
-## File to Process
+## Subsystem: {subsystem_label}
 
-{file_path}
+### Files
+
+{file_paths}
+
+### Cross-File Dependencies
+
+{cross_file_context}

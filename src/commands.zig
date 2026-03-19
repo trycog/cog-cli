@@ -738,21 +738,46 @@ fn initBrain(allocator: std.mem.Allocator, host: []const u8, existing_parts: ?Br
 fn deployBootstrapTemplates() void {
     const cog_dir = std.fs.cwd().openDir(".cog", .{}) catch return;
 
-    // Write MEM_BOOTSTRAP.md only if it doesn't already exist
-    cog_dir.access("MEM_BOOTSTRAP.md", .{}) catch {
+    // Write or upgrade MEM_BOOTSTRAP.md
+    // If the existing file has the old per-file placeholder, replace it with the new subsystem prompt
+    const needs_bootstrap_upgrade = blk: {
+        const file = cog_dir.openFile("MEM_BOOTSTRAP.md", .{}) catch break :blk true; // doesn't exist
+        defer file.close();
+        const content = file.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch break :blk false;
+        defer std.heap.page_allocator.free(content);
+        // Old prompt uses {file_path} (singular), new uses {file_paths} (plural)
+        if (std.mem.indexOf(u8, content, "{file_path}") != null and
+            std.mem.indexOf(u8, content, "{file_paths}") == null)
+        {
+            break :blk true;
+        }
+        break :blk false;
+    };
+    if (needs_bootstrap_upgrade) {
         if (cog_dir.createFile("MEM_BOOTSTRAP.md", .{})) |file| {
             defer file.close();
             file.writeAll(build_options.bootstrap_prompt) catch {};
         } else |_| {}
-    };
+    }
 
-    // Write MEM_BOOTSTRAP_ASSOCIATE.md only if it doesn't already exist
-    cog_dir.access("MEM_BOOTSTRAP_ASSOCIATE.md", .{}) catch {
+    // Write or upgrade MEM_BOOTSTRAP_ASSOCIATE.md
+    const needs_associate_upgrade = blk: {
+        const file = cog_dir.openFile("MEM_BOOTSTRAP_ASSOCIATE.md", .{}) catch break :blk true;
+        defer file.close();
+        const content = file.readToEndAlloc(std.heap.page_allocator, 64 * 1024) catch break :blk false;
+        defer std.heap.page_allocator.free(content);
+        // Old prompt says "per-file concepts", new says "per-subsystem concepts"
+        if (std.mem.indexOf(u8, content, "per-file concepts") != null) {
+            break :blk true;
+        }
+        break :blk false;
+    };
+    if (needs_associate_upgrade) {
         if (cog_dir.createFile("MEM_BOOTSTRAP_ASSOCIATE.md", .{})) |file| {
             defer file.close();
             file.writeAll(build_options.bootstrap_associate_prompt) catch {};
         } else |_| {}
-    };
+    }
 }
 
 fn buildAccountLabel(allocator: std.mem.Allocator, account: json.Value) ![]const u8 {
