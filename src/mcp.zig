@@ -16,6 +16,7 @@ const memory_mod = @import("memory.zig");
 const repo_context_mod = @import("repo_context.zig");
 const session_context_mod = @import("session_context.zig");
 const memory_envelope_mod = @import("memory_envelope.zig");
+const log_server_mod = @import("log_server.zig");
 
 const Config = config_mod.Config;
 const DebugServer = debug_server_mod.DebugServer;
@@ -33,6 +34,7 @@ const RemoteTool = struct {
 };
 
 const ToolTier = debug_server_mod.ToolTier;
+const LogServer = log_server_mod.LogServer;
 
 const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -40,6 +42,7 @@ const Runtime = struct {
     brain_type: config_mod.BrainType,
     mem_db: ?memory_mod.MemoryDb = null,
     debug_server: DebugServer,
+    log_server: LogServer,
     code_cache: ?code_intel.CodeIndex = null,
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
@@ -63,6 +66,7 @@ const Runtime = struct {
             .brain_type = brain,
             .mem_db = null,
             .debug_server = DebugServer.init(allocator),
+            .log_server = LogServer.init(allocator),
             .code_cache = null,
             .remote_tools = null,
             .mcp_session_id = null,
@@ -76,6 +80,7 @@ const Runtime = struct {
 
     fn deinit(self: *Runtime) void {
         if (self.watcher) |*w| w.deinit();
+        self.log_server.deinit();
         if (self.mem_db) |*mdb| mdb.close();
         // brain_type owns the Config when .remote — don't also free via mem_config
         self.brain_type.deinit(self.allocator);
@@ -1099,6 +1104,11 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
             try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
         }
     }
+
+    // Log tools
+    for (log_server_mod.tool_definitions) |tool| {
+        try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+    }
 }
 
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
@@ -1127,6 +1137,13 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
         return result;
     } else if (std.mem.eql(u8, tool_name, "code_explore")) {
         const result = try callCodeExplore(runtime, arguments);
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
+    }
+
+    // Log tools — own mutex (LogServer.mutex)
+    if (std.mem.startsWith(u8, tool_name, "log_")) {
+        const result = try callLogTool(runtime, tool_name, arguments);
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
         return result;
     }
@@ -1677,6 +1694,15 @@ fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Valu
     };
 }
 
+fn callLogTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    debug_log_mod.log("callLogTool: dispatching {s}", .{tool_name});
+    const result = runtime.log_server.callTool(tool_name, arguments) catch |err| {
+        return try std.fmt.allocPrint(runtime.allocator, "Error: log tool failed: {s}", .{@errorName(err)});
+    };
+    debug_log_mod.log("callLogTool: {s} returned", .{tool_name});
+    return result;
+}
+
 // ── JSON Helpers ────────────────────────────────────────────────────────
 
 fn getStr(obj: json.Value, key: []const u8) ?[]const u8 {
@@ -1999,6 +2025,7 @@ fn testRuntime(allocator: std.mem.Allocator) Runtime {
         .brain_type = .none,
         .mem_db = null,
         .debug_server = DebugServer.init(allocator),
+        .log_server = LogServer.init(allocator),
         .code_cache = null,
         .remote_tools = null,
         .mcp_session_id = null,
