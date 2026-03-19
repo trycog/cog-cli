@@ -1183,7 +1183,7 @@ const RemoteStats = struct {
 };
 
 fn parseRemoteStats(allocator: std.mem.Allocator, body: []const u8) ?RemoteStats {
-    // The MCP response wraps the tool result in {"result":{"content":[{"type":"text","text":"..."}]}}
+    // MCP response: {"result":{"content":[{"type":"text","text":"{\"total_engrams\":42,...}"}]}}
     const parsed = json.parseFromSlice(json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
 
@@ -1196,37 +1196,22 @@ fn parseRemoteStats(allocator: std.mem.Allocator, body: []const u8) ?RemoteStats
     const text = if (first == .object) (if (first.object.get("text")) |t| (if (t == .string) t.string else null) else null) else null;
     const stats_text = text orelse return null;
 
-    // Parse "Engrams: 123" and "Synapses: 456" from the text
-    var engrams: i64 = -1;
-    var synapses: i64 = -1;
-    var lines = std.mem.splitScalar(u8, stats_text, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "Engrams:")) |pos| {
-            const after = std.mem.trim(u8, line[pos + "Engrams:".len ..], &std.ascii.whitespace);
-            // Take first number (before any parenthetical)
-            var num_end: usize = 0;
-            for (after) |c| {
-                if (std.ascii.isDigit(c)) {
-                    num_end += 1;
-                } else break;
-            }
-            if (num_end > 0) {
-                engrams = std.fmt.parseInt(i64, after[0..num_end], 10) catch -1;
-            }
-        }
-        if (std.mem.indexOf(u8, line, "Synapses:")) |pos| {
-            const after = std.mem.trim(u8, line[pos + "Synapses:".len ..], &std.ascii.whitespace);
-            var num_end: usize = 0;
-            for (after) |c| {
-                if (std.ascii.isDigit(c)) {
-                    num_end += 1;
-                } else break;
-            }
-            if (num_end > 0) {
-                synapses = std.fmt.parseInt(i64, after[0..num_end], 10) catch -1;
-            }
-        }
-    }
+    // The text content is JSON: {"total_engrams":42,"total_synapses":127,...}
+    const stats_parsed = json.parseFromSlice(json.Value, allocator, stats_text, .{}) catch return null;
+    defer stats_parsed.deinit();
+
+    if (stats_parsed.value != .object) return null;
+    const obj = stats_parsed.value.object;
+
+    const engrams = if (obj.get("total_engrams")) |v| switch (v) {
+        .integer => v.integer,
+        else => @as(i64, -1),
+    } else @as(i64, -1);
+
+    const synapses = if (obj.get("total_synapses")) |v| switch (v) {
+        .integer => v.integer,
+        else => @as(i64, -1),
+    } else @as(i64, -1);
 
     if (engrams >= 0 and synapses >= 0) return .{ .engrams = engrams, .synapses = synapses };
     if (engrams >= 0) return .{ .engrams = engrams, .synapses = 0 };
@@ -1429,14 +1414,12 @@ pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
                 // Try to fetch stats from remote brain (best-effort)
                 remote_stats: {
-                    const api_url = config_mod.extractApiUrl(allocator, url) catch break :remote_stats;
-                    defer allocator.free(api_url);
-
-                    const endpoint = std.fmt.allocPrint(allocator, "{s}/mcp", .{api_url}) catch break :remote_stats;
+                    // MCP route is /:username/:brain_name/mcp (no /api/v1 prefix)
+                    const endpoint = std.fmt.allocPrint(allocator, "{s}/mcp", .{url}) catch break :remote_stats;
                     defer allocator.free(endpoint);
 
                     debug_log.log("doctor: fetching remote stats from {s}", .{endpoint});
-                    const resp = client.mcpCallToolQuiet(allocator, endpoint, key, null, "stats", "{}") catch break :remote_stats;
+                    const resp = client.mcpCallToolQuiet(allocator, endpoint, key, null, "cog_stats", "{}") catch break :remote_stats;
                     defer allocator.free(resp.body);
                     if (resp.session_id) |sid| allocator.free(sid);
 
