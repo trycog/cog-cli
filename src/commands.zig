@@ -16,7 +16,6 @@ const paths = @import("paths.zig");
 const code_intel = @import("code_intel.zig");
 const extensions_mod = @import("extensions.zig");
 const memory_mod = @import("memory.zig");
-const debug_mod = @import("debug.zig");
 const sqlite = @import("sqlite.zig");
 
 const Config = config_mod.Config;
@@ -1588,47 +1587,6 @@ pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     }
                 }
             }
-        }
-    }
-
-    // ── 6. Debug ───────────────────────────────────────────────────────
-
-    printErr("\n" ++ cyan ++ bold ++ "  Debug" ++ reset ++ "\n");
-
-    debug_check: {
-        var path_buf: [128]u8 = undefined;
-        const sock_path = debug_mod.daemon.getSocketPath(&path_buf) orelse {
-            printErr("    " ++ dim ++ "- Could not determine socket path" ++ reset ++ "\n");
-            break :debug_check;
-        };
-        debug_log.log("doctor: checking daemon socket at {s}", .{sock_path});
-
-        // Check if socket file exists
-        if (std.fs.accessAbsolute(sock_path, .{})) {
-            // Socket exists — try to connect
-            const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch {
-                printErr("    " ++ yellow ++ "!" ++ reset ++ " Daemon socket exists but cannot connect (stale?)\n");
-                warnings += 1;
-                break :debug_check;
-            };
-
-            var addr: std.posix.sockaddr.un = .{ .path = undefined };
-            @memset(&addr.path, 0);
-            @memcpy(addr.path[0..sock_path.len], sock_path);
-
-            std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch {
-                std.posix.close(sock);
-                printErr("    " ++ yellow ++ "!" ++ reset ++ " Daemon socket stale (connection refused)\n");
-                warnings += 1;
-                break :debug_check;
-            };
-
-            std.posix.close(sock);
-            printErr("    " ++ cyan ++ check ++ reset ++ " Daemon running\n");
-            passed += 1;
-        } else |_| {
-            printErr("    " ++ dim ++ "- Daemon not running" ++ reset ++ "\n");
-            debug_log.log("doctor: daemon not running", .{});
         }
     }
 
