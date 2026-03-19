@@ -8,7 +8,7 @@
 
 **Memory, code intelligence, and debugging for AI agents.**
 
-[Benchmarks](#benchmarks) · [Install](#install) · [Setup](#setup) · [How It Works](#how-it-works) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Extensions](#extensions) · [Diagnostics](#diagnostics)
+[Benchmarks](#benchmarks) · [Install](#install) · [Setup](#setup) · [How It Works](#how-it-works) · [Memory](#memory) · [Code Intelligence](#code-intelligence) · [Debug](#debug) · [Log Analysis](#log-analysis) · [Extensions](#extensions) · [Diagnostics](#diagnostics)
 
 </div>
 
@@ -18,11 +18,12 @@
 
 AI coding can feel fast but it's still limited by suboptimal methods and tooling. Your agent doesn't remember the architectural decisions from last week. It can't look up where a function is defined without grepping through your entire codebase. When something breaks it can't set a breakpoint, inspect a variable, or step through the code. It's stuck adding print statements and guessing.
 
-We built Cog to fix that. It's a single native binary that runs as an MCP server and gives your agent three capabilities it doesn't have on its own:
+We built Cog to fix that. It's a single native binary that runs as an MCP server and gives your agent four capabilities it doesn't have on its own:
 
 1. **Persistent memory** that carries across sessions. Your agent learns your architecture, remembers past bugs, and builds knowledge that compounds over time. Memory can run locally (SQLite) or hosted on [trycog.ai](https://trycog.ai) for team sharing.
 2. **Structured code intelligence** that returns definitions, references, and symbols in one tool call instead of 15 rounds of grep and file reads.
 3. **An interactive debugger** your agent drives directly. Breakpoints, variable inspection, stepping through code. No more print statement debugging.
+4. **Log file analysis** with incremental reading, auto-format detection, level filtering, and error deduplication. No more shelling out to `tail` and `grep`.
 
 ## Benchmarks
 
@@ -153,6 +154,7 @@ Your Agent  <->  MCP (stdio)  <->  cog mcp
                                      |-- Memory (local SQLite or trycog.ai)
                                      |-- Code Intelligence (local SCIP index)
                                      |-- Debug (local daemon)
+                                     |-- Log Analysis (cursor-based file watching)
 ```
 
 Tool families your agent discovers:
@@ -160,6 +162,7 @@ Tool families your agent discovers:
 - `cog_mem_*` for memory operations (when configured)
 - `cog_code_*` for code intelligence (query, explore, index status)
 - `cog_debug_*` for the debugger (36 tools: launch, breakpoints, stepping, inspection, and more)
+- `cog_log_*` for log file analysis (watch, tail, search, error extraction)
 
 ### Sub-agents
 
@@ -376,6 +379,49 @@ Under the hood, a local daemon communicates with debug adapters (DAP). The daemo
 | `debug:sign` | macOS code-signing for debug entitlements |
 
 On macOS, `cog init` handles the code-signing for you.
+
+---
+
+## Log Analysis
+
+Structured log file analysis your agent drives through MCP. Instead of shelling out to `tail`, `grep`, and `cat` — wasting context tokens on routine output — your agent watches log files incrementally and gets parsed, filtered results.
+
+### How it works
+
+Cursor-based file watching with no background threads. Your agent opens a log file, gets a session with a read cursor, and polls for new content. The log server auto-detects the file's format and extracts structured data (log levels, timestamps, stack traces) without configuration.
+
+### Format detection
+
+Detected automatically from the first 50 lines:
+
+| Format | Detection |
+|--------|-----------|
+| JSON lines | >80% of lines are valid JSON objects |
+| Logfmt | >50% of lines contain `level=`/`msg=` or 3+ `key=value` pairs |
+| Timestamped | >50% of lines start with ISO 8601, syslog, nginx, or Rails timestamps |
+| Plaintext | Fallback |
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `cog_log_watch` | Open a log file and start a session. Auto-detects format, returns initial tail lines. |
+| `cog_log_tail` | Read new lines since last read. Cursor advances automatically. Supports level and pattern filters. |
+| `cog_log_search` | Search the entire file for matches with optional context lines and time range filters. Does not advance the cursor. |
+| `cog_log_errors` | Extract and deduplicate errors with stack traces. Groups by fingerprint, reports counts and line ranges. |
+| `cog_log_overview` | File metadata: size, line count, format, log level distribution, head/tail samples. |
+| `cog_log_sessions` | List all active watching sessions. |
+| `cog_log_stop` | Close a session. |
+
+### Typical workflow
+
+1. `cog_log_watch` the application log
+2. Trigger the behavior (run tests, make a request, etc.)
+3. `cog_log_tail` to see what happened — filter by `level: "ERROR"` to focus
+4. `cog_log_errors` to get deduplicated errors with stack traces
+5. `cog_log_stop` when done
+
+Works well alongside the debugger: watch the log, launch a debug session, then correlate log output with breakpoint observations.
 
 ---
 
