@@ -15,7 +15,7 @@ case "$tool_name" in
     exit 2
     ;;
   run_shell_command)
-    if printf '%s' "$payload" | grep -Eq '"command"[[:space:]]*:[[:space:]]*"[^"]*(rg|grep|find)[^"]*"'; then
+    if printf '%s' "$payload" | grep -Eq '"command"[[:space:]]*:[[:space:]]*"[^"]*\b(rg|grep|find)\b[^"]*"'; then
       printf '%s\n' "Cog policy: use Cog code intelligence tools before shell search commands like grep, rg, find, or git grep when the Cog MCP server is configured." >&2
       exit 2
     fi

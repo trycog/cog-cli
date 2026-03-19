@@ -64,7 +64,7 @@ case "$tool_name" in
     deny "Use Cog code intelligence tools before raw file search when the Cog MCP server is configured."
     ;;
   Bash)
-    if printf '%s' "$payload" | grep -Eq '"command"[[:space:]]*:[[:space:]]*"[^"]*(rg|grep|find)[^"]*"'; then
+    if printf '%s' "$payload" | grep -Eq '"command"[[:space:]]*:[[:space:]]*"[^"]*\b(rg|grep|find)\b[^"]*"'; then
       deny "Use Cog code intelligence tools before shell search commands like grep, rg, find, or git grep when the Cog MCP server is configured."
     fi
     ;;
