@@ -62,9 +62,9 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "mem_get",
-        .description = "Get a specific engram by its ID.",
+        .description = "Get one or more engrams by ID. Pass 'id' for one, or 'engram_ids' array for a batch.",
         .input_schema =
-        \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID"}},"required":["id"]}
+        \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID"},"engram_ids":{"type":"array","items":{"type":"string"},"description":"Batch: array of engram UUIDs to retrieve at once"}}}
         ,
     },
     .{
@@ -111,9 +111,9 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "mem_flush",
-        .description = "Delete a specific short-term memory.",
+        .description = "Delete one or more short-term memories. Pass 'id' for one, or 'engram_ids' array for a batch.",
         .input_schema =
-        \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID to flush"}},"required":["id"]}
+        \\{"type":"object","properties":{"id":{"type":"string","description":"Engram UUID to flush"},"engram_ids":{"type":"array","items":{"type":"string"},"description":"Batch: array of engram UUIDs to flush at once"}}}
         ,
     },
     .{
@@ -663,8 +663,41 @@ fn toolRecall(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
 
 fn toolGet(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     const allocator = mem_db.allocator;
+
+    // Batch path: if 'engram_ids' array is present, retrieve all at once
+    if (getArrayArg(arguments, "engram_ids")) |ids| {
+        var out = Output.init(allocator);
+        errdefer out.deinit();
+        var count: usize = 0;
+        for (ids) |id_val| {
+            if (id_val != .string) continue;
+            const eid = id_val.string;
+            if (count > 0) out.append("\n---\n");
+            var stmt = try mem_db.db.prepare("SELECT term, definition, memory_term, weight, created_at, updated_at FROM engrams WHERE id = ? AND brain_id = ?");
+            defer stmt.finalize();
+            try stmt.bindText(1, eid);
+            try stmt.bindText(2, mem_db.brain_id);
+            const result = try stmt.step();
+            if (result == .done) {
+                out.print("`{s}`: Not found.", .{eid});
+            } else {
+                const e_term = stmt.columnText(0) orelse "";
+                const e_def = stmt.columnText(1) orelse "";
+                const e_mem = stmt.columnText(2) orelse "short";
+                const e_weight = stmt.columnReal(3);
+                const e_created = stmt.columnText(4) orelse "";
+                const e_updated = stmt.columnText(5) orelse "";
+                out.print("**{s}** ({s}, weight: {d:.2})\n{s}\n`id: {s}`\nCreated: {s} | Updated: {s}", .{ e_term, e_mem, e_weight, e_def, eid, e_created, e_updated });
+            }
+            count += 1;
+        }
+        if (count == 0) return allocator.dupe(u8, "Error: 'engram_ids' array is empty.");
+        debug_log.log("memory: batch get count={d}", .{count});
+        return out.toOwnedSlice();
+    }
+
     const id = getStringArg(arguments, "id") orelse
-        return allocator.dupe(u8, "Error: 'id' is required.");
+        return allocator.dupe(u8, "Error: 'id' or 'engram_ids' is required.");
 
     var stmt = try mem_db.db.prepare("SELECT term, definition, memory_term, weight, created_at, updated_at FROM engrams WHERE id = ? AND brain_id = ?");
     defer stmt.finalize();
@@ -921,8 +954,36 @@ fn toolReinforce(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
 
 fn toolFlush(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     const allocator = mem_db.allocator;
+
+    // Batch path: if 'engram_ids' array is present, flush all at once
+    if (getArrayArg(arguments, "engram_ids")) |ids| {
+        var out = Output.init(allocator);
+        errdefer out.deinit();
+        var flushed: usize = 0;
+        var not_found: usize = 0;
+        for (ids) |id_val| {
+            if (id_val != .string) continue;
+            const eid = id_val.string;
+            var stmt = try mem_db.db.prepare("DELETE FROM engrams WHERE id = ? AND brain_id = ? AND memory_term = 'short'");
+            defer stmt.finalize();
+            try stmt.bindText(1, eid);
+            try stmt.bindText(2, mem_db.brain_id);
+            _ = try stmt.step();
+            if (mem_db.db.changes() > 0) {
+                flushed += 1;
+            } else {
+                not_found += 1;
+            }
+        }
+        debug_log.log("memory: batch flush flushed={d} not_found={d}", .{ flushed, not_found });
+        if (not_found > 0) {
+            return std.fmt.allocPrint(allocator, "Flushed {d} memories. {d} not found or not short-term.", .{ flushed, not_found });
+        }
+        return std.fmt.allocPrint(allocator, "Flushed {d} memories.", .{flushed});
+    }
+
     const id = getStringArg(arguments, "id") orelse
-        return allocator.dupe(u8, "Error: 'id' is required.");
+        return allocator.dupe(u8, "Error: 'id' or 'engram_ids' is required.");
 
     var stmt = try mem_db.db.prepare("DELETE FROM engrams WHERE id = ? AND brain_id = ? AND memory_term = 'short'");
     defer stmt.finalize();

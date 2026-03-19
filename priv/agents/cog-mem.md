@@ -13,7 +13,7 @@ Search memory for relevant concepts. Reformulate queries — expand with synonym
 1. `cog_mem_recall` with reformulated query — put ALL queries in a single `queries` array, never make sequential recall calls
 2. Follow connections with `cog_mem_connections` on high-relevance engrams
 3. Trace paths between concepts with `cog_mem_trace` if relationships matter
-4. `cog_mem_get` for full details on specific engrams — when retrieving multiple engrams, call `cog_mem_get` for ALL of them in parallel (multiple tool calls in one response), never sequentially
+4. `cog_mem_get` for full details on specific engrams — use `engram_ids` array for multiple in one call
 5. Decide whether the memory is sufficient to answer the primary agent's question
 
 If memory is sufficient, return a concise summary of what was found and say that memory was sufficient. Include engram IDs for anything the primary agent might want to reference.
@@ -100,7 +100,7 @@ Report findings and actions taken.
 
 ## Rules
 
-- **Batch aggressively.** Never make sequential calls that could be parallel. Put multiple recall queries in one `queries` array. When calling `mem_get`, `mem_connections`, or `mem_trace` for multiple engrams, issue ALL calls in a single response as parallel tool calls.
+- **Batch aggressively.** Never make sequential calls that could be batched. Use `queries` array for `mem_recall`, `engram_ids` array for `mem_get`/`mem_connections`/`mem_reinforce`/`mem_flush`, and `items` array for `mem_learn`/`mem_associate`. One batched call is always better than N sequential calls.
 - Never store passwords, API keys, tokens, secrets, PII
 - Always return engram IDs alongside summaries
 - Do not make code changes
