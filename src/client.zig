@@ -473,6 +473,54 @@ fn writeJsonValueTo(w: *Writer, value: json.Value) !void {
     }
 }
 
+pub const ApiResponse = struct {
+    status_code: u16,
+    body: []const u8,
+};
+
+/// Authenticated GET request that returns status code and body without printing errors.
+pub fn apiGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8) !ApiResponse {
+    debug_log.log("apiGet: {s}", .{url});
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth_header);
+
+    const result = curl.get(allocator, url, &.{
+        auth_header,
+        "Accept: application/json",
+    }) catch {
+        debug_log.log("apiGet: connection failed to {s}", .{url});
+        return error.HttpError;
+    };
+
+    debug_log.log("apiGet: {s} -> status {d}", .{ url, result.status_code });
+    return .{
+        .status_code = result.status_code,
+        .body = result.body,
+    };
+}
+
+/// Authenticated POST request that returns status code and body without printing errors.
+pub fn apiPost(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8, body: []const u8) !ApiResponse {
+    debug_log.log("apiPost: {s} ({d} bytes)", .{ url, body.len });
+    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+    defer allocator.free(auth_header);
+
+    const result = curl.post(allocator, url, &.{
+        auth_header,
+        "Content-Type: application/json",
+        "Accept: application/json",
+    }, body) catch {
+        debug_log.log("apiPost: connection failed to {s}", .{url});
+        return error.HttpError;
+    };
+
+    debug_log.log("apiPost: {s} -> status {d}", .{ url, result.status_code });
+    return .{
+        .status_code = result.status_code,
+        .body = result.body,
+    };
+}
+
 fn printErr(msg: []const u8) void {
     if (@import("builtin").is_test) return;
     var buf: [4096]u8 = undefined;
