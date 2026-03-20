@@ -16,9 +16,14 @@ pub const DebugConfig = struct {
     log: bool = false,
 };
 
+pub const BootstrapConfig = struct {
+    model: ?[]const u8 = null,
+};
+
 pub const MemoryConfig = struct {
     brain: ?BrainConfig = null,
-    model: ?[]const u8 = null,
+    model: ?[]const u8 = null, // legacy: memory.model (deprecated, use memory.bootstrap.model)
+    bootstrap: ?BootstrapConfig = null,
 };
 
 pub const CodeConfig = struct {
@@ -141,9 +146,22 @@ fn parseMemoryConfig(allocator: std.mem.Allocator, value: std.json.Value) !Memor
     if (obj.get("brain")) |v| {
         result.brain = try parseBrainConfig(allocator, v);
     }
-    if (obj.get("model")) |v| {
-        if (v == .string) {
-            result.model = try allocator.dupe(u8, v.string);
+    // New format: memory.bootstrap.model
+    if (obj.get("bootstrap")) |bs| {
+        if (bs == .object) {
+            if (bs.object.get("model")) |v| {
+                if (v == .string) {
+                    result.bootstrap = .{ .model = try allocator.dupe(u8, v.string) };
+                }
+            }
+        }
+    }
+    // Legacy fallback: memory.model
+    if (result.bootstrap == null) {
+        if (obj.get("model")) |v| {
+            if (v == .string) {
+                result.model = try allocator.dupe(u8, v.string);
+            }
         }
     }
     return result;
@@ -234,6 +252,9 @@ fn freeBrainConfig(allocator: std.mem.Allocator, config: *const BrainConfig) voi
 fn freeMemoryConfig(allocator: std.mem.Allocator, config: *const MemoryConfig) void {
     if (config.brain) |b| freeBrainConfig(allocator, &b);
     if (config.model) |m| allocator.free(m);
+    if (config.bootstrap) |bs| {
+        if (bs.model) |m| allocator.free(m);
+    }
 }
 
 fn freeCodeConfig(allocator: std.mem.Allocator, config: *const CodeConfig) void {

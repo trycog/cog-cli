@@ -218,13 +218,15 @@ cog mem:bootstrap --debug                # Show agent stderr output
 
 On first run, `cog mem:bootstrap` presents an interactive agent selector — pick whichever AI coding agent CLI you have installed (Amp, Claude Code, Gemini CLI, Goose, OpenAI Codex CLI, OpenCode, or a custom command). The list starts alphabetically and then adapts based on your global selection history in `~/.config/cog/agent-selection-counts.json`. Progress is checkpointed to `.cog/bootstrap-checkpoint.json` so interrupted runs resume where they left off.
 
-**Model override.** Set `memory.model` in `.cog/settings.json` to override the model the agent uses during bootstrap:
+**Model override.** By default, bootstrap uses whichever model the selected agent is configured to use. To override this, set `memory.bootstrap.model` in `.cog/settings.json`:
 
 ```json
 {
   "memory": {
     "brain": "https://trycog.ai/you/brain",
-    "model": "claude-sonnet-4-20250514"
+    "bootstrap": {
+      "model": "claude-sonnet-4-20250514"
+    }
   }
 }
 ```

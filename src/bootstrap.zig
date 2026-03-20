@@ -1462,10 +1462,14 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         return;
     }
 
-    // Load model from settings.json memory.model
+    // Load model from settings.json: memory.bootstrap.model (preferred) or memory.model (legacy)
     const settings = settings_mod.Settings.load(allocator);
     defer if (settings) |s| s.deinit(allocator);
-    const model: ?[]const u8 = if (settings) |s| if (s.memory) |m| m.model else null else null;
+    const model: ?[]const u8 = if (settings) |s| blk: {
+        const mem = s.memory orelse break :blk null;
+        if (mem.bootstrap) |bs| break :blk bs.model;
+        break :blk mem.model; // legacy fallback
+    } else null;
 
     try runBootstrap(allocator, concurrency, clean, debug, timeout_ms, cog_dir, selected_agent, custom_cmd, model);
 }
