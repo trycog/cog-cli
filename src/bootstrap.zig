@@ -424,6 +424,9 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     if (std.mem.eql(u8, subcmd, "mem:info")) {
         return memInfo(allocator);
     }
+    if (std.mem.eql(u8, subcmd, "mem:upload")) {
+        return memUpload(allocator, args);
+    }
     if (std.mem.eql(u8, subcmd, "mem:upgrade")) {
         return memUpgrade();
     }
