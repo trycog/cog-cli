@@ -307,6 +307,7 @@ This runs entirely locally. No account required.
 | Zig | External extension | Supported via [`cog-zig`](https://github.com/trycog/cog-zig) |
 | Ruby | External extension | Supported via [`cog-ruby`](https://github.com/trycog/cog-ruby) |
 | Swift | External extension | Supported via [`cog-swift`](https://github.com/trycog/cog-swift) |
+| Nix | External extension | Supported via [`cog-nix`](https://github.com/trycog/cog-nix) |
 | Elixir | External extension | Supported via [`cog-elixir`](https://github.com/trycog/cog-elixir) |
 
 Built-in coverage comes from the bundled grammars and extension definitions in `src/extensions.zig`. Additional repo-supported languages are available through installable extensions in the [Extensions](#extensions) section.
@@ -397,6 +398,7 @@ Extensions install from GitHub release tarballs into `~/.config/cog/extensions/`
 | Extension | Language | Code Intelligence | Debugging |
 |-----------|----------|:-----------------:|-----------|
 | [cog-elixir](https://github.com/trycog/cog-elixir) | Elixir | Yes | DAP (ElixirLS) |
+| [cog-nix](https://github.com/trycog/cog-nix) | Nix | Yes | |
 | [cog-ruby](https://github.com/trycog/cog-ruby) | Ruby | Yes | DAP (rdbg) |
 | [cog-swift](https://github.com/trycog/cog-swift) | Swift | Yes | DAP (lldb) |
 | [cog-zig](https://github.com/trycog/cog-zig) | Zig | Yes | DWARF (native) |
