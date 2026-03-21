@@ -93,7 +93,7 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     if (existing) |content| {
@@ -171,7 +171,7 @@ fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     // Preserve existing top-level keys except mcpServers
@@ -243,7 +243,7 @@ fn writeJsonAmp(allocator: std.mem.Allocator, path: []const u8) !void {
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     if (existing) |content| {
@@ -287,7 +287,7 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     if (existing) |content| {
@@ -520,7 +520,7 @@ fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     var existing_allow: ?json.Value = null;
@@ -649,7 +649,7 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     if (parsed_holder) |parsed| {
@@ -838,7 +838,7 @@ fn writeGeminiTrust(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     var iter = parsed.value.object.iterator();
@@ -897,7 +897,7 @@ fn writeGeminiRuntimeHooks(allocator: std.mem.Allocator, mcp_path: []const u8) !
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     var wrote_before_tool = false;
@@ -1005,7 +1005,7 @@ fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     // Check if amp.permissions already exists and has our rule
@@ -1076,7 +1076,7 @@ fn writeOpenCodePermissions(allocator: std.mem.Allocator, mcp_path: []const u8) 
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
 
     var existing_permissions: ?json.Value = null;
@@ -1696,7 +1696,7 @@ fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8, slug: []const u
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: Stringify = .{ .writer = &aw.writer };
+    var s: Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
 
     try s.beginObject();
     try s.objectField("customModes");
