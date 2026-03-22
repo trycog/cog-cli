@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const process_types = @import("process_types.zig");
+const debug_log = @import("../../debug_log.zig");
 
 pub const WaitResult = process_types.WaitResult;
 pub const RegisterState = process_types.RegisterState;

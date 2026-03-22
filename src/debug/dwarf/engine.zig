@@ -10,6 +10,7 @@ const parser = @import("parser.zig");
 const location = @import("location.zig");
 const unwind = @import("unwind.zig");
 const core_dump_mod = @import("core_dump.zig");
+const debug_log = @import("../../debug_log.zig");
 
 const ProcessControl = process_mod.ProcessControl;
 const StopState = types.StopState;
@@ -92,6 +93,7 @@ pub const DwarfEngine = struct {
     core_dump: ?core_dump_mod.CoreDump = null,
 
     pub fn init(allocator: std.mem.Allocator) DwarfEngine {
+        debug_log.log("dwarf.engine: init", .{});
         return .{
             .allocator = allocator,
             .bp_manager = BreakpointManager.init(allocator),
@@ -99,6 +101,7 @@ pub const DwarfEngine = struct {
     }
 
     pub fn deinit(self: *DwarfEngine) void {
+        debug_log.log("dwarf.engine: deinit, launched={}", .{self.launched});
         // Clear hardware watchpoints before killing to leave clean state
         if (self.core_dump == null) {
             for (self.hw_watchpoints, 0..) |wp, slot| {
@@ -202,15 +205,19 @@ pub const DwarfEngine = struct {
 
     fn engineLaunch(ctx: *anyopaque, allocator: std.mem.Allocator, config: LaunchConfig) anyerror!void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: launch binary={s}", .{config.program});
         try self.process.spawn(allocator, config.program, config.args);
+        debug_log.log("dwarf.engine: process spawned, pid={?}", .{self.process.pid});
         self.launched = true;
         self.program_path = try allocator.dupe(u8, config.program);
 
         // Load binary and parse DWARF line tables for breakpoint resolution
         self.loadDebugInfo(config.program) catch {};
+        debug_log.log("dwarf.engine: debug info loaded, line_entries={d}, functions={d}, file_entries={d}", .{ self.line_entries.len, self.functions.len, self.file_entries.len });
 
         // Compute ASLR slide and adjust line entry addresses
         self.applyAslrSlide() catch {};
+        debug_log.log("dwarf.engine: ASLR slide={d}", .{self.aslr_slide});
     }
 
     fn applyAslrSlide(self: *DwarfEngine) !void {
@@ -299,6 +306,7 @@ pub const DwarfEngine = struct {
     }
 
     fn loadDebugInfoMachO(self: *DwarfEngine, program: []const u8) void {
+        debug_log.log("dwarf.engine: loading Mach-O debug info from {s}", .{program});
         var binary = binary_macho.MachoBinary.loadFile(self.allocator, program) catch return;
         errdefer binary.deinit(self.allocator);
 
@@ -330,9 +338,16 @@ pub const DwarfEngine = struct {
             }
         }
 
-        // Fallback: on macOS, Apple clang stores DWARF in a .dSYM bundle
+        // Fallback 1: on macOS, Apple clang stores DWARF in a .dSYM bundle
         if (self.line_entries.len == 0) {
+            debug_log.log("dwarf.engine: no line entries in binary, trying dSYM bundle", .{});
             self.loadDsymDebugInfo(program) catch {};
+        }
+
+        // Fallback 2: on macOS, load DWARF from object files via N_OSO stab entries
+        if (self.line_entries.len == 0) {
+            debug_log.log("dwarf.engine: no dSYM found, trying N_OSO object files", .{});
+            self.loadObjectFileDebugInfo(program) catch {};
         }
 
         // Parse function info from debug_info + debug_abbrev
@@ -342,6 +357,7 @@ pub const DwarfEngine = struct {
     }
 
     fn loadDebugInfoElf(self: *DwarfEngine, program: []const u8) void {
+        debug_log.log("dwarf.engine: loading ELF debug info from {s}", .{program});
         var elf = binary_elf.ElfBinary.loadFile(self.allocator, program) catch return;
         errdefer elf.deinit(self.allocator);
 
@@ -645,6 +661,7 @@ pub const DwarfEngine = struct {
     fn loadDsymDebugInfo(self: *DwarfEngine, program: []const u8) !void {
         // dSYM path: <program>.dSYM/Contents/Resources/DWARF/<basename>
         const basename = std.fs.path.basename(program);
+        debug_log.log("dwarf.engine: looking for dSYM bundle for {s}", .{basename});
 
         const dsym_path = try std.fmt.allocPrint(
             self.allocator,
@@ -682,13 +699,128 @@ pub const DwarfEngine = struct {
             }
         }
 
+        debug_log.log("dwarf.engine: dSYM loaded, line_entries={d}", .{self.line_entries.len});
         self.dsym_binary = dsym_binary;
+    }
+
+    fn loadObjectFileDebugInfo(self: *DwarfEngine, program: []const u8) !void {
+        // Read the binary data
+        const file = try std.fs.cwd().openFile(program, .{});
+        defer file.close();
+        const stat = try file.stat();
+        const data = try self.allocator.alloc(u8, stat.size);
+        defer self.allocator.free(data);
+        _ = try file.readAll(data);
+
+        // Extract N_OSO object file paths
+        const obj_paths = binary_macho.extractObjectFilePaths(self.allocator, data) catch return;
+        defer {
+            for (obj_paths) |p| self.allocator.free(p);
+            self.allocator.free(obj_paths);
+        }
+
+        debug_log.log("dwarf.engine: found {d} object files via N_OSO", .{obj_paths.len});
+        if (obj_paths.len == 0) return;
+
+        // Load and merge DWARF from each object file
+        var all_line_entries = std.ArrayListUnmanaged(parser.LineEntry).empty;
+        var all_file_entries = std.ArrayListUnmanaged(parser.FileEntry).empty;
+        var all_allocated_paths = std.ArrayListUnmanaged([]const u8).empty;
+        var all_functions = std.ArrayListUnmanaged(parser.FunctionInfo).empty;
+
+        for (obj_paths) |obj_path| {
+            debug_log.log("dwarf.engine: loading object file {s}", .{obj_path});
+            var obj_binary = binary_macho.MachoBinary.loadFile(self.allocator, obj_path) catch {
+                debug_log.log("dwarf.engine: failed to load object file {s}", .{obj_path});
+                continue;
+            };
+
+            if (!obj_binary.sections.hasDebugInfo()) {
+                debug_log.log("dwarf.engine: object file {s} has no debug info", .{obj_path});
+                obj_binary.deinit(self.allocator);
+                continue;
+            }
+
+            // Parse line program from this object file
+            if (obj_binary.sections.debug_line) |line_section| {
+                const line_data = (obj_binary.getSectionDataAlloc(self.allocator, line_section) catch null) orelse obj_binary.getSectionData(line_section);
+                if (line_data) |ld| {
+                    const line_str_data = if (obj_binary.sections.debug_line_str) |ls|
+                        (obj_binary.getSectionDataAlloc(self.allocator, ls) catch null) orelse obj_binary.getSectionData(ls)
+                    else
+                        null;
+                    if (parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data)) |result| {
+                        for (result.line_entries) |entry| {
+                            all_line_entries.append(self.allocator, entry) catch continue;
+                        }
+                        if (result.line_entries.len > 0) self.allocator.free(result.line_entries);
+
+                        for (result.file_entries) |entry| {
+                            all_file_entries.append(self.allocator, entry) catch continue;
+                        }
+                        if (result.file_entries.len > 0) self.allocator.free(result.file_entries);
+
+                        for (result.allocated_paths) |p| {
+                            all_allocated_paths.append(self.allocator, p) catch continue;
+                        }
+                        if (result.allocated_paths.len > 0) self.allocator.free(result.allocated_paths);
+                    } else |_| {
+                        // Try simpler parse
+                        if (parser.parseLineProgram(ld, self.allocator)) |entries| {
+                            for (entries) |entry| {
+                                all_line_entries.append(self.allocator, entry) catch continue;
+                            }
+                            self.allocator.free(entries);
+                        } else |_| {}
+                    }
+                }
+            }
+
+            // Parse function info from this object file
+            if (obj_binary.sections.debug_info) |info_section| {
+                if (obj_binary.sections.debug_abbrev) |abbrev_section| {
+                    const info_data = (obj_binary.getSectionDataAlloc(self.allocator, info_section) catch null) orelse obj_binary.getSectionData(info_section);
+                    const abbrev_data = (obj_binary.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse obj_binary.getSectionData(abbrev_section);
+                    if (info_data) |id| {
+                        if (abbrev_data) |ad| {
+                            const str_data = if (obj_binary.sections.debug_str) |s| (obj_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse obj_binary.getSectionData(s) else null;
+                            if (parser.parseCompilationUnitEx(id, ad, str_data, .{}, self.allocator)) |funcs| {
+                                for (funcs) |f| {
+                                    all_functions.append(self.allocator, f) catch continue;
+                                }
+                                self.allocator.free(funcs);
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+
+            obj_binary.deinit(self.allocator);
+        }
+
+        // Store merged results
+        if (all_line_entries.items.len > 0) {
+            self.line_entries = all_line_entries.toOwnedSlice(self.allocator) catch return;
+            debug_log.log("dwarf.engine: merged {d} line entries from object files", .{self.line_entries.len});
+        }
+        if (all_file_entries.items.len > 0) {
+            self.file_entries = all_file_entries.toOwnedSlice(self.allocator) catch return;
+            debug_log.log("dwarf.engine: merged {d} file entries from object files", .{self.file_entries.len});
+        }
+        if (all_allocated_paths.items.len > 0) {
+            self.allocated_paths = all_allocated_paths.toOwnedSlice(self.allocator) catch return;
+        }
+        if (all_functions.items.len > 0) {
+            self.functions = all_functions.toOwnedSlice(self.allocator) catch return;
+            debug_log.log("dwarf.engine: merged {d} functions from object files", .{self.functions.len});
+        }
     }
 
     // ── Run ─────────────────────────────────────────────────────────
 
     fn engineRun(ctx: *anyopaque, _: std.mem.Allocator, action: RunAction, options: types.RunOptions) anyerror!StopState {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: run action={s}", .{@tagName(action)});
         if (self.core_dump != null) return error.NotSupported; // core dumps are read-only
         // Track step operations for stop_reason reporting
         self.step_in_progress = switch (action) {
@@ -1098,6 +1230,7 @@ pub const DwarfEngine = struct {
         // Wait and handle stop — with transparent resume for conditional breakpoints
         const stop_state = try self.waitAndHandleStop();
         self.is_single_stepping = false;
+        debug_log.log("dwarf.engine: run result={s}", .{@tagName(stop_state.stop_reason)});
         return stop_state;
     }
 
@@ -2239,6 +2372,7 @@ pub const DwarfEngine = struct {
 
     fn engineSetBreakpoint(ctx: *anyopaque, _: std.mem.Allocator, file: []const u8, line: u32, condition: ?[]const u8, hit_condition: ?[]const u8, log_message: ?[]const u8) anyerror!BreakpointInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: setBreakpoint file={s} line={d}", .{ file, line });
         if (self.core_dump != null) return error.NotSupported; // core dumps are read-only
 
         if (self.line_entries.len > 0) {
@@ -2252,6 +2386,7 @@ pub const DwarfEngine = struct {
                 return err;
             };
 
+            debug_log.log("dwarf.engine: breakpoint set id={d} addr=0x{x} verified=true line={d}", .{ bp.id, bp.address, bp.line });
             return .{
                 .id = bp.id,
                 .verified = true,
@@ -2263,6 +2398,7 @@ pub const DwarfEngine = struct {
         }
 
         // No debug info — return unverified breakpoint
+        debug_log.log("dwarf.engine: breakpoint unverified, no debug info for {s}:{d}", .{ file, line });
         return .{ .id = 0, .verified = false, .file = file, .line = line };
     }
 
@@ -2333,6 +2469,7 @@ pub const DwarfEngine = struct {
 
     fn engineInspect(ctx: *anyopaque, allocator: std.mem.Allocator, request: InspectRequest) anyerror!InspectResult {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: inspect expr={s} frame_id={?}", .{ if (request.expression) |e| e else "<none>", request.frame_id });
 
         // Map variablesReference IDs from engineScopes to scope filters
         // 1 = Locals, 2 = Arguments (assigned in engineScopes)
@@ -3303,6 +3440,7 @@ pub const DwarfEngine = struct {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         const regs = try self.process.readRegisters();
         const all_frames = self.buildStackTrace(regs) catch return &.{};
+        debug_log.log("dwarf.engine: getStackTrace frame_count={d}", .{all_frames.len});
 
         // Apply pagination: start_frame and levels
         if (start_frame == 0 and levels == 0) return all_frames;
@@ -3471,7 +3609,11 @@ pub const DwarfEngine = struct {
 
     fn engineSetFunctionBreakpoint(ctx: *anyopaque, _: std.mem.Allocator, name: []const u8, condition: ?[]const u8) anyerror!BreakpointInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        if (self.functions.len == 0) return error.NoDebugInfo;
+        debug_log.log("dwarf.engine: setFunctionBreakpoint name={s}", .{name});
+        if (self.functions.len == 0) {
+            debug_log.log("dwarf.engine: setFunctionBreakpoint failed, no debug info", .{});
+            return error.NoDebugInfo;
+        }
 
         // Find function by name
         for (self.functions) |func| {
@@ -3508,6 +3650,7 @@ pub const DwarfEngine = struct {
                     return err;
                 };
 
+                debug_log.log("dwarf.engine: function breakpoint set id={d} addr=0x{x} func={s}", .{ bp_id, bp_addr, name });
                 return .{
                     .id = bp_id,
                     .verified = true,
@@ -3518,6 +3661,7 @@ pub const DwarfEngine = struct {
             }
         }
 
+        debug_log.log("dwarf.engine: function not found: {s}", .{name});
         return error.FunctionNotFound;
     }
 
@@ -3803,8 +3947,10 @@ pub const DwarfEngine = struct {
 
     fn engineAttach(ctx: *anyopaque, _: std.mem.Allocator, pid: u32) anyerror!void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: attach pid={d}", .{pid});
         try self.process.attach(@intCast(pid));
         self.launched = true;
+        debug_log.log("dwarf.engine: attached successfully", .{});
 
         // Try to find binary path from /proc or lsof for debug info
         // For now, debug info loading requires explicit program path
@@ -4038,6 +4184,7 @@ pub const DwarfEngine = struct {
             });
         }
 
+        debug_log.log("dwarf.engine: getModules count={d}", .{mods.items.len});
         return try mods.toOwnedSlice(allocator);
     }
 
@@ -4082,6 +4229,7 @@ pub const DwarfEngine = struct {
             });
         }
 
+        debug_log.log("dwarf.engine: getLoadedSources count={d}", .{sources.items.len});
         return try sources.toOwnedSlice(allocator);
     }
 
@@ -4428,6 +4576,7 @@ pub const DwarfEngine = struct {
 
     fn engineTerminate(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: terminate", .{});
         // Use process.kill() which handles ptrace-stopped processes correctly.
         // SIGTERM can't be delivered to a ptrace-stopped process on macOS,
         // causing the same deadlock as SIGKILL without PT_KILL.
@@ -4522,6 +4671,7 @@ pub const DwarfEngine = struct {
 
     fn engineStop(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: stop", .{});
         try self.process.kill();
         self.launched = false;
     }
@@ -4570,6 +4720,7 @@ pub const DwarfEngine = struct {
 
     fn engineFindSymbol(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const types.SymbolInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: findSymbol name={s}", .{name});
 
         var symbols = std.ArrayListUnmanaged(types.SymbolInfo).empty;
         errdefer symbols.deinit(allocator);
@@ -4622,6 +4773,7 @@ pub const DwarfEngine = struct {
                         .line = line_num,
                     });
                 }
+                debug_log.log("dwarf.engine: findSymbol via debug_names, results={d}", .{symbols.items.len});
                 return try symbols.toOwnedSlice(allocator);
             }
         }
@@ -4653,6 +4805,7 @@ pub const DwarfEngine = struct {
             }
         }
 
+        debug_log.log("dwarf.engine: findSymbol linear scan, results={d}", .{symbols.items.len});
         return try symbols.toOwnedSlice(allocator);
     }
 
@@ -5015,6 +5168,7 @@ pub const DwarfEngine = struct {
 
     fn engineDeinit(ctx: *anyopaque) void {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: engineDeinit", .{});
         const allocator = self.allocator;
         self.deinit();
         allocator.destroy(self);

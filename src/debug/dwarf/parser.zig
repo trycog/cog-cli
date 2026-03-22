@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const binary_macho = @import("binary_macho.zig");
 const location = @import("location.zig");
+const debug_log = @import("../../debug_log.zig");
 
 // ── DWARF Debug Info Parser ────────────────────────────────────────────
 
@@ -366,7 +367,9 @@ pub fn parseAbbrevTable(data: []const u8, allocator: std.mem.Allocator) ![]Abbre
         });
     }
 
-    return try entries.toOwnedSlice(allocator);
+    const result = try entries.toOwnedSlice(allocator);
+    debug_log.log("dwarf.parser: abbreviation table parsed, entries={d}", .{result.len});
+    return result;
 }
 
 pub fn freeAbbrevTable(entries: []AbbrevEntry, allocator: std.mem.Allocator) void {
@@ -424,6 +427,7 @@ pub const CuIndexEntry = struct {
 /// Build a CU index from .debug_info for fast PC-to-CU lookup.
 /// Parses CU headers and root DIE low_pc/high_pc where possible.
 pub fn buildCuIndex(debug_info: []const u8, debug_abbrev: []const u8, allocator: std.mem.Allocator) ![]CuIndexEntry {
+    debug_log.log("dwarf.parser: building CU index, debug_info_size={d}", .{debug_info.len});
     var entries: std.ArrayListUnmanaged(CuIndexEntry) = .empty;
     errdefer entries.deinit(allocator);
 
@@ -513,6 +517,7 @@ pub fn buildCuIndex(debug_info: []const u8, debug_abbrev: []const u8, allocator:
     }
 
     const result = try entries.toOwnedSlice(allocator);
+    debug_log.log("dwarf.parser: CU index built, cu_count={d}", .{result.len});
 
     // Sort by low_pc for binary search
     std.mem.sort(CuIndexEntry, result, {}, struct {
@@ -626,6 +631,7 @@ pub fn parseLineProgram(data: []const u8, allocator: std.mem.Allocator) ![]LineE
 }
 
 fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_files: bool, debug_line_str: ?[]const u8) !LineProgramResult {
+    debug_log.log("dwarf.parser: parsing line program, data_size={d}", .{data.len});
     var pos: usize = 0;
     var entries: std.ArrayListUnmanaged(LineEntry) = .empty;
     errdefer entries.deinit(allocator);
@@ -1010,6 +1016,7 @@ fn parseLineProgramImpl(data: []const u8, allocator: std.mem.Allocator, keep_fil
     }
 
     const line_result = try entries.toOwnedSlice(allocator);
+    debug_log.log("dwarf.parser: line program parsed, line_entries={d}, files={d}", .{ line_result.len, files.items.len });
 
     if (keep_files) {
         const owned_files = try allocator.dupe(FileEntry, files.items);
@@ -1119,6 +1126,7 @@ pub fn parseCompilationUnitEx(
     extra: ExtraSections,
     allocator: std.mem.Allocator,
 ) ![]FunctionInfo {
+    debug_log.log("dwarf.parser: parsing compilation units, debug_info_size={d}", .{debug_info.len});
     var functions: std.ArrayListUnmanaged(FunctionInfo) = .empty;
     errdefer functions.deinit(allocator);
 
@@ -1354,6 +1362,7 @@ pub fn parseCompilationUnitEx(
         }
     }
 
+    debug_log.log("dwarf.parser: compilation units parsed, functions={d}", .{functions.items.len});
     return try functions.toOwnedSlice(allocator);
 }
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const process_types = @import("process_types.zig");
+const debug_log = @import("../../debug_log.zig");
 
 pub const WaitResult = process_types.WaitResult;
 pub const RegisterState = process_types.RegisterState;
@@ -171,6 +172,7 @@ pub const MachProcessControl = struct {
     }
 
     pub fn spawn(self: *MachProcessControl, allocator: std.mem.Allocator, program: []const u8, args: []const []const u8) !void {
+        debug_log.log("dwarf.process: spawn program={s} args_count={d}", .{ program, args.len });
         var argv: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
         defer argv.deinit(allocator);
 
@@ -233,6 +235,7 @@ pub const MachProcessControl = struct {
         self.pid = pid;
         self.is_running = false;
         self.alloc = allocator;
+        debug_log.log("dwarf.process: forked child pid={d}", .{pid});
 
         // Parent: close write ends, keep read ends, set non-blocking
         if (stdout_pipe) |p| {
@@ -283,6 +286,7 @@ pub const MachProcessControl = struct {
             const status = result.status;
             // WIFEXITED: (status & 0x7f) == 0
             if ((status & 0x7f) == 0) {
+                debug_log.log("dwarf.process: pid={d} exited, exit_code={d}", .{ pid, (status >> 8) & 0xff });
                 self.pid = null;
                 self.cached_task = null;
                 self.cached_thread = null;
@@ -305,6 +309,7 @@ pub const MachProcessControl = struct {
             }
             // WIFSIGNALED: low 7 bits are signal number (non-zero, not 0x7f)
             if ((status & 0x7f) != 0 and (status & 0x7f) != 0x7f) {
+                debug_log.log("dwarf.process: pid={d} signaled, signal={d}", .{ pid, status & 0x7f });
                 self.pid = null;
                 self.cached_task = null;
                 self.cached_thread = null;
@@ -327,6 +332,7 @@ pub const MachProcessControl = struct {
             }
             // WIFSTOPPED: (status & 0xff) == 0x7f
             if ((status & 0xff) == 0x7f) {
+                debug_log.log("dwarf.process: pid={d} stopped, signal={d}", .{ pid, (status >> 8) & 0xff });
                 return .{ .status = .stopped, .signal = @intCast((status >> 8) & 0xff) };
             }
             return .{ .status = .unknown };
@@ -486,6 +492,7 @@ pub const MachProcessControl = struct {
 
     pub fn readMemory(self: *MachProcessControl, address: u64, size: usize, allocator: std.mem.Allocator) ![]u8 {
         if (self.pid == null) return error.NoProcess;
+        debug_log.log("dwarf.process: readMemory addr=0x{x} size={d}", .{ address, size });
         if (builtin.os.tag != .macos) {
             const buf = try allocator.alloc(u8, size);
             @memset(buf, 0);
@@ -509,6 +516,7 @@ pub const MachProcessControl = struct {
 
     pub fn writeMemory(self: *MachProcessControl, address: u64, data: []const u8) !void {
         if (self.pid == null) return error.NoProcess;
+        debug_log.log("dwarf.process: writeMemory addr=0x{x} size={d}", .{ address, data.len });
         if (builtin.os.tag != .macos) return;
 
         const task = try self.getTask();
@@ -561,7 +569,11 @@ pub const MachProcessControl = struct {
         const pid = self.pid orelse return error.NoProcess;
         var task: std.c.mach_port_name_t = undefined;
         const kr = std.c.task_for_pid(std.c.mach_task_self(), pid, &task);
-        if (kr != 0) return error.TaskForPidFailed;
+        if (kr != 0) {
+            debug_log.log("dwarf.process: task_for_pid failed for pid={d}, kr={d}", .{ pid, kr });
+            return error.TaskForPidFailed;
+        }
+        debug_log.log("dwarf.process: task_for_pid pid={d} -> task={d}", .{ pid, task });
         self.cached_task = task;
         return task;
     }
@@ -626,6 +638,7 @@ pub const MachProcessControl = struct {
 
     pub fn kill(self: *MachProcessControl) !void {
         if (self.pid) |pid| {
+            debug_log.log("dwarf.process: kill pid={d}", .{pid});
             if (builtin.os.tag == .macos) {
                 // PT_KILL atomically sends SIGKILL and resumes a ptrace-stopped process.
                 // This avoids the macOS deadlock where signals queue but don't deliver
@@ -669,15 +682,20 @@ pub const MachProcessControl = struct {
     }
 
     pub fn attach(self: *MachProcessControl, pid: posix.pid_t) !void {
+        debug_log.log("dwarf.process: attach pid={d}", .{pid});
         if (builtin.os.tag == .macos) {
             const PT_ATTACH = 10;
             const result = std.c.ptrace(PT_ATTACH, pid, null, 0);
-            if (result != 0) return error.AttachFailed;
+            if (result != 0) {
+                debug_log.log("dwarf.process: attach failed for pid={d}", .{pid});
+                return error.AttachFailed;
+            }
         }
         self.pid = pid;
         self.is_running = false;
         // Wait for the stop signal from attach
         _ = posix.waitpid(pid, WUNTRACED);
+        debug_log.log("dwarf.process: attached to pid={d}", .{pid});
     }
 
     pub fn detach(self: *MachProcessControl) !void {

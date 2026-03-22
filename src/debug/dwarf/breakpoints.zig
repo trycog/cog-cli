@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const process_mod = @import("process.zig");
 const types = @import("../types.zig");
+const debug_log = @import("../../debug_log.zig");
 
 // ── Software Breakpoint Management ─────────────────────────────────────
 
@@ -102,6 +103,7 @@ pub const BreakpointManager = struct {
         hit_condition: ?[]const u8,
         log_message: ?[]const u8,
     ) !Breakpoint {
+        debug_log.log("dwarf.breakpoints: resolving {s}:{d} (col={?}, entries={d})", .{ file, line, column, line_entries.len });
         // Find the best matching line entry
         var best_addr: ?u64 = null;
         var best_line: u32 = 0;
@@ -157,7 +159,11 @@ pub const BreakpointManager = struct {
             }
         }
 
-        const address = best_addr orelse return error.NoAddressForLine;
+        const address = best_addr orelse {
+            debug_log.log("dwarf.breakpoints: no address found for {s}:{d}", .{ file, line });
+            return error.NoAddressForLine;
+        };
+        debug_log.log("dwarf.breakpoints: resolved {s}:{d} -> addr=0x{x} (actual_line={d})", .{ file, line, address, best_line });
 
         const owned_file = try self.allocator.dupe(u8, file);
         errdefer self.allocator.free(owned_file);
@@ -305,9 +311,11 @@ pub const BreakpointManager = struct {
 
                 // Write trap instruction (BRK #0 on ARM64, INT3 on x86)
                 try process.writeMemory(bp.address, trap_instruction);
+                debug_log.log("dwarf.breakpoints: trap written at 0x{x} for bp id={d}", .{ bp.address, id });
                 return;
             }
         }
+        debug_log.log("dwarf.breakpoints: writeBreakpoint failed, id={d} not found", .{id});
         return error.BreakpointNotFound;
     }
 
@@ -315,6 +323,7 @@ pub const BreakpointManager = struct {
     pub fn removeBreakpoint(self: *BreakpointManager, id: u32, process: *process_mod.ProcessControl) !void {
         for (self.breakpoints.items, 0..) |*bp, i| {
             if (bp.id == id) {
+                debug_log.log("dwarf.breakpoints: removing bp id={d} addr=0x{x}", .{ id, bp.address });
                 if (bp.enabled) {
                     try process.writeMemory(bp.address, &bp.original_bytes);
                 }
@@ -323,6 +332,7 @@ pub const BreakpointManager = struct {
                 return;
             }
         }
+        debug_log.log("dwarf.breakpoints: remove failed, id={d} not found", .{id});
         return error.BreakpointNotFound;
     }
 
