@@ -1094,9 +1094,14 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
         }
     }
 
-    // Debug tools are NOT advertised in tools/list — they pollute the primary
-    // agent's context window. The cog-debug subagent prompt documents available
-    // tools directly. Debug tools are still callable via tools/call.
+    // Debug tools must be in tools/list because MCP clients only allow calling
+    // tools that appear in the discovered list. The primary agent prompt tells
+    // it to delegate to the cog-debug subagent rather than calling these directly.
+    for (debug_server_mod.tool_definitions) |tool| {
+        if (tool.tier.isWithin(runtime.debug_tool_tier)) {
+            try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+        }
+    }
 }
 
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
