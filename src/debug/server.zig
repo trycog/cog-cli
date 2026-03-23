@@ -61,6 +61,7 @@ pub fn errorMessage(err: anyerror) []const u8 {
     if (err == error.JavacNotFound) return "javac not found on PATH";
     if (err == error.JdiCompileFailed) return "Failed to compile JDI debug adapter";
     if (err == error.UnsupportedLanguage) return "Unsupported language for debugging";
+    if (err == error.NoDebugInfo) return "Binary has no debug info. Make sure you are launching the built executable (not the compiler/interpreter). For compiled languages, build first then pass the output binary path.";
     return @errorName(err);
 }
 
@@ -1068,6 +1069,9 @@ pub const DebugServer = struct {
             const bp = session.driver.setBreakpointEx(allocator, file_val.string, @intCast(line_val.integer), condition, hit_condition, log_message) catch |err| {
                 debug_log.log("toolBreakpoint: set failed: {s}", .{@errorName(err)});
                 self.dashboard.onError("debug_breakpoint", @errorName(err));
+                if (err == error.NoAddressForLine) {
+                    return .{ .err = .{ .code = errorToCode(err), .message = "No executable code at this line (function may be inlined/optimized). Try set_function with the function name, or a nearby line." } };
+                }
                 return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
             };
             debug_log.log("toolBreakpoint: set bp#{d} verified={}", .{ bp.id, bp.verified });
@@ -1143,8 +1147,15 @@ pub const DebugServer = struct {
 
             var out = TextOutput.init(allocator);
             errdefer out.deinit();
+            // Report which function was matched (may differ from requested name due to suffix matching)
             try out.append("Set function breakpoint:\n");
             try appendBreakpointText(&out, &bp);
+            // Hint: if the matched file/name differs from the request, note it
+            if (!std.mem.eql(u8, bp.file, func_val.string) and bp.file.len > 0) {
+                try out.append("  (matched: ");
+                try out.append(bp.file);
+                try out.append(")\n");
+            }
             return .{ .ok = try out.toOwnedSlice() };
         } else if (std.mem.eql(u8, action_str, "set_exception")) {
             const filters_val = a.object.get("filters") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing filters for set_exception" } };
@@ -1650,7 +1661,7 @@ pub const DebugServer = struct {
             return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
         };
         defer result_val.deinit(allocator);
-        debug_log.log("toolInspect: result count={d} is_error={}", .{ result_val.children.len, result_val.is_error });
+        debug_log.log("toolInspect: result={s} type={s} children={d} is_error={}", .{ result_val.result, result_val.type, result_val.children.len, result_val.is_error });
         self.dashboard.onInspect(
             session_id_val.string,
             if (request.expression) |e| e else "(scope)",

@@ -215,6 +215,16 @@ pub const DwarfEngine = struct {
         self.loadDebugInfo(config.program) catch {};
         debug_log.log("dwarf.engine: debug info loaded, line_entries={d}, functions={d}, file_entries={d}", .{ self.line_entries.len, self.functions.len, self.file_entries.len });
 
+        // Fail fast if the binary has no debug info at all — this usually means the
+        // wrong binary was passed (e.g. a compiler/interpreter instead of the built
+        // executable). Letting this proceed silently causes all breakpoints to fail
+        // with "unverified" and all inspections to return empty results.
+        if (self.line_entries.len == 0 and self.functions.len == 0) {
+            debug_log.log("dwarf.engine: launch rejected, no debug info in binary '{s}'", .{config.program});
+            self.process.kill() catch {};
+            return error.NoDebugInfo;
+        }
+
         // Compute ASLR slide and adjust line entry addresses
         self.applyAslrSlide() catch {};
         debug_log.log("dwarf.engine: ASLR slide={d}", .{self.aslr_slide});
@@ -3727,73 +3737,92 @@ pub const DwarfEngine = struct {
             return error.NoDebugInfo;
         }
 
-        // Find function by name
+        // Find ALL functions matching by exact name or suffix (e.g. "add" matches "Calculator.add")
+        var last_result: ?BreakpointInfo = null;
+        var match_count: u32 = 0;
+
         for (self.functions) |func| {
-            if (std.mem.eql(u8, func.name, name)) {
-                // Find the first executable line AFTER the function prologue.
-                // The first line entry at low_pc is typically the function signature/declaration
-                // where arguments aren't yet materialized. We skip to the second distinct line
-                // (the first statement in the body) so parameters have correct values when we stop.
-                var bp_addr = func.low_pc;
-                var bp_line: u32 = 0;
-                if (self.line_entries.len > 0) {
-                    // Collect line entries within this function's range, sorted by address
-                    var first_addr: ?u64 = null;
-                    var first_line: u32 = 0;
-                    var second_addr: ?u64 = null;
-                    var second_line: u32 = 0;
-                    for (self.line_entries) |entry| {
-                        if (entry.end_sequence) continue;
-                        if (entry.address >= func.low_pc and
-                            (func.high_pc == 0 or entry.address < func.high_pc))
-                        {
-                            if (first_addr == null or entry.address < first_addr.?) {
-                                // Push previous first to second if it was a different line
-                                if (first_addr != null and first_line != entry.line) {
-                                    if (second_addr == null or first_addr.? < second_addr.?) {
-                                        second_addr = first_addr;
-                                        second_line = first_line;
-                                    }
+            const matches = std.mem.eql(u8, func.name, name) or
+                (func.name.len > name.len and
+                func.name[func.name.len - name.len - 1] == '.' and
+                std.mem.eql(u8, func.name[func.name.len - name.len ..], name));
+            if (!matches) continue;
+
+            // Find the first executable line AFTER the function prologue.
+            // The first line entry at low_pc is typically the function signature/declaration
+            // where arguments aren't yet materialized. We skip to the second distinct line
+            // (the first statement in the body) so parameters have correct values when we stop.
+            var bp_addr = func.low_pc;
+            var bp_line: u32 = 0;
+            if (self.line_entries.len > 0) {
+                // Collect line entries within this function's range, sorted by address
+                var first_addr: ?u64 = null;
+                var first_line: u32 = 0;
+                var second_addr: ?u64 = null;
+                var second_line: u32 = 0;
+                for (self.line_entries) |entry| {
+                    if (entry.end_sequence) continue;
+                    if (entry.address >= func.low_pc and
+                        (func.high_pc == 0 or entry.address < func.high_pc))
+                    {
+                        if (first_addr == null or entry.address < first_addr.?) {
+                            // Push previous first to second if it was a different line
+                            if (first_addr != null and first_line != entry.line) {
+                                if (second_addr == null or first_addr.? < second_addr.?) {
+                                    second_addr = first_addr;
+                                    second_line = first_line;
                                 }
-                                first_addr = entry.address;
-                                first_line = entry.line;
-                            } else if (first_addr != null and entry.line != first_line) {
-                                // Different line than the first — candidate for second
-                                if (second_addr == null or entry.address < second_addr.?) {
-                                    second_addr = entry.address;
-                                    second_line = entry.line;
-                                }
+                            }
+                            first_addr = entry.address;
+                            first_line = entry.line;
+                        } else if (first_addr != null and entry.line != first_line) {
+                            // Different line than the first — candidate for second
+                            if (second_addr == null or entry.address < second_addr.?) {
+                                second_addr = entry.address;
+                                second_line = entry.line;
                             }
                         }
                     }
-                    // Prefer the second line (first body statement) over the declaration line
-                    if (second_addr) |addr| {
-                        bp_addr = addr;
-                        bp_line = second_line;
-                        debug_log.log("dwarf.engine: function bp skipped prologue, line {d} -> {d}", .{ first_line, second_line });
-                    } else if (first_addr) |addr| {
-                        bp_addr = addr;
-                        bp_line = first_line;
-                    }
                 }
-
-                const bp_id = try self.bp_manager.setAtAddressEx(bp_addr, func.name, bp_line, condition);
-
-                // Write trap instruction
-                self.bp_manager.writeBreakpoint(bp_id, &self.process) catch |err| {
-                    self.bp_manager.remove(bp_id) catch {};
-                    return err;
-                };
-
-                debug_log.log("dwarf.engine: function breakpoint set id={d} addr=0x{x} func={s}", .{ bp_id, bp_addr, name });
-                return .{
-                    .id = bp_id,
-                    .verified = true,
-                    .file = func.name,
-                    .line = bp_line,
-                    .condition = condition,
-                };
+                // Prefer the second line (first body statement) over the declaration line
+                if (second_addr) |addr| {
+                    bp_addr = addr;
+                    bp_line = second_line;
+                    debug_log.log("dwarf.engine: function bp skipped prologue, line {d} -> {d}", .{ first_line, second_line });
+                } else if (first_addr) |addr| {
+                    bp_addr = addr;
+                    bp_line = first_line;
+                }
             }
+
+            const bp_id = self.bp_manager.setAtAddressEx(bp_addr, func.name, bp_line, condition) catch |err| {
+                debug_log.log("dwarf.engine: function breakpoint failed for {s}: {s}", .{ func.name, @errorName(err) });
+                continue;
+            };
+
+            // Write trap instruction
+            self.bp_manager.writeBreakpoint(bp_id, &self.process) catch |err| {
+                self.bp_manager.remove(bp_id) catch {};
+                debug_log.log("dwarf.engine: function breakpoint trap write failed for {s}: {s}", .{ func.name, @errorName(err) });
+                continue;
+            };
+
+            match_count += 1;
+            debug_log.log("dwarf.engine: function breakpoint set id={d} addr=0x{x} func={s} (match {d})", .{ bp_id, bp_addr, func.name, match_count });
+            last_result = .{
+                .id = bp_id,
+                .verified = true,
+                .file = func.name,
+                .line = bp_line,
+                .condition = condition,
+            };
+        }
+
+        if (last_result) |result| {
+            if (match_count > 1) {
+                debug_log.log("dwarf.engine: set {d} function breakpoints for '{s}'", .{ match_count, name });
+            }
+            return result;
         }
 
         debug_log.log("dwarf.engine: function not found: {s}", .{name});
