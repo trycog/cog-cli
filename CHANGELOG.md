@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-03-24
+
+### Added
+
+- Field-access expression evaluation in the debugger — expressions like `self.mode` and `self.precision_shift` now resolve struct fields through pointers using DWARF type descriptions
+- Agent auto-detection in `cog init` — the agent multi-select menu pre-selects agents already configured in the project based on their MCP config and sub-agent files
+- Improved `toolInspect` logging — now logs the actual result value and type, not just children count, making log-based debugging possible
+- `set_function` breakpoints now match all functions with the same name (including suffix matches like `add` matching `Calculator.add`) instead of silently picking the first
+
+### Fixed
+
+- **SIGABRT crash in `debug_inspect`** — when inspecting variables with `type_byte_size > 8` (structs, large types), the engine created an 8-byte buffer but sliced it with the full type size, causing an out-of-bounds panic
+- **`step_over` breakpoint explosion with inlined functions** — temporary step breakpoints were never cleaned up when unhit, and inlined code from other source files triggered spurious stops, creating hundreds of leaked breakpoints per step operation
+- **OpenCode plugin phantom session lock** — the `cog-debug.ts` plugin unconditionally marked debug sessions as active even when the launch failed, blocking all subsequent launch attempts
+- **`debug_launch` with no-debug-info binaries** — launching a binary with no DWARF debug info (e.g. passing the compiler instead of the built executable) now fails fast with a clear error message instead of silently producing broken sessions
+- `NoAddressForLine` breakpoint errors now suggest the function may be inlined/optimized and recommend `set_function` or trying nearby lines
+
 ## [0.22.1] - 2026-03-22
 
 ### Fixed
@@ -630,3 +647,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.10.0]: https://github.com/trycog/cog-cli/releases/tag/v0.10.0
 [0.9.1]: https://github.com/trycog/cog-cli/releases/tag/v0.9.1
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
+[0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
