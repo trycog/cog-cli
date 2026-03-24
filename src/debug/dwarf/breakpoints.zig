@@ -211,8 +211,10 @@ pub const BreakpointManager = struct {
         var i: usize = 0;
         while (i < self.breakpoints.items.len) {
             const bp = &self.breakpoints.items[i];
-            if (bp.is_temporary and bp.hit_count > 0) {
-                // Restore original bytes
+            if (bp.is_temporary) {
+                // Restore original bytes for all temporary BPs — not just hit ones.
+                // Step operations set multiple temp BPs across the function; only one
+                // gets hit per stop but ALL must be cleaned up to prevent accumulation.
                 if (bp.enabled) {
                     process.writeMemory(bp.address, &bp.original_bytes) catch {};
                 }

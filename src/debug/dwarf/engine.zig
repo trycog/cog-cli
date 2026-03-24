@@ -924,7 +924,9 @@ pub const DwarfEngine = struct {
                 // with CFA or SP as secondary frame identity (handles same-function recursion).
                 // This prevents entering callees when Go's SIGURG causes a resume
                 // after the process has already entered a callee.
-                const current_line = self.getLineForPC(original_regs.pc);
+                const current_line_info = self.getLineInfoForPC(original_regs.pc);
+                const current_line = if (current_line_info) |info| info.line else null;
+                const current_file = if (current_line_info) |info| info.file_index else 0;
 
                 // Frame identity: use CFA if available, else SP (always available from registers)
                 const pre_cfa = self.computeCfa(original_regs);
@@ -948,6 +950,7 @@ pub const DwarfEngine = struct {
                             func_low,
                             func_high,
                             current_line.?,
+                            current_file,
                             &bp_targets,
                         );
                     }
@@ -995,7 +998,9 @@ pub const DwarfEngine = struct {
                             }
 
                             const post_regs = self.process.readRegisters() catch return result;
-                            const post_line = self.getLineForPC(post_regs.pc);
+                            const post_line_info = self.getLineInfoForPC(post_regs.pc);
+                            const post_line = if (post_line_info) |info| @as(?u32, info.line) else null;
+                            const post_file = if (post_line_info) |info| info.file_index else 0;
 
                             // PRIMARY CHECK: Is PC within the original function?
                             const in_original_func = if (func_low != 0 and func_high != 0)
@@ -1004,15 +1009,22 @@ pub const DwarfEngine = struct {
                                 true;
 
                             if (in_original_func) {
-                                if (post_line != null and post_line.? != current_line.?) {
+                                // A different line in the SAME file = successful step.
+                                // A different file_index means we're in inlined code from another
+                                // source — treat it as "same line" and keep stepping.
+                                const is_different_source_line = post_line != null and
+                                    post_line.? != current_line.? and
+                                    post_file == current_file;
+
+                                if (is_different_source_line) {
                                     // Verify frame identity (handles recursion)
                                     const post_cfa = self.computeCfa(post_regs);
                                     const post_frame_id = post_cfa orelse post_regs.sp;
                                     if (post_frame_id == pre_frame_id) {
-                                        return result; // Same frame, different line — success!
+                                        return result; // Same frame, different line, same file — success!
                                     }
                                 } else {
-                                    // Same line — re-set all BPs and continue
+                                    // Same line or inlined code from different file — re-set BPs and continue
                                     for (bp_targets[0..bp_count]) |target_addr| {
                                         const re_id = self.bp_manager.setTemporary(target_addr) catch continue;
                                         self.bp_manager.writeBreakpoint(re_id, &self.process) catch continue;
@@ -1260,9 +1272,10 @@ pub const DwarfEngine = struct {
 
     /// Get the source line number for a given PC address.
     /// Uses binary search (line_entries are sorted by address during loadDebugInfo).
-    fn getLineForPC(self: *DwarfEngine, pc: u64) ?u32 {
+    const LineInfo = struct { line: u32, file_index: u32 };
+
+    fn getLineInfoForPC(self: *DwarfEngine, pc: u64) ?LineInfo {
         if (self.line_entries.len == 0) return null;
-        // Binary search: find rightmost entry with address <= pc
         var lo: usize = 0;
         var hi: usize = self.line_entries.len;
         while (lo < hi) {
@@ -1273,15 +1286,18 @@ pub const DwarfEngine = struct {
                 hi = mid;
             }
         }
-        // Walk back to find non-end_sequence entry
         var i = lo;
         while (i > 0) {
             i -= 1;
             if (!self.line_entries[i].end_sequence) {
-                return self.line_entries[i].line;
+                return .{ .line = self.line_entries[i].line, .file_index = self.line_entries[i].file_index };
             }
         }
         return null;
+    }
+
+    fn getLineForPC(self: *DwarfEngine, pc: u64) ?u32 {
+        return if (self.getLineInfoForPC(pc)) |info| info.line else null;
     }
 
     /// Find the address of the next source line after the given PC.
@@ -1341,7 +1357,9 @@ pub const DwarfEngine = struct {
     }
 
     /// Find ALL statement line addresses within a function range that are on lines
-    /// different from `current_line`. Used for multi-BP step_over (like Delve's strategy).
+    /// different from `current_line` AND in the same source file. This filters out
+    /// inlined code from other files, preventing step_over from stopping inside
+    /// inlined callees (e.g. applyPrecision inlined into add).
     /// Returns the number of addresses written into `buf`.
     fn findAllLineAddressesInRange(
         self: *DwarfEngine,
@@ -1349,6 +1367,7 @@ pub const DwarfEngine = struct {
         func_low: u64,
         func_high: u64,
         current_line: u32,
+        current_file: u32,
         buf: []u64,
     ) usize {
         if (self.line_entries.len == 0) return 0;
@@ -1370,6 +1389,8 @@ pub const DwarfEngine = struct {
             if (entry.end_sequence) continue;
             if (!entry.is_stmt) continue;
             if (entry.address < func_low) continue;
+            // Skip lines from different files (inlined code)
+            if (entry.file_index != current_file) continue;
             if (entry.line != current_line and entry.line != last_line) {
                 if (count >= buf.len) break;
                 buf[count] = entry.address;
