@@ -72,6 +72,8 @@ pub const SessionContext = struct {
     allocator: std.mem.Allocator,
     session_id: []const u8,
     host_agent_id: []const u8,
+    host_agent_version: ?[]const u8,
+    host_model: ?[]const u8,
     workspace_root: []const u8,
     brain_url: []const u8,
     brain_namespace: ?[]const u8,
@@ -96,6 +98,8 @@ pub const SessionContext = struct {
         const allocator = self.allocator;
         allocator.free(self.session_id);
         allocator.free(self.host_agent_id);
+        if (self.host_agent_version) |v| allocator.free(v);
+        if (self.host_model) |v| allocator.free(v);
         allocator.free(self.workspace_root);
         allocator.free(self.brain_url);
         if (self.brain_namespace) |value| allocator.free(value);
@@ -116,6 +120,8 @@ pub fn initSessionContext(
     allocator: std.mem.Allocator,
     session_id: []const u8,
     host_agent_id: []const u8,
+    host_agent_version: ?[]const u8,
+    host_model: ?[]const u8,
     workspace_root: []const u8,
     brain_url: []const u8,
     brain_namespace: ?[]const u8,
@@ -123,11 +129,19 @@ pub fn initSessionContext(
     repo_context: *const repo_context_mod.RepoContext,
 ) !SessionContext {
     const now = std.time.timestamp();
-    debug_log.log("session_context.init: session={s} host={s} workspace={s}", .{ session_id, host_agent_id, workspace_root });
+    debug_log.log("session_context.init: session={s} host={s} version={s} model={s} workspace={s}", .{
+        session_id,
+        host_agent_id,
+        host_agent_version orelse "unknown",
+        host_model orelse "unknown",
+        workspace_root,
+    });
     return .{
         .allocator = allocator,
         .session_id = try allocator.dupe(u8, session_id),
         .host_agent_id = try allocator.dupe(u8, host_agent_id),
+        .host_agent_version = if (host_agent_version) |v| try allocator.dupe(u8, v) else null,
+        .host_model = if (host_model) |v| try allocator.dupe(u8, v) else null,
         .workspace_root = try allocator.dupe(u8, workspace_root),
         .brain_url = try allocator.dupe(u8, brain_url),
         .brain_namespace = if (brain_namespace) |value| try allocator.dupe(u8, value) else null,
@@ -528,7 +542,7 @@ test "classifyWriteSource prefers debug over code exploration" {
     };
     defer repo_context.deinit(std.testing.allocator);
 
-    var ctx = try initSessionContext(std.testing.allocator, "session-1", "opencode", "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
+    var ctx = try initSessionContext(std.testing.allocator, "session-1", "opencode", null, null, "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
     defer ctx.deinit();
 
     const code_args = try json.parseFromSlice(json.Value, std.testing.allocator, "{\"name\":\"Runtime\"}", .{});
@@ -552,7 +566,7 @@ test "buildWriteContext includes recent tool sequence and targets" {
     };
     defer repo_context.deinit(std.testing.allocator);
 
-    var ctx = try initSessionContext(std.testing.allocator, "session-2", "opencode", "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
+    var ctx = try initSessionContext(std.testing.allocator, "session-2", "opencode", null, null, "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
     defer ctx.deinit();
 
     const explore_args = try json.parseFromSlice(json.Value, std.testing.allocator, "{\"queries\":[{\"name\":\"Runtime\"},{\"name\":\"discoverRemoteTools\"}]}", .{});
@@ -586,7 +600,7 @@ test "recordUserFactMarker makes user instructions win when no code evidence exi
     };
     defer repo_context.deinit(std.testing.allocator);
 
-    var ctx = try initSessionContext(std.testing.allocator, "session-3", "cursor", "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
+    var ctx = try initSessionContext(std.testing.allocator, "session-3", "cursor", null, null, "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
     defer ctx.deinit();
     recordUserFactMarker(&ctx);
 
@@ -603,7 +617,7 @@ test "question followed by tool infers recent user fact marker" {
     };
     defer repo_context.deinit(std.testing.allocator);
 
-    var ctx = try initSessionContext(std.testing.allocator, "session-4", "claude_code", "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
+    var ctx = try initSessionContext(std.testing.allocator, "session-4", "claude_code", null, null, "/tmp/project", "https://trycog.ai/acme/brain", "acme", "brain", &repo_context);
     defer ctx.deinit();
 
     try recordToolEvent(&ctx, "question", null);

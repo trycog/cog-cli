@@ -48,6 +48,10 @@ const Runtime = struct {
     repo_context_cache: std.StringHashMapUnmanaged(repo_context_mod.RepoContext) = .empty,
     watcher: ?watcher_mod.Watcher = null,
     debug_tool_tier: ToolTier = .specialist,
+    /// Client info from MCP initialize request (agent name, version, model).
+    client_agent_name: ?[]const u8 = null,
+    client_agent_version: ?[]const u8 = null,
+    client_model: ?[]const u8 = null,
     /// Protects code_cache, remote_tools, mcp_session_id, and mem_db from concurrent access.
     mutex: std.Thread.Mutex = .{},
 
@@ -103,6 +107,9 @@ const Runtime = struct {
         }
         self.repo_context_cache.deinit(self.allocator);
         if (self.mcp_session_id) |sid| self.allocator.free(sid);
+        if (self.client_agent_name) |v| self.allocator.free(v);
+        if (self.client_agent_version) |v| self.allocator.free(v);
+        if (self.client_model) |v| self.allocator.free(v);
         self.debug_server.deinit();
     }
 
@@ -182,6 +189,8 @@ const Runtime = struct {
             self.allocator,
             key,
             host_agent_id,
+            self.client_agent_version,
+            self.client_model,
             workspace_root,
             brain_url,
             if (brain_parts) |parts| parts.namespace else null,
@@ -500,7 +509,8 @@ fn processMessage(runtime: *Runtime, line: []const u8, stdout: StdoutWriter) !vo
 
     // Dispatch
     if (std.mem.eql(u8, method, "initialize")) {
-        handleInitialize(allocator, &reply) catch |err| {
+        const params = root.object.get("params");
+        handleInitialize(runtime, &reply, params) catch |err| {
             reply.sendInternalError(err);
         };
     } else if (std.mem.eql(u8, method, "notifications/initialized")) {
@@ -690,7 +700,57 @@ fn handlePing(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     try reply.sendRaw(result);
 }
 
-fn handleInitialize(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
+fn handleInitialize(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !void {
+    const allocator = runtime.allocator;
+
+    // Extract clientInfo from params (agent name, version, model)
+    if (params) |p| {
+        if (p == .object) {
+            if (p.object.get("clientInfo")) |ci| {
+                if (ci == .object) {
+                    if (ci.object.get("name")) |n| {
+                        if (n == .string) {
+                            if (runtime.client_agent_name) |old| allocator.free(old);
+                            runtime.client_agent_name = allocator.dupe(u8, n.string) catch null;
+                        }
+                    }
+                    if (ci.object.get("version")) |v| {
+                        if (v == .string) {
+                            if (runtime.client_agent_version) |old| allocator.free(old);
+                            runtime.client_agent_version = allocator.dupe(u8, v.string) catch null;
+                        }
+                    }
+                    // Extension: some agents may report model in clientInfo
+                    if (ci.object.get("model")) |m| {
+                        if (m == .string) {
+                            if (runtime.client_model) |old| allocator.free(old);
+                            runtime.client_model = allocator.dupe(u8, m.string) catch null;
+                        }
+                    }
+                }
+            }
+            // Also check _meta.model as an extension field
+            if (runtime.client_model == null) {
+                if (p.object.get("_meta")) |meta| {
+                    if (meta == .object) {
+                        if (meta.object.get("model")) |m| {
+                            if (m == .string) {
+                                runtime.client_model = allocator.dupe(u8, m.string) catch null;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Append client info to the log header (completes the header block)
+    debug_log_mod.logClientInfo(
+        runtime.client_agent_name,
+        runtime.client_agent_version,
+        runtime.client_model,
+    );
+
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };

@@ -204,6 +204,8 @@ test "buildRemoteWriteEnvelope includes provenance and hints" {
         std.testing.allocator,
         "sid-1",
         "opencode",
+        null,
+        null,
         "/tmp/project",
         "https://trycog.ai/acme/brain",
         "acme",

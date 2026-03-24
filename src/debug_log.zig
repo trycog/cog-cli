@@ -52,6 +52,19 @@ pub fn init(cog_dir: []const u8, version: []const u8, args: []const [:0]const u8
         pos = end;
     }
     log("command: {s}", .{cmd_buf[0..pos]});
+}
+
+/// Append client (agent) info to the log header. Called once the MCP
+/// initialize handshake supplies clientInfo.
+pub fn logClientInfo(agent: ?[]const u8, version: ?[]const u8, model: ?[]const u8) void {
+    log("agent: {s}", .{agent orelse "unknown"});
+    log("agent_version: {s}", .{version orelse "unknown"});
+    log("model: {s}", .{model orelse "unknown"});
+    log("---", .{});
+}
+
+/// Write the header separator. Use when no MCP client info will follow.
+pub fn logHeaderSeparator() void {
     log("---", .{});
 }
 

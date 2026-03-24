@@ -80,6 +80,12 @@ fn mainInner() !void {
     const subcmd: []const u8 = args[1];
     const cmd_args = args[2..];
 
+    // For non-MCP commands, close the log header now. MCP mode defers
+    // the separator until handleInitialize appends client info.
+    if (!std.mem.eql(u8, subcmd, "mcp") and debug_flag) {
+        debug_log.logHeaderSeparator();
+    }
+
     // Avoid unnecessary startup work for MCP server mode.
     if (!std.mem.eql(u8, subcmd, "mcp")) {
         const curl = @import("cog").curl;

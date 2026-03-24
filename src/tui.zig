@@ -987,7 +987,7 @@ pub fn confirmOverwrite(path: []const u8) !OverwriteAction {
 
     stderrWrite("  " ++ cyan ++ "?" ++ reset ++ " Overwrite " ++ bold);
     stderrWrite(path);
-    stderrWrite(reset ++ "? " ++ dim ++ "(y/N/a/d)" ++ reset ++ " ");
+    stderrWrite(reset ++ "? " ++ dim ++ "(yes/No/all/diff)" ++ reset ++ " ");
 
     var term = try RawTerminal.enter(fd);
     defer term.leave();
@@ -1010,7 +1010,7 @@ pub fn confirmOverwrite(path: []const u8) !OverwriteAction {
 fn confirmOverwriteFallback(path: []const u8) !OverwriteAction {
     stderrWrite("  ? Overwrite ");
     stderrWrite(path);
-    stderrWrite("? (y/N/a/d) ");
+    stderrWrite("? (yes/No/all/diff) ");
 
     var buf: [64]u8 = undefined;
     const n = posix.read(std.fs.File.stdin().handle, &buf) catch return .no;
