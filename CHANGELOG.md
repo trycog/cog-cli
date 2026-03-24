@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-03-24
+
+### Added
+
+- MCP client info (agent name, version, model) extracted from initialize handshake and logged in the debug header for easier triage
+- Agent version and model propagated through session context for provenance tracking
+
+### Changed
+
+- Overwrite prompt labels changed from `(y/N/a/d)` to `(yes/No/all/diff)` for clarity
+- CLAUDE.md debug section rewritten with structured QUESTION/HYPOTHESIS/TEST delegation format
+
 ## [0.23.0] - 2026-03-24
 
 ### Added
@@ -648,3 +660,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.1]: https://github.com/trycog/cog-cli/releases/tag/v0.9.1
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
+[0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
