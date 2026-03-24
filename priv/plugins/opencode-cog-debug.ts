@@ -257,14 +257,12 @@ export default async () => ({
     if (!debugTools.has(input.tool)) return
 
     if (input.tool === "cog_debug_launch" || input.tool === "cog_debug_attach") {
-      // Only mark session active if the launch succeeded (not an error response)
+      // Only mark session active if the launch succeeded.
+      // A successful launch returns a message containing "session" and the session ID.
+      // Failed launches return MCP errors (isError) or empty/error output.
       const output = typeof input.output === "string" ? input.output : ""
-      const failed =
-        input.isError ||
-        output.includes("NoDebugInfo") ||
-        output.includes("launch failed") ||
-        output.includes("error")
-      if (!failed) {
+      const succeeded = !input.isError && output.length > 0 && output.includes("session")
+      if (succeeded) {
         state.activeDebugSession = true
         state.launchCount += 1
       }
