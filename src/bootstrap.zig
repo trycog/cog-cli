@@ -2324,7 +2324,7 @@ fn runSubsystem(
     var child = std.process.Child.init(argv_buf.items, allocator);
     child.cwd = project_root;
     child.stdin_behavior = .Ignore;
-    child.stderr_behavior = if (debug) .Inherit else .Ignore;
+    child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.pgid = 0;
 
@@ -2356,7 +2356,14 @@ fn runSubsystem(
     else
         null;
 
-    // Read stdout
+    // Read stderr on a background thread to avoid deadlocking with stdout
+    var stderr_data: ?[]const u8 = null;
+    const stderr_thread = if (child.stderr) |pipe|
+        std.Thread.spawn(.{}, readPipeToEnd, .{ pipe, allocator, &stderr_data }) catch null
+    else
+        null;
+
+    // Read stdout on main thread
     const stdout_data = if (child.stdout) |stdout|
         stdout.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
     else
@@ -2366,6 +2373,8 @@ fn runSubsystem(
     const term = child.wait() catch |err| {
         tw.cancelled.store(true, .release);
         if (tw_thread) |t| t.join();
+        if (stderr_thread) |t| t.join();
+        if (stderr_data) |d| allocator.free(d);
         if (child_pid > 0) unregisterChild(child_pid);
         dismissReaper(reaper);
         if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "wait error: {s}" ++ reset ++ "\n", .{@errorName(err)});
@@ -2373,6 +2382,8 @@ fn runSubsystem(
     };
     tw.cancelled.store(true, .release);
     if (tw_thread) |t| t.join();
+    if (stderr_thread) |t| t.join();
+    defer if (stderr_data) |d| allocator.free(d);
     if (child_pid > 0) unregisterChild(child_pid);
     dismissReaper(reaper);
 
@@ -2380,12 +2391,14 @@ fn runSubsystem(
         .Exited => |code| {
             debug_log.log("runSubsystem: {s} exited code={d}", .{ subsystem.label, code });
             if (code != 0) {
+                logSubsystemError(allocator, subsystem.label, stderr_data, stdout_data, debug, use_tui);
                 if (!use_tui) printFmtErr(allocator, "    " ++ red ++ "exited with code {d}" ++ reset ++ "\n", .{code});
                 return fail;
             }
         },
         .Signal => |sig| {
             debug_log.log("runSubsystem: {s} killed by signal {d}", .{ subsystem.label, sig });
+            logSubsystemError(allocator, subsystem.label, stderr_data, stdout_data, debug, use_tui);
             if (!use_tui) {
                 if (sig == posix.SIG.KILL and tw.fired.load(.acquire)) {
                     printFmtErr(allocator, "    " ++ red ++ "timed out after {d}m" ++ reset ++ "\n", .{scaled_timeout / 60_000});
@@ -2395,7 +2408,10 @@ fn runSubsystem(
             }
             return fail;
         },
-        else => return fail,
+        else => {
+            logSubsystemError(allocator, subsystem.label, stderr_data, stdout_data, debug, use_tui);
+            return fail;
+        },
     }
 
     // Parse token usage from stdout
@@ -2413,6 +2429,48 @@ fn runSubsystem(
         .output_tokens = usage.output_tokens,
         .cost_microdollars = usage.cost_microdollars,
     };
+}
+
+/// Read a pipe to completion (for use in a background thread).
+fn readPipeToEnd(pipe: std.fs.File, alloc: std.mem.Allocator, out: *?[]const u8) void {
+    out.* = pipe.readToEndAlloc(alloc, 1 * 1024 * 1024) catch null;
+}
+
+/// Log stderr/stdout from a failed subsystem agent run.
+fn logSubsystemError(allocator: std.mem.Allocator, label: []const u8, stderr_data: ?[]const u8, stdout_data: ?[]const u8, debug: bool, use_tui: bool) void {
+    if (stderr_data) |data| {
+        if (data.len > 0) {
+            // Always write to debug log when enabled
+            debug_log.log("runSubsystem: {s} stderr ({d} bytes):", .{ label, data.len });
+            // Log in chunks to fit debug_log's 8KB buffer
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const end = @min(offset + 4096, data.len);
+                debug_log.log("{s}", .{data[offset..end]});
+                offset = end;
+            }
+            // Print to terminal in debug mode (non-TUI only)
+            if (debug and !use_tui) {
+                printFmtErr(allocator, "    " ++ dim ++ "--- agent stderr ---" ++ reset ++ "\n", .{});
+                var buf: [8192]u8 = undefined;
+                var w = std.fs.File.stderr().writer(&buf);
+                w.interface.writeAll(data) catch {};
+                w.interface.flush() catch {};
+                printFmtErr(allocator, "    " ++ dim ++ "--- end stderr ---" ++ reset ++ "\n", .{});
+            }
+        }
+    }
+    if (stdout_data) |data| {
+        if (data.len > 0) {
+            debug_log.log("runSubsystem: {s} stdout ({d} bytes):", .{ label, data.len });
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const end = @min(offset + 4096, data.len);
+                debug_log.log("{s}", .{data[offset..end]});
+                offset = end;
+            }
+        }
+    }
 }
 
 fn runAssociationPhase(
