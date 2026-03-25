@@ -86,6 +86,12 @@ export default async () => ({
       return
     }
 
+    if (input.toolID === "lsp_symbols") {
+      output.description =
+        "Fallback only. Prefer cog_code_query (mode=find or mode=symbols) and cog_code_explore — they use the SCIP index which is faster and more complete than LSP."
+      return
+    }
+
     if (input.toolID === "cog_code_explore") {
       output.description +=
         " Batch all candidate symbols or files in one call whenever possible. For repository summaries, start with one batched repo explore."
@@ -101,7 +107,7 @@ export default async () => ({
     output.system.push(
       "Cog batching policy: for repository-understanding tasks, make one initial batched cog_code_explore call with include_architecture=true and overview_scope=repo.",
       "Do not chain repeated file-scoped cog_code_query overview/imports/contains/calls/callers requests across multiple files. If more than one follow-up target is needed, batch it into cog_code_explore.",
-      "Prefer cog_code_explore and cog_code_query for structural code exploration. Use shell search (rg, grep, find) only for raw text patterns, log messages, or string literals that the SCIP index does not cover."
+      "Prefer cog_code_explore and cog_code_query for ALL structural code exploration — symbol lookup, definition finding, references, file symbols, imports, call graphs. Do NOT use lsp_symbols when cog_code_query is available; cog_code_query mode=find and mode=symbols replace it with better coverage. Use shell search (rg, grep, find) only for raw text patterns, log messages, or string literals that the SCIP index does not cover."
     )
   },
   "tool.execute.before": async (input, output) => {
