@@ -306,6 +306,7 @@ This runs entirely locally. No account required.
 | JSONC | Built-in | `.jsonc` via the built-in JSON grammar |
 | reStructuredText | Built-in | `.rst` |
 | AsciiDoc | Built-in | Includes `.adoc`, `.asciidoc` |
+| Bash | Built-in | Includes `.sh`, `.bash`, `.bats`; DAP debugging via bashdb |
 | Zig | External extension | Supported via [`cog-zig`](https://github.com/trycog/cog-zig) |
 | Ruby | External extension | Supported via [`cog-ruby`](https://github.com/trycog/cog-ruby) |
 | Swift | External extension | Supported via [`cog-swift`](https://github.com/trycog/cog-swift) |

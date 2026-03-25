@@ -27,6 +27,7 @@ extern fn tree_sitter_c() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_cpp() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_yaml() callconv(.c) *c.TSLanguage;
 extern fn tree_sitter_asciidoc() callconv(.c) *c.TSLanguage;
+extern fn tree_sitter_bash() callconv(.c) *c.TSLanguage;
 
 // ── Grammar lookup ──────────────────────────────────────────────────────
 
@@ -49,6 +50,7 @@ pub fn getGrammar(name: []const u8) ?*c.TSLanguage {
     if (std.mem.eql(u8, name, "cpp")) return tree_sitter_cpp();
     if (std.mem.eql(u8, name, "yaml")) return tree_sitter_yaml();
     if (std.mem.eql(u8, name, "asciidoc")) return tree_sitter_asciidoc();
+    if (std.mem.eql(u8, name, "bash")) return tree_sitter_bash();
     return null;
 }
 

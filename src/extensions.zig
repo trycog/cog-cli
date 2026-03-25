@@ -440,6 +440,36 @@ pub const builtins = [_]Extension{
         } },
         .debug = .{ .native = .{} },
     },
+    // Bash
+    .{
+        .name = "bash",
+        .file_extensions = &.{ ".sh", ".bash", ".bats" },
+        .language_names = &.{ "bash", "shell", "sh" },
+        .indexer = .{ .tree_sitter = .{
+            .grammar_name = "bash",
+            .query_source = @embedFile("queries/bash.scm"),
+            .scip_name = "bash",
+        } },
+        .architecture = .{ .imports = false, .calls = true, .containment = true },
+        .debug = .{ .dap = .{
+            .adapter_command = "node",
+            .adapter_args = &.{"{entry_point}"},
+            .transport = .stdio,
+            .dependencies = &.{
+                .{ .command = "bash", .check_args = &.{ "-c", "[ ${BASH_VERSINFO[0]} -ge 4 ]" }, .error_message = "Bash 4.0+ is required for bash debugging. Update your bash installation" },
+                .{ .command = "node", .check_args = &.{"--version"}, .error_message = "Node.js not found on PATH (required for bash debug adapter)" },
+            },
+            .adapter_install = .{
+                .method = .github_release,
+                .repo = "rogalmic/vscode-bash-debug",
+                .version = "v0.3.7",
+                .asset_pattern = "bash-debug-0.3.7.vsix",
+                .extract_format = "zip",
+                .install_dir = "bash-debug",
+                .entry_point = "bash-debug/extension/out/bashDebug.js",
+            },
+        } },
+    },
 };
 
 // ── Public API ──────────────────────────────────────────────────────────

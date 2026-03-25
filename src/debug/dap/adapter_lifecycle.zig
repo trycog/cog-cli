@@ -87,7 +87,16 @@ fn downloadGithubRelease(allocator: std.mem.Allocator, config_dir: []const u8, i
         const term = try tar.wait();
         if (term.Exited != 0) return error.ExtractFailed;
     } else if (std.mem.eql(u8, format, "zip")) {
-        var unzip = std.process.Child.init(&.{ "unzip", "-o", tarball_path, "-d", config_dir }, allocator);
+        // Extract zip into install_dir subdirectory for isolation (e.g. VSIX
+        // archives always contain a top-level "extension/" directory, so
+        // extracting directly into config_dir would collide across adapters).
+        const dest = try std.fs.path.join(allocator, &.{ config_dir, install.install_dir });
+        defer allocator.free(dest);
+        std.fs.makeDirAbsolute(dest) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        var unzip = std.process.Child.init(&.{ "unzip", "-o", tarball_path, "-d", dest }, allocator);
         unzip.stdin_behavior = .Ignore;
         unzip.stdout_behavior = .Ignore;
         unzip.stderr_behavior = .Ignore;

@@ -36,6 +36,7 @@ const grammars = [_]GrammarSource{
     .{ .name = "tsx", .repo = "tree-sitter/tree-sitter-typescript", .ref_name = "v0.23.2", .src_prefix = "tsx/src", .has_scanner = true },
     .{ .name = "yaml", .repo = "tree-sitter-grammars/tree-sitter-yaml", .ref_name = "v0.7.2", .src_prefix = "src", .has_scanner = true },
     .{ .name = "asciidoc", .repo = "cathaysia/tree-sitter-asciidoc", .ref_name = "v0.6.0", .src_prefix = "tree-sitter-asciidoc/src", .has_scanner = true },
+    .{ .name = "bash", .repo = "tree-sitter/tree-sitter-bash", .ref_name = "v0.25.1", .src_prefix = "src", .has_scanner = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -222,6 +223,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addIncludePath(b.path("grammars/cpp"));
     mod.addIncludePath(b.path("grammars/yaml"));
     mod.addIncludePath(b.path("grammars/asciidoc"));
+    mod.addIncludePath(b.path("grammars/bash"));
 
     // Disable Zig's UBSan for third-party C code: in ReleaseSafe Zig passes
     // -fsanitize=undefined -fsanitize-trap=undefined to Clang, which causes
@@ -266,6 +268,8 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     mod.addCSourceFile(.{ .file = b.path("grammars/asciidoc/scanner.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/cpp/parser.c"), .flags = c_flags });
     mod.addCSourceFile(.{ .file = b.path("grammars/cpp/scanner.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/bash/parser.c"), .flags = c_flags });
+    mod.addCSourceFile(.{ .file = b.path("grammars/bash/scanner.c"), .flags = c_flags });
 }
 
 /// Add libcurl (with mbedTLS and zlib) to a module via the zig-curl package.
