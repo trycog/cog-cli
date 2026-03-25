@@ -100,33 +100,45 @@ export default async () => ({
   "experimental.chat.system.transform": async (_, output) => {
     output.system.push(
       "Cog batching policy: for repository-understanding tasks, make one initial batched cog_code_explore call with include_architecture=true and overview_scope=repo.",
-      "Do not chain repeated file-scoped cog_code_query overview/imports/contains/calls/callers requests across multiple files. If more than one follow-up target is needed, batch it into cog_code_explore."
+      "Do not chain repeated file-scoped cog_code_query overview/imports/contains/calls/callers requests across multiple files. If more than one follow-up target is needed, batch it into cog_code_explore.",
+      "Prefer cog_code_explore and cog_code_query for structural code exploration. Use shell search (rg, grep, find) only for raw text patterns, log messages, or string literals that the SCIP index does not cover."
     )
   },
   "tool.execute.before": async (input, output) => {
     const state = getState(input.sessionID)
 
-    // When a cog code tool is called, mark this session as having cog tool
-    // access. Sessions without cog tools (e.g. OpenCode tasks that don't
-    // inherit MCP connections) are allowed to use shell search as fallback.
+    // Track cog tool access per session.
     if (cogCodeTools.has(input.tool)) {
       state.hasCogTools = true
     }
 
-    if (!state.hasCogTools) return
-
+    // The grep built-in tool is always blocked — cog_code_query is a
+    // direct replacement regardless of session state.
     if (blockedFallbackTools.has(input.tool)) {
       throw new Error(
-        "Cog override policy: use cog_code_explore or cog_code_query. Glob and grep are disabled for OpenCode exploration workflows."
+        "Cog override policy: use cog_code_explore or cog_code_query. The grep tool is disabled; use Cog code intelligence instead."
       )
     }
 
-    if (isBlockedShellSearch(input.tool, output.args)) {
+    // Shell search (rg, grep, find, git grep) in bash:
+    //  - Sessions that have used cog tools: ALLOW (model already tried
+    //    cog, choosing shell search deliberately for raw text patterns)
+    //  - Sessions that haven't used cog tools yet: BLOCK (guide the
+    //    model to try cog first; also covers task sessions that don't
+    //    have MCP access — once they hit this block once, they'll
+    //    attempt cog tools, which won't be found, and hasCogTools
+    //    stays false, so we need a fallback)
+    //
+    // Net effect: block shell search only in the window before the
+    // model has tried cog tools.  After the first cog call, shell
+    // search is allowed as a complement for raw text patterns.
+    if (isBlockedShellSearch(input.tool, output.args) && !state.hasCogTools) {
       throw new Error(
         "Cog override policy: use cog_code_explore or cog_code_query before shell search commands like grep, rg, find, or git grep."
       )
     }
 
+    // Batching enforcement for file-scoped architecture queries
     const args = getArgs(output.args)
     if (!isFileArchitectureQuery(input.tool, args)) return
 
