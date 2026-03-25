@@ -1405,22 +1405,65 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
     const clean = hasFlag(args, "--clean");
     const debug = hasFlag(args, "--debug");
 
-    // Require SCIP index
+    // Require .cog directory
     const cog_dir = paths.findCogDir(allocator) catch {
-        printErr("error: no .cog directory found. Run " ++ dim ++ "cog code:index" ++ reset ++ " first.\n");
+        printErr("error: no .cog directory found.\n\n");
+        printErr("  To prepare your codebase for memory bootstrapping:\n\n");
+        printErr("    1. Run " ++ dim ++ "cog init" ++ reset ++ " to create a .cog/ directory\n");
+        printErr("    2. Add index patterns to " ++ dim ++ ".cog/settings.json" ++ reset ++ ":\n");
+        printErr("       " ++ dim ++ "{\"code\": {\"index\": [\"src/**/*.ts\", \"lib/**/*.py\"]}}" ++ reset ++ "\n");
+        printErr("    3. Run " ++ dim ++ "cog code:index" ++ reset ++ " to build the SCIP index\n\n");
         return error.Explained;
     };
     defer allocator.free(cog_dir);
 
+    // Require code.index patterns in settings.json
+    const pre_settings = settings_mod.Settings.load(allocator);
+    defer if (pre_settings) |s| s.deinit(allocator);
+    const has_index_patterns = if (pre_settings) |s| blk: {
+        const code = s.code orelse break :blk false;
+        const idx = code.index orelse break :blk false;
+        break :blk idx.len > 0;
+    } else false;
+
+    if (!has_index_patterns) {
+        debug_log.log("mem:bootstrap: no code.index patterns in settings.json", .{});
+        printErr("error: no " ++ bold ++ "code.index" ++ reset ++ " patterns configured in settings.json.\n\n");
+        printErr("  Memory bootstrapping needs to know which files to analyze.\n");
+        printErr("  Add index patterns to " ++ dim ++ ".cog/settings.json" ++ reset ++ ":\n\n");
+        printErr("    " ++ dim ++ "{" ++ reset ++ "\n");
+        printErr("    " ++ dim ++ "  \"code\": {" ++ reset ++ "\n");
+        printErr("    " ++ dim ++ "    \"index\": [\"src/**/*.ts\", \"lib/**/*.py\"]" ++ reset ++ "\n");
+        printErr("    " ++ dim ++ "  }" ++ reset ++ "\n");
+        printErr("    " ++ dim ++ "}" ++ reset ++ "\n\n");
+        printErr("  Then run " ++ dim ++ "cog code:index" ++ reset ++ " to build the index.\n\n");
+        return error.Explained;
+    }
+
+    // Require SCIP index file
     const index_path = try std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir});
     defer allocator.free(index_path);
 
     {
         const index_file = std.fs.openFileAbsolute(index_path, .{}) catch {
-            printErr("error: no SCIP index found. Run " ++ dim ++ "cog code:index" ++ reset ++ " first.\n");
+            debug_log.log("mem:bootstrap: index.scip not found at {s}", .{index_path});
+            printErr("error: no SCIP index found. Run " ++ dim ++ "cog code:index" ++ reset ++ " to index your codebase first.\n\n");
+            return error.Explained;
+        };
+        const stat = index_file.stat() catch {
+            index_file.close();
+            printErr("error: could not read SCIP index.\n\n");
             return error.Explained;
         };
         index_file.close();
+
+        if (stat.size == 0) {
+            debug_log.log("mem:bootstrap: index.scip is empty (0 bytes)", .{});
+            printErr("error: SCIP index is empty — no files have been indexed.\n\n");
+            printErr("  Check that your " ++ bold ++ "code.index" ++ reset ++ " patterns in .cog/settings.json\n");
+            printErr("  match your source files, then run " ++ dim ++ "cog code:index" ++ reset ++ " again.\n\n");
+            return error.Explained;
+        }
     }
 
     // Agent selection menu
