@@ -120,23 +120,11 @@ export default async () => ({
       )
     }
 
-    // Shell search (rg, grep, find, git grep) in bash:
-    //  - Sessions that have used cog tools: ALLOW (model already tried
-    //    cog, choosing shell search deliberately for raw text patterns)
-    //  - Sessions that haven't used cog tools yet: BLOCK (guide the
-    //    model to try cog first; also covers task sessions that don't
-    //    have MCP access — once they hit this block once, they'll
-    //    attempt cog tools, which won't be found, and hasCogTools
-    //    stays false, so we need a fallback)
-    //
-    // Net effect: block shell search only in the window before the
-    // model has tried cog tools.  After the first cog call, shell
-    // search is allowed as a complement for raw text patterns.
-    if (isBlockedShellSearch(input.tool, output.args) && !state.hasCogTools) {
-      throw new Error(
-        "Cog override policy: use cog_code_explore or cog_code_query before shell search commands like grep, rg, find, or git grep."
-      )
-    }
+    // Shell search (rg, grep, find, git grep) in bash is NOT hard-blocked.
+    // System prompt guidance steers the model to prefer cog tools for
+    // structural exploration.  Shell search remains available for raw text
+    // patterns, log messages, and string literals that the SCIP index
+    // doesn't cover — and for task sessions that lack MCP tool access.
 
     // Batching enforcement for file-scoped architecture queries
     const args = getArgs(output.args)
