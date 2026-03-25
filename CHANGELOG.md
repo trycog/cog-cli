@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-03-25
+
+### Added
+
+- Built-in Bash language support — tree-sitter indexing for `.sh`, `.bash`, `.bats` files with function definitions, variable assignments, declaration commands, and command call tracking
+- DAP debugging for Bash scripts via bundled vscode-bash-debug adapter; requires Bash 4.0+ and Node.js, fails fast with clear error if dependencies are missing
+
+### Fixed
+
+- OpenCode override plugin no longer blocks shell search (grep, rg, find) in task sessions that lack MCP tool access — previously tasks without cog_code_explore/cog_code_query were completely stuck
+- Zip-based adapter extraction now uses isolated subdirectories to prevent collisions across adapters
+
 ## [0.23.1] - 2026-03-24
 
 ### Added
@@ -661,3 +673,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
 [0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
+[0.24.0]: https://github.com/trycog/cog-cli/releases/tag/v0.24.0
