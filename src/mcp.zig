@@ -1204,7 +1204,23 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
             return result;
         } else {
-            const result = try callRemoteHostedTool(runtime, session_ctx, tool_name, arguments);
+            // Ensure remote tools are discovered while holding the mutex
+            // (first-call safety: prevents two threads from racing on
+            // discoverRemoteTools).
+            if (runtime.remote_tools == null) {
+                try discoverRemoteTools(runtime);
+            }
+
+            // Release mutex for the remote HTTP call so concurrent tool
+            // calls (code_query, code_explore, other mem_* calls) are not
+            // blocked by network latency.  Re-acquire afterwards for the
+            // deferred unlock and recordToolEvent.
+            runtime.mutex.unlock();
+            const result = callRemoteHostedTool(runtime, session_ctx, tool_name, arguments) catch |err| {
+                runtime.mutex.lock();
+                return err;
+            };
+            runtime.mutex.lock();
             try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
             return result;
         }
