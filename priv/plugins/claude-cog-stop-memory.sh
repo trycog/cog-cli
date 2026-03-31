@@ -41,7 +41,7 @@ if transcript_has 'mcp__cog__mem_recall'; then
 fi
 
 used_explore=false
-if transcript_has 'mcp__cog__code_explore'; then
+if transcript_has 'mcp__cog__code_explore' || transcript_has 'mcp__cog__code_query'; then
   used_explore=true
 fi
 

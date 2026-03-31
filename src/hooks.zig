@@ -451,6 +451,8 @@ const opencode_runtime_policy_assets = [_]RuntimePolicyAsset{
 const claude_runtime_policy_assets = [_]RuntimePolicyAsset{
     .{ .path = ".claude/hooks/cog-pretooluse.sh", .content = claude_pretooluse_hook_content },
     .{ .path = ".claude/hooks/cog-stop-memory.sh", .content = claude_stop_memory_hook_content },
+    .{ .path = ".claude/hooks/cog-posttooluse-failure.sh", .content = claude_posttooluse_failure_hook_content },
+    .{ .path = ".claude/hooks/cog-precompact.sh", .content = claude_precompact_hook_content },
 };
 
 const gemini_runtime_policy_assets = [_]RuntimePolicyAsset{
@@ -668,6 +670,8 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
 
     var wrote_pretooluse = false;
     var wrote_stop = false;
+    var wrote_posttooluse_failure = false;
+    var wrote_precompact = false;
     if (existing_hooks) |hooks| {
         if (hooks == .object) {
             var iter = hooks.object.iterator();
@@ -680,6 +684,18 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
                     wrote_stop = true;
                     try s.objectField("Stop");
                     try writeClaudeStopHookArray(&s, entry.value_ptr.*);
+                } else if (std.mem.eql(u8, entry.key_ptr.*, "PostToolUseFailure")) {
+                    wrote_posttooluse_failure = true;
+                    try s.objectField("PostToolUseFailure");
+                    try writeClaudeCogHookArray(&s, entry.value_ptr.*,
+                        "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-posttooluse-failure.sh",
+                        "mcp__cog__.*", 10, null);
+                } else if (std.mem.eql(u8, entry.key_ptr.*, "PreCompact")) {
+                    wrote_precompact = true;
+                    try s.objectField("PreCompact");
+                    try writeClaudeCogHookArray(&s, entry.value_ptr.*,
+                        "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-precompact.sh",
+                        null, 10, "Preserving Cog context...");
                 } else {
                     try s.objectField(entry.key_ptr.*);
                     try s.write(entry.value_ptr.*);
@@ -696,6 +712,20 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
     if (!wrote_stop) {
         try s.objectField("Stop");
         try writeClaudeStopHookArray(&s, null);
+    }
+
+    if (!wrote_posttooluse_failure) {
+        try s.objectField("PostToolUseFailure");
+        try writeClaudeCogHookArray(&s, null,
+            "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-posttooluse-failure.sh",
+            "mcp__cog__.*", 10, null);
+    }
+
+    if (!wrote_precompact) {
+        try s.objectField("PreCompact");
+        try writeClaudeCogHookArray(&s, null,
+            "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-precompact.sh",
+            null, 10, "Preserving Cog context...");
     }
 
     try s.endObject();
@@ -818,6 +848,77 @@ fn writeClaudeStopHookArray(s: *Stringify, existing_value: ?json.Value) !void {
         try s.write(10);
         try s.objectField("statusMessage");
         try s.write("Verifying memory storage...");
+        try s.endObject();
+        try s.endArray();
+        try s.endObject();
+    }
+
+    try s.endArray();
+}
+
+/// Generic merge writer for Cog-owned Claude hook arrays.
+/// Detects existing Cog groups by command string, preserves non-Cog groups,
+/// and creates or updates the Cog group as needed.
+fn writeClaudeCogHookArray(
+    s: *Stringify,
+    existing_value: ?json.Value,
+    command: []const u8,
+    matcher_value: ?[]const u8,
+    timeout: u32,
+    status_message: ?[]const u8,
+) !void {
+    var already_has_hook = false;
+
+    try s.beginArray();
+    if (existing_value) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                var is_cog_group = false;
+                if (item == .object) {
+                    if (item.object.get("hooks")) |hooks| {
+                        if (hooks == .array) {
+                            for (hooks.array.items) |hook| {
+                                if (hook == .object) {
+                                    if (hook.object.get("command")) |existing_command| {
+                                        if (existing_command == .string and std.mem.eql(u8, existing_command.string, command)) {
+                                            is_cog_group = true;
+                                            already_has_hook = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!is_cog_group) {
+                    try s.write(item);
+                } else {
+                    // Preserve existing Cog group as-is (idempotent)
+                    try s.write(item);
+                }
+            }
+        }
+    }
+
+    if (!already_has_hook) {
+        try s.beginObject();
+        if (matcher_value) |m| {
+            try s.objectField("matcher");
+            try s.write(m);
+        }
+        try s.objectField("hooks");
+        try s.beginArray();
+        try s.beginObject();
+        try s.objectField("type");
+        try s.write("command");
+        try s.objectField("command");
+        try s.write(command);
+        try s.objectField("timeout");
+        try s.write(timeout);
+        if (status_message) |msg| {
+            try s.objectField("statusMessage");
+            try s.write(msg);
+        }
         try s.endObject();
         try s.endArray();
         try s.endObject();
@@ -1590,6 +1691,8 @@ pub const opencode_memory_content = build_options.opencode_memory_plugin;
 pub const opencode_debug_content = build_options.opencode_debug_plugin;
 pub const claude_pretooluse_hook_content = build_options.claude_pretooluse_hook;
 pub const claude_stop_memory_hook_content = build_options.claude_stop_memory_hook;
+pub const claude_posttooluse_failure_hook_content = build_options.claude_posttooluse_failure_hook;
+pub const claude_precompact_hook_content = build_options.claude_precompact_hook;
 pub const gemini_before_tool_hook_content = build_options.gemini_before_tool_hook;
 pub const amp_cog_plugin_content = build_options.amp_cog_plugin;
 pub const pi_cog_extension_content = build_options.pi_cog_extension;
@@ -2143,9 +2246,11 @@ test "writeRuntimePolicyAsset creates Amp plugin asset" {
 
 test "runtimePolicyAssets stay capability-driven" {
     const claude_assets = runtimePolicyAssets(agents_mod.agents[0]);
-    try std.testing.expectEqual(@as(usize, 2), claude_assets.len);
+    try std.testing.expectEqual(@as(usize, 4), claude_assets.len);
     try std.testing.expectEqualStrings(".claude/hooks/cog-pretooluse.sh", claude_assets[0].path);
     try std.testing.expectEqualStrings(".claude/hooks/cog-stop-memory.sh", claude_assets[1].path);
+    try std.testing.expectEqualStrings(".claude/hooks/cog-posttooluse-failure.sh", claude_assets[2].path);
+    try std.testing.expectEqualStrings(".claude/hooks/cog-precompact.sh", claude_assets[3].path);
 
     const gemini_assets = runtimePolicyAssets(agents_mod.agents[1]);
     try std.testing.expectEqual(@as(usize, 1), gemini_assets.len);

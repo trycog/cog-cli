@@ -864,12 +864,12 @@ fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !v
     // Dispatch tool
     const tool_result = runtimeCallTool(runtime, tool_name, arguments) catch |err| {
         const err_msg = switch (err) {
-            error.MissingName => "Missing required parameter: name",
-            error.MissingFile => "Missing required parameter: file",
-            error.NotConfigured => "Memory not configured. Run 'cog init' with memory enabled.",
-            error.IndexUnavailable => "Code index unavailable. Run 'cog code:index' before using Cog code tools.",
-            error.Explained => "Operation failed (see stderr)",
-            else => "Internal error",
+            error.MissingName => "Missing required parameter: name. Check the tool schema for required fields.",
+            error.MissingFile => "Missing required parameter: file. Provide a file path for this query.",
+            error.NotConfigured => "Memory not configured. Proceed without memory for now. The user can run 'cog init' to enable it.",
+            error.IndexUnavailable => "Code index unavailable. Run 'cog code:index' in a terminal to build it, or use Read and Glob for file-based exploration.",
+            error.Explained => "Operation failed. Try once more or use an alternative approach.",
+            else => "Internal error. Try the operation once more. If it fails again, use an alternative approach.",
         };
         try reply.sendToolError(err_msg);
         return;

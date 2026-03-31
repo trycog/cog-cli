@@ -75,6 +75,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "opencode_debug_plugin", @embedFile("priv/plugins/opencode-cog-debug.ts"));
     build_options.addOption([]const u8, "claude_pretooluse_hook", @embedFile("priv/plugins/claude-cog-pretooluse.sh"));
     build_options.addOption([]const u8, "claude_stop_memory_hook", @embedFile("priv/plugins/claude-cog-stop-memory.sh"));
+    build_options.addOption([]const u8, "claude_posttooluse_failure_hook", @embedFile("priv/plugins/claude-cog-posttooluse-failure.sh"));
+    build_options.addOption([]const u8, "claude_precompact_hook", @embedFile("priv/plugins/claude-cog-precompact.sh"));
     build_options.addOption([]const u8, "gemini_before_tool_hook", @embedFile("priv/plugins/gemini-cog-before-tool.sh"));
     build_options.addOption([]const u8, "amp_cog_plugin", @embedFile("priv/plugins/amp-cog.ts"));
     build_options.addOption([]const u8, "pi_cog_extension", @embedFile("priv/plugins/pi-cog.ts"));
