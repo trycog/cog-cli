@@ -327,7 +327,7 @@ fn printDebugHelp(allocator: std.mem.Allocator) void {
 
 fn printMemHelp() void {
     tui.header();
-    printErr(bold ++ "  cog mem" ++ reset ++ " — Memory utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:bootstrap" ++ reset ++ "         " ++ dim ++ "Scan project files and populate memory" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:info" ++ reset ++ "              " ++ dim ++ "Show brain type, path, and memory stats" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:upload" ++ reset ++ "            " ++ dim ++ "Upload a local brain to trycog.ai" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:upgrade" ++ reset ++ "           " ++ dim ++ "Instructions for migrating to hosted brain" ++ reset ++ "\n" ++ "\n");
+    printErr(bold ++ "  cog mem" ++ reset ++ " — Memory utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:bootstrap" ++ reset ++ "         " ++ dim ++ "Scan project files and populate memory" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:info" ++ reset ++ "              " ++ dim ++ "Show brain type, path, and memory stats" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:upgrade" ++ reset ++ "           " ++ dim ++ "Migrate local brain to hosted memory on trycog.ai" ++ reset ++ "\n" ++ "\n");
 }
 
 fn printMcpHelp() void {

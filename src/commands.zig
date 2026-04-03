@@ -97,7 +97,7 @@ fn printErrFmt(comptime fmt: []const u8, args: anytype) void {
     printErr(msg);
 }
 
-fn readStdinLine(allocator: std.mem.Allocator) ![]const u8 {
+pub fn readStdinLine(allocator: std.mem.Allocator) ![]const u8 {
     var buf: [1024]u8 = undefined;
     const n = std.posix.read(std.fs.File.stdin().handle, &buf) catch {
         printErr("error: failed to read input\n");
@@ -164,13 +164,13 @@ fn processCogMemTags(allocator: std.mem.Allocator, content: []const u8, keep_con
 
 // ── Brain URL Parser ────────────────────────────────────────────────────
 
-const BrainUrlParts = struct {
+pub const BrainUrlParts = struct {
     host: []const u8,
     account: []const u8,
     brain: []const u8,
 };
 
-fn parseBrainUrl(url: []const u8) ?BrainUrlParts {
+pub fn parseBrainUrl(url: []const u8) ?BrainUrlParts {
     const after_scheme = if (std.mem.startsWith(u8, url, "https://"))
         url["https://".len..]
     else if (std.mem.startsWith(u8, url, "http://"))
@@ -786,7 +786,7 @@ fn deployBootstrapTemplates() void {
     }
 }
 
-fn buildAccountLabel(allocator: std.mem.Allocator, account: json.Value) ![]const u8 {
+pub fn buildAccountLabel(allocator: std.mem.Allocator, account: json.Value) ![]const u8 {
     if (account == .object) {
         const name = if (account.object.get("name")) |s| (if (s == .string) s.string else null) else null;
         const acct_type = if (account.object.get("type")) |t| (if (t == .string) t.string else null) else null;
@@ -800,12 +800,12 @@ fn buildAccountLabel(allocator: std.mem.Allocator, account: json.Value) ![]const
     return allocator.dupe(u8, "(unknown)");
 }
 
-const AccountBrainSelection = struct {
+pub const AccountBrainSelection = struct {
     account_slug: []const u8,
     brain_name: []const u8,
 };
 
-fn selectAccountAndBrain(
+pub fn selectAccountAndBrain(
     allocator: std.mem.Allocator,
     accounts_array: []const json.Value,
     host: []const u8,
@@ -881,7 +881,7 @@ fn selectAccountAndBrain(
     }
 }
 
-fn getAccountSlug(account: json.Value) ?[]const u8 {
+pub fn getAccountSlug(account: json.Value) ?[]const u8 {
     if (account == .object) {
         if (account.object.get("name")) |s| {
             if (s == .string) return s.string;
@@ -890,7 +890,7 @@ fn getAccountSlug(account: json.Value) ?[]const u8 {
     return null;
 }
 
-fn selectBrain(
+pub fn selectBrain(
     allocator: std.mem.Allocator,
     selected_account: json.Value,
     account_slug: []const u8,
@@ -968,7 +968,7 @@ fn selectBrain(
     }
 }
 
-fn promptCreateBrain(
+pub fn promptCreateBrain(
     allocator: std.mem.Allocator,
     account_slug: []const u8,
     host: []const u8,
@@ -1030,7 +1030,7 @@ fn promptCreateBrain(
     return error.Explained;
 }
 
-fn isAlreadyExistsError(allocator: std.mem.Allocator, body: []const u8) bool {
+pub fn isAlreadyExistsError(allocator: std.mem.Allocator, body: []const u8) bool {
     const parsed = json.parseFromSlice(json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
@@ -1041,7 +1041,7 @@ fn isAlreadyExistsError(allocator: std.mem.Allocator, body: []const u8) bool {
     return std.mem.indexOf(u8, msg.string, "has already been taken") != null;
 }
 
-fn printServerError(allocator: std.mem.Allocator, body: []const u8) void {
+pub fn printServerError(allocator: std.mem.Allocator, body: []const u8) void {
     const parsed = json.parseFromSlice(json.Value, allocator, body, .{}) catch {
         printErr("error: server returned an error\n");
         return;

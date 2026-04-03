@@ -14,6 +14,8 @@ const memory_mod = @import("memory.zig");
 const memory_schema = @import("memory_schema.zig");
 const sqlite = @import("sqlite.zig");
 const agent_usage = @import("agent_usage.zig");
+const commands_mod = @import("commands.zig");
+const json = std.json;
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -431,11 +433,8 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     if (std.mem.eql(u8, subcmd, "mem:info")) {
         return memInfo(allocator);
     }
-    if (std.mem.eql(u8, subcmd, "mem:upload")) {
-        return memUpload(allocator, args);
-    }
     if (std.mem.eql(u8, subcmd, "mem:upgrade")) {
-        return memUpgrade();
+        return memUpgrade(allocator, args);
     }
 
     printErr("error: unknown command '");
@@ -512,15 +511,516 @@ fn countBrainQuery(db: *sqlite.Db, sql: [*:0]const u8, brain_id: []const u8) i64
     return 0;
 }
 
-fn memUpgrade() !void {
+fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
+        tui.header();
+        printErr(help_text.mem_upgrade);
+        return;
+    }
+
     tui.header();
+    debug_log.log("memUpgrade: starting", .{});
+
+    const checkpoint_path = ".cog/upgrade-checkpoint.json";
+    const clean = hasFlag(args, "--clean");
+
+    if (clean) {
+        deleteUploadCheckpoint(checkpoint_path);
+        printErr("  Checkpoint cleared.\n\n");
+    }
+
+    // Step 1: Check brain type
+    const brain = config_mod.resolveBrain(allocator);
+    defer brain.deinit(allocator);
+
+    switch (brain) {
+        .remote => |remote| {
+            printErr(bold ++ "  Memory is already upgraded" ++ reset ++ "\n\n");
+            printErr("  Brain: ");
+            printErr(remote.brain_url);
+            printErr("\n\n");
+            return;
+        },
+        .none => {
+            printErr("  No brain configured.\n");
+            printErr(dim ++ "  Run " ++ reset ++ bold ++ "cog init" ++ reset ++ dim ++ " to set up memory.\n" ++ reset ++ "\n");
+            return;
+        },
+        .local => {},
+    }
+
+    const local = brain.local;
+
+    // Step 2: Show local brain stats
+    debug_log.log("memUpgrade: local brain at {s}", .{local.path});
+    const path_z = try allocator.dupeZ(u8, local.path);
+    defer allocator.free(path_z);
+
+    var db = sqlite.Db.open(path_z) catch {
+        printErr("  error: failed to open local brain database\n");
+        return error.Explained;
+    };
+    defer db.close();
+    memory_schema.ensureSchema(&db) catch {
+        printErr("  error: failed to initialize database schema\n");
+        return error.Explained;
+    };
+
+    const total_engrams: usize = @intCast(@max(countBrainQuery(&db, "SELECT count(*) FROM engrams WHERE brain_id = ?", local.brain_id), 0));
+    const total_synapses: usize = @intCast(@max(countBrainQuery(&db, "SELECT count(*) FROM synapses WHERE brain_id = ?", local.brain_id), 0));
+
     printErr(bold ++ "  Upgrade to Hosted Memory" ++ reset ++ "\n\n");
-    printErr("  Local SQLite brains can be migrated to a hosted brain on trycog.ai\n");
-    printErr("  for cross-project memory, team sharing, and AI-powered features.\n\n");
-    printErr(cyan ++ bold ++ "  Steps" ++ reset ++ "\n");
-    printErr("    1. Sign up at " ++ bold ++ "https://trycog.ai" ++ reset ++ "\n");
-    printErr("    2. Run " ++ bold ++ "cog init" ++ reset ++ " and enter your brain URL\n");
-    printErr("    3. Use " ++ bold ++ "cog mem:bootstrap" ++ reset ++ " to re-populate from your codebase\n\n");
+    printErr(bold ++ "  Local brain: " ++ reset);
+    printErr(local.path);
+    printErr("\n");
+    printFmtErr(allocator, "    Engrams: {d} | Synapses: {d}\n\n", .{ total_engrams, total_synapses });
+
+    if (total_engrams == 0 and total_synapses == 0) {
+        printErr("  Local brain is empty. Nothing to migrate.\n");
+        printErr(dim ++ "  Run " ++ reset ++ bold ++ "cog init" ++ reset ++ dim ++ " to switch to hosted memory.\n" ++ reset ++ "\n");
+        return;
+    }
+
+    // Step 3: Validate API key
+    debug_log.log("memUpgrade: getting API key", .{});
+    const api_key = config_mod.getApiKey(allocator) catch {
+        printErr("  error: COG_API_KEY not set.\n");
+        printErr("         Set it in your environment or .env file.\n");
+        return error.Explained;
+    };
+    defer allocator.free(api_key);
+
+    // Step 4: Host selection TUI
+    const host: []const u8 = if (getFlagValue(args, "--host")) |h| h else blk: {
+        var host_items_buf: [2]tui.MenuItem = undefined;
+        host_items_buf[0] = .{ .label = "trycog.ai" };
+        host_items_buf[1] = .{ .label = "Custom host", .is_input_option = true };
+
+        const host_result = try tui.select(allocator, .{
+            .prompt = "Server host:",
+            .items = host_items_buf[0..2],
+            .initial = 0,
+        });
+        break :blk switch (host_result) {
+            .selected => @as([]const u8, "trycog.ai"),
+            .input => |custom| custom,
+            .back, .cancelled => {
+                printErr("  Aborted.\n");
+                return;
+            },
+        };
+    };
+
+    printErr("\n");
+
+    // Step 5: Verify API key
+    printErr("  Verifying API key... ");
+    const verify_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/verify", .{host});
+    defer allocator.free(verify_url);
+
+    debug_log.log("memUpgrade: verifying API key at {s}", .{verify_url});
+    const verify_resp = client.apiGet(allocator, verify_url, api_key) catch {
+        printErr("\n  error: failed to connect to server\n");
+        return error.Explained;
+    };
+    defer allocator.free(verify_resp.body);
+
+    if (verify_resp.status_code != 200) {
+        printErr("\n  error: invalid API key (HTTP ");
+        printFmtErr(allocator, "{d})\n", .{verify_resp.status_code});
+        return error.Explained;
+    }
+
+    const verify_parsed = json.parseFromSlice(json.Value, allocator, verify_resp.body, .{}) catch {
+        printErr("\n  error: invalid response from server\n");
+        return error.Explained;
+    };
+    defer verify_parsed.deinit();
+
+    const username = blk: {
+        if (verify_parsed.value == .object) {
+            if (verify_parsed.value.object.get("data")) |data| {
+                if (data == .object) {
+                    if (data.object.get("username")) |u| {
+                        if (u == .string) break :blk try allocator.dupe(u8, u.string);
+                    }
+                }
+            }
+            if (verify_parsed.value.object.get("username")) |u| {
+                if (u == .string) break :blk try allocator.dupe(u8, u.string);
+            }
+        }
+        printErr("\n  error: unexpected response from verify endpoint\n");
+        return error.Explained;
+    };
+    defer allocator.free(username);
+
+    tui.checkmark();
+    printErr(" Authenticated as ");
+    printErr(username);
+    printErr("\n\n");
+
+    // Step 6: List brains and select account/brain via TUI
+    const list_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/brains/list", .{host});
+    defer allocator.free(list_url);
+
+    debug_log.log("memUpgrade: listing brains at {s}", .{list_url});
+    const brains_resp = client.apiPost(allocator, list_url, api_key, "{}") catch {
+        printErr("  error: failed to connect to server\n");
+        return error.Explained;
+    };
+    defer allocator.free(brains_resp.body);
+
+    if (brains_resp.status_code != 200) {
+        printFmtErr(allocator, "  error: failed to list brains (HTTP {d})\n", .{brains_resp.status_code});
+        return error.Explained;
+    }
+
+    const accounts_parsed = json.parseFromSlice(json.Value, allocator, brains_resp.body, .{}) catch {
+        printErr("  error: invalid response from server\n");
+        return error.Explained;
+    };
+    defer accounts_parsed.deinit();
+
+    const accounts_array = blk: {
+        if (accounts_parsed.value == .object) {
+            if (accounts_parsed.value.object.get("namespaces")) |a| {
+                if (a == .array) break :blk a.array.items;
+            }
+        }
+        printErr("  error: unexpected accounts format\n");
+        return error.Explained;
+    };
+
+    if (accounts_array.len == 0) {
+        printErr("  error: no accounts found\n");
+        return error.Explained;
+    }
+
+    const selection = try commands_mod.selectAccountAndBrain(allocator, accounts_array, host, api_key, null);
+    if (selection == null) {
+        printErr("  Aborted.\n");
+        return;
+    }
+    const account_slug = selection.?.account_slug;
+    const selected_brain = selection.?.brain_name;
+    defer allocator.free(selected_brain);
+
+    printErr("\n");
+
+    // Step 7: Check for upload checkpoint or initialize
+    var checkpoint: ?UploadCheckpoint = loadUploadCheckpoint(allocator, checkpoint_path);
+    defer if (checkpoint) |*cp| freeUploadCheckpoint(allocator, cp);
+
+    if (checkpoint) |cp| {
+        printFmtErr(allocator, "  Resuming migration to https://{s}/{s}/{s}\n\n", .{ cp.host, cp.username, cp.brain_name });
+    } else {
+        const target_url = try std.fmt.allocPrint(allocator, "https://{s}/{s}/{s}", .{ host, account_slug, selected_brain });
+        const cp_username = try allocator.dupe(u8, username);
+        const cp_brain_name = try allocator.dupe(u8, selected_brain);
+        const cp_host = try allocator.dupe(u8, host);
+
+        checkpoint = UploadCheckpoint{
+            .version = 1,
+            .target_url = target_url,
+            .username = cp_username,
+            .brain_name = cp_brain_name,
+            .host = cp_host,
+            .engrams_uploaded = 0,
+            .total_engrams = total_engrams,
+            .synapses_uploaded = 0,
+            .total_synapses = total_synapses,
+        };
+        saveUploadCheckpoint(allocator, checkpoint_path, &checkpoint.?);
+    }
+
+    const cp = &checkpoint.?;
+
+    // Step 8: Upload engrams in batches
+    const batch_size: usize = 50;
+
+    if (cp.engrams_uploaded < total_engrams) {
+        debug_log.log("memUpgrade: uploading engrams ({d}/{d})", .{ cp.engrams_uploaded, total_engrams });
+
+        var engram_stmt = db.prepare("SELECT id, term, definition, memory_term, weight FROM engrams WHERE brain_id = ?") catch {
+            printErr("  error: failed to query engrams\n");
+            return error.Explained;
+        };
+        defer engram_stmt.finalize();
+        engram_stmt.bindText(1, local.brain_id) catch {
+            printErr("  error: failed to bind brain_id\n");
+            return error.Explained;
+        };
+
+        const Engram = struct {
+            term: []const u8,
+            definition: []const u8,
+            memory_term: []const u8,
+            weight: f64,
+        };
+
+        var engrams: std.ArrayListUnmanaged(Engram) = .empty;
+        defer {
+            for (engrams.items) |e| {
+                allocator.free(e.term);
+                allocator.free(e.definition);
+                allocator.free(e.memory_term);
+            }
+            engrams.deinit(allocator);
+        }
+
+        while (true) {
+            const row = engram_stmt.step() catch break;
+            if (row != .row) break;
+            const term = allocator.dupe(u8, engram_stmt.columnText(1) orelse "") catch continue;
+            errdefer allocator.free(term);
+            const definition = allocator.dupe(u8, engram_stmt.columnText(2) orelse "") catch {
+                allocator.free(term);
+                continue;
+            };
+            errdefer allocator.free(definition);
+            const memory_term = allocator.dupe(u8, engram_stmt.columnText(3) orelse "long") catch {
+                allocator.free(term);
+                allocator.free(definition);
+                continue;
+            };
+            const weight = engram_stmt.columnReal(4);
+            engrams.append(allocator, .{ .term = term, .definition = definition, .memory_term = memory_term, .weight = weight }) catch continue;
+        }
+
+        var uploaded: usize = cp.engrams_uploaded;
+        const bulk_learn_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_learn", .{ cp.host, cp.username, cp.brain_name });
+        defer allocator.free(bulk_learn_url);
+
+        while (uploaded < engrams.items.len) {
+            const end = @min(uploaded + batch_size, engrams.items.len);
+            const batch = engrams.items[uploaded..end];
+
+            var batch_aw: std.io.Writer.Allocating = .init(allocator);
+            defer batch_aw.deinit();
+            var batch_s: json.Stringify = .{ .writer = &batch_aw.writer };
+            batch_s.beginObject() catch break;
+            batch_s.objectField("items") catch break;
+            batch_s.beginArray() catch break;
+            for (batch) |e| {
+                batch_s.beginObject() catch break;
+                batch_s.objectField("term") catch break;
+                batch_s.write(e.term) catch break;
+                batch_s.objectField("definition") catch break;
+                batch_s.write(e.definition) catch break;
+                batch_s.objectField("memory_term") catch break;
+                batch_s.write(e.memory_term) catch break;
+                batch_s.endObject() catch break;
+            }
+            batch_s.endArray() catch break;
+            batch_s.endObject() catch break;
+            const batch_body = batch_aw.toOwnedSlice() catch break;
+            defer allocator.free(batch_body);
+
+            debug_log.log("memUpgrade: POST bulk_learn batch {d}-{d}", .{ uploaded, end });
+            const resp = client.apiPost(allocator, bulk_learn_url, api_key, batch_body) catch {
+                printErr("\n  error: failed to upload engram batch\n");
+                return error.Explained;
+            };
+            defer allocator.free(resp.body);
+
+            if (resp.status_code != 200 and resp.status_code != 201) {
+                printFmtErr(allocator, "\n  error: bulk_learn failed (HTTP {d})\n", .{resp.status_code});
+                return error.Explained;
+            }
+
+            uploaded = end;
+            cp.engrams_uploaded = uploaded;
+            saveUploadCheckpoint(allocator, checkpoint_path, cp);
+
+            if (tui.isStderrTty()) {
+                printFmtErr(allocator, "\r  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
+            }
+        }
+        if (tui.isStderrTty()) {
+            printErr("\r");
+        }
+        printErr("  ");
+        tui.checkmark();
+        printFmtErr(allocator, " Engrams uploaded: {d}\n", .{uploaded});
+    } else {
+        printErr("  ");
+        tui.checkmark();
+        printFmtErr(allocator, " Engrams already uploaded: {d}\n", .{cp.engrams_uploaded});
+    }
+
+    // Step 9: Upload synapses in batches
+    if (cp.synapses_uploaded < total_synapses) {
+        debug_log.log("memUpgrade: uploading synapses ({d}/{d})", .{ cp.synapses_uploaded, total_synapses });
+
+        var synapse_stmt = db.prepare(
+            "SELECT s.source_id, s.target_id, s.relation, s.weight, " ++
+                "e1.term as source_term, e2.term as target_term " ++
+                "FROM synapses s " ++
+                "JOIN engrams e1 ON s.source_id = e1.id " ++
+                "JOIN engrams e2 ON s.target_id = e2.id " ++
+                "WHERE s.brain_id = ?",
+        ) catch {
+            printErr("  error: failed to query synapses\n");
+            return error.Explained;
+        };
+        defer synapse_stmt.finalize();
+        synapse_stmt.bindText(1, local.brain_id) catch {
+            printErr("  error: failed to bind brain_id\n");
+            return error.Explained;
+        };
+
+        const Synapse = struct {
+            source_term: []const u8,
+            target_term: []const u8,
+            relation: []const u8,
+            weight: f64,
+        };
+
+        var synapses: std.ArrayListUnmanaged(Synapse) = .empty;
+        defer {
+            for (synapses.items) |s| {
+                allocator.free(s.source_term);
+                allocator.free(s.target_term);
+                allocator.free(s.relation);
+            }
+            synapses.deinit(allocator);
+        }
+
+        while (true) {
+            const row = synapse_stmt.step() catch break;
+            if (row != .row) break;
+            const source_term = allocator.dupe(u8, synapse_stmt.columnText(4) orelse "") catch continue;
+            errdefer allocator.free(source_term);
+            const target_term = allocator.dupe(u8, synapse_stmt.columnText(5) orelse "") catch {
+                allocator.free(source_term);
+                continue;
+            };
+            errdefer allocator.free(target_term);
+            const relation = allocator.dupe(u8, synapse_stmt.columnText(2) orelse "related_to") catch {
+                allocator.free(source_term);
+                allocator.free(target_term);
+                continue;
+            };
+            const weight = synapse_stmt.columnReal(3);
+            synapses.append(allocator, .{ .source_term = source_term, .target_term = target_term, .relation = relation, .weight = weight }) catch continue;
+        }
+
+        var uploaded: usize = cp.synapses_uploaded;
+        const bulk_assoc_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_associate", .{ cp.host, cp.username, cp.brain_name });
+        defer allocator.free(bulk_assoc_url);
+
+        while (uploaded < synapses.items.len) {
+            const end = @min(uploaded + batch_size, synapses.items.len);
+            const batch = synapses.items[uploaded..end];
+
+            var batch_aw: std.io.Writer.Allocating = .init(allocator);
+            defer batch_aw.deinit();
+            var batch_s: json.Stringify = .{ .writer = &batch_aw.writer };
+            batch_s.beginObject() catch break;
+            batch_s.objectField("items") catch break;
+            batch_s.beginArray() catch break;
+            for (batch) |syn| {
+                batch_s.beginObject() catch break;
+                batch_s.objectField("source") catch break;
+                batch_s.write(syn.source_term) catch break;
+                batch_s.objectField("target") catch break;
+                batch_s.write(syn.target_term) catch break;
+                batch_s.objectField("relation") catch break;
+                batch_s.write(syn.relation) catch break;
+                batch_s.objectField("weight") catch break;
+                batch_s.write(syn.weight) catch break;
+                batch_s.endObject() catch break;
+            }
+            batch_s.endArray() catch break;
+            batch_s.endObject() catch break;
+            const batch_body = batch_aw.toOwnedSlice() catch break;
+            defer allocator.free(batch_body);
+
+            debug_log.log("memUpgrade: POST bulk_associate batch {d}-{d}", .{ uploaded, end });
+            const resp = client.apiPost(allocator, bulk_assoc_url, api_key, batch_body) catch {
+                printErr("\n  error: failed to upload synapse batch\n");
+                return error.Explained;
+            };
+            defer allocator.free(resp.body);
+
+            if (resp.status_code != 200 and resp.status_code != 201) {
+                printFmtErr(allocator, "\n  error: bulk_associate failed (HTTP {d})\n", .{resp.status_code});
+                return error.Explained;
+            }
+
+            uploaded = end;
+            cp.synapses_uploaded = uploaded;
+            saveUploadCheckpoint(allocator, checkpoint_path, cp);
+
+            if (tui.isStderrTty()) {
+                printFmtErr(allocator, "\r  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
+            }
+        }
+        if (tui.isStderrTty()) {
+            printErr("\r");
+        }
+        printErr("  ");
+        tui.checkmark();
+        printFmtErr(allocator, " Synapses uploaded: {d}\n", .{uploaded});
+    } else {
+        printErr("  ");
+        tui.checkmark();
+        printFmtErr(allocator, " Synapses already uploaded: {d}\n", .{cp.synapses_uploaded});
+    }
+
+    // Step 10: Validate remote stats
+    printErr("\n  Validating... ");
+    const stats_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/stats", .{ cp.host, cp.username, cp.brain_name });
+    defer allocator.free(stats_url);
+
+    debug_log.log("memUpgrade: POST stats at {s}", .{stats_url});
+    const stats_resp = client.apiPost(allocator, stats_url, api_key, "{}") catch {
+        printErr("skipped (connection error)\n\n");
+        return upgradeFinalize(allocator, cp, checkpoint_path, local.path);
+    };
+    defer allocator.free(stats_resp.body);
+
+    if (stats_resp.status_code == 200 or stats_resp.status_code == 201) {
+        const stats_parsed = json.parseFromSlice(json.Value, allocator, stats_resp.body, .{}) catch null;
+        defer if (stats_parsed) |sp| sp.deinit();
+
+        if (stats_parsed) |sp| {
+            const stats_obj = if (sp.value == .object)
+                if (sp.value.object.get("data")) |d| (if (d == .object) d else sp.value) else sp.value
+            else
+                sp.value;
+
+            if (stats_obj == .object) {
+                const remote_engrams = if (stats_obj.object.get("total_engrams")) |v| (if (v == .integer) v.integer else null) else null;
+                const remote_synapses = if (stats_obj.object.get("total_synapses")) |v| (if (v == .integer) v.integer else null) else null;
+
+                if (remote_engrams) |re| {
+                    if (remote_synapses) |rs| {
+                        tui.checkmark();
+                        printFmtErr(allocator, " Remote: {d} engrams, {d} synapses\n", .{ re, rs });
+                    } else {
+                        tui.checkmark();
+                        printFmtErr(allocator, " Remote: {d} engrams\n", .{re});
+                    }
+                } else {
+                    tui.checkmark();
+                    printErr(" Validated\n");
+                }
+            } else {
+                tui.checkmark();
+                printErr(" Validated\n");
+            }
+        } else {
+            tui.checkmark();
+            printErr(" Done\n");
+        }
+    } else {
+        printErr("skipped (HTTP ");
+        printFmtErr(allocator, "{d})\n", .{stats_resp.status_code});
+    }
+
+    return upgradeFinalize(allocator, cp, checkpoint_path, local.path);
 }
 
 // ── Upload checkpoint ─────────────────────────────────────────────────
@@ -625,576 +1125,7 @@ fn deleteUploadCheckpoint(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
-// ── mem:upload ────────────────────────────────────────────────────────
-
-fn memUpload(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
-    if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
-        tui.header();
-        printErr(help_text.mem_upload);
-        return;
-    }
-
-    tui.header();
-
-    const checkpoint_path = ".cog/upload-checkpoint.json";
-    const clean = hasFlag(args, "--clean");
-
-    if (clean) {
-        deleteUploadCheckpoint(checkpoint_path);
-        printErr("  Checkpoint cleared.\n\n");
-    }
-
-    // Step 1: Validate local brain
-    debug_log.log("memUpload: resolving brain", .{});
-    const brain = config_mod.resolveBrain(allocator);
-    defer brain.deinit(allocator);
-
-    const local = switch (brain) {
-        .local => |l| l,
-        .remote => {
-            printErr("  error: mem:upload requires a local brain. Current brain is remote.\n");
-            printErr("         Upload is only needed for local SQLite brains.\n");
-            return error.Explained;
-        },
-        .none => {
-            printErr("  error: No brain configured. Run " ++ dim ++ "cog init" ++ reset ++ " first.\n");
-            return error.Explained;
-        },
-    };
-
-    // Open SQLite DB
-    debug_log.log("memUpload: opening db at {s}", .{local.path});
-    const path_z = try allocator.dupeZ(u8, local.path);
-    defer allocator.free(path_z);
-
-    var db = sqlite.Db.open(path_z) catch {
-        printErr("  error: failed to open local brain database\n");
-        return error.Explained;
-    };
-    defer db.close();
-    memory_schema.ensureSchema(&db) catch {
-        printErr("  error: failed to initialize database schema\n");
-        return error.Explained;
-    };
-
-    // Count engrams and synapses
-    const total_engrams: usize = @intCast(@max(countBrainQuery(&db, "SELECT count(*) FROM engrams WHERE brain_id = ?", local.brain_id), 0));
-    const total_synapses: usize = @intCast(@max(countBrainQuery(&db, "SELECT count(*) FROM synapses WHERE brain_id = ?", local.brain_id), 0));
-
-    if (total_engrams == 0 and total_synapses == 0) {
-        printErr("  Local brain is empty. Nothing to upload.\n\n");
-        return;
-    }
-
-    printErr(bold ++ "  Local brain: " ++ reset);
-    printErr(local.path);
-    printErr("\n");
-    printFmtErr(allocator, "    Engrams: {d} | Synapses: {d}\n\n", .{ total_engrams, total_synapses });
-
-    // Step 2: Validate API key
-    debug_log.log("memUpload: getting API key", .{});
-    const api_key = config_mod.getApiKey(allocator) catch {
-        printErr("  error: COG_API_KEY not set.\n");
-        printErr("         Set it in your environment or .env file.\n");
-        return error.Explained;
-    };
-    defer allocator.free(api_key);
-
-    // Determine host
-    const host: []const u8 = if (getFlagValue(args, "--host")) |h| h else if (std.posix.getenv("COG_HOST")) |h| h else "trycog.ai";
-
-    // Verify API key
-    printErr("  Verifying API key... ");
-    const verify_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/verify", .{host});
-    defer allocator.free(verify_url);
-
-    debug_log.log("memUpload: verifying API key at {s}", .{verify_url});
-    const verify_resp = client.apiGet(allocator, verify_url, api_key) catch {
-        printErr("\n  error: failed to connect to server\n");
-        return error.Explained;
-    };
-    defer allocator.free(verify_resp.body);
-
-    if (verify_resp.status_code != 200) {
-        printErr("\n  error: invalid API key (HTTP ");
-        printFmtErr(allocator, "{d})\n", .{verify_resp.status_code});
-        return error.Explained;
-    }
-
-    // Parse verify response for username
-    const verify_parsed = std.json.parseFromSlice(std.json.Value, allocator, verify_resp.body, .{}) catch {
-        printErr("\n  error: invalid response from server\n");
-        return error.Explained;
-    };
-    defer verify_parsed.deinit();
-
-    const username = blk: {
-        if (verify_parsed.value == .object) {
-            if (verify_parsed.value.object.get("data")) |data| {
-                if (data == .object) {
-                    if (data.object.get("username")) |u| {
-                        if (u == .string) break :blk try allocator.dupe(u8, u.string);
-                    }
-                }
-            }
-            // Fallback: try top-level username
-            if (verify_parsed.value.object.get("username")) |u| {
-                if (u == .string) break :blk try allocator.dupe(u8, u.string);
-            }
-        }
-        printErr("\n  error: unexpected response from verify endpoint\n");
-        return error.Explained;
-    };
-    defer allocator.free(username);
-
-    tui.checkmark();
-    printErr(" Authenticated as ");
-    printErr(username);
-    printErr("\n\n");
-
-    // Step 3: Check for upload checkpoint
-    var checkpoint: ?UploadCheckpoint = loadUploadCheckpoint(allocator, checkpoint_path);
-    defer if (checkpoint) |*cp| freeUploadCheckpoint(allocator, cp);
-
-    var brain_name: []const u8 = undefined;
-    var brain_name_owned = false;
-    defer if (brain_name_owned) allocator.free(brain_name);
-
-    if (checkpoint) |cp| {
-        brain_name = cp.brain_name;
-        printFmtErr(allocator, "  Resuming upload to https://{s}/{s}/{s}\n\n", .{ cp.host, cp.username, cp.brain_name });
-    } else {
-        // Step 4: Prompt for brain name
-        var items = [_]tui.MenuItem{
-            .{ .label = "Enter brain name", .is_input_option = true },
-        };
-        const result = try tui.select(allocator, .{
-            .prompt = "Brain name for " ++ bold ++ "" ++ reset ++ "" ++ dim ++ "" ++ reset ++ "upload:",
-            .items = &items,
-            .input_validator = &tui.validateBrainName,
-        });
-        switch (result) {
-            .input => |name| {
-                brain_name = name;
-                brain_name_owned = true;
-            },
-            .back, .cancelled => {
-                printErr("  Aborted.\n");
-                return;
-            },
-            .selected => {
-                printErr("  Aborted.\n");
-                return;
-            },
-        }
-
-        printErr("\n");
-
-        // Step 5: Create remote brain
-        debug_log.log("memUpload: creating brain {s}/{s} on {s}", .{ username, brain_name, host });
-        printErr("  Creating remote brain... ");
-
-        var aw: std.io.Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-        var s_json: std.json.Stringify = .{ .writer = &aw.writer };
-        try s_json.beginObject();
-        try s_json.objectField("namespace");
-        try s_json.write(@as([]const u8, username));
-        try s_json.objectField("name");
-        try s_json.write(@as([]const u8, brain_name));
-        try s_json.endObject();
-        const create_body = try aw.toOwnedSlice();
-        defer allocator.free(create_body);
-
-        const create_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/brains/create", .{host});
-        defer allocator.free(create_url);
-
-        debug_log.log("memUpload: POST {s}", .{create_url});
-        const create_resp = client.apiPost(allocator, create_url, api_key, create_body) catch {
-            printErr("\n  error: failed to connect to server\n");
-            return error.Explained;
-        };
-        defer allocator.free(create_resp.body);
-
-        if (create_resp.status_code == 201 or create_resp.status_code == 200) {
-            tui.checkmark();
-            printErr(" Created\n\n");
-        } else if (create_resp.status_code == 422) {
-            // Check if "already exists"
-            const err_parsed = std.json.parseFromSlice(std.json.Value, allocator, create_resp.body, .{}) catch null;
-            defer if (err_parsed) |ep| ep.deinit();
-
-            const is_exists = if (err_parsed) |ep| blk: {
-                if (ep.value == .object) {
-                    if (ep.value.object.get("error")) |err_val| {
-                        if (err_val == .object) {
-                            if (err_val.object.get("message")) |msg| {
-                                if (msg == .string) {
-                                    break :blk std.mem.indexOf(u8, msg.string, "has already been taken") != null;
-                                }
-                            }
-                        }
-                    }
-                }
-                break :blk false;
-            } else false;
-
-            if (is_exists) {
-                printErr("\n");
-                const confirm_msg = try std.fmt.allocPrint(allocator, "Brain '{s}' already exists. Upload to it?", .{brain_name});
-                defer allocator.free(confirm_msg);
-                const confirmed = try tui.confirm(confirm_msg);
-                if (!confirmed) {
-                    printErr("  Aborted.\n");
-                    return;
-                }
-                printErr("\n");
-            } else {
-                printErr("\n  error: failed to create brain (HTTP 422)\n");
-                // Print error details if available
-                if (err_parsed) |ep| {
-                    if (ep.value == .object) {
-                        if (ep.value.object.get("error")) |err_val| {
-                            if (err_val == .object) {
-                                if (err_val.object.get("message")) |msg| {
-                                    if (msg == .string) {
-                                        printErr("         ");
-                                        printErr(msg.string);
-                                        printErr("\n");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                return error.Explained;
-            }
-        } else {
-            printFmtErr(allocator, "\n  error: failed to create brain (HTTP {d})\n", .{create_resp.status_code});
-            return error.Explained;
-        }
-
-        // Initialize checkpoint
-        const target_url = try std.fmt.allocPrint(allocator, "https://{s}/{s}/{s}", .{ host, username, brain_name });
-        const cp_username = try allocator.dupe(u8, username);
-        const cp_brain_name = try allocator.dupe(u8, brain_name);
-        const cp_host = try allocator.dupe(u8, host);
-
-        checkpoint = UploadCheckpoint{
-            .version = 1,
-            .target_url = target_url,
-            .username = cp_username,
-            .brain_name = cp_brain_name,
-            .host = cp_host,
-            .engrams_uploaded = 0,
-            .total_engrams = total_engrams,
-            .synapses_uploaded = 0,
-            .total_synapses = total_synapses,
-        };
-        saveUploadCheckpoint(allocator, checkpoint_path, &checkpoint.?);
-    }
-
-    const cp = &checkpoint.?;
-
-    // Step 6: Upload engrams in batches of 50
-    const batch_size: usize = 50;
-
-    if (cp.engrams_uploaded < total_engrams) {
-        debug_log.log("memUpload: uploading engrams ({d}/{d})", .{ cp.engrams_uploaded, total_engrams });
-
-        // Read all engrams
-        var engram_stmt = db.prepare("SELECT id, term, definition, memory_term, weight FROM engrams WHERE brain_id = ?") catch {
-            printErr("  error: failed to query engrams\n");
-            return error.Explained;
-        };
-        defer engram_stmt.finalize();
-        engram_stmt.bindText(1, local.brain_id) catch {
-            printErr("  error: failed to bind brain_id\n");
-            return error.Explained;
-        };
-
-        const Engram = struct {
-            term: []const u8,
-            definition: []const u8,
-            memory_term: []const u8,
-            weight: f64,
-        };
-
-        var engrams: std.ArrayListUnmanaged(Engram) = .empty;
-        defer {
-            for (engrams.items) |e| {
-                allocator.free(e.term);
-                allocator.free(e.definition);
-                allocator.free(e.memory_term);
-            }
-            engrams.deinit(allocator);
-        }
-
-        while (true) {
-            const row = engram_stmt.step() catch break;
-            if (row != .row) break;
-            const term = allocator.dupe(u8, engram_stmt.columnText(1) orelse "") catch continue;
-            errdefer allocator.free(term);
-            const definition = allocator.dupe(u8, engram_stmt.columnText(2) orelse "") catch {
-                allocator.free(term);
-                continue;
-            };
-            errdefer allocator.free(definition);
-            const memory_term = allocator.dupe(u8, engram_stmt.columnText(3) orelse "long") catch {
-                allocator.free(term);
-                allocator.free(definition);
-                continue;
-            };
-            const weight = engram_stmt.columnReal(4);
-            engrams.append(allocator, .{ .term = term, .definition = definition, .memory_term = memory_term, .weight = weight }) catch continue;
-        }
-
-        // Upload in batches
-        var uploaded: usize = cp.engrams_uploaded;
-        const bulk_learn_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_learn", .{ cp.host, cp.username, cp.brain_name });
-        defer allocator.free(bulk_learn_url);
-
-        while (uploaded < engrams.items.len) {
-            const end = @min(uploaded + batch_size, engrams.items.len);
-            const batch = engrams.items[uploaded..end];
-
-            // Build JSON body
-            var batch_aw: std.io.Writer.Allocating = .init(allocator);
-            defer batch_aw.deinit();
-            var batch_s: std.json.Stringify = .{ .writer = &batch_aw.writer };
-            batch_s.beginObject() catch break;
-            batch_s.objectField("items") catch break;
-            batch_s.beginArray() catch break;
-            for (batch) |e| {
-                batch_s.beginObject() catch break;
-                batch_s.objectField("term") catch break;
-                batch_s.write(e.term) catch break;
-                batch_s.objectField("definition") catch break;
-                batch_s.write(e.definition) catch break;
-                batch_s.objectField("memory_term") catch break;
-                batch_s.write(e.memory_term) catch break;
-                batch_s.endObject() catch break;
-            }
-            batch_s.endArray() catch break;
-            batch_s.endObject() catch break;
-            const batch_body = batch_aw.toOwnedSlice() catch break;
-            defer allocator.free(batch_body);
-
-            debug_log.log("memUpload: POST bulk_learn batch {d}-{d}", .{ uploaded, end });
-            const resp = client.apiPost(allocator, bulk_learn_url, api_key, batch_body) catch {
-                printErr("\n  error: failed to upload engram batch\n");
-                return error.Explained;
-            };
-            defer allocator.free(resp.body);
-
-            if (resp.status_code != 200 and resp.status_code != 201) {
-                printFmtErr(allocator, "\n  error: bulk_learn failed (HTTP {d})\n", .{resp.status_code});
-                return error.Explained;
-            }
-
-            uploaded = end;
-            cp.engrams_uploaded = uploaded;
-            saveUploadCheckpoint(allocator, checkpoint_path, cp);
-
-            // Progress display
-            if (tui.isStderrTty()) {
-                printFmtErr(allocator, "\r  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
-            }
-        }
-        if (tui.isStderrTty()) {
-            printErr("\r");
-        }
-        printErr("  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Engrams uploaded: {d}\n", .{uploaded});
-    } else {
-        printErr("  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Engrams already uploaded: {d}\n", .{cp.engrams_uploaded});
-    }
-
-    // Step 7: Upload synapses in batches of 50
-    if (cp.synapses_uploaded < total_synapses) {
-        debug_log.log("memUpload: uploading synapses ({d}/{d})", .{ cp.synapses_uploaded, total_synapses });
-
-        var synapse_stmt = db.prepare(
-            "SELECT s.source_id, s.target_id, s.relation, s.weight, " ++
-                "e1.term as source_term, e2.term as target_term " ++
-                "FROM synapses s " ++
-                "JOIN engrams e1 ON s.source_id = e1.id " ++
-                "JOIN engrams e2 ON s.target_id = e2.id " ++
-                "WHERE s.brain_id = ?",
-        ) catch {
-            printErr("  error: failed to query synapses\n");
-            return error.Explained;
-        };
-        defer synapse_stmt.finalize();
-        synapse_stmt.bindText(1, local.brain_id) catch {
-            printErr("  error: failed to bind brain_id\n");
-            return error.Explained;
-        };
-
-        const Synapse = struct {
-            source_term: []const u8,
-            target_term: []const u8,
-            relation: []const u8,
-            weight: f64,
-        };
-
-        var synapses: std.ArrayListUnmanaged(Synapse) = .empty;
-        defer {
-            for (synapses.items) |s| {
-                allocator.free(s.source_term);
-                allocator.free(s.target_term);
-                allocator.free(s.relation);
-            }
-            synapses.deinit(allocator);
-        }
-
-        while (true) {
-            const row = synapse_stmt.step() catch break;
-            if (row != .row) break;
-            const source_term = allocator.dupe(u8, synapse_stmt.columnText(4) orelse "") catch continue;
-            errdefer allocator.free(source_term);
-            const target_term = allocator.dupe(u8, synapse_stmt.columnText(5) orelse "") catch {
-                allocator.free(source_term);
-                continue;
-            };
-            errdefer allocator.free(target_term);
-            const relation = allocator.dupe(u8, synapse_stmt.columnText(2) orelse "related_to") catch {
-                allocator.free(source_term);
-                allocator.free(target_term);
-                continue;
-            };
-            const weight = synapse_stmt.columnReal(3);
-            synapses.append(allocator, .{ .source_term = source_term, .target_term = target_term, .relation = relation, .weight = weight }) catch continue;
-        }
-
-        // Upload in batches
-        var uploaded: usize = cp.synapses_uploaded;
-        const bulk_assoc_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_associate", .{ cp.host, cp.username, cp.brain_name });
-        defer allocator.free(bulk_assoc_url);
-
-        while (uploaded < synapses.items.len) {
-            const end = @min(uploaded + batch_size, synapses.items.len);
-            const batch = synapses.items[uploaded..end];
-
-            var batch_aw: std.io.Writer.Allocating = .init(allocator);
-            defer batch_aw.deinit();
-            var batch_s: std.json.Stringify = .{ .writer = &batch_aw.writer };
-            batch_s.beginObject() catch break;
-            batch_s.objectField("items") catch break;
-            batch_s.beginArray() catch break;
-            for (batch) |syn| {
-                batch_s.beginObject() catch break;
-                batch_s.objectField("source") catch break;
-                batch_s.write(syn.source_term) catch break;
-                batch_s.objectField("target") catch break;
-                batch_s.write(syn.target_term) catch break;
-                batch_s.objectField("relation") catch break;
-                batch_s.write(syn.relation) catch break;
-                batch_s.objectField("weight") catch break;
-                batch_s.write(syn.weight) catch break;
-                batch_s.endObject() catch break;
-            }
-            batch_s.endArray() catch break;
-            batch_s.endObject() catch break;
-            const batch_body = batch_aw.toOwnedSlice() catch break;
-            defer allocator.free(batch_body);
-
-            debug_log.log("memUpload: POST bulk_associate batch {d}-{d}", .{ uploaded, end });
-            const resp = client.apiPost(allocator, bulk_assoc_url, api_key, batch_body) catch {
-                printErr("\n  error: failed to upload synapse batch\n");
-                return error.Explained;
-            };
-            defer allocator.free(resp.body);
-
-            if (resp.status_code != 200 and resp.status_code != 201) {
-                printFmtErr(allocator, "\n  error: bulk_associate failed (HTTP {d})\n", .{resp.status_code});
-                return error.Explained;
-            }
-
-            uploaded = end;
-            cp.synapses_uploaded = uploaded;
-            saveUploadCheckpoint(allocator, checkpoint_path, cp);
-
-            if (tui.isStderrTty()) {
-                printFmtErr(allocator, "\r  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
-            }
-        }
-        if (tui.isStderrTty()) {
-            printErr("\r");
-        }
-        printErr("  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Synapses uploaded: {d}\n", .{uploaded});
-    } else {
-        printErr("  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Synapses already uploaded: {d}\n", .{cp.synapses_uploaded});
-    }
-
-    // Step 8: Validate
-    printErr("\n  Validating... ");
-    const stats_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/stats", .{ cp.host, cp.username, cp.brain_name });
-    defer allocator.free(stats_url);
-
-    debug_log.log("memUpload: POST stats at {s}", .{stats_url});
-    const stats_resp = client.apiPost(allocator, stats_url, api_key, "{}") catch {
-        printErr("skipped (connection error)\n");
-        // Non-fatal — continue with settings update
-        printErr("\n");
-        // Still update settings and clean up
-        return memUploadFinalize(allocator, cp, checkpoint_path, local.path);
-    };
-    defer allocator.free(stats_resp.body);
-
-    if (stats_resp.status_code == 200 or stats_resp.status_code == 201) {
-        // Try to parse stats
-        const stats_parsed = std.json.parseFromSlice(std.json.Value, allocator, stats_resp.body, .{}) catch null;
-        defer if (stats_parsed) |sp| sp.deinit();
-
-        if (stats_parsed) |sp| {
-            // Try data envelope first, then top-level
-            const stats_obj = if (sp.value == .object)
-                if (sp.value.object.get("data")) |d| (if (d == .object) d else sp.value) else sp.value
-            else
-                sp.value;
-
-            if (stats_obj == .object) {
-                const remote_engrams = if (stats_obj.object.get("total_engrams")) |v| (if (v == .integer) v.integer else null) else null;
-                const remote_synapses = if (stats_obj.object.get("total_synapses")) |v| (if (v == .integer) v.integer else null) else null;
-
-                if (remote_engrams) |re| {
-                    if (remote_synapses) |rs| {
-                        tui.checkmark();
-                        printFmtErr(allocator, " Remote: {d} engrams, {d} synapses\n", .{ re, rs });
-                    } else {
-                        tui.checkmark();
-                        printFmtErr(allocator, " Remote: {d} engrams\n", .{re});
-                    }
-                } else {
-                    tui.checkmark();
-                    printErr(" Validated\n");
-                }
-            } else {
-                tui.checkmark();
-                printErr(" Validated\n");
-            }
-        } else {
-            tui.checkmark();
-            printErr(" Done\n");
-        }
-    } else {
-        printErr("skipped (HTTP ");
-        printFmtErr(allocator, "{d})\n", .{stats_resp.status_code});
-    }
-
-    return memUploadFinalize(allocator, cp, checkpoint_path, local.path);
-}
-
-fn memUploadFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, checkpoint_path: []const u8, local_path: []const u8) !void {
-    // Step 9: Update settings to point to remote brain
+fn upgradeFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, checkpoint_path: []const u8, local_path: []const u8) !void {
     printErr("\n");
     const brain_url = try std.fmt.allocPrint(allocator, "https://{s}/{s}/{s}", .{ cp.host, cp.username, cp.brain_name });
     defer allocator.free(brain_url);
@@ -1206,10 +1137,8 @@ fn memUploadFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, 
     printErr(brain_url);
     printErr("\n\n");
 
-    // Step 10: Delete checkpoint
     deleteUploadCheckpoint(checkpoint_path);
 
-    // Step 11: Optionally delete local brain
     const del_confirmed = tui.confirm("Delete local brain.db?") catch false;
     if (del_confirmed) {
         std.fs.deleteFileAbsolute(local_path) catch {
@@ -1223,12 +1152,11 @@ fn memUploadFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, 
         printErr("\n");
     }
 
-    printErr("\n  Upload complete.\n\n");
+    printErr("\n  Upgrade complete.\n\n");
 }
 
-/// Write brain URL into .cog/settings.json, preserving other settings.
+/// Write brain URL into .cog/settings.json using flat string format, preserving other settings.
 fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !void {
-    // Ensure .cog/ directory exists
     std.fs.cwd().makeDir(".cog") catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
@@ -1237,7 +1165,6 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
         },
     };
 
-    // Read existing settings
     const existing = blk: {
         const f = std.fs.cwd().openFile(".cog/settings.json", .{}) catch break :blk null;
         defer f.close();
@@ -1247,16 +1174,15 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
 
     var aw: std.io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
+    var s: json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
 
     try s.beginObject();
 
     if (existing) |content| {
-        if (std.json.parseFromSlice(std.json.Value, allocator, content, .{})) |parsed| {
+        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
             defer parsed.deinit();
 
             if (parsed.value == .object) {
-                // Copy all non-memory top-level keys
                 var top_iter = parsed.value.object.iterator();
                 while (top_iter.next()) |entry| {
                     if (std.mem.eql(u8, entry.key_ptr.*, "memory")) continue;
@@ -1264,7 +1190,6 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
                     try s.write(entry.value_ptr.*);
                 }
 
-                // Deep merge memory, preserving all existing non-brain keys
                 try s.objectField("memory");
                 try s.beginObject();
 
@@ -1279,43 +1204,18 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
                     }
                 }
 
-                // Write brain as object with url field
+                // Write brain as flat string (canonical format)
                 try s.objectField("brain");
-                try s.beginObject();
-                try s.objectField("url");
                 try s.write(brain_url);
-                try s.endObject(); // brain
                 try s.endObject(); // memory
             } else {
-                // Not a valid object — write fresh
-                try s.objectField("memory");
-                try s.beginObject();
-                try s.objectField("brain");
-                try s.beginObject();
-                try s.objectField("url");
-                try s.write(brain_url);
-                try s.endObject();
-                try s.endObject();
+                try writeFreshMemoryBrain(&s, brain_url);
             }
         } else |_| {
-            try s.objectField("memory");
-            try s.beginObject();
-            try s.objectField("brain");
-            try s.beginObject();
-            try s.objectField("url");
-            try s.write(brain_url);
-            try s.endObject();
-            try s.endObject();
+            try writeFreshMemoryBrain(&s, brain_url);
         }
     } else {
-        try s.objectField("memory");
-        try s.beginObject();
-        try s.objectField("brain");
-        try s.beginObject();
-        try s.objectField("url");
-        try s.write(brain_url);
-        try s.endObject();
-        try s.endObject();
+        try writeFreshMemoryBrain(&s, brain_url);
     }
 
     try s.endObject();
@@ -1344,6 +1244,14 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
         printErr("  error: failed to write .cog/settings.json\n");
         return error.Explained;
     };
+}
+
+fn writeFreshMemoryBrain(s: *json.Stringify, brain_url: []const u8) !void {
+    try s.objectField("memory");
+    try s.beginObject();
+    try s.objectField("brain");
+    try s.write(brain_url);
+    try s.endObject();
 }
 
 fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
