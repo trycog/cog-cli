@@ -384,9 +384,11 @@ pub fn uploadProgressStart(total_engrams: usize, total_synapses: usize) void {
     stderrWrite("\n");
 }
 
-/// Update the upload progress lines (bottom 3 of 4).
+/// Update all 4 upload progress lines in place.
 pub fn uploadProgressUpdate(engrams: usize, total_engrams: usize, synapses: usize, total_synapses: usize) void {
-    clearLines(2);
+    clearLines(4);
+    stderrWrite("  " ++ cyan ++ bold ++ "Migrating" ++ reset ++ "\n");
+    stderrWrite("\n");
     var bar_buf: [512]u8 = undefined;
     stderrWrite("    ");
     stderrWrite(renderBar(&bar_buf, engrams + synapses, total_engrams + total_synapses));
