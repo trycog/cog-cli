@@ -728,10 +728,14 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const cp = &checkpoint.?;
 
-    // Step 8-9: Upload engrams and synapses with progress bar
-    const batch_size: usize = 50;
+    // Step 8-9: Upload engrams and synapses one at a time with progress bar
 
     tui.uploadProgressStart(total_engrams, total_synapses);
+
+    const learn_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_learn", .{ cp.host, cp.username, cp.brain_name });
+    defer allocator.free(learn_url);
+    const assoc_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_associate", .{ cp.host, cp.username, cp.brain_name });
+    defer allocator.free(assoc_url);
 
     // ── Engrams ──
     if (cp.engrams_uploaded < total_engrams) {
@@ -747,87 +751,57 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return error.Explained;
         };
 
-        const Engram = struct {
-            term: []const u8,
-            definition: []const u8,
-            memory_term: []const u8,
-            weight: f64,
-        };
-
-        var engrams: std.ArrayListUnmanaged(Engram) = .empty;
-        defer {
-            for (engrams.items) |e| {
-                allocator.free(e.term);
-                allocator.free(e.definition);
-                allocator.free(e.memory_term);
-            }
-            engrams.deinit(allocator);
-        }
-
-        while (true) {
+        // Skip already-uploaded rows
+        var skip: usize = cp.engrams_uploaded;
+        while (skip > 0) : (skip -= 1) {
             const row = engram_stmt.step() catch break;
             if (row != .row) break;
-            const term = allocator.dupe(u8, engram_stmt.columnText(1) orelse "") catch continue;
-            errdefer allocator.free(term);
-            const definition = allocator.dupe(u8, engram_stmt.columnText(2) orelse "") catch {
-                allocator.free(term);
-                continue;
-            };
-            errdefer allocator.free(definition);
-            const memory_term = allocator.dupe(u8, engram_stmt.columnText(3) orelse "long") catch {
-                allocator.free(term);
-                allocator.free(definition);
-                continue;
-            };
-            const weight = engram_stmt.columnReal(4);
-            engrams.append(allocator, .{ .term = term, .definition = definition, .memory_term = memory_term, .weight = weight }) catch continue;
         }
 
         var uploaded: usize = cp.engrams_uploaded;
-        const bulk_learn_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_learn", .{ cp.host, cp.username, cp.brain_name });
-        defer allocator.free(bulk_learn_url);
+        while (true) {
+            const row = engram_stmt.step() catch break;
+            if (row != .row) break;
 
-        while (uploaded < engrams.items.len) {
-            const end = @min(uploaded + batch_size, engrams.items.len);
-            const batch = engrams.items[uploaded..end];
+            const term = engram_stmt.columnText(1) orelse "";
+            const definition = engram_stmt.columnText(2) orelse "";
+            const memory_term = engram_stmt.columnText(3) orelse "long";
 
-            var batch_aw: std.io.Writer.Allocating = .init(allocator);
-            defer batch_aw.deinit();
-            var batch_s: json.Stringify = .{ .writer = &batch_aw.writer };
-            batch_s.beginObject() catch break;
-            batch_s.objectField("items") catch break;
-            batch_s.beginArray() catch break;
-            for (batch) |e| {
-                batch_s.beginObject() catch break;
-                batch_s.objectField("term") catch break;
-                batch_s.write(e.term) catch break;
-                batch_s.objectField("definition") catch break;
-                batch_s.write(e.definition) catch break;
-                batch_s.objectField("memory_term") catch break;
-                batch_s.write(e.memory_term) catch break;
-                batch_s.endObject() catch break;
-            }
-            batch_s.endArray() catch break;
-            batch_s.endObject() catch break;
-            const batch_body = batch_aw.toOwnedSlice() catch break;
-            defer allocator.free(batch_body);
+            // Build single-item payload
+            var aw: std.io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var s: json.Stringify = .{ .writer = &aw.writer };
+            s.beginObject() catch break;
+            s.objectField("items") catch break;
+            s.beginArray() catch break;
+            s.beginObject() catch break;
+            s.objectField("term") catch break;
+            s.write(term) catch break;
+            s.objectField("definition") catch break;
+            s.write(definition) catch break;
+            s.objectField("memory_term") catch break;
+            s.write(memory_term) catch break;
+            s.endObject() catch break;
+            s.endArray() catch break;
+            s.endObject() catch break;
+            const body = aw.toOwnedSlice() catch break;
+            defer allocator.free(body);
 
-            debug_log.log("memUpgrade: POST bulk_learn batch {d}-{d}", .{ uploaded, end });
-            const resp = client.apiPost(allocator, bulk_learn_url, api_key, batch_body) catch {
-                printErr("\n  error: failed to upload engram batch\n");
+            debug_log.log("memUpgrade: POST engram {d}/{d}", .{ uploaded + 1, total_engrams });
+            const resp = client.apiPost(allocator, learn_url, api_key, body) catch {
+                printErr("\n  error: failed to upload engram\n");
                 return error.Explained;
             };
             defer allocator.free(resp.body);
 
             if (resp.status_code != 200 and resp.status_code != 201) {
-                printFmtErr(allocator, "\n  error: bulk_learn failed (HTTP {d})\n", .{resp.status_code});
+                printFmtErr(allocator, "\n  error: learn failed (HTTP {d})\n", .{resp.status_code});
                 return error.Explained;
             }
 
-            uploaded = end;
+            uploaded += 1;
             cp.engrams_uploaded = uploaded;
             saveUploadCheckpoint(allocator, checkpoint_path, cp);
-
             tui.uploadProgressUpdate(uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
         }
     }
@@ -853,89 +827,60 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             return error.Explained;
         };
 
-        const Synapse = struct {
-            source_term: []const u8,
-            target_term: []const u8,
-            relation: []const u8,
-            weight: f64,
-        };
-
-        var synapses: std.ArrayListUnmanaged(Synapse) = .empty;
-        defer {
-            for (synapses.items) |s| {
-                allocator.free(s.source_term);
-                allocator.free(s.target_term);
-                allocator.free(s.relation);
-            }
-            synapses.deinit(allocator);
-        }
-
-        while (true) {
+        // Skip already-uploaded rows
+        var skip: usize = cp.synapses_uploaded;
+        while (skip > 0) : (skip -= 1) {
             const row = synapse_stmt.step() catch break;
             if (row != .row) break;
-            const source_term = allocator.dupe(u8, synapse_stmt.columnText(4) orelse "") catch continue;
-            errdefer allocator.free(source_term);
-            const target_term = allocator.dupe(u8, synapse_stmt.columnText(5) orelse "") catch {
-                allocator.free(source_term);
-                continue;
-            };
-            errdefer allocator.free(target_term);
-            const relation = allocator.dupe(u8, synapse_stmt.columnText(2) orelse "related_to") catch {
-                allocator.free(source_term);
-                allocator.free(target_term);
-                continue;
-            };
-            const weight = synapse_stmt.columnReal(3);
-            synapses.append(allocator, .{ .source_term = source_term, .target_term = target_term, .relation = relation, .weight = weight }) catch continue;
         }
 
         var uploaded: usize = cp.synapses_uploaded;
-        const bulk_assoc_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_associate", .{ cp.host, cp.username, cp.brain_name });
-        defer allocator.free(bulk_assoc_url);
+        while (true) {
+            const row = synapse_stmt.step() catch break;
+            if (row != .row) break;
 
-        while (uploaded < synapses.items.len) {
-            const end = @min(uploaded + batch_size, synapses.items.len);
-            const batch = synapses.items[uploaded..end];
+            const source_term = synapse_stmt.columnText(4) orelse "";
+            const target_term = synapse_stmt.columnText(5) orelse "";
+            const relation = synapse_stmt.columnText(2) orelse "related_to";
+            const weight = synapse_stmt.columnReal(3);
 
-            var batch_aw: std.io.Writer.Allocating = .init(allocator);
-            defer batch_aw.deinit();
-            var batch_s: json.Stringify = .{ .writer = &batch_aw.writer };
-            batch_s.beginObject() catch break;
-            batch_s.objectField("items") catch break;
-            batch_s.beginArray() catch break;
-            for (batch) |syn| {
-                batch_s.beginObject() catch break;
-                batch_s.objectField("source") catch break;
-                batch_s.write(syn.source_term) catch break;
-                batch_s.objectField("target") catch break;
-                batch_s.write(syn.target_term) catch break;
-                batch_s.objectField("relation") catch break;
-                batch_s.write(syn.relation) catch break;
-                batch_s.objectField("weight") catch break;
-                batch_s.write(syn.weight) catch break;
-                batch_s.endObject() catch break;
-            }
-            batch_s.endArray() catch break;
-            batch_s.endObject() catch break;
-            const batch_body = batch_aw.toOwnedSlice() catch break;
-            defer allocator.free(batch_body);
+            // Build single-item payload
+            var aw: std.io.Writer.Allocating = .init(allocator);
+            defer aw.deinit();
+            var s: json.Stringify = .{ .writer = &aw.writer };
+            s.beginObject() catch break;
+            s.objectField("items") catch break;
+            s.beginArray() catch break;
+            s.beginObject() catch break;
+            s.objectField("source") catch break;
+            s.write(source_term) catch break;
+            s.objectField("target") catch break;
+            s.write(target_term) catch break;
+            s.objectField("relation") catch break;
+            s.write(relation) catch break;
+            s.objectField("weight") catch break;
+            s.write(weight) catch break;
+            s.endObject() catch break;
+            s.endArray() catch break;
+            s.endObject() catch break;
+            const body = aw.toOwnedSlice() catch break;
+            defer allocator.free(body);
 
-            debug_log.log("memUpgrade: POST bulk_associate batch {d}-{d}", .{ uploaded, end });
-            const resp = client.apiPost(allocator, bulk_assoc_url, api_key, batch_body) catch {
-                printErr("\n  error: failed to upload synapse batch\n");
+            debug_log.log("memUpgrade: POST synapse {d}/{d}", .{ uploaded + 1, total_synapses });
+            const resp = client.apiPost(allocator, assoc_url, api_key, body) catch {
+                printErr("\n  error: failed to upload synapse\n");
                 return error.Explained;
             };
             defer allocator.free(resp.body);
 
             if (resp.status_code != 200 and resp.status_code != 201) {
-                printFmtErr(allocator, "\n  error: bulk_associate failed (HTTP {d})\n", .{resp.status_code});
+                printFmtErr(allocator, "\n  error: associate failed (HTTP {d})\n", .{resp.status_code});
                 return error.Explained;
             }
 
-            uploaded = end;
+            uploaded += 1;
             cp.synapses_uploaded = uploaded;
             saveUploadCheckpoint(allocator, checkpoint_path, cp);
-
             tui.uploadProgressUpdate(cp.engrams_uploaded, total_engrams, uploaded, total_synapses);
         }
     }
