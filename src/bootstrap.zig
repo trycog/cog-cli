@@ -784,6 +784,8 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const bulk_learn_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_learn", .{ cp.host, cp.username, cp.brain_name });
         defer allocator.free(bulk_learn_url);
 
+        printFmtErr(allocator, "  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
+
         while (uploaded < engrams.items.len) {
             const end = @min(uploaded + batch_size, engrams.items.len);
             const batch = engrams.items[uploaded..end];
@@ -825,14 +827,9 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             cp.engrams_uploaded = uploaded;
             saveUploadCheckpoint(allocator, checkpoint_path, cp);
 
-            if (tui.isStderrTty()) {
-                printFmtErr(allocator, "\r  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
-            }
+            printFmtErr(allocator, "\r  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
         }
-        if (tui.isStderrTty()) {
-            printErr("\r");
-        }
-        printErr("  ");
+        printErr("\r                                        \r  ");
         tui.checkmark();
         printFmtErr(allocator, " Engrams uploaded: {d}\n", .{uploaded});
     } else {
@@ -902,6 +899,8 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const bulk_assoc_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_associate", .{ cp.host, cp.username, cp.brain_name });
         defer allocator.free(bulk_assoc_url);
 
+        printFmtErr(allocator, "  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
+
         while (uploaded < synapses.items.len) {
             const end = @min(uploaded + batch_size, synapses.items.len);
             const batch = synapses.items[uploaded..end];
@@ -945,14 +944,9 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             cp.synapses_uploaded = uploaded;
             saveUploadCheckpoint(allocator, checkpoint_path, cp);
 
-            if (tui.isStderrTty()) {
-                printFmtErr(allocator, "\r  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
-            }
+            printFmtErr(allocator, "\r  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
         }
-        if (tui.isStderrTty()) {
-            printErr("\r");
-        }
-        printErr("  ");
+        printErr("\r                                        \r  ");
         tui.checkmark();
         printFmtErr(allocator, " Synapses uploaded: {d}\n", .{uploaded});
     } else {
