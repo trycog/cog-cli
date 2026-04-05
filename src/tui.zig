@@ -365,6 +365,65 @@ pub fn progressFinish(files: usize, symbols: usize, skipped: usize, index_path: 
     stderrWrite(reset ++ "\n");
 }
 
+// ── Upload Progress ─────────────────────────────────────────────────────
+
+/// Print the initial upload progress block (4 lines):
+///   Migrating\n \n     bar 0%\n     Engrams  0 / total  |  Synapses  0 / total\n
+pub fn uploadProgressStart(total_engrams: usize, total_synapses: usize) void {
+    stderrWrite("  " ++ cyan ++ bold ++ "Migrating" ++ reset ++ "\n");
+    stderrWrite("\n");
+    var bar_buf: [512]u8 = undefined;
+    stderrWrite("    ");
+    stderrWrite(renderBar(&bar_buf, 0, total_engrams + total_synapses));
+    stderrWrite("\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Engrams" ++ reset ++ "   0 / ");
+    stderrWrite(formatNumber(&num_buf, total_engrams));
+    stderrWrite("  " ++ dim ++ "|" ++ reset ++ "  " ++ bold ++ "Synapses" ++ reset ++ "  0 / ");
+    stderrWrite(formatNumber(&num_buf, total_synapses));
+    stderrWrite("\n");
+}
+
+/// Update the upload progress lines (bottom 3 of 4).
+pub fn uploadProgressUpdate(engrams: usize, total_engrams: usize, synapses: usize, total_synapses: usize) void {
+    clearLines(2);
+    var bar_buf: [512]u8 = undefined;
+    stderrWrite("    ");
+    stderrWrite(renderBar(&bar_buf, engrams + synapses, total_engrams + total_synapses));
+    stderrWrite("\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Engrams" ++ reset ++ "   ");
+    stderrWrite(formatNumber(&num_buf, engrams));
+    stderrWrite(" / ");
+    stderrWrite(formatNumber(&num_buf, total_engrams));
+    stderrWrite("  " ++ dim ++ "|" ++ reset ++ "  " ++ bold ++ "Synapses" ++ reset ++ "  ");
+    stderrWrite(formatNumber(&num_buf, synapses));
+    stderrWrite(" / ");
+    stderrWrite(formatNumber(&num_buf, total_synapses));
+    stderrWrite("\n");
+}
+
+/// Replace all 4 upload progress lines with final state.
+pub fn uploadProgressFinish(engrams: usize, total_engrams: usize, synapses: usize, total_synapses: usize) void {
+    clearLines(4);
+    stderrWrite("  " ++ cyan ++ bold ++ "Migrated " ++ check ++ reset ++ "\n");
+    stderrWrite("\n");
+    var bar_buf: [512]u8 = undefined;
+    stderrWrite("    ");
+    stderrWrite(renderBar(&bar_buf, total_engrams + total_synapses, total_engrams + total_synapses));
+    stderrWrite("\n");
+    var num_buf: [32]u8 = undefined;
+    stderrWrite("    " ++ bold ++ "Engrams" ++ reset ++ "   ");
+    stderrWrite(formatNumber(&num_buf, engrams));
+    stderrWrite(" / ");
+    stderrWrite(formatNumber(&num_buf, total_engrams));
+    stderrWrite("  " ++ dim ++ "|" ++ reset ++ "  " ++ bold ++ "Synapses" ++ reset ++ "  ");
+    stderrWrite(formatNumber(&num_buf, synapses));
+    stderrWrite(" / ");
+    stderrWrite(formatNumber(&num_buf, total_synapses));
+    stderrWrite("\n");
+}
+
 // ── Bootstrap Progress ──────────────────────────────────────────────────
 
 /// Format cost from microdollars into a stack buffer. Returns formatted slice.

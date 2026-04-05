@@ -728,9 +728,12 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const cp = &checkpoint.?;
 
-    // Step 8: Upload engrams in batches
+    // Step 8-9: Upload engrams and synapses with progress bar
     const batch_size: usize = 50;
 
+    tui.uploadProgressStart(total_engrams, total_synapses);
+
+    // ── Engrams ──
     if (cp.engrams_uploaded < total_engrams) {
         debug_log.log("memUpgrade: uploading engrams ({d}/{d})", .{ cp.engrams_uploaded, total_engrams });
 
@@ -784,8 +787,6 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const bulk_learn_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_learn", .{ cp.host, cp.username, cp.brain_name });
         defer allocator.free(bulk_learn_url);
 
-        printFmtErr(allocator, "  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
-
         while (uploaded < engrams.items.len) {
             const end = @min(uploaded + batch_size, engrams.items.len);
             const batch = engrams.items[uploaded..end];
@@ -827,18 +828,11 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             cp.engrams_uploaded = uploaded;
             saveUploadCheckpoint(allocator, checkpoint_path, cp);
 
-            printFmtErr(allocator, "\r  Uploading engrams... {d}/{d}", .{ uploaded, total_engrams });
+            tui.uploadProgressUpdate(uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
         }
-        printErr("\r                                        \r  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Engrams uploaded: {d}\n", .{uploaded});
-    } else {
-        printErr("  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Engrams already uploaded: {d}\n", .{cp.engrams_uploaded});
     }
 
-    // Step 9: Upload synapses in batches
+    // ── Synapses ──
     if (cp.synapses_uploaded < total_synapses) {
         debug_log.log("memUpgrade: uploading synapses ({d}/{d})", .{ cp.synapses_uploaded, total_synapses });
 
@@ -899,8 +893,6 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const bulk_assoc_url = try std.fmt.allocPrint(allocator, "https://{s}/api/v1/{s}/{s}/bulk_associate", .{ cp.host, cp.username, cp.brain_name });
         defer allocator.free(bulk_assoc_url);
 
-        printFmtErr(allocator, "  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
-
         while (uploaded < synapses.items.len) {
             const end = @min(uploaded + batch_size, synapses.items.len);
             const batch = synapses.items[uploaded..end];
@@ -944,16 +936,11 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             cp.synapses_uploaded = uploaded;
             saveUploadCheckpoint(allocator, checkpoint_path, cp);
 
-            printFmtErr(allocator, "\r  Uploading synapses... {d}/{d}", .{ uploaded, total_synapses });
+            tui.uploadProgressUpdate(cp.engrams_uploaded, total_engrams, uploaded, total_synapses);
         }
-        printErr("\r                                        \r  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Synapses uploaded: {d}\n", .{uploaded});
-    } else {
-        printErr("  ");
-        tui.checkmark();
-        printFmtErr(allocator, " Synapses already uploaded: {d}\n", .{cp.synapses_uploaded});
     }
+
+    tui.uploadProgressFinish(cp.engrams_uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
 
     // Step 10: Validate remote stats
     printErr("\n  Validating... ");
