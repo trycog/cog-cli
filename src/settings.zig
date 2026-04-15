@@ -16,6 +16,12 @@ pub const DebugConfig = struct {
     log: bool = false,
 };
 
+pub const ObserveConfig = struct {
+    timeout: ?i64 = null,
+    log: bool = false,
+    default_backend: ?[]const u8 = null,
+};
+
 pub const BootstrapConfig = struct {
     model: ?[]const u8 = null,
 };
@@ -39,6 +45,7 @@ pub const Settings = struct {
     memory: ?MemoryConfig = null,
     code: ?CodeConfig = null,
     debug: ?DebugConfig = null,
+    observe: ?ObserveConfig = null,
 
     /// Load merged settings: global (~/.config/cog/settings.json) with local (.cog/settings.json) overrides.
     pub fn load(allocator: std.mem.Allocator) ?Settings {
@@ -60,6 +67,7 @@ pub const Settings = struct {
         result.memory = mergeMemoryConfig(allocator, l.memory, g.memory);
         result.code = mergeCodeConfig(allocator, l.code, g.code);
         result.debug = mergeDebugConfig(l.debug, g.debug);
+        result.observe = mergeObserveConfig(allocator, l.observe, g.observe);
 
         return result;
     }
@@ -128,6 +136,9 @@ pub const Settings = struct {
         if (obj.get("debug")) |v| {
             result.debug = parseDebugConfig(v);
         }
+        if (obj.get("observe")) |v| {
+            result.observe = parseObserveConfig(allocator, v);
+        }
 
         return result;
     }
@@ -135,6 +146,7 @@ pub const Settings = struct {
     pub fn deinit(self: *const Settings, allocator: std.mem.Allocator) void {
         if (self.memory) |cfg| freeMemoryConfig(allocator, &cfg);
         if (self.code) |cfg| freeCodeConfig(allocator, &cfg);
+        if (self.observe) |cfg| freeObserveConfig(allocator, &cfg);
     }
 };
 
@@ -338,6 +350,43 @@ fn mergeDebugConfig(local: ?DebugConfig, global: ?DebugConfig) ?DebugConfig {
         .timeout = l.timeout orelse g.timeout,
         .log = l.log or g.log,
     };
+}
+
+fn parseObserveConfig(allocator: std.mem.Allocator, value: std.json.Value) ?ObserveConfig {
+    if (value != .object) return null;
+    const obj = value.object;
+
+    var result: ObserveConfig = .{};
+    if (obj.get("timeout")) |v| {
+        if (v == .integer) result.timeout = v.integer;
+    }
+    if (obj.get("log")) |v| {
+        if (v == .bool) result.log = v.bool;
+    }
+    if (obj.get("default_backend")) |v| {
+        if (v == .string) result.default_backend = allocator.dupe(u8, v.string) catch null;
+    }
+    return result;
+}
+
+fn mergeObserveConfig(allocator: std.mem.Allocator, local: ?ObserveConfig, global: ?ObserveConfig) ?ObserveConfig {
+    const l = local orelse return global;
+    const g = global orelse return local;
+
+    // Free the losing default_backend
+    if (l.default_backend != null) {
+        if (g.default_backend) |gb| allocator.free(gb);
+    }
+
+    return .{
+        .timeout = l.timeout orelse g.timeout,
+        .log = l.log or g.log,
+        .default_backend = l.default_backend orelse g.default_backend,
+    };
+}
+
+fn freeObserveConfig(allocator: std.mem.Allocator, config: *const ObserveConfig) void {
+    if (config.default_backend) |db| allocator.free(db);
 }
 
 fn freeToolConfig(allocator: std.mem.Allocator, config: *const ToolConfig) void {

@@ -25,6 +25,7 @@ pub const memory_envelope = @import("memory_envelope.zig");
 pub const sqlite = @import("sqlite.zig");
 pub const memory_schema = @import("memory_schema.zig");
 pub const memory = @import("memory.zig");
+pub const observe = @import("observe.zig");
 
 test {
     _ = config;
@@ -54,4 +55,5 @@ test {
     _ = sqlite;
     _ = memory_schema;
     _ = memory;
+    _ = observe;
 }

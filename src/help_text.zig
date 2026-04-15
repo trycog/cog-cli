@@ -56,6 +56,26 @@ pub const mem_bootstrap =
 pub const mem_upgrade =
     bold ++ "  cog mem:upgrade" ++ reset ++ "\n" ++ "\n" ++ "  Migrate a local SQLite brain to hosted memory on trycog.ai.\n" ++ "  If memory is already hosted, reports the current brain URL.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog mem:upgrade " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--host" ++ reset ++ " HOST             " ++ dim ++ "Server hostname (default: trycog.ai)" ++ reset ++ "\n" ++ "    " ++ bold ++ "--clean" ++ reset ++ "                " ++ dim ++ "Clear migration checkpoint and start fresh" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Requirements" ++ reset ++ "\n" ++ "    COG_API_KEY must be set in your environment or .env file.\n" ++ "    The current brain must be local (file: scheme in settings).\n" ++ "\n" ++ cyan ++ bold ++ "  Resumability" ++ reset ++ "\n" ++ "    Progress is saved to " ++ dim ++ ".cog/upgrade-checkpoint.json" ++ reset ++ ".\n" ++ "    Re-run the command to resume from where it left off.\n" ++ "    Use " ++ dim ++ "--clean" ++ reset ++ " to discard the checkpoint and start over.\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog mem:upgrade                     " ++ dim ++ "Migrate to trycog.ai" ++ reset ++ "\n" ++ "    cog mem:upgrade --host custom.host   " ++ dim ++ "Migrate to a custom host" ++ reset ++ "\n" ++ "    cog mem:upgrade --clean              " ++ dim ++ "Clear checkpoint and restart" ++ reset ++ "\n" ++ "\n";
 
+// ── Observe ──────────────────────────────────────────────────────────
+
+pub const observe_start =
+    bold ++ "  cog observe:start" ++ reset ++ "\n" ++ "\n" ++ "  Start an observation session. Captures system-level events\n" ++ "  (syscalls, GPU operations, network flows, or cost data) for\n" ++ "  a target process.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:start --backend <type> " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--backend" ++ reset ++ " TYPE        " ++ dim ++ "Backend: syscall, gpu, net, cost" ++ reset ++ "\n" ++ "    " ++ bold ++ "--pid" ++ reset ++ " PID              " ++ dim ++ "Process ID to observe" ++ reset ++ "\n" ++ "    " ++ bold ++ "--command" ++ reset ++ " CMD         " ++ dim ++ "Command to launch and observe" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog observe:start --backend syscall --pid 1234\n" ++ "    cog observe:start --backend gpu --command \"./train.py\"\n" ++ "\n";
+
+pub const observe_stop =
+    bold ++ "  cog observe:stop" ++ reset ++ "\n" ++ "\n" ++ "  Stop an active observation session and finalize the\n" ++ "  investigation database.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:stop --session <id>\n" ++ "\n";
+
+pub const observe_status =
+    bold ++ "  cog observe:status" ++ reset ++ "\n" ++ "\n" ++ "  Check observation subsystem status. Reports daemon health,\n" ++ "  available backends, and platform capabilities.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:status\n" ++ "\n";
+
+pub const observe_sessions =
+    bold ++ "  cog observe:sessions" ++ reset ++ "\n" ++ "\n" ++ "  List observation sessions. Shows active and completed\n" ++ "  investigation databases with backend type and event counts.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:sessions " ++ dim ++ "[--status <filter>]" ++ reset ++ "\n" ++ "\n";
+
+pub const observe_query =
+    bold ++ "  cog observe:query" ++ reset ++ "\n" ++ "\n" ++ "  Run a read-only SQL query against an investigation database.\n" ++ "  The database contains events, causal_chains, and sessions tables.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:query --session <id> --sql \"SELECT ...\"\n" ++ "\n" ++ cyan ++ bold ++ "  Examples" ++ reset ++ "\n" ++ "    cog observe:query --session abc123 --sql \"SELECT count(*) FROM events\"\n" ++ "    cog observe:query --session abc123 --sql \"SELECT * FROM causal_chains\"\n" ++ "\n";
+
+pub const observe_export =
+    bold ++ "  cog observe:export" ++ reset ++ "\n" ++ "\n" ++ "  Export an investigation database as a portable artifact.\n" ++ "  The exported .db file can be shared and reopened by any\n" ++ "  agent or tool.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:export --session <id> --output <path>\n" ++ "\n";
+
 // ── Extensions ────────────────────────────────────────────────────────
 
 pub const ext_install =

@@ -4,6 +4,7 @@ const commands = @import("cog").commands;
 const code_intel = @import("cog").code_intel;
 const extensions_mod = @import("cog").extensions;
 const debug_mod = @import("cog").debug;
+const observe_mod = @import("cog").observe;
 const debug_log = @import("cog").debug_log;
 const settings_mod = @import("cog").settings;
 const tui = @import("cog").tui;
@@ -202,6 +203,18 @@ fn mainInner() !void {
         return;
     }
 
+    // Handle group help: cog observe
+    if (std.mem.eql(u8, subcmd, "observe")) {
+        printObserveHelp();
+        return;
+    }
+
+    // Handle observe:* commands (don't need config — local system observation)
+    if (std.mem.startsWith(u8, subcmd, "observe:")) {
+        try observe_mod.dispatch(allocator, subcmd, cmd_args);
+        return;
+    }
+
     // Handle group help: cog mem
     if (std.mem.eql(u8, subcmd, "mem")) {
         printMemHelp();
@@ -223,7 +236,7 @@ fn mainInner() !void {
 }
 
 fn printHelp(allocator: std.mem.Allocator) void {
-    const static_help = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "    " ++ bold ++ "doctor" ++ reset ++ "                " ++ dim ++ "Validate installation and configuration" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext" ++ reset ++ "                   " ++ dim ++ "Extension utilities" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n";
+    const static_help = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "    " ++ bold ++ "doctor" ++ reset ++ "                " ++ dim ++ "Validate installation and configuration" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe" ++ reset ++ "               " ++ dim ++ "System observability" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext" ++ reset ++ "                   " ++ dim ++ "Extension utilities" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n";
 
     const footer = dim ++ "  Run 'cog <command> --help' for details on a specific command." ++ reset ++ "\n\n";
 
@@ -323,6 +336,11 @@ fn printDebugHelp(allocator: std.mem.Allocator) void {
     } else {
         printErr(static_debug);
     }
+}
+
+fn printObserveHelp() void {
+    tui.header();
+    printErr(bold ++ "  cog observe" ++ reset ++ " — System observability\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:start" ++ reset ++ "         " ++ dim ++ "Start an observation session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:stop" ++ reset ++ "          " ++ dim ++ "Stop a session and finalize investigation DB" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:status" ++ reset ++ "        " ++ dim ++ "Check daemon health and available backends" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:sessions" ++ reset ++ "      " ++ dim ++ "List investigation databases" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:query" ++ reset ++ "         " ++ dim ++ "Run SQL against an investigation database" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:export" ++ reset ++ "        " ++ dim ++ "Export investigation as portable artifact" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Backends" ++ reset ++ "\n" ++ "    " ++ bold ++ "syscall" ++ reset ++ "               " ++ dim ++ "Kernel syscall tracing (eBPF / DTrace)" ++ reset ++ "\n" ++ "    " ++ bold ++ "gpu" ++ reset ++ "                   " ++ dim ++ "GPU operation tracing (CUDA / Metal)" ++ reset ++ "\n" ++ "    " ++ bold ++ "net" ++ reset ++ "                   " ++ dim ++ "Network flow capture and analysis" ++ reset ++ "\n" ++ "    " ++ bold ++ "cost" ++ reset ++ "                  " ++ dim ++ "Cloud cost observability (AWS / GCP / Azure)" ++ reset ++ "\n" ++ "\n");
 }
 
 fn printMemHelp() void {

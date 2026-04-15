@@ -9,6 +9,7 @@ const config_mod = @import("config.zig");
 const client = @import("client.zig");
 const debug_server_mod = @import("debug/server.zig");
 const debug_mod = @import("debug.zig");
+const observe_server_mod = @import("observe/server.zig");
 const watcher_mod = @import("watcher.zig");
 const paths = @import("paths.zig");
 const debug_log_mod = @import("debug_log.zig");
@@ -19,6 +20,7 @@ const memory_envelope_mod = @import("memory_envelope.zig");
 
 const Config = config_mod.Config;
 const DebugServer = debug_server_mod.DebugServer;
+const ObserveServer = observe_server_mod.ObserveServer;
 
 // ── MCP Server ──────────────────────────────────────────────────────────
 
@@ -40,6 +42,7 @@ const Runtime = struct {
     brain_type: config_mod.BrainType,
     mem_db: ?memory_mod.MemoryDb = null,
     debug_server: DebugServer,
+    observe_server: ObserveServer,
     code_cache: ?code_intel.CodeIndex = null,
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
@@ -67,6 +70,7 @@ const Runtime = struct {
             .brain_type = brain,
             .mem_db = null,
             .debug_server = DebugServer.init(allocator),
+            .observe_server = ObserveServer.init(allocator),
             .code_cache = null,
             .remote_tools = null,
             .mcp_session_id = null,
@@ -111,6 +115,7 @@ const Runtime = struct {
         if (self.client_agent_version) |v| self.allocator.free(v);
         if (self.client_model) |v| self.allocator.free(v);
         self.debug_server.deinit();
+        self.observe_server.deinit();
     }
 
     fn hasMemory(self: *const Runtime) bool {
@@ -1167,6 +1172,11 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
             try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
         }
     }
+
+    // Observe tools — system-level observability (syscalls, GPU, network, cost).
+    for (observe_server_mod.tool_definitions) |tool| {
+        try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+    }
 }
 
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
@@ -1203,6 +1213,13 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             debug_log_mod.log("runtimeCallTool: code_explore failed: {s}", .{@errorName(err)});
             return err;
         };
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
+    }
+
+    // Observe tools — delegate to ObserveServer (has its own mutex).
+    if (std.mem.startsWith(u8, tool_name, "observe_")) {
+        const result = try callObserveTool(runtime, tool_name, arguments);
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
         return result;
     }
@@ -1837,6 +1854,18 @@ fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Valu
     };
 }
 
+fn callObserveTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
+    debugLog("callObserveTool: dispatching {s}", .{tool_name});
+    const allocator = runtime.allocator;
+    const result = runtime.observe_server.callTool(allocator, tool_name, arguments) catch return error.Explained;
+    debugLog("callObserveTool: {s} returned", .{tool_name});
+    return switch (result) {
+        .ok => |payload| payload,
+        .ok_static => |payload| try allocator.dupe(u8, payload),
+        .err => |e| try std.fmt.allocPrint(allocator, "Error {d}: {s}", .{ e.code, e.message }),
+    };
+}
+
 // ── JSON Helpers ────────────────────────────────────────────────────────
 
 fn getStr(obj: json.Value, key: []const u8) ?[]const u8 {
@@ -2159,6 +2188,7 @@ fn testRuntime(allocator: std.mem.Allocator) Runtime {
         .brain_type = .none,
         .mem_db = null,
         .debug_server = DebugServer.init(allocator),
+        .observe_server = ObserveServer.init(allocator),
         .code_cache = null,
         .remote_tools = null,
         .mcp_session_id = null,
