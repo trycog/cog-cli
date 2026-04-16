@@ -1,6 +1,10 @@
 const std = @import("std");
 const json = std.json;
 const debug_log = @import("../debug_log.zig");
+const session_mod = @import("session.zig");
+const types = @import("types.zig");
+const Stringify = json.Stringify;
+const Writer = std.io.Writer;
 
 // Error codes
 const INVALID_PARAMS: i32 = -32602;
@@ -84,16 +88,18 @@ pub const tool_definitions = [_]ToolDef{
 
 pub const ObserveServer = struct {
     allocator: std.mem.Allocator,
+    session_manager: session_mod.SessionManager,
     mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) ObserveServer {
         return .{
             .allocator = allocator,
+            .session_manager = session_mod.SessionManager.init(allocator),
         };
     }
 
     pub fn deinit(self: *ObserveServer) void {
-        _ = self;
+        self.session_manager.deinit();
     }
 
     pub fn callTool(self: *ObserveServer, allocator: std.mem.Allocator, tool_name: []const u8, tool_args: ?json.Value) !ToolResult {
@@ -129,7 +135,6 @@ pub const ObserveServer = struct {
     // ── Tool Handlers ───────────────────────────────────────────────────
 
     fn toolStart(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
         debug_log.log("toolStart: entered", .{});
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
@@ -137,18 +142,25 @@ pub const ObserveServer = struct {
         const backend_val = a.object.get("backend") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing required field: backend" } };
         if (backend_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "backend must be a string" } };
 
-        const backend_name = backend_val.string;
-        _ = allocator;
+        const backend = types.Backend.fromString(backend_val.string) orelse {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Invalid backend. Must be one of: syscall, gpu, net, cost" } };
+        };
 
-        debug_log.log("toolStart: backend={s}", .{backend_name});
+        const target_pid: ?i64 = if (a.object.get("pid")) |v| (if (v == .integer) v.integer else null) else null;
 
-        // Phase 1 stub — backend execution comes in Phase 3
-        return .{ .ok_static = "{\"status\":\"not_implemented\",\"message\":\"Observe backends are not yet available. This feature is under development.\"}" };
+        debug_log.log("toolStart: backend={s} pid={?d}", .{ backend.toString(), target_pid });
+
+        const session_id = self.session_manager.createSession(backend, target_pid) catch {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to create observation session" } };
+        };
+
+        // TODO: actual backend capture starts here in Phase 3
+        debug_log.log("toolStart: session created id={s}", .{session_id});
+
+        return okJson(allocator, .{ .session_id = session_id, .backend = backend.toString(), .status = "capturing", .message = "Observation session started. Backend capture is not yet implemented — session is ready for manual event insertion or future backend integration." });
     }
 
     fn toolStop(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
-        _ = allocator;
         debug_log.log("toolStop: entered", .{});
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
@@ -156,13 +168,19 @@ pub const ObserveServer = struct {
         const session_val = a.object.get("session_id") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing required field: session_id" } };
         if (session_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "session_id must be a string" } };
 
-        debug_log.log("toolStop: session_id={s}", .{session_val.string});
-        return .{ .ok_static = "{\"status\":\"not_implemented\",\"message\":\"No active observation sessions.\"}" };
+        const sid = session_val.string;
+        debug_log.log("toolStop: session_id={s}", .{sid});
+
+        self.session_manager.finalizeSession(sid) catch {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
+        };
+
+        const event_count = self.session_manager.getEventCount(sid) catch 0;
+
+        return okJson(allocator, .{ .session_id = sid, .status = "finalized", .event_count = event_count });
     }
 
     fn toolEvents(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
-        _ = allocator;
         debug_log.log("toolEvents: entered", .{});
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
@@ -170,29 +188,123 @@ pub const ObserveServer = struct {
         const session_val = a.object.get("session_id") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing required field: session_id" } };
         if (session_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "session_id must be a string" } };
 
-        debug_log.log("toolEvents: session_id={s}", .{session_val.string});
-        return .{ .ok_static = "{\"events\":[],\"total\":0}" };
+        const sid = session_val.string;
+        debug_log.log("toolEvents: session_id={s}", .{sid});
+
+        const session = self.session_manager.getSession(sid) orelse {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
+        };
+
+        const limit: i64 = if (a.object.get("limit")) |v| (if (v == .integer) v.integer else 100) else 100;
+        const offset: i64 = if (a.object.get("offset")) |v| (if (v == .integer) v.integer else 0) else 0;
+
+        var stmt = session.db.prepare("SELECT id, timestamp_ns, event_type, pid, tid, data_json FROM events WHERE session_id = ? ORDER BY timestamp_ns LIMIT ? OFFSET ?") catch {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to query events" } };
+        };
+        defer stmt.finalize();
+        stmt.bindText(1, sid) catch return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to bind query parameters" } };
+        stmt.bindInt(2, limit) catch return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to bind query parameters" } };
+        stmt.bindInt(3, offset) catch return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to bind query parameters" } };
+
+        var aw: Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        var count: usize = 0;
+
+        jw.beginObject() catch return error.OutOfMemory;
+        jw.objectField("events") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+
+        while (true) {
+            const row = stmt.step() catch break;
+            if (row != .row) break;
+
+            jw.beginObject() catch return error.OutOfMemory;
+            jw.objectField("id") catch return error.OutOfMemory;
+            jw.write(stmt.columnInt(0)) catch return error.OutOfMemory;
+            jw.objectField("timestamp_ns") catch return error.OutOfMemory;
+            jw.write(stmt.columnInt(1)) catch return error.OutOfMemory;
+            jw.objectField("event_type") catch return error.OutOfMemory;
+            jw.write(stmt.columnText(2)) catch return error.OutOfMemory;
+            if (stmt.columnText(3)) |pid_text| {
+                jw.objectField("pid") catch return error.OutOfMemory;
+                jw.write(pid_text) catch return error.OutOfMemory;
+            }
+            if (stmt.columnText(5)) |data| {
+                jw.objectField("data") catch return error.OutOfMemory;
+                jw.write(data) catch return error.OutOfMemory;
+            }
+            jw.endObject() catch return error.OutOfMemory;
+            count += 1;
+        }
+
+        jw.endArray() catch return error.OutOfMemory;
+        jw.objectField("count") catch return error.OutOfMemory;
+        jw.write(count) catch return error.OutOfMemory;
+        jw.endObject() catch return error.OutOfMemory;
+
+        return .{ .ok = try aw.toOwnedSlice() };
     }
 
     fn toolSessions(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
-        _ = allocator;
         _ = args;
         debug_log.log("toolSessions: entered", .{});
-        return .{ .ok_static = "{\"sessions\":[],\"total\":0}" };
+
+        const sessions = self.session_manager.listSessions(allocator) catch {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to list sessions" } };
+        };
+        defer allocator.free(sessions);
+
+        var aw: Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+
+        jw.beginObject() catch return error.OutOfMemory;
+        jw.objectField("sessions") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+
+        for (sessions) |s| {
+            jw.beginObject() catch return error.OutOfMemory;
+            jw.objectField("id") catch return error.OutOfMemory;
+            jw.write(s.id) catch return error.OutOfMemory;
+            jw.objectField("backend") catch return error.OutOfMemory;
+            jw.write(s.backend.toString()) catch return error.OutOfMemory;
+            jw.objectField("status") catch return error.OutOfMemory;
+            jw.write(s.status.toString()) catch return error.OutOfMemory;
+            if (s.target_pid) |pid| {
+                jw.objectField("pid") catch return error.OutOfMemory;
+                jw.write(pid) catch return error.OutOfMemory;
+            }
+            jw.endObject() catch return error.OutOfMemory;
+        }
+
+        jw.endArray() catch return error.OutOfMemory;
+        jw.objectField("total") catch return error.OutOfMemory;
+        jw.write(sessions.len) catch return error.OutOfMemory;
+        jw.endObject() catch return error.OutOfMemory;
+
+        return .{ .ok = try aw.toOwnedSlice() };
     }
 
     fn toolStatus(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
-        _ = allocator;
         _ = args;
         debug_log.log("toolStatus: entered", .{});
-        return .{ .ok_static = "{\"active_sessions\":0,\"backends\":{\"syscall\":\"not_available\",\"gpu\":\"not_available\",\"net\":\"not_available\",\"cost\":\"not_available\"},\"platform\":\"" ++ @tagName(@import("builtin").os.tag) ++ "\"}" };
+
+        const count = self.session_manager.sessionCount();
+
+        return okJson(allocator, .{
+            .active_sessions = count,
+            .backends = .{
+                .syscall = "not_available",
+                .gpu = "not_available",
+                .net = "not_available",
+                .cost = "not_available",
+            },
+            .platform = @tagName(@import("builtin").os.tag),
+        });
     }
 
     fn toolCausalChains(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
-        _ = allocator;
         debug_log.log("toolCausalChains: entered", .{});
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
@@ -200,13 +312,52 @@ pub const ObserveServer = struct {
         const session_val = a.object.get("session_id") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing required field: session_id" } };
         if (session_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "session_id must be a string" } };
 
-        debug_log.log("toolCausalChains: session_id={s}", .{session_val.string});
-        return .{ .ok_static = "{\"causal_chains\":[],\"total\":0}" };
+        const sid = session_val.string;
+        debug_log.log("toolCausalChains: session_id={s}", .{sid});
+
+        const session = self.session_manager.getSession(sid) orelse {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
+        };
+
+        var stmt = session.db.prepare("SELECT id, chain_type, description, root_event_id, event_ids_json FROM causal_chains WHERE session_id = ? ORDER BY id") catch {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to query causal chains" } };
+        };
+        defer stmt.finalize();
+        stmt.bindText(1, sid) catch return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to bind query parameters" } };
+
+        var aw: Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        var count: usize = 0;
+
+        jw.beginObject() catch return error.OutOfMemory;
+        jw.objectField("causal_chains") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+
+        while (true) {
+            const row = stmt.step() catch break;
+            if (row != .row) break;
+
+            jw.beginObject() catch return error.OutOfMemory;
+            jw.objectField("id") catch return error.OutOfMemory;
+            jw.write(stmt.columnInt(0)) catch return error.OutOfMemory;
+            jw.objectField("chain_type") catch return error.OutOfMemory;
+            jw.write(stmt.columnText(1)) catch return error.OutOfMemory;
+            jw.objectField("description") catch return error.OutOfMemory;
+            jw.write(stmt.columnText(2)) catch return error.OutOfMemory;
+            jw.endObject() catch return error.OutOfMemory;
+            count += 1;
+        }
+
+        jw.endArray() catch return error.OutOfMemory;
+        jw.objectField("count") catch return error.OutOfMemory;
+        jw.write(count) catch return error.OutOfMemory;
+        jw.endObject() catch return error.OutOfMemory;
+
+        return .{ .ok = try aw.toOwnedSlice() };
     }
 
     fn toolQuery(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = self;
-        _ = allocator;
         debug_log.log("toolQuery: entered", .{});
         const a = args orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing arguments" } };
         if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
@@ -217,16 +368,73 @@ pub const ObserveServer = struct {
         const sql_val = a.object.get("sql") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing required field: sql" } };
         if (sql_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "sql must be a string" } };
 
-        // Validate read-only
         const sql = sql_val.string;
         if (!isReadOnlyQuery(sql)) {
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Only SELECT queries are allowed. Write operations are not permitted on investigation databases." } };
         }
 
-        debug_log.log("toolQuery: session_id={s} sql_len={d}", .{ session_val.string, sql.len });
-        return .{ .ok_static = "{\"columns\":[],\"rows\":[],\"row_count\":0}" };
+        const sid = session_val.string;
+        debug_log.log("toolQuery: session_id={s} sql_len={d}", .{ sid, sql.len });
+
+        const session = self.session_manager.getSession(sid) orelse {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
+        };
+
+        // SQLite prepare requires null-terminated string
+        const sql_z = allocator.dupeZ(u8, sql) catch return error.OutOfMemory;
+        defer allocator.free(sql_z);
+
+        var stmt = session.db.prepare(sql_z) catch {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "SQL query failed to prepare — check syntax" } };
+        };
+        defer stmt.finalize();
+
+        var aw: Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        var row_count: usize = 0;
+
+        jw.beginObject() catch return error.OutOfMemory;
+        jw.objectField("rows") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+
+        while (true) {
+            const row = stmt.step() catch break;
+            if (row != .row) break;
+
+            // Each row as an array of text values
+            jw.beginArray() catch return error.OutOfMemory;
+            const col_count: usize = @intCast(stmt.columnCount());
+            var col: usize = 0;
+            while (col < col_count) : (col += 1) {
+                const text = stmt.columnText(@intCast(col));
+                jw.write(text) catch return error.OutOfMemory;
+            }
+            jw.endArray() catch return error.OutOfMemory;
+            row_count += 1;
+
+            // Safety limit
+            if (row_count >= 1000) break;
+        }
+
+        jw.endArray() catch return error.OutOfMemory;
+        jw.objectField("row_count") catch return error.OutOfMemory;
+        jw.write(row_count) catch return error.OutOfMemory;
+        jw.endObject() catch return error.OutOfMemory;
+
+        return .{ .ok = try aw.toOwnedSlice() };
     }
 };
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+fn okJson(allocator: std.mem.Allocator, value: anytype) !ToolResult {
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var jw: Stringify = .{ .writer = &aw.writer };
+    jw.write(value) catch return error.OutOfMemory;
+    return .{ .ok = try aw.toOwnedSlice() };
+}
 
 /// Check if a SQL query is read-only (SELECT only).
 fn isReadOnlyQuery(sql: []const u8) bool {
@@ -265,7 +473,8 @@ test "callTool dispatches known tools" {
     // observe_status requires no arguments
     const result = try server.callTool(std.testing.allocator, "observe_status", null);
     switch (result) {
-        .ok_static => |payload| {
+        .ok => |payload| {
+            defer std.testing.allocator.free(payload);
             try std.testing.expect(std.mem.indexOf(u8, payload, "active_sessions") != null);
         },
         else => return error.UnexpectedResult,

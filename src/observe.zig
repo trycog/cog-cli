@@ -1,6 +1,7 @@
 pub const types = @import("observe/types.zig");
 pub const schema = @import("observe/schema.zig");
 pub const server = @import("observe/server.zig");
+pub const session = @import("observe/session.zig");
 
 const std = @import("std");
 const help = @import("help_text.zig");
@@ -81,4 +82,5 @@ test {
     _ = types;
     _ = schema;
     _ = server;
+    _ = session;
 }
