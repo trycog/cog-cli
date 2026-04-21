@@ -7,7 +7,7 @@ Examine the project directory structure and source files to determine:
 
 # Instructions
 
-1. List the files and directories in the current working directory
+1. List the files and directories in the current working directory. If any entries are symlinks to directories, follow them and examine their contents too — workspace directories often symlink to multiple projects
 2. Identify the primary programming languages by examining file extensions, config files (package.json, mix.exs, Cargo.toml, go.mod, build.zig, Gemfile, etc.), and directory structure
 3. Determine the glob patterns that would capture all relevant source files for indexing (e.g. `src/**/*.ex`, `lib/**/*.rb`)
 4. From the available Cog extensions list below, recommend any that match the detected languages
