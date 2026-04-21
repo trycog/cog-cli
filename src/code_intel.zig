@@ -1900,10 +1900,16 @@ fn collectGlobFilesRecursive(
         else
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
 
-        if (entry.kind == .directory) {
+        // Resolve symlinks to their target kind
+        const kind = if (entry.kind == .sym_link) blk: {
+            const stat = dir.statFile(entry.name) catch break :blk entry.kind;
+            break :blk if (stat.kind == .directory) std.fs.Dir.Entry.Kind.directory else if (stat.kind == .file) std.fs.Dir.Entry.Kind.file else entry.kind;
+        } else entry.kind;
+
+        if (kind == .directory) {
             try collectGlobFilesRecursive(allocator, child_path, pattern, out);
             allocator.free(child_path);
-        } else if (entry.kind == .file) {
+        } else if (kind == .file) {
             if (globMatch(pattern, child_path)) {
                 try out.append(allocator, child_path);
             } else {

@@ -573,7 +573,12 @@ fn addWatchRecursive(
 
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
-        if (entry.kind != .directory) continue;
+        // Resolve symlinks to their target kind
+        const kind = if (entry.kind == .sym_link) blk: {
+            const stat = dir.statFile(entry.name) catch break :blk entry.kind;
+            break :blk if (stat.kind == .directory) std.fs.Dir.Entry.Kind.directory else entry.kind;
+        } else entry.kind;
+        if (kind != .directory) continue;
         if (entry.name[0] == '.') continue;
         if (isExcludedDir(entry.name)) continue;
 
