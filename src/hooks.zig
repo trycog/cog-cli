@@ -687,15 +687,11 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
                 } else if (std.mem.eql(u8, entry.key_ptr.*, "PostToolUseFailure")) {
                     wrote_posttooluse_failure = true;
                     try s.objectField("PostToolUseFailure");
-                    try writeClaudeCogHookArray(&s, entry.value_ptr.*,
-                        "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-posttooluse-failure.sh",
-                        "mcp__cog__.*", 10, null);
+                    try writeClaudeCogHookArray(&s, entry.value_ptr.*, "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-posttooluse-failure.sh", "mcp__cog__.*", 10, null);
                 } else if (std.mem.eql(u8, entry.key_ptr.*, "PreCompact")) {
                     wrote_precompact = true;
                     try s.objectField("PreCompact");
-                    try writeClaudeCogHookArray(&s, entry.value_ptr.*,
-                        "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-precompact.sh",
-                        null, 10, "Preserving Cog context...");
+                    try writeClaudeCogHookArray(&s, entry.value_ptr.*, "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-precompact.sh", null, 10, "Preserving Cog context...");
                 } else {
                     try s.objectField(entry.key_ptr.*);
                     try s.write(entry.value_ptr.*);
@@ -716,16 +712,12 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
 
     if (!wrote_posttooluse_failure) {
         try s.objectField("PostToolUseFailure");
-        try writeClaudeCogHookArray(&s, null,
-            "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-posttooluse-failure.sh",
-            "mcp__cog__.*", 10, null);
+        try writeClaudeCogHookArray(&s, null, "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-posttooluse-failure.sh", "mcp__cog__.*", 10, null);
     }
 
     if (!wrote_precompact) {
         try s.objectField("PreCompact");
-        try writeClaudeCogHookArray(&s, null,
-            "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-precompact.sh",
-            null, 10, "Preserving Cog context...");
+        try writeClaudeCogHookArray(&s, null, "sh \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cog-precompact.sh", null, 10, "Preserving Cog context...");
     }
 
     try s.endObject();

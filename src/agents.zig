@@ -689,52 +689,52 @@ pub const agents = [_]Agent{
         .mcp_path = ".gemini/settings.json",
         .mcp_format = .json_mcpServers,
         .agent_file_path = ".gemini/agents/cog-code-query.md",
-        .agent_file_header = 
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-    ++ gemini_code_query_tools ++
-        \\---
-        \\
-        ,
-    .debug_file_path = ".gemini/agents/cog-debug.md",
-        .debug_file_header = 
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-    ++ gemini_debug_tools ++
-        \\max_turns: 15
-        \\---
-        \\
-        ,
-    .mem_file_path = ".gemini/agents/cog-mem.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-    ++ gemini_memory_tools ++
-        \\---
-        \\
-        ,
-    .validate_file_path = ".gemini/agents/cog-mem-validate.md",
-        .validate_file_header =
-        \\---
-        \\name: cog-mem-validate
-        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-    ++ gemini_validate_tools ++
-        \\---
-        \\
-        ,
+        .agent_file_header = (
+            \\---
+            \\name: cog-code-query
+            \\description: Explore code structure using the Cog SCIP index
+        ++ gemini_code_query_tools ++
+            \\---
+            \\
+        ),
+        .debug_file_path = ".gemini/agents/cog-debug.md",
+        .debug_file_header = (
+            \\---
+            \\name: cog-debug
+            \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        ++ gemini_debug_tools ++
+            \\max_turns: 15
+            \\---
+            \\
+        ),
+        .mem_file_path = ".gemini/agents/cog-mem.md",
+        .mem_file_header = (
+            \\---
+            \\name: cog-mem
+            \\description: Memory sub-agent for recall, consolidation, and maintenance
+        ++ gemini_memory_tools ++
+            \\---
+            \\
+        ),
+        .validate_file_path = ".gemini/agents/cog-mem-validate.md",
+        .validate_file_header = (
+            \\---
+            \\name: cog-mem-validate
+            \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        ++ gemini_validate_tools ++
+            \\---
+            \\
+        ),
         .observe_file_path = ".gemini/agents/cog-observe.md",
-        .observe_file_header =
-        \\---
-        \\name: cog-observe
-        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
-    ++ gemini_observe_tools ++
-        \\max_turns: 15
-        \\---
-        \\
-        ,
+        .observe_file_header = (
+            \\---
+            \\name: cog-observe
+            \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        ++ gemini_observe_tools ++
+            \\max_turns: 15
+            \\---
+            \\
+        ),
     },
     // ── GitHub Copilot ──────────────────────────────────────────────
     .{
@@ -744,54 +744,54 @@ pub const agents = [_]Agent{
         .mcp_path = ".vscode/mcp.json",
         .mcp_format = .json_servers,
         .agent_file_path = ".github/agents/cog-code-query.agent.md",
-        .agent_file_header = 
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-    ++ copilot_code_query_tools ++
-        \\---
-        \\
-        ,
-    .debug_file_path = ".github/agents/cog-debug.agent.md",
-        .debug_file_header = 
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-    ++ copilot_debug_tools ++
-        \\user-invokable: false
-        \\---
-        \\
-        ,
-    .mem_file_path = ".github/agents/cog-mem.agent.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-    ++ copilot_memory_tools ++
-        \\user-invokable: false
-        \\---
-        \\
-        ,
-    .validate_file_path = ".github/agents/cog-mem-validate.agent.md",
-        .validate_file_header =
-        \\---
-        \\name: cog-mem-validate
-        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-    ++ copilot_validate_tools ++
-        \\user-invokable: false
-        \\---
-        \\
-        ,
+        .agent_file_header = (
+            \\---
+            \\name: cog-code-query
+            \\description: Explore code structure using the Cog SCIP index
+        ++ copilot_code_query_tools ++
+            \\---
+            \\
+        ),
+        .debug_file_path = ".github/agents/cog-debug.agent.md",
+        .debug_file_header = (
+            \\---
+            \\name: cog-debug
+            \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
+        ++ copilot_debug_tools ++
+            \\user-invokable: false
+            \\---
+            \\
+        ),
+        .mem_file_path = ".github/agents/cog-mem.agent.md",
+        .mem_file_header = (
+            \\---
+            \\name: cog-mem
+            \\description: Memory sub-agent for recall, consolidation, and maintenance
+        ++ copilot_memory_tools ++
+            \\user-invokable: false
+            \\---
+            \\
+        ),
+        .validate_file_path = ".github/agents/cog-mem-validate.agent.md",
+        .validate_file_header = (
+            \\---
+            \\name: cog-mem-validate
+            \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        ++ copilot_validate_tools ++
+            \\user-invokable: false
+            \\---
+            \\
+        ),
         .observe_file_path = ".github/agents/cog-observe.agent.md",
-        .observe_file_header =
-        \\---
-        \\name: cog-observe
-        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
-    ++ copilot_observe_tools ++
-        \\user-invokable: false
-        \\---
-        \\
-        ,
+        .observe_file_header = (
+            \\---
+            \\name: cog-observe
+            \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        ++ copilot_observe_tools ++
+            \\user-invokable: false
+            \\---
+            \\
+        ),
     },
     // ── Windsurf ────────────────────────────────────────────────────
     .{

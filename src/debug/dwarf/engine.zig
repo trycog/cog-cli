@@ -3765,8 +3765,8 @@ pub const DwarfEngine = struct {
         for (self.functions) |func| {
             const matches = std.mem.eql(u8, func.name, name) or
                 (func.name.len > name.len and
-                func.name[func.name.len - name.len - 1] == '.' and
-                std.mem.eql(u8, func.name[func.name.len - name.len ..], name));
+                    func.name[func.name.len - name.len - 1] == '.' and
+                    std.mem.eql(u8, func.name[func.name.len - name.len ..], name));
             if (!matches) continue;
 
             // Find the first executable line AFTER the function prologue.

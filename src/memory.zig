@@ -799,47 +799,47 @@ fn toolConnections(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         if (section_count > 0) out.append("\n\n");
         out.print("## Connections for `{s}`\n", .{eid});
         var conn_count: i64 = 0;
-            const show_outgoing = std.mem.eql(u8, direction, "both") or std.mem.eql(u8, direction, "outgoing");
-            const show_incoming = std.mem.eql(u8, direction, "both") or std.mem.eql(u8, direction, "incoming");
-            if (show_outgoing) {
-                var stmt = try mem_db.db.prepare(
-                    \\SELECT s.id, s.relation, s.weight, e.id, e.term
-                    \\FROM synapses s JOIN engrams e ON s.target_id = e.id
-                    \\WHERE s.brain_id = ? AND s.source_id = ?
-                );
-                defer stmt.finalize();
-                try stmt.bindText(1, mem_db.brain_id);
-                try stmt.bindText(2, eid);
-                while (try stmt.step() == .row) {
-                    const s_id = stmt.columnText(0) orelse continue;
-                    const s_rel = stmt.columnText(1) orelse "related_to";
-                    const e_term = stmt.columnText(4) orelse continue;
-                    if (conn_count > 0) out.append("\n");
-                    out.print("-> **{s}** ({s}) [synapse: `{s}`]", .{ e_term, s_rel, s_id });
-                    conn_count += 1;
-                }
+        const show_outgoing = std.mem.eql(u8, direction, "both") or std.mem.eql(u8, direction, "outgoing");
+        const show_incoming = std.mem.eql(u8, direction, "both") or std.mem.eql(u8, direction, "incoming");
+        if (show_outgoing) {
+            var stmt = try mem_db.db.prepare(
+                \\SELECT s.id, s.relation, s.weight, e.id, e.term
+                \\FROM synapses s JOIN engrams e ON s.target_id = e.id
+                \\WHERE s.brain_id = ? AND s.source_id = ?
+            );
+            defer stmt.finalize();
+            try stmt.bindText(1, mem_db.brain_id);
+            try stmt.bindText(2, eid);
+            while (try stmt.step() == .row) {
+                const s_id = stmt.columnText(0) orelse continue;
+                const s_rel = stmt.columnText(1) orelse "related_to";
+                const e_term = stmt.columnText(4) orelse continue;
+                if (conn_count > 0) out.append("\n");
+                out.print("-> **{s}** ({s}) [synapse: `{s}`]", .{ e_term, s_rel, s_id });
+                conn_count += 1;
             }
-            if (show_incoming) {
-                var stmt = try mem_db.db.prepare(
-                    \\SELECT s.id, s.relation, s.weight, e.id, e.term
-                    \\FROM synapses s JOIN engrams e ON s.source_id = e.id
-                    \\WHERE s.brain_id = ? AND s.target_id = ?
-                );
-                defer stmt.finalize();
-                try stmt.bindText(1, mem_db.brain_id);
-                try stmt.bindText(2, eid);
-                while (try stmt.step() == .row) {
-                    const s_id = stmt.columnText(0) orelse continue;
-                    const s_rel = stmt.columnText(1) orelse "related_to";
-                    const e_term = stmt.columnText(4) orelse continue;
-                    if (conn_count > 0) out.append("\n");
-                    out.print("<- **{s}** ({s}) [synapse: `{s}`]", .{ e_term, s_rel, s_id });
-                    conn_count += 1;
-                }
-            }
-            if (conn_count == 0) out.append("No connections.");
-            section_count += 1;
         }
+        if (show_incoming) {
+            var stmt = try mem_db.db.prepare(
+                \\SELECT s.id, s.relation, s.weight, e.id, e.term
+                \\FROM synapses s JOIN engrams e ON s.source_id = e.id
+                \\WHERE s.brain_id = ? AND s.target_id = ?
+            );
+            defer stmt.finalize();
+            try stmt.bindText(1, mem_db.brain_id);
+            try stmt.bindText(2, eid);
+            while (try stmt.step() == .row) {
+                const s_id = stmt.columnText(0) orelse continue;
+                const s_rel = stmt.columnText(1) orelse "related_to";
+                const e_term = stmt.columnText(4) orelse continue;
+                if (conn_count > 0) out.append("\n");
+                out.print("<- **{s}** ({s}) [synapse: `{s}`]", .{ e_term, s_rel, s_id });
+                conn_count += 1;
+            }
+        }
+        if (conn_count == 0) out.append("No connections.");
+        section_count += 1;
+    }
     if (section_count == 0) out.append("No engram IDs provided.");
     debug_log.log("memory: connections sections={d}", .{section_count});
     return out.toOwnedSlice();
