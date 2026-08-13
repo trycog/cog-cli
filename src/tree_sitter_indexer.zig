@@ -345,6 +345,27 @@ pub const Indexer = struct {
             target_symbol: ?[]const u8 = null,
             kind: []const u8,
         };
+        const RawRelationshipContext = struct {
+            pub fn hash(_: @This(), relationship: RawRelationship) u64 {
+                var hasher = std.hash.Wyhash.init(0);
+                hasher.update(std.mem.asBytes(&relationship.from_idx));
+                if (relationship.to_idx) |to_idx| hasher.update(std.mem.asBytes(&to_idx));
+                if (relationship.target_symbol) |target_symbol| hasher.update(target_symbol);
+                hasher.update(relationship.kind);
+                return hasher.final();
+            }
+
+            pub fn eql(_: @This(), left: RawRelationship, right: RawRelationship) bool {
+                if (left.from_idx != right.from_idx or left.to_idx != right.to_idx) return false;
+                if (!std.mem.eql(u8, left.kind, right.kind)) return false;
+                if (left.target_symbol) |left_target| {
+                    const right_target = right.target_symbol orelse return false;
+                    return std.mem.eql(u8, left_target, right_target);
+                }
+                return right.target_symbol == null;
+            }
+        };
+        const RawRelationshipSet = std.HashMapUnmanaged(RawRelationship, void, RawRelationshipContext, std.hash_map.default_max_load_percentage);
 
         var raw_defs: std.ArrayListUnmanaged(RawDef) = .empty;
         defer raw_defs.deinit(allocator);
@@ -366,6 +387,19 @@ pub const Indexer = struct {
         defer raw_calls.deinit(allocator);
         var raw_relationships: std.ArrayListUnmanaged(RawRelationship) = .empty;
         defer raw_relationships.deinit(allocator);
+        var relationship_seen: RawRelationshipSet = .empty;
+        defer relationship_seen.deinit(allocator);
+        const RelationshipAppender = struct {
+            fn append(
+                alloc: std.mem.Allocator,
+                list: *std.ArrayListUnmanaged(RawRelationship),
+                seen: *RawRelationshipSet,
+                relationship: RawRelationship,
+            ) !void {
+                const gop = try seen.getOrPutContext(alloc, relationship, .{});
+                if (!gop.found_existing) try list.append(alloc, relationship);
+            }
+        };
 
         var match: c.TSQueryMatch = undefined;
 
@@ -604,7 +638,7 @@ pub const Indexer = struct {
 
             if (enclosing_indices[i]) |parent_idx| {
                 enclosing_symbol = string_data[offset_pairs[parent_idx].sym.off..][0..offset_pairs[parent_idx].sym.len];
-                try raw_relationships.append(allocator, .{
+                try RelationshipAppender.append(allocator, &raw_relationships, &relationship_seen, .{
                     .from_idx = parent_idx,
                     .to_idx = i,
                     .kind = "contains",
@@ -656,7 +690,7 @@ pub const Indexer = struct {
             var attached = false;
             for (symbols, 0..) |sym, sym_idx| {
                 if (sym.enclosing_symbol.len != 0) continue;
-                try raw_relationships.append(allocator, .{
+                try RelationshipAppender.append(allocator, &raw_relationships, &relationship_seen, .{
                     .from_idx = sym_idx,
                     .target_symbol = string_data[off.off..][0..off.len],
                     .kind = "imports",
@@ -665,7 +699,7 @@ pub const Indexer = struct {
             }
             if (!attached) {
                 for (raw_defs.items, 0..) |_, candidate_idx| {
-                    try raw_relationships.append(allocator, .{
+                    try RelationshipAppender.append(allocator, &raw_relationships, &relationship_seen, .{
                         .from_idx = candidate_idx,
                         .target_symbol = string_data[off.off..][0..off.len],
                         .kind = "imports",
@@ -729,7 +763,7 @@ pub const Indexer = struct {
                     target_idx = def_name_map.get(item.name);
                 }
                 if (target_idx) |to_idx| {
-                    try raw_relationships.append(allocator, .{
+                    try RelationshipAppender.append(allocator, &raw_relationships, &relationship_seen, .{
                         .from_idx = from_idx,
                         .to_idx = to_idx,
                         .kind = "calls",
@@ -1109,6 +1143,15 @@ fn expectImportOccurrence(doc: scip.Document, label: []const u8) !void {
     return error.TestUnexpectedResult;
 }
 
+fn expectUniqueRelationships(sym: scip.SymbolInformation) !void {
+    for (sym.relationships, 0..) |relationship, i| {
+        for (sym.relationships[i + 1 ..]) |candidate| {
+            try std.testing.expect(!std.mem.eql(u8, relationship.symbol, candidate.symbol) or
+                !std.mem.eql(u8, relationship.kind, candidate.kind));
+        }
+    }
+}
+
 test "indexFile JavaScript anchors member calls to the property" {
     const allocator = std.testing.allocator;
     var indexer = Indexer.init();
@@ -1179,8 +1222,10 @@ test "indexFile Java emits imports constructors fields and calls" {
     try std.testing.expect(found_class);
     try std.testing.expect(found_constructor);
     try std.testing.expect(found_field);
-    _ = try expectSymbolKind(doc, "helper", 26);
-    _ = try expectSymbolKind(doc, "run", 26);
+    const helper = try expectSymbolKind(doc, "helper", 26);
+    const run = try expectSymbolKind(doc, "run", 26);
+    try expectUniqueRelationships(helper);
+    try expectUniqueRelationships(run);
     _ = try expectCallOccurrence(doc, "helper");
     try expectImportOccurrence(doc, "java.util.List");
     try expectImportOccurrence(doc, "java.util.Collections.emptyList");
