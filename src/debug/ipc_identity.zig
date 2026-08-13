@@ -394,6 +394,34 @@ test "validateProcessIdentity rejects foreign executable fixture" {
     return error.ForeignFixtureDidNotExec;
 }
 
+test "signalValidatedProcess binds signal zero to current process identity" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    try signalValidatedProcess(currentPid(), 0);
+}
+
+test "signalValidatedProcess rejects foreign executable without signaling it" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var child = std.process.Child.init(&.{ "/bin/sh", "-c", "sleep 10" }, allocator);
+    try child.spawn();
+    defer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        if (signalValidatedProcess(child.id, 0)) |_| {
+            posix.nanosleep(0, 10_000_000);
+        } else |err| {
+            try std.testing.expectEqual(error.ProcessWrongExecutable, err);
+            return;
+        }
+    }
+    return error.ForeignFixtureDidNotExec;
+}
+
 test "validatePeerUid accepts same-user Unix socket peer" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
 
