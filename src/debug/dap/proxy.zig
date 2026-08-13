@@ -882,7 +882,7 @@ pub const DapProxy = struct {
                                     else
                                         0;
                                     dapLog("[DAP readResponse] Responding to startDebugging (req_seq={d})", .{req_seq});
-                                    self.sendReverseResponse(allocator, req_seq, "startDebugging");
+                                    self.sendReverseResponse(allocator, req_seq, "startDebugging", true, null);
                                 } else if (std.mem.eql(u8, cmd.string, "runInTerminal")) {
                                     // Queue notification for AI agent to handle
                                     self.queueNotification("debug/run_in_terminal", decoded.body);
@@ -892,9 +892,14 @@ pub const DapProxy = struct {
                                     else
                                         0;
                                     dapLog("[DAP readResponse] Responding to runInTerminal (req_seq={d})", .{req_seq});
-                                    self.sendReverseResponse(allocator, req_seq, "runInTerminal");
+                                    self.sendReverseResponse(allocator, req_seq, "runInTerminal", false, "runInTerminal is unsupported by Cog");
                                 } else {
-                                    dapLog("[DAP readResponse] Unhandled reverse request: {s}", .{cmd.string});
+                                    const req_seq = if (parsed.value.object.get("seq")) |v|
+                                        (if (v == .integer) v.integer else 0)
+                                    else
+                                        0;
+                                    dapLog("[DAP readResponse] Rejecting unsupported reverse request: {s}", .{cmd.string});
+                                    self.sendReverseResponse(allocator, req_seq, cmd.string, false, "unsupported reverse request");
                                 }
                             }
                         }
@@ -1631,13 +1636,19 @@ pub const DapProxy = struct {
                                         (if (v == .integer) v.integer else 0)
                                     else
                                         0;
-                                    self.sendReverseResponse(allocator, req_seq, "startDebugging");
+                                    self.sendReverseResponse(allocator, req_seq, "startDebugging", true, null);
                                 } else if (std.mem.eql(u8, cmd_val.string, "runInTerminal")) {
                                     const req_seq = if (parsed.value.object.get("seq")) |v|
                                         (if (v == .integer) v.integer else 0)
                                     else
                                         0;
-                                    self.sendReverseResponse(allocator, req_seq, "runInTerminal");
+                                    self.sendReverseResponse(allocator, req_seq, "runInTerminal", false, "runInTerminal is unsupported by Cog");
+                                } else {
+                                    const req_seq = if (parsed.value.object.get("seq")) |v|
+                                        (if (v == .integer) v.integer else 0)
+                                    else
+                                        0;
+                                    self.sendReverseResponse(allocator, req_seq, cmd_val.string, false, "unsupported reverse request");
                                 }
                             }
                         }
@@ -2174,26 +2185,33 @@ pub const DapProxy = struct {
         }) catch {};
     }
 
-    /// Send a success response for a reverse request from the adapter.
-    fn sendReverseResponse(self: *DapProxy, allocator: std.mem.Allocator, request_seq: i64, command: []const u8) void {
+    fn buildReverseResponse(allocator: std.mem.Allocator, seq: i64, request_seq: i64, command: []const u8, success: bool, message: ?[]const u8) ![]const u8 {
         var aw: Writer.Allocating = .init(allocator);
-        defer aw.deinit();
+        errdefer aw.deinit();
         var s: Stringify = .{ .writer = &aw.writer };
 
-        s.beginObject() catch return;
-        s.objectField("seq") catch return;
-        s.write(self.nextSeq()) catch return;
-        s.objectField("type") catch return;
-        s.write("response") catch return;
-        s.objectField("request_seq") catch return;
-        s.write(request_seq) catch return;
-        s.objectField("success") catch return;
-        s.write(true) catch return;
-        s.objectField("command") catch return;
-        s.write(command) catch return;
-        s.endObject() catch return;
+        try s.beginObject();
+        try s.objectField("seq");
+        try s.write(seq);
+        try s.objectField("type");
+        try s.write("response");
+        try s.objectField("request_seq");
+        try s.write(request_seq);
+        try s.objectField("success");
+        try s.write(success);
+        try s.objectField("command");
+        try s.write(command);
+        if (message) |text| {
+            try s.objectField("message");
+            try s.write(text);
+        }
+        try s.endObject();
+        return aw.toOwnedSlice();
+    }
 
-        const msg = aw.toOwnedSlice() catch return;
+    /// Send a response for a reverse request from the adapter.
+    fn sendReverseResponse(self: *DapProxy, allocator: std.mem.Allocator, request_seq: i64, command: []const u8, success: bool, message: ?[]const u8) void {
+        const msg = buildReverseResponse(allocator, self.nextSeq(), request_seq, command, success, message) catch return;
         defer allocator.free(msg);
 
         const encoded = transport.encodeMessage(allocator, msg) catch return;
@@ -2203,7 +2221,8 @@ pub const DapProxy = struct {
             dapLog("[DAP sendReverseResponse] Write failed!", .{});
             return;
         };
-        dapLog("[DAP sendReverseResponse] Sent response for {s} (req_seq={d}, {d} bytes)", .{ command, request_seq, encoded.len });
+        dapLog("[DAP sendReverseResponse] Sent response for {s} (req_seq={d}, success={}, {d} bytes)", .{ command, request_seq, success, encoded.len });
+        debug_log.log("dap.proxy: answered reverse request command={s} request_seq={d} success={}", .{ command, request_seq, success });
     }
 
     fn queueNotification(self: *DapProxy, method: []const u8, params_json: []const u8) void {
@@ -4234,6 +4253,19 @@ test "DapProxy rejects invalid readMemory base64" {
     ;
 
     try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
+}
+
+test "DapProxy builds failure response for unsupported reverse request" {
+    const allocator = std.testing.allocator;
+    const response = try DapProxy.buildReverseResponse(allocator, 9, 27, "runInTerminal", false, "unsupported reverse request");
+    defer allocator.free(response);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, response, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 9), parsed.value.object.get("seq").?.integer);
+    try std.testing.expectEqual(@as(i64, 27), parsed.value.object.get("request_seq").?.integer);
+    try std.testing.expect(!parsed.value.object.get("success").?.bool);
+    try std.testing.expectEqualStrings("unsupported reverse request", parsed.value.object.get("message").?.string);
 }
 
 test "DapProxy extracts explicit request sequence" {
