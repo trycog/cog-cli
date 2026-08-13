@@ -1153,7 +1153,7 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
     defer allocator.free(with_newline);
 
     debug_log.log("writeSettingsBrainUrl: atomically writing .cog/settings.json", .{});
-    fs_util.writeFileAtomic(std.fs.cwd(), allocator, ".cog/settings.json", with_newline) catch |err| {
+    fs_util.writeFileAtomicMode(std.fs.cwd(), allocator, ".cog/settings.json", with_newline, 0o600) catch |err| {
         debug_log.log("writeSettingsBrainUrl: failed to write settings: {s}", .{@errorName(err)});
         printErr("  error: failed to write .cog/settings.json\n");
         return error.Explained;
