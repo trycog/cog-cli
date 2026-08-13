@@ -53,6 +53,35 @@ fn existingFileMode(parent: std.fs.Dir, basename: []const u8) !std.fs.File.Mode 
     return stat.mode;
 }
 
+/// Create a uniquely named, mode-restricted file in `dir`. The caller owns the
+/// returned name and file, and is responsible for deleting the file when done.
+pub fn createSecureTempFile(
+    dir: std.fs.Dir,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) !struct { name: []u8, file: std.fs.File } {
+    if (std.fs.path.basename(prefix).len != prefix.len or prefix.len == 0) {
+        return error.InvalidTempPrefix;
+    }
+
+    while (true) {
+        const sequence = temp_counter.fetchAdd(1, .monotonic);
+        const name = try std.fmt.allocPrint(allocator, ".{s}-{d}-{d}.tmp", .{ prefix, std.time.nanoTimestamp(), sequence });
+        const file = dir.createFile(name, .{ .exclusive = true, .mode = 0o600 }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(name);
+                continue;
+            },
+            else => {
+                allocator.free(name);
+                return err;
+            },
+        };
+        debug_log.log("fs_util.createSecureTempFile: created {s}", .{name});
+        return .{ .name = name, .file = file };
+    }
+}
+
 test "writeFileAtomic creates a file" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -128,4 +157,35 @@ test "writeFileAtomic leaves the old file when setup fails" {
     while (try iterator.next()) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".settings.json.tmp-"));
     }
+}
+
+test "createSecureTempFile creates unique mode 0600 files" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var first = try createSecureTempFile(tmp.dir, allocator, "entitlements");
+    defer allocator.free(first.name);
+    defer tmp.dir.deleteFile(first.name) catch {};
+    defer first.file.close();
+    var second = try createSecureTempFile(tmp.dir, allocator, "entitlements");
+    defer allocator.free(second.name);
+    defer tmp.dir.deleteFile(second.name) catch {};
+    defer second.file.close();
+
+    try std.testing.expect(!std.mem.eql(u8, first.name, second.name));
+    const first_stat = try first.file.stat();
+    const second_stat = try second.file.stat();
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), first_stat.mode & 0o777);
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), second_stat.mode & 0o777);
+}
+
+test "createSecureTempFile rejects path prefixes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectError(error.InvalidTempPrefix, createSecureTempFile(tmp.dir, std.testing.allocator, "nested/file"));
+    try std.testing.expectError(error.InvalidTempPrefix, createSecureTempFile(tmp.dir, std.testing.allocator, ""));
 }
