@@ -189,7 +189,7 @@ pub const EhFrameIndex = struct {
 
 /// Build an FDE index from eh_frame data for fast PC lookups.
 /// Single pass through eh_frame parsing only headers (length, CIE_id, initial_location, range).
-pub fn buildEhFrameIndex(data: []const u8, is_debug_frame: bool, allocator: std.mem.Allocator) !EhFrameIndex {
+pub fn buildEhFrameIndex(data: []const u8, is_debug_frame: bool, section_pc_base: u64, allocator: std.mem.Allocator) !EhFrameIndex {
     var entries: std.ArrayListUnmanaged(EhFrameIndex.FdeIndexEntry) = .empty;
     errdefer entries.deinit(allocator);
 
@@ -227,7 +227,7 @@ pub fn buildEhFrameIndex(data: []const u8, is_debug_frame: bool, allocator: std.
         const cie = parseCie(data, cie_offset);
         const fde_enc: u8 = if (cie) |c| c.fde_encoding else 0xFF;
 
-        const addr_field_pc = @as(u64, @intCast(pos));
+        const addr_field_pc = section_pc_base +% @as(u64, @intCast(pos));
         const initial_location = if (fde_enc != 0xFF)
             readEncodedPointer(data, &pos, fde_enc, addr_field_pc) orelse {
                 pos = entry_end;
@@ -291,7 +291,7 @@ pub const CieCache = struct {
 };
 
 /// Parse .eh_frame section to extract CIE and FDE entries.
-pub fn parseEhFrame(data: []const u8, allocator: std.mem.Allocator) ![]FdeEntry {
+pub fn parseEhFrame(data: []const u8, section_pc_base: u64, allocator: std.mem.Allocator) ![]FdeEntry {
     var fdes: std.ArrayListUnmanaged(FdeEntry) = .empty;
     errdefer fdes.deinit(allocator);
 
@@ -338,7 +338,7 @@ pub fn parseEhFrame(data: []const u8, allocator: std.mem.Allocator) ![]FdeEntry 
         const fde_enc: u8 = if (cie) |c| c.fde_encoding else 0xFF;
 
         // Read initial location and address range using the CIE's FDE encoding
-        const addr_field_pc = @as(u64, @intCast(pos));
+        const addr_field_pc = section_pc_base +% @as(u64, @intCast(pos));
         const initial_location = if (fde_enc != 0xFF)
             readEncodedPointer(data, &pos, fde_enc, addr_field_pc) orelse {
                 pos = entry_end;
@@ -738,6 +738,7 @@ pub const CfaUnwindResult = struct {
 /// When `index` and `cie_cache` are provided, uses O(log n) FDE lookup and cached CIE parsing.
 pub fn unwindCfa(
     eh_frame_data: []const u8,
+    section_pc_base: u64,
     target_pc: u64,
     ctx: *anyopaque,
     reg_reader: *const fn (ctx: *anyopaque, reg: u64) ?u64,
@@ -750,7 +751,7 @@ pub fn unwindCfa(
     // Fast path: use pre-built index for O(log n) FDE lookup
     if (index) |idx| {
         if (idx.findFde(target_pc)) |fde_entry| {
-            return unwindCfaFromFde(eh_frame_data, target_pc, fde_entry.fde_offset, fde_entry.cie_offset, ctx, reg_reader, mem_reader, cie_cache, allocator);
+            return unwindCfaFromFde(eh_frame_data, section_pc_base, target_pc, fde_entry.fde_offset, fde_entry.cie_offset, ctx, reg_reader, mem_reader, cie_cache, allocator);
         }
         return null;
     }
@@ -795,7 +796,7 @@ pub fn unwindCfa(
             continue;
         };
 
-        const addr_field_pc = @as(u64, @intCast(pos));
+        const addr_field_pc = section_pc_base +% @as(u64, @intCast(pos));
         const initial_location = if (cie.fde_encoding != 0xFF)
             readEncodedPointer(eh_frame_data, &pos, cie.fde_encoding, addr_field_pc) orelse {
                 pos = entry_end;
@@ -834,6 +835,7 @@ pub fn unwindCfa(
 /// Unwind CFA from a known FDE offset (used by index-based fast path).
 fn unwindCfaFromFde(
     eh_frame_data: []const u8,
+    section_pc_base: u64,
     target_pc: u64,
     fde_offset: usize,
     cie_offset: usize,
@@ -869,7 +871,7 @@ fn unwindCfaFromFde(
     const cie = if (cie_cache) |cc| cc.getOrParse(eh_frame_data, cie_offset, allocator) orelse return null else parseCie(eh_frame_data, cie_offset) orelse return null;
 
     // Skip initial_location and address_range (we already know them from the index)
-    const addr_field_pc = @as(u64, @intCast(pos));
+    const addr_field_pc = section_pc_base +% @as(u64, @intCast(pos));
     const initial_location = if (cie.fde_encoding != 0xFF)
         readEncodedPointer(eh_frame_data, &pos, cie.fde_encoding, addr_field_pc) orelse return null
     else blk: {
@@ -999,6 +1001,7 @@ const VirtualRegCtx = struct {
 /// from DWARF unwind instructions.
 pub fn unwindStackCfa(
     eh_frame_data: []const u8,
+    section_pc_base: u64,
     start_pc: u64,
     start_sp: u64,
     functions: []const parser.FunctionInfo,
@@ -1056,6 +1059,7 @@ pub fn unwindStackCfa(
         // Use CFA unwinding to get the return address and register rules for this frame
         const result = unwindCfa(
             eh_frame_data,
+            section_pc_base,
             pc,
             @ptrCast(&virt_ctx),
             &VirtualRegCtx.regReader,
@@ -1287,11 +1291,45 @@ test "parseEhFrame extracts frame description entries" {
     const eh_frame_info = macho.sections.eh_frame orelse return error.SkipZigTest;
     const eh_frame_data = macho.getSectionData(eh_frame_info) orelse return error.SkipZigTest;
 
-    const fdes = try parseEhFrame(eh_frame_data, std.testing.allocator);
+    const fdes = try parseEhFrame(eh_frame_data, eh_frame_info.virtual_address, std.testing.allocator);
     defer std.testing.allocator.free(fdes);
 
     // The fixture has at least 2 functions (add, main), so should have FDEs
     try std.testing.expect(fdes.len > 0);
+}
+
+test "eh_frame pcrel FDE uses section virtual address as PC base" {
+    var frame_data: [45]u8 = [_]u8{0} ** 45;
+
+    // CIE with zR augmentation and DW_EH_PE_pcrel|DW_EH_PE_sdata4 FDE encoding.
+    std.mem.writeInt(u32, frame_data[0..4], 13, .little);
+    std.mem.writeInt(u32, frame_data[4..8], 0, .little);
+    frame_data[8] = 1;
+    @memcpy(frame_data[9..12], "zR\x00");
+    frame_data[12] = 1;
+    frame_data[13] = 0x78;
+    frame_data[14] = 16;
+    frame_data[15] = 1;
+    frame_data[16] = DW_EH_PE_pcrel | DW_EH_PE_sdata4;
+
+    // FDE address field is at section_base + 25. Encode target 0x401000 relative to it.
+    std.mem.writeInt(u32, frame_data[17..21], 12, .little);
+    std.mem.writeInt(u32, frame_data[21..25], 21, .little);
+    const section_base: u64 = 0x400000;
+    const field_pc = section_base + 25;
+    const relative: i32 = @intCast(@as(i64, 0x401000) - @as(i64, @intCast(field_pc)));
+    std.mem.writeInt(i32, frame_data[25..29], relative, .little);
+    std.mem.writeInt(u32, frame_data[29..33], 0x80, .little);
+    frame_data[33] = 0;
+    std.mem.writeInt(u32, frame_data[34..38], 0, .little);
+
+    const index = try buildEhFrameIndex(&frame_data, false, section_base, std.testing.allocator);
+    defer {
+        var mutable_index = index;
+        mutable_index.deinit(std.testing.allocator);
+    }
+    const fde = index.findFde(0x401020) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0x401000), fde.initial_location);
 }
 
 test "buildStackTrace produces ordered frame list" {
@@ -1595,7 +1633,7 @@ test "unwindCfa returns null for empty eh_frame" {
     };
     var dummy: u8 = 0;
     const ctx: *anyopaque = @ptrCast(&dummy);
-    const result = unwindCfa(&[_]u8{}, 0x1000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator, false);
+    const result = unwindCfa(&[_]u8{}, 0, 0x1000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator, false);
     try std.testing.expect(result == null);
 }
 
@@ -1633,6 +1671,6 @@ test "unwindCfa returns null when no FDE covers target PC" {
     // Terminator
     std.mem.writeInt(u32, frame_data[36..40], 0, .little);
 
-    const result = unwindCfa(&frame_data, 0x2000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator, false);
+    const result = unwindCfa(&frame_data, 0, 0x2000, ctx, &TestCtx.regReader, &TestCtx.memReader, null, null, std.testing.allocator, false);
     try std.testing.expect(result == null);
 }

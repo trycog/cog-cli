@@ -1,10 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const binary_macho = @import("binary_macho.zig");
+const binary_common = @import("binary.zig");
+const debug_log = @import("../../debug_log.zig");
 
 // ── ELF Binary Format Loading ──────────────────────────────────────────
 
-const DebugSections = binary_macho.DebugSections;
+const DebugSections = binary_common.DebugSections;
 
 // ELF format constants
 const ELF_MAGIC = [4]u8{ 0x7f, 'E', 'L', 'F' };
@@ -12,9 +13,10 @@ const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const SHF_COMPRESSED: u64 = 0x800;
+const PT_LOAD: u32 = 1;
 
-const SectionInfo = binary_macho.SectionInfo;
-const CompressionKind = binary_macho.CompressionKind;
+const SectionInfo = binary_common.SectionInfo;
+const CompressionKind = binary_common.CompressionKind;
 
 const Elf32Header = extern struct {
     e_ident: [16]u8,
@@ -76,13 +78,37 @@ const Elf64SectionHeader = extern struct {
     sh_entsize: u64,
 };
 
+const Elf32ProgramHeader = extern struct {
+    p_type: u32,
+    p_offset: u32,
+    p_vaddr: u32,
+    p_paddr: u32,
+    p_filesz: u32,
+    p_memsz: u32,
+    p_flags: u32,
+    p_align: u32,
+};
+
+const Elf64ProgramHeader = extern struct {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+};
+
 pub const ElfBinary = struct {
     data: []const u8,
     owned: bool,
     sections: DebugSections,
+    preferred_base: u64 = 0,
     decompressed_buffers: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !ElfBinary {
+        debug_log.log("dwarf.elf: loading binary {s}", .{path});
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
 
@@ -92,12 +118,14 @@ pub const ElfBinary = struct {
 
         const bytes_read = try file.readAll(data);
         if (bytes_read != stat.size) {
+            debug_log.log("dwarf.elf: incomplete read for {s}, expected {d} got {d}", .{ path, stat.size, bytes_read });
             allocator.free(data);
             return error.IncompleteRead;
         }
 
         var result = try parseElf(data);
         result.owned = true;
+        debug_log.log("dwarf.elf: loaded {s}, size={d}, preferred_base=0x{x} has_debug_info={}", .{ path, stat.size, result.preferred_base, result.sections.hasDebugInfo() });
         return result;
     }
 
@@ -113,6 +141,13 @@ pub const ElfBinary = struct {
         if (self.owned) {
             allocator.free(@constCast(self.data));
         }
+    }
+
+    /// Compute the signed relocation from the preferred image base to its runtime base.
+    pub fn loadBias(self: ElfBinary, runtime_base: u64) i64 {
+        const runtime: i128 = runtime_base;
+        const preferred: i128 = self.preferred_base;
+        return @intCast(runtime - preferred);
     }
 
     pub fn getSectionData(self: *const ElfBinary, info: SectionInfo) ?[]const u8 {
@@ -183,20 +218,21 @@ fn parseElf32(data: []const u8) !ElfBinary {
     const header = readStruct(Elf32Header, data, 0) catch return error.TooSmall;
 
     var sections = DebugSections{};
+    const preferred_base = preferredBase32(data, header);
 
     if (header.e_shstrndx == 0 or header.e_shnum == 0) {
-        return .{ .data = data, .owned = false, .sections = sections };
+        return .{ .data = data, .owned = false, .sections = sections, .preferred_base = preferred_base };
     }
 
     const shstrtab_offset = @as(u64, header.e_shoff) + @as(u64, header.e_shstrndx) * @as(u64, header.e_shentsize);
     const shstrtab_hdr = readStruct(Elf32SectionHeader, data, @intCast(shstrtab_offset)) catch {
-        return .{ .data = data, .owned = false, .sections = sections };
+        return .{ .data = data, .owned = false, .sections = sections, .preferred_base = preferred_base };
     };
 
     const strtab_start: usize = @intCast(shstrtab_hdr.sh_offset);
     const strtab_end = strtab_start + @as(usize, @intCast(shstrtab_hdr.sh_size));
     if (strtab_end > data.len) {
-        return .{ .data = data, .owned = false, .sections = sections };
+        return .{ .data = data, .owned = false, .sections = sections, .preferred_base = preferred_base };
     }
     const strtab = data[strtab_start..strtab_end];
 
@@ -210,6 +246,7 @@ fn parseElf32(data: []const u8) !ElfBinary {
         var info = SectionInfo{
             .offset = @as(u64, shdr.sh_offset),
             .size = @as(u64, shdr.sh_size),
+            .virtual_address = @as(u64, shdr.sh_addr),
         };
         if (shdr.sh_flags & @as(u32, @truncate(SHF_COMPRESSED)) != 0) {
             info.compression = .shf_compressed_32;
@@ -218,10 +255,12 @@ fn parseElf32(data: []const u8) !ElfBinary {
         matchDebugSection(name, info, &sections);
     }
 
+    debug_log.log("dwarf.elf: parsed ELF32 preferred_base=0x{x} debug_info={} eh_frame={}", .{ preferred_base, sections.debug_info != null, sections.eh_frame != null });
     return .{
         .data = data,
         .owned = false,
         .sections = sections,
+        .preferred_base = preferred_base,
     };
 }
 
@@ -231,20 +270,21 @@ fn parseElf64(data: []const u8) !ElfBinary {
     const header = readStruct(Elf64Header, data, 0) catch return error.TooSmall;
 
     var sections = DebugSections{};
+    const preferred_base = preferredBase64(data, header);
 
     if (header.e_shstrndx == 0 or header.e_shnum == 0) {
-        return .{ .data = data, .owned = false, .sections = sections };
+        return .{ .data = data, .owned = false, .sections = sections, .preferred_base = preferred_base };
     }
 
     const shstrtab_offset = header.e_shoff + @as(u64, header.e_shstrndx) * @as(u64, header.e_shentsize);
     const shstrtab_hdr = readStruct(Elf64SectionHeader, data, @intCast(shstrtab_offset)) catch {
-        return .{ .data = data, .owned = false, .sections = sections };
+        return .{ .data = data, .owned = false, .sections = sections, .preferred_base = preferred_base };
     };
 
     const strtab_start: usize = @intCast(shstrtab_hdr.sh_offset);
     const strtab_end = strtab_start + @as(usize, @intCast(shstrtab_hdr.sh_size));
     if (strtab_end > data.len) {
-        return .{ .data = data, .owned = false, .sections = sections };
+        return .{ .data = data, .owned = false, .sections = sections, .preferred_base = preferred_base };
     }
     const strtab = data[strtab_start..strtab_end];
 
@@ -258,6 +298,7 @@ fn parseElf64(data: []const u8) !ElfBinary {
         var info = SectionInfo{
             .offset = shdr.sh_offset,
             .size = shdr.sh_size,
+            .virtual_address = shdr.sh_addr,
         };
         if (shdr.sh_flags & SHF_COMPRESSED != 0) {
             info.compression = .shf_compressed_64;
@@ -266,11 +307,41 @@ fn parseElf64(data: []const u8) !ElfBinary {
         matchDebugSection(name, info, &sections);
     }
 
+    debug_log.log("dwarf.elf: parsed ELF64 preferred_base=0x{x} debug_info={} eh_frame={}", .{ preferred_base, sections.debug_info != null, sections.eh_frame != null });
     return .{
         .data = data,
         .owned = false,
         .sections = sections,
+        .preferred_base = preferred_base,
     };
+}
+
+fn preferredBase32(data: []const u8, header: Elf32Header) u64 {
+    var preferred: ?u64 = null;
+    if (header.e_phentsize < @sizeOf(Elf32ProgramHeader)) return 0;
+    for (0..header.e_phnum) |i| {
+        const offset = @as(u64, header.e_phoff) + @as(u64, @intCast(i)) * @as(u64, header.e_phentsize);
+        const phdr = readStruct(Elf32ProgramHeader, data, @intCast(offset)) catch continue;
+        if (phdr.p_type != PT_LOAD) continue;
+        const alignment = if (phdr.p_align > 1) phdr.p_align else 1;
+        const base = @as(u64, phdr.p_vaddr) -% (@as(u64, phdr.p_offset) % alignment);
+        preferred = if (preferred) |current| @min(current, base) else base;
+    }
+    return preferred orelse 0;
+}
+
+fn preferredBase64(data: []const u8, header: Elf64Header) u64 {
+    var preferred: ?u64 = null;
+    if (header.e_phentsize < @sizeOf(Elf64ProgramHeader)) return 0;
+    for (0..header.e_phnum) |i| {
+        const offset = header.e_phoff + @as(u64, @intCast(i)) * @as(u64, header.e_phentsize);
+        const phdr = readStruct(Elf64ProgramHeader, data, @intCast(offset)) catch continue;
+        if (phdr.p_type != PT_LOAD) continue;
+        const alignment = if (phdr.p_align > 1) phdr.p_align else 1;
+        const base = phdr.p_vaddr -% (phdr.p_offset % alignment);
+        preferred = if (preferred) |current| @min(current, base) else base;
+    }
+    return preferred orelse 0;
 }
 
 fn matchDebugSection(name: []const u8, info: SectionInfo, sections: *DebugSections) void {
@@ -378,7 +449,12 @@ fn matchDebugSection(name: []const u8, info: SectionInfo, sections: *DebugSectio
 /// If the section was also marked SHF_COMPRESSED, zdebug takes precedence
 /// since the section name determines the format.
 fn zdebugInfo(info: SectionInfo) SectionInfo {
-    return .{ .offset = info.offset, .size = info.size, .compression = .zdebug };
+    return .{
+        .offset = info.offset,
+        .size = info.size,
+        .virtual_address = info.virtual_address,
+        .compression = .zdebug,
+    };
 }
 
 fn readStruct(comptime T: type, data: []const u8, offset: usize) !T {
@@ -613,6 +689,60 @@ test "parseElf loads .debug_str_offsets and .debug_addr sections" {
     try std.testing.expect(binary.sections.debug_addr != null);
     try std.testing.expectEqual(@as(u64, str_offsets_data.len), binary.sections.debug_str_offsets.?.size);
     try std.testing.expectEqual(@as(u64, addr_data.len), binary.sections.debug_addr.?.size);
+}
+
+test "ELF64 PIE preserves load base and eh_frame virtual address" {
+    const header_size = @sizeOf(Elf64Header);
+    const phdr_size: usize = 56;
+    const shdr_size = @sizeOf(Elf64SectionHeader);
+    const num_sections = 3;
+    const phoff = header_size;
+    const shoff = phoff + phdr_size;
+    const strtab = "\x00.eh_frame\x00.shstrtab\x00";
+    const strtab_offset = shoff + num_sections * shdr_size;
+    const eh_frame_offset = strtab_offset + strtab.len;
+    const eh_frame_data = [_]u8{0xaa} ** 16;
+    const total_size = eh_frame_offset + eh_frame_data.len;
+
+    var data = [_]u8{0} ** total_size;
+    @memcpy(data[0..4], &ELF_MAGIC);
+    data[4] = ELFCLASS64;
+    data[5] = ELFDATA2LSB;
+    std.mem.writeInt(u16, data[16..18], 3, .little); // ET_DYN
+    std.mem.writeInt(u64, data[32..40], phoff, .little);
+    std.mem.writeInt(u64, data[40..48], shoff, .little);
+    std.mem.writeInt(u16, data[54..56], phdr_size, .little);
+    std.mem.writeInt(u16, data[56..58], 1, .little);
+    std.mem.writeInt(u16, data[58..60], shdr_size, .little);
+    std.mem.writeInt(u16, data[60..62], num_sections, .little);
+    std.mem.writeInt(u16, data[62..64], 2, .little);
+
+    // PT_LOAD with a non-zero preferred link-time base.
+    std.mem.writeInt(u32, data[phoff..][0..4], 1, .little);
+    std.mem.writeInt(u64, data[phoff + 8 ..][0..8], 0, .little);
+    std.mem.writeInt(u64, data[phoff + 16 ..][0..8], 0x400000, .little);
+    std.mem.writeInt(u64, data[phoff + 32 ..][0..8], total_size, .little);
+    std.mem.writeInt(u64, data[phoff + 40 ..][0..8], total_size, .little);
+    std.mem.writeInt(u64, data[phoff + 48 ..][0..8], 0x1000, .little);
+
+    const eh_shoff = shoff + shdr_size;
+    std.mem.writeInt(u32, data[eh_shoff..][0..4], 1, .little);
+    std.mem.writeInt(u64, data[eh_shoff + 16 ..][0..8], 0x401000, .little);
+    std.mem.writeInt(u64, data[eh_shoff + 24 ..][0..8], eh_frame_offset, .little);
+    std.mem.writeInt(u64, data[eh_shoff + 32 ..][0..8], eh_frame_data.len, .little);
+
+    const str_shoff = shoff + 2 * shdr_size;
+    std.mem.writeInt(u32, data[str_shoff..][0..4], 11, .little);
+    std.mem.writeInt(u64, data[str_shoff + 24 ..][0..8], strtab_offset, .little);
+    std.mem.writeInt(u64, data[str_shoff + 32 ..][0..8], strtab.len, .little);
+
+    @memcpy(data[strtab_offset..][0..strtab.len], strtab);
+    @memcpy(data[eh_frame_offset..][0..eh_frame_data.len], &eh_frame_data);
+
+    const binary = try ElfBinary.loadFromMemory(&data);
+    try std.testing.expectEqual(@as(u64, 0x400000), binary.preferred_base);
+    try std.testing.expectEqual(@as(u64, 0x401000), binary.sections.eh_frame.?.virtual_address);
+    try std.testing.expectEqual(@as(i64, 0x300000), binary.loadBias(0x700000));
 }
 
 test "loadBinary returns error for non-debug ELF binary" {

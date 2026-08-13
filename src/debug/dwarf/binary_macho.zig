@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_log = @import("../../debug_log.zig");
+const binary_common = @import("binary.zig");
 
 // ── Mach-O Binary Format Loading ───────────────────────────────────────
 
@@ -68,44 +69,9 @@ const Section64 = extern struct {
     reserved3: u32,
 };
 
-pub const CompressionKind = enum {
-    none,
-    zdebug, // GNU __zdebug_* / .zdebug_* with 12-byte header (4-byte "ZLIB" + 8-byte BE size)
-    shf_compressed_32, // ELF SHF_COMPRESSED with Elf32_Chdr (12 bytes)
-    shf_compressed_64, // ELF SHF_COMPRESSED with Elf64_Chdr (24 bytes)
-};
-
-pub const SectionInfo = struct {
-    offset: u64,
-    size: u64,
-    compression: CompressionKind = .none,
-};
-
-pub const DebugSections = struct {
-    debug_info: ?SectionInfo = null,
-    debug_abbrev: ?SectionInfo = null,
-    debug_line: ?SectionInfo = null,
-    debug_str: ?SectionInfo = null,
-    debug_str_offsets: ?SectionInfo = null,
-    debug_addr: ?SectionInfo = null,
-    debug_ranges: ?SectionInfo = null,
-    debug_aranges: ?SectionInfo = null,
-    debug_line_str: ?SectionInfo = null,
-    debug_frame: ?SectionInfo = null,
-    debug_loc: ?SectionInfo = null,
-    debug_loclists: ?SectionInfo = null,
-    debug_rnglists: ?SectionInfo = null,
-    eh_frame: ?SectionInfo = null,
-    debug_macro: ?SectionInfo = null,
-    debug_names: ?SectionInfo = null,
-    debug_types: ?SectionInfo = null,
-    debug_pubnames: ?SectionInfo = null,
-    debug_pubtypes: ?SectionInfo = null,
-
-    pub fn hasDebugInfo(self: DebugSections) bool {
-        return self.debug_info != null or self.debug_line != null;
-    }
-};
+pub const CompressionKind = binary_common.CompressionKind;
+pub const SectionInfo = binary_common.SectionInfo;
+pub const DebugSections = binary_common.DebugSections;
 
 pub const MachoBinary = struct {
     data: []const u8,
@@ -238,6 +204,7 @@ fn parseMachO(data: []const u8) !MachoBinary {
                 const info = SectionInfo{
                     .offset = sect.offset,
                     .size = sect.size,
+                    .virtual_address = sect.addr,
                 };
 
                 matchMachoDebugSection(name, info, &sections);
@@ -364,7 +331,7 @@ fn parseName(name: *const [16]u8) []const u8 {
 
 // ── N_OSO Object File Path Extraction ────────────────────────────────────
 
-/// Extract unique object file paths from N_OSO stab entries in a Mach-O binary.
+/// Extract unique object file paths from N_OSO stab entries in a Mach-O binary_common.
 /// On macOS, when a binary is compiled without dsymutil, DWARF debug info remains
 /// in the individual .o files. The symbol table contains N_OSO stab entries pointing
 /// to those object files. Returns an owned slice of owned path strings.
@@ -565,6 +532,36 @@ test "loadBinary locates .debug_str section" {
     try std.testing.expect(binary.sections.debug_str != null);
     const info = binary.sections.debug_str.?;
     try std.testing.expect(info.size > 0);
+}
+
+test "parseMachO preserves section virtual address" {
+    const header_size = @sizeOf(MachHeader64);
+    const seg_size = @sizeOf(SegmentCommand64);
+    const sect_size = @sizeOf(Section64);
+    const seg_cmdsize = seg_size + sect_size;
+    const data_offset = header_size + seg_cmdsize;
+    const total_size = data_offset + 8;
+    var data = [_]u8{0} ** total_size;
+
+    std.mem.writeInt(u32, data[0..4], MH_MAGIC_64, .little);
+    std.mem.writeInt(u32, data[16..20], 1, .little);
+
+    const seg_off = header_size;
+    std.mem.writeInt(u32, data[seg_off..][0..4], LC_SEGMENT_64, .little);
+    std.mem.writeInt(u32, data[seg_off + 4 ..][0..4], @intCast(seg_cmdsize), .little);
+    @memcpy(data[seg_off + 8 ..][0..6], "__TEXT");
+    std.mem.writeInt(u64, data[seg_off + 24 ..][0..8], 0x100000000, .little);
+    std.mem.writeInt(u32, data[seg_off + 64 ..][0..4], 1, .little);
+
+    const sect_off = seg_off + seg_size;
+    @memcpy(data[sect_off..][0..10], "__eh_frame");
+    std.mem.writeInt(u64, data[sect_off + 32 ..][0..8], 0x100001000, .little);
+    std.mem.writeInt(u64, data[sect_off + 40 ..][0..8], 8, .little);
+    std.mem.writeInt(u32, data[sect_off + 48 ..][0..4], data_offset, .little);
+
+    const binary = try MachoBinary.loadFromMemory(&data);
+    try std.testing.expectEqual(@as(u64, 0x100000000), binary.text_vmaddr);
+    try std.testing.expectEqual(@as(u64, 0x100001000), binary.sections.eh_frame.?.virtual_address);
 }
 
 test "getSectionData returns correct byte slice" {

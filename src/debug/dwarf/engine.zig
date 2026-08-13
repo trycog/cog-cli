@@ -280,8 +280,8 @@ pub const DwarfEngine = struct {
         }
 
         // Build FDE index for fast CFA unwinding
-        if (self.resolveFrameData()) |eh_frame_data| {
-            self.eh_frame_index = unwind.buildEhFrameIndex(eh_frame_data, self.is_debug_frame, self.allocator) catch null;
+        if (self.resolveFrameData()) |frame_data| {
+            self.eh_frame_index = unwind.buildEhFrameIndex(frame_data.data, frame_data.is_debug_frame, frame_data.pc_base, self.allocator) catch null;
             if (self.eh_frame_index != null) {
                 self.cie_cache = .{};
             }
@@ -1760,14 +1760,15 @@ pub const DwarfEngine = struct {
             break :blk std.mem.eql(u8, last_name, "main") or std.mem.eql(u8, last_name, "_start");
         };
         if (!fp_complete) {
-            if (self.resolveFrameData()) |eh_frame_data| {
+            if (self.resolveFrameData()) |frame_data| {
                 var cfa_ctx = CfaReaderCtx{
                     .regs = regs,
                     .process = &self.process,
                     .allocator = self.allocator,
                 };
                 const cfa_frames = unwind.unwindStackCfa(
-                    eh_frame_data,
+                    frame_data.data,
+                    frame_data.pc_base,
                     regs.pc,
                     regs.sp,
                     self.functions,
@@ -1780,7 +1781,7 @@ pub const DwarfEngine = struct {
                     50,
                     if (self.eh_frame_index) |*idx| idx else null,
                     if (self.cie_cache) |*cc| cc else null,
-                    self.is_debug_frame,
+                    frame_data.is_debug_frame,
                 ) catch fp_frames;
 
                 // Use CFA result only if it's better than FP result
@@ -1960,16 +1961,21 @@ pub const DwarfEngine = struct {
         };
     }
 
-    /// Resolve .eh_frame or .debug_frame section data from available binaries.
-    /// Tries .eh_frame first, then falls back to .debug_frame (used by Go binaries).
-    /// Sets self.is_debug_frame accordingly.
-    fn resolveFrameData(self: *DwarfEngine) ?[]const u8 {
+    const FrameData = struct {
+        data: []const u8,
+        pc_base: u64,
+        is_debug_frame: bool,
+    };
+
+    /// Resolve .eh_frame or .debug_frame bytes together with the section PC base.
+    /// The PC base is required for DW_EH_PE_pcrel encoded FDE addresses.
+    fn resolveFrameData(self: *DwarfEngine) ?FrameData {
         // Try .eh_frame first
         if (self.dsym_binary) |*dsym| {
             if (dsym.sections.eh_frame) |s| {
                 if ((dsym.getSectionDataAlloc(self.allocator, s) catch null) orelse dsym.getSectionData(s)) |d| {
                     self.is_debug_frame = false;
-                    return d;
+                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = false };
                 }
             }
         }
@@ -1977,7 +1983,7 @@ pub const DwarfEngine = struct {
             if (bin.sections.eh_frame) |s| {
                 if ((bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s)) |d| {
                     self.is_debug_frame = false;
-                    return d;
+                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = false };
                 }
             }
         }
@@ -1985,7 +1991,7 @@ pub const DwarfEngine = struct {
             if (elf.sections.eh_frame) |s| {
                 if ((elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s)) |d| {
                     self.is_debug_frame = false;
-                    return d;
+                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = false };
                 }
             }
         }
@@ -1994,7 +2000,7 @@ pub const DwarfEngine = struct {
             if (dsym.sections.debug_frame) |s| {
                 if ((dsym.getSectionDataAlloc(self.allocator, s) catch null) orelse dsym.getSectionData(s)) |d| {
                     self.is_debug_frame = true;
-                    return d;
+                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = true };
                 }
             }
         }
@@ -2002,7 +2008,7 @@ pub const DwarfEngine = struct {
             if (bin.sections.debug_frame) |s| {
                 if ((bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s)) |d| {
                     self.is_debug_frame = true;
-                    return d;
+                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = true };
                 }
             }
         }
@@ -2010,7 +2016,7 @@ pub const DwarfEngine = struct {
             if (elf.sections.debug_frame) |s| {
                 if ((elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s)) |d| {
                     self.is_debug_frame = true;
-                    return d;
+                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = true };
                 }
             }
         }
@@ -2063,7 +2069,7 @@ pub const DwarfEngine = struct {
     /// Compute the Canonical Frame Address from .eh_frame/.debug_frame.
     /// Uses the existing unwind infrastructure (EhFrameIndex, CieCache) for O(log n) lookup.
     fn computeCfa(self: *DwarfEngine, regs: process_mod.RegisterState) ?u64 {
-        const eh_frame_data = self.resolveFrameData() orelse return null;
+        const frame_data = self.resolveFrameData() orelse return null;
         // For .debug_frame, FDE addresses are absolute DWARF addresses.
         // Convert runtime PC to DWARF space for correct FDE lookup and CFA execution.
         const target_pc: u64 = if (self.is_debug_frame and self.aslr_slide != 0) blk: {
@@ -2078,7 +2084,8 @@ pub const DwarfEngine = struct {
             .allocator = self.allocator,
         };
         const result = unwind.unwindCfa(
-            eh_frame_data,
+            frame_data.data,
+            frame_data.pc_base,
             target_pc,
             @ptrCast(&cfa_ctx),
             &CfaReaderCtx.regReader,
@@ -2086,7 +2093,7 @@ pub const DwarfEngine = struct {
             if (self.eh_frame_index) |*idx| idx else null,
             if (self.cie_cache) |*cc| cc else null,
             self.allocator,
-            self.is_debug_frame,
+            frame_data.is_debug_frame,
         ) orelse return null;
         return result.cfa;
     }
