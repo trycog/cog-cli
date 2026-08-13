@@ -35,9 +35,9 @@ pub const Decoder = struct {
         const tag = try self.readVarint();
         const wire_raw: u3 = @truncate(tag);
         const wire_type = std.meta.intToEnum(WireType, wire_raw) catch return error.InvalidWireType;
-        const number: u32 = @intCast(tag >> 3);
-        if (number == 0) return error.InvalidFieldNumber;
-        return .{ .number = number, .wire_type = wire_type };
+        const number_raw = tag >> 3;
+        if (number_raw == 0 or number_raw > 0x1FFFFFFF) return error.InvalidFieldNumber;
+        return .{ .number = @intCast(number_raw), .wire_type = wire_type };
     }
 
     /// Read a varint (LEB128).
@@ -56,10 +56,11 @@ pub const Decoder = struct {
 
     /// Read a length-delimited field as a sub-slice (zero-copy).
     pub fn readLengthDelimited(self: *Decoder) ![]const u8 {
-        const len: usize = @intCast(try self.readVarint());
-        if (self.pos + len > self.data.len) return error.UnexpectedEndOfData;
-        const result = self.data[self.pos .. self.pos + len];
-        self.pos += len;
+        const len = std.math.cast(usize, try self.readVarint()) orelse return error.LengthOverflow;
+        const end = std.math.add(usize, self.pos, len) catch return error.LengthOverflow;
+        if (end > self.data.len) return error.UnexpectedEndOfData;
+        const result = self.data[self.pos..end];
+        self.pos = end;
         return result;
     }
 
@@ -95,19 +96,19 @@ pub const Decoder = struct {
             .VARINT => {
                 _ = try self.readVarint();
             },
-            .I64 => {
-                if (self.pos + 8 > self.data.len) return error.UnexpectedEndOfData;
-                self.pos += 8;
-            },
+            .I64 => try self.skipBytes(8),
             .LEN => {
                 _ = try self.readLengthDelimited();
             },
-            .I32 => {
-                if (self.pos + 4 > self.data.len) return error.UnexpectedEndOfData;
-                self.pos += 4;
-            },
+            .I32 => try self.skipBytes(4),
             .SGROUP, .EGROUP => return error.UnsupportedWireType,
         }
+    }
+
+    fn skipBytes(self: *Decoder, len: usize) !void {
+        const end = std.math.add(usize, self.pos, len) catch return error.LengthOverflow;
+        if (end > self.data.len) return error.UnexpectedEndOfData;
+        self.pos = end;
     }
 };
 
@@ -136,6 +137,7 @@ pub const Encoder = struct {
 
     /// Write a field tag (field number + wire type).
     pub fn writeField(self: *Encoder, number: u32, wire_type: WireType) !void {
+        if (number == 0 or number > 0x1FFFFFFF) return error.InvalidFieldNumber;
         const tag: u64 = (@as(u64, number) << 3) | @intFromEnum(wire_type);
         try self.writeVarint(tag);
     }
@@ -228,6 +230,16 @@ test "readField LEN type" {
     try std.testing.expectEqual(WireType.LEN, f.wire_type);
 }
 
+test "readField rejects oversized field number" {
+    var d = Decoder.init(&.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 });
+    try std.testing.expectError(error.InvalidFieldNumber, d.readField());
+}
+
+test "readField rejects reserved wire type" {
+    var d = Decoder.init(&.{0x0E});
+    try std.testing.expectError(error.InvalidWireType, d.readField());
+}
+
 test "readLengthDelimited" {
     // length=5, then 5 bytes of data
     var d = Decoder.init(&.{ 0x05, 'h', 'e', 'l', 'l', 'o' });
@@ -241,6 +253,27 @@ test "readLengthDelimited truncated" {
     var d = Decoder.init(&.{ 0x05, 'h', 'e', 'l' });
     const result = d.readLengthDelimited();
     try std.testing.expectError(error.UnexpectedEndOfData, result);
+}
+
+test "readLengthDelimited rejects lengths wider than usize" {
+    if (@bitSizeOf(usize) >= @bitSizeOf(u64)) return error.SkipZigTest;
+
+    var bytes: [11]u8 = undefined;
+    bytes[0] = 0xFF;
+    bytes[1] = 0xFF;
+    bytes[2] = 0xFF;
+    bytes[3] = 0xFF;
+    bytes[4] = 0x1F;
+    @memset(bytes[5..], 0);
+
+    var d = Decoder.init(&bytes);
+    try std.testing.expectError(error.LengthOverflow, d.readLengthDelimited());
+}
+
+test "readLengthDelimited rejects length addition overflow" {
+    var bytes: [11]u8 = .{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00 };
+    var d = Decoder.init(&bytes);
+    try std.testing.expectError(error.LengthOverflow, d.readLengthDelimited());
 }
 
 test "readString alias" {
@@ -297,6 +330,14 @@ test "skipField LEN" {
     try std.testing.expectEqual(@as(u32, 2), f2.number);
     const v = try d.readVarint();
     try std.testing.expectEqual(@as(u64, 42), v);
+}
+
+test "skipField fixed widths reject position overflow" {
+    var d64 = Decoder{ .data = &.{}, .pos = std.math.maxInt(usize) - 3 };
+    try std.testing.expectError(error.LengthOverflow, d64.skipField(.I64));
+
+    var d32 = Decoder{ .data = &.{}, .pos = std.math.maxInt(usize) - 1 };
+    try std.testing.expectError(error.LengthOverflow, d32.skipField(.I32));
 }
 
 test "nested message decoding" {
@@ -362,6 +403,16 @@ test "Encoder writeField" {
     // field 2, LEN => (2 << 3) | 2 = 0x12
     try enc.writeField(2, .LEN);
     try std.testing.expectEqualSlices(u8, &.{0x12}, enc.data.items);
+}
+
+test "Encoder writeField rejects invalid field numbers" {
+    const allocator = std.testing.allocator;
+    var enc = Encoder.init(allocator);
+    defer enc.deinit();
+
+    try std.testing.expectError(error.InvalidFieldNumber, enc.writeField(0, .LEN));
+    try std.testing.expectError(error.InvalidFieldNumber, enc.writeField(0x20000000, .LEN));
+    try std.testing.expectEqual(@as(usize, 0), enc.data.items.len);
 }
 
 test "Encoder writeString" {
