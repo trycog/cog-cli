@@ -91,10 +91,10 @@ pub const ObserveServer = struct {
     session_manager: session_mod.SessionManager,
     mutex: std.Thread.Mutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator) ObserveServer {
+    pub fn init(allocator: std.mem.Allocator) !ObserveServer {
         return .{
             .allocator = allocator,
-            .session_manager = session_mod.SessionManager.init(allocator),
+            .session_manager = try session_mod.SessionManager.init(allocator),
         };
     }
 
@@ -146,6 +146,11 @@ pub const ObserveServer = struct {
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Invalid backend. Must be one of: syscall, gpu, net, cost" } };
         };
 
+        if (!backend.isImplemented()) {
+            debug_log.log("toolStart: rejecting unavailable backend={s} reason={s}", .{ backend.toString(), backend.unavailableReason() });
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = backend.unavailableReason() } };
+        }
+
         const target_pid: ?i64 = if (a.object.get("pid")) |v| (if (v == .integer) v.integer else null) else null;
 
         debug_log.log("toolStart: backend={s} pid={?d}", .{ backend.toString(), target_pid });
@@ -195,8 +200,12 @@ pub const ObserveServer = struct {
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
         };
 
-        const limit: i64 = if (a.object.get("limit")) |v| (if (v == .integer) v.integer else 100) else 100;
-        const offset: i64 = if (a.object.get("offset")) |v| (if (v == .integer) v.integer else 0) else 0;
+        const limit = parseBoundedInteger(a.object.get("limit"), 100, 1, 1000) orelse {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "limit must be an integer between 1 and 1000" } };
+        };
+        const offset = parseBoundedInteger(a.object.get("offset"), 0, 0, 1_000_000) orelse {
+            return .{ .err = .{ .code = INVALID_PARAMS, .message = "offset must be an integer between 0 and 1000000" } };
+        };
 
         var stmt = session.db.prepare("SELECT id, timestamp_ns, event_type, pid, tid, data_json FROM events WHERE session_id = ? ORDER BY timestamp_ns LIMIT ? OFFSET ?") catch {
             return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to query events" } };
@@ -216,7 +225,10 @@ pub const ObserveServer = struct {
         jw.beginArray() catch return error.OutOfMemory;
 
         while (true) {
-            const row = stmt.step() catch break;
+            const row = stmt.step() catch {
+                debug_log.log("toolEvents: query execution failed", .{});
+                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed while reading observation events" } };
+            };
             if (row != .row) break;
 
             jw.beginObject() catch return error.OutOfMemory;
@@ -247,13 +259,23 @@ pub const ObserveServer = struct {
     }
 
     fn toolSessions(self: *ObserveServer, allocator: std.mem.Allocator, args: ?json.Value) !ToolResult {
-        _ = args;
         debug_log.log("toolSessions: entered", .{});
 
-        const sessions = self.session_manager.listSessions(allocator) catch {
-            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to list sessions" } };
+        var status_filter: ?types.SessionStatus = null;
+        if (args) |a| {
+            if (a != .object) return .{ .err = .{ .code = INVALID_PARAMS, .message = "Arguments must be object" } };
+            if (a.object.get("status")) |status_value| {
+                if (status_value != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "status must be a string" } };
+                status_filter = types.SessionStatus.fromString(status_value.string) orelse {
+                    return .{ .err = .{ .code = INVALID_PARAMS, .message = "Invalid status. Must be one of: capturing, stopped, finalized, error" } };
+                };
+            }
+        }
+
+        const sessions = self.session_manager.listSessions(allocator, status_filter) catch {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to list observation sessions; one or more databases may be corrupt" } };
         };
-        defer allocator.free(sessions);
+        defer self.session_manager.freeSessionInfos(allocator, sessions);
 
         var aw: Writer.Allocating = .init(allocator);
         errdefer aw.deinit();
@@ -275,12 +297,25 @@ pub const ObserveServer = struct {
                 jw.objectField("pid") catch return error.OutOfMemory;
                 jw.write(pid) catch return error.OutOfMemory;
             }
+            jw.objectField("event_count") catch return error.OutOfMemory;
+            jw.write(s.event_count) catch return error.OutOfMemory;
             jw.endObject() catch return error.OutOfMemory;
         }
 
         jw.endArray() catch return error.OutOfMemory;
         jw.objectField("total") catch return error.OutOfMemory;
         jw.write(sessions.len) catch return error.OutOfMemory;
+        jw.objectField("corrupt_databases") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+        for (self.session_manager.corruptDatabasePaths()) |path| {
+            jw.beginObject() catch return error.OutOfMemory;
+            jw.objectField("path") catch return error.OutOfMemory;
+            jw.write(path) catch return error.OutOfMemory;
+            jw.objectField("reason") catch return error.OutOfMemory;
+            jw.write("database could not be opened or did not contain one valid observation session") catch return error.OutOfMemory;
+            jw.endObject() catch return error.OutOfMemory;
+        }
+        jw.endArray() catch return error.OutOfMemory;
         jw.endObject() catch return error.OutOfMemory;
 
         return .{ .ok = try aw.toOwnedSlice() };
@@ -294,11 +329,12 @@ pub const ObserveServer = struct {
 
         return okJson(allocator, .{
             .active_sessions = count,
+            .corrupt_database_count = self.session_manager.corruptDatabasePaths().len,
             .backends = .{
-                .syscall = "not_available",
-                .gpu = "not_available",
-                .net = "not_available",
-                .cost = "not_available",
+                .syscall = .{ .available = types.Backend.syscall.isImplemented(), .reason = types.Backend.syscall.unavailableReason() },
+                .gpu = .{ .available = types.Backend.gpu.isImplemented(), .reason = types.Backend.gpu.unavailableReason() },
+                .net = .{ .available = types.Backend.net.isImplemented(), .reason = types.Backend.net.unavailableReason() },
+                .cost = .{ .available = types.Backend.cost.isImplemented(), .reason = types.Backend.cost.unavailableReason() },
             },
             .platform = @tagName(@import("builtin").os.tag),
         });
@@ -335,7 +371,10 @@ pub const ObserveServer = struct {
         jw.beginArray() catch return error.OutOfMemory;
 
         while (true) {
-            const row = stmt.step() catch break;
+            const row = stmt.step() catch {
+                debug_log.log("toolCausalChains: query execution failed", .{});
+                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed while reading causal chains" } };
+            };
             if (row != .row) break;
 
             jw.beginObject() catch return error.OutOfMemory;
@@ -399,12 +438,20 @@ pub const ObserveServer = struct {
         jw.beginArray() catch return error.OutOfMemory;
 
         while (true) {
-            const row = stmt.step() catch break;
+            const row = stmt.step() catch {
+                debug_log.log("toolQuery: query execution failed", .{});
+                return .{ .err = .{ .code = INVALID_PARAMS, .message = "SQL query failed during execution" } };
+            };
             if (row != .row) break;
 
-            // Each row as an array of text values
+            // Each row as an array of text values.
+            const column_count = stmt.columnCount();
+            if (column_count < 0 or column_count > @as(c_int, @intCast(MAX_QUERY_COLUMNS))) {
+                debug_log.log("toolQuery: rejecting result column_count={d}", .{column_count});
+                return .{ .err = .{ .code = INVALID_PARAMS, .message = "SQL query returns too many columns" } };
+            }
             jw.beginArray() catch return error.OutOfMemory;
-            const col_count: usize = @intCast(stmt.columnCount());
+            const col_count: usize = @intCast(column_count);
             var col: usize = 0;
             while (col < col_count) : (col += 1) {
                 const text = stmt.columnText(@intCast(col));
@@ -414,7 +461,7 @@ pub const ObserveServer = struct {
             row_count += 1;
 
             // Safety limit
-            if (row_count >= 1000) break;
+            if (row_count >= MAX_QUERY_ROWS) break;
         }
 
         jw.endArray() catch return error.OutOfMemory;
@@ -436,38 +483,151 @@ fn okJson(allocator: std.mem.Allocator, value: anytype) !ToolResult {
     return .{ .ok = try aw.toOwnedSlice() };
 }
 
-/// Check if a SQL query is read-only (SELECT only).
-fn isReadOnlyQuery(sql: []const u8) bool {
-    // Skip leading whitespace
-    var i: usize = 0;
-    while (i < sql.len and (sql[i] == ' ' or sql[i] == '\t' or sql[i] == '\n' or sql[i] == '\r')) : (i += 1) {}
-    if (i + 6 > sql.len) return false;
+const MAX_SQL_BYTES: usize = 64 * 1024;
+const MAX_QUERY_ROWS: usize = 1000;
+const MAX_QUERY_COLUMNS: usize = 256;
 
-    // Case-insensitive check for "SELECT"
-    const prefix = sql[i .. i + 6];
-    return (std.ascii.eqlIgnoreCase(prefix, "SELECT") or std.ascii.eqlIgnoreCase(prefix, "EXPLAI"));
+fn parseBoundedInteger(value: ?json.Value, default_value: i64, min: i64, max: i64) ?i64 {
+    const result = if (value) |v| switch (v) {
+        .integer => |integer| integer,
+        else => return null,
+    } else default_value;
+    if (result < min or result > max) return null;
+    return result;
+}
+
+fn isSqlIdentifierByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn isForbiddenSqlToken(token: []const u8) bool {
+    const forbidden = [_][]const u8{
+        "INSERT", "UPDATE",   "DELETE",    "REPLACE", "CREATE",         "DROP",      "ALTER",
+        "ATTACH", "DETACH",   "PRAGMA",    "VACUUM",  "REINDEX",        "ANALYZE",   "BEGIN",
+        "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "LOAD_EXTENSION", "WRITEFILE",
+    };
+    for (forbidden) |candidate| {
+        if (std.ascii.eqlIgnoreCase(token, candidate)) return true;
+    }
+    return false;
+}
+
+/// Validate one bounded, comment-free, read-only SQLite statement.
+fn isReadOnlyQuery(sql: []const u8) bool {
+    if (sql.len == 0 or sql.len > MAX_SQL_BYTES) return false;
+
+    var first_token: ?[]const u8 = null;
+    var second_token: ?[]const u8 = null;
+    var third_token: ?[]const u8 = null;
+    var fourth_token: ?[]const u8 = null;
+    var statement_ended = false;
+    var i: usize = 0;
+
+    while (i < sql.len) {
+        const byte = sql[i];
+        if (byte == 0) return false;
+        if (std.ascii.isWhitespace(byte)) {
+            i += 1;
+            continue;
+        }
+        if (statement_ended) return false;
+        if (byte == '-' and i + 1 < sql.len and sql[i + 1] == '-') return false;
+        if (byte == '/' and i + 1 < sql.len and sql[i + 1] == '*') return false;
+        if (byte == ';') {
+            statement_ended = true;
+            i += 1;
+            continue;
+        }
+
+        if (byte == '\'' or byte == '"' or byte == '`' or byte == '[') {
+            const closing: u8 = if (byte == '[') ']' else byte;
+            i += 1;
+            var closed = false;
+            while (i < sql.len) {
+                if (sql[i] == 0) return false;
+                if (sql[i] == closing) {
+                    if (closing != ']' and i + 1 < sql.len and sql[i + 1] == closing) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if (!closed) return false;
+            continue;
+        }
+
+        if (isSqlIdentifierByte(byte)) {
+            const start = i;
+            while (i < sql.len and isSqlIdentifierByte(sql[i])) : (i += 1) {}
+            const token = sql[start..i];
+            if (isForbiddenSqlToken(token)) return false;
+            if (first_token == null) {
+                first_token = token;
+            } else if (second_token == null) {
+                second_token = token;
+            } else if (third_token == null) {
+                third_token = token;
+            } else if (fourth_token == null) {
+                fourth_token = token;
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    const first = first_token orelse return false;
+    if (std.ascii.eqlIgnoreCase(first, "SELECT") or std.ascii.eqlIgnoreCase(first, "WITH")) return true;
+    if (!std.ascii.eqlIgnoreCase(first, "EXPLAIN")) return false;
+
+    const second = second_token orelse return false;
+    if (std.ascii.eqlIgnoreCase(second, "SELECT") or std.ascii.eqlIgnoreCase(second, "WITH")) return true;
+    return std.ascii.eqlIgnoreCase(second, "QUERY") and
+        third_token != null and
+        std.ascii.eqlIgnoreCase(third_token.?, "PLAN") and
+        fourth_token != null and
+        (std.ascii.eqlIgnoreCase(fourth_token.?, "SELECT") or std.ascii.eqlIgnoreCase(fourth_token.?, "WITH"));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
-test "isReadOnlyQuery accepts SELECT" {
+test "isReadOnlyQuery accepts one bounded SELECT statement" {
     try std.testing.expect(isReadOnlyQuery("SELECT * FROM events"));
-    try std.testing.expect(isReadOnlyQuery("  SELECT count(*) FROM events"));
+    try std.testing.expect(isReadOnlyQuery("  SELECT count(*) FROM events;  "));
     try std.testing.expect(isReadOnlyQuery("select id from sessions"));
+    try std.testing.expect(isReadOnlyQuery("WITH recent AS (SELECT * FROM events) SELECT * FROM recent"));
     try std.testing.expect(isReadOnlyQuery("EXPLAIN SELECT * FROM events"));
+    try std.testing.expect(isReadOnlyQuery("EXPLAIN QUERY PLAN SELECT * FROM events"));
+    try std.testing.expect(!isReadOnlyQuery("EXPLAIN QUERY PLAN"));
 }
 
-test "isReadOnlyQuery rejects writes" {
+test "isReadOnlyQuery rejects writes comments and additional statements" {
     try std.testing.expect(!isReadOnlyQuery("INSERT INTO events VALUES (1)"));
     try std.testing.expect(!isReadOnlyQuery("UPDATE events SET pid = 1"));
     try std.testing.expect(!isReadOnlyQuery("DELETE FROM events"));
     try std.testing.expect(!isReadOnlyQuery("DROP TABLE events"));
     try std.testing.expect(!isReadOnlyQuery("ALTER TABLE events ADD COLUMN x"));
+    try std.testing.expect(!isReadOnlyQuery("SELECT * FROM events; DELETE FROM events"));
+    try std.testing.expect(!isReadOnlyQuery("SELECT 'safe'; DROP TABLE events"));
+    try std.testing.expect(!isReadOnlyQuery("SELECT * FROM events -- hidden write\n; DELETE FROM events"));
+    try std.testing.expect(!isReadOnlyQuery("/* comment */ SELECT * FROM events"));
     try std.testing.expect(!isReadOnlyQuery(""));
 }
 
+test "query bounds reject invalid pagination" {
+    try std.testing.expectEqual(@as(?i64, 100), parseBoundedInteger(null, 100, 1, 1000));
+    try std.testing.expectEqual(@as(?i64, null), parseBoundedInteger(.{ .integer = 0 }, 100, 1, 1000));
+    try std.testing.expectEqual(@as(?i64, null), parseBoundedInteger(.{ .integer = 1001 }, 100, 1, 1000));
+    try std.testing.expectEqual(@as(?i64, 250), parseBoundedInteger(.{ .integer = 250 }, 100, 1, 1000));
+    try std.testing.expectEqual(@as(?i64, null), parseBoundedInteger(.{ .string = "10" }, 100, 1, 1000));
+}
+
 test "callTool dispatches known tools" {
-    var server = ObserveServer.init(std.testing.allocator);
+    var server = try ObserveServer.init(std.testing.allocator);
     defer server.deinit();
 
     // observe_status requires no arguments
@@ -481,8 +641,34 @@ test "callTool dispatches known tools" {
     }
 }
 
+test "observe_start rejects unavailable backend without creating database" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    var server = try ObserveServer.init(std.testing.allocator);
+    defer server.deinit();
+
+    var args = json.ObjectMap.init(std.testing.allocator);
+    defer args.deinit();
+    try args.put("backend", .{ .string = "syscall" });
+
+    const result = try server.callTool(std.testing.allocator, "observe_start", .{ .object = args });
+    switch (result) {
+        .err => |err| try std.testing.expect(std.mem.indexOf(u8, err.message, "not implemented") != null),
+        else => return error.UnexpectedResult,
+    }
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(".cog/observe", .{}));
+}
+
 test "callTool returns error for unknown tool" {
-    var server = ObserveServer.init(std.testing.allocator);
+    var server = try ObserveServer.init(std.testing.allocator);
     defer server.deinit();
 
     const result = try server.callTool(std.testing.allocator, "observe_nonexistent", null);

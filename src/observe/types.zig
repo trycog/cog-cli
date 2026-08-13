@@ -23,6 +23,21 @@ pub const Backend = enum {
         if (std.mem.eql(u8, s, "cost")) return .cost;
         return null;
     }
+
+    /// Whether this build includes a working capture implementation.
+    pub fn isImplemented(_: Backend) bool {
+        return false;
+    }
+
+    /// Explain why this backend cannot currently start a session.
+    pub fn unavailableReason(self: Backend) []const u8 {
+        return switch (self) {
+            .syscall => "syscall capture backend is not implemented in this build",
+            .gpu => "GPU capture backend is not implemented in this build",
+            .net => "network capture backend is not implemented in this build",
+            .cost => "cost capture backend is not implemented in this build",
+        };
+    }
 };
 
 /// Status of an observation session.
@@ -92,6 +107,14 @@ test "Backend round-trip" {
         try std.testing.expectEqual(b, parsed.?);
     }
     try std.testing.expect(Backend.fromString("unknown") == null);
+}
+
+test "Backend reports implementation availability and reasons" {
+    const backends = [_]Backend{ .syscall, .gpu, .net, .cost };
+    for (backends) |backend| {
+        try std.testing.expect(!backend.isImplemented());
+        try std.testing.expect(backend.unavailableReason().len > 0);
+    }
 }
 
 test "SessionStatus round-trip" {
