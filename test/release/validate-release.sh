@@ -88,6 +88,10 @@ create_artifacts() {
         chmod +x "$payload/cog"
         tar -czf "$fixture/artifacts/cog-$target.tar.gz" -C "$payload" cog
     done
+
+    if [ "$mode" = extra ]; then
+        cp "$fixture/artifacts/cog-linux-x86_64.tar.gz" "$fixture/artifacts/cog-windows-x86_64.tar.gz"
+    fi
 }
 
 run_case() {
@@ -127,7 +131,7 @@ ZON
 CHANGELOG
 
     case "$artifact_mode" in
-        good|wrong-version|wrong-format)
+        good|wrong-version|wrong-format|extra)
             create_artifacts "$fixture" "$artifact_mode"
             ;;
         missing)
@@ -207,6 +211,7 @@ fi
 run_case "accepts versioned release artifacts" success "Release artifacts validated for source version 1.2.3" v1.2.3 good
 run_case "handles temporary paths containing spaces" success "Release artifacts validated for source version 1.2.3" v1.2.3 good true
 run_case "rejects missing release artifacts" failure "release artifact set does not match expected targets" v1.2.3 missing
+run_case "rejects extra release artifacts" failure "release artifact set does not match expected targets" v1.2.3 extra
 run_case "rejects artifact source version drift" failure "reports version 1.2.2, expected 1.2.3" v1.2.3 wrong-version
 run_case "rejects wrong non-host artifact format" failure "has unexpected binary format" v1.2.3 wrong-format
 
@@ -254,7 +259,10 @@ end
         missing-checksum-entry)
             ruby -e 'lines = File.readlines(ARGV.fetch(0)); File.write(ARGV.fetch(0), lines.drop(1).join)' "$fixture/artifacts/SHA256SUMS"
             ;;
-        provenance-failure) ;;
+        checksum-subject-mismatch)
+            ruby -pi -e 'sub(/cog-linux-x86_64\.tar\.gz/, "cog-linux-amd64.tar.gz") if $. == 3' "$fixture/artifacts/SHA256SUMS"
+            ;;
+        provenance-failure|provenance-digest-mismatch) ;;
         *)
             printf 'unknown integrity mode: %s\n' "$integrity_mode" >&2
             exit 2
@@ -269,6 +277,10 @@ if [ "${PROVENANCE_FAILURE:-false}" = true ]; then
     printf 'provenance verification failed\n' >&2
     exit 1
 fi
+if [ "${PROVENANCE_DIGEST_MISMATCH:-false}" = true ] && printf '%s' "$*" | grep -F 'cog-darwin-arm64.tar.gz' >/dev/null; then
+    printf 'provenance digest does not match\n' >&2
+    exit 1
+fi
 FAKE_GH
     chmod +x "$fixture/fake-gh"
 
@@ -280,6 +292,7 @@ FAKE_GH
         SOURCE_REPOSITORY=trycog/cog-cli \
         SIGNER_WORKFLOW=trycog/cog-cli/.github/workflows/release.yml \
         PROVENANCE_FAILURE=$(if [ "$integrity_mode" = provenance-failure ]; then printf true; else printf false; fi) \
+        PROVENANCE_DIGEST_MISMATCH=$(if [ "$integrity_mode" = provenance-digest-mismatch ]; then printf true; else printf false; fi) \
         ./validate-release.sh v1.2.3 "$fixture/artifacts" "$fixture/release-notes.md" "$fixture/provenance.json" 2>&1)
     status=$?
     set -e
@@ -314,7 +327,9 @@ FAKE_GH
 run_integrity_case "accepts checksums and provenance for release artifacts" success "Release integrity validated for source version 1.2.3" good
 run_integrity_case "rejects a checksum mismatch" failure "SHA256SUMS digest mismatch" bad-checksum
 run_integrity_case "rejects an incomplete checksum manifest" failure "SHA256SUMS must list exactly the release artifacts" missing-checksum-entry
+run_integrity_case "rejects checksum subject mismatch" failure "SHA256SUMS must list exactly the release artifacts" checksum-subject-mismatch
 run_integrity_case "rejects provenance verification failure" failure "provenance verification failed" provenance-failure
+run_integrity_case "rejects provenance subject digest mismatch" failure "provenance verification failed for cog-darwin-arm64.tar.gz" provenance-digest-mismatch
 
 workflow="$ROOT/.github/workflows/release.yml"
 ci_workflow="$ROOT/.github/workflows/ci.yml"
