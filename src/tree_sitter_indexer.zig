@@ -1076,6 +1076,200 @@ test "indexFile TSX emits import and call captures" {
     try std.testing.expect(saw_import_occurrence);
 }
 
+fn expectSymbolKind(doc: scip.Document, name: []const u8, kind: i32) !scip.SymbolInformation {
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, name)) {
+            try std.testing.expectEqual(kind, sym.kind);
+            return sym;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn expectCallOccurrence(doc: scip.Document, name: []const u8) !scip.Occurrence {
+    for (doc.occurrences) |occ| {
+        if (!std.mem.startsWith(u8, occ.symbol, "cog/call/")) continue;
+        if (std.mem.eql(u8, occ.symbol["cog/call/".len..], name)) return occ;
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn expectImportOccurrence(doc: scip.Document, label: []const u8) !void {
+    for (doc.occurrences) |occ| {
+        if ((occ.symbol_roles & scip.SymbolRole.Import) == 0) continue;
+        if (!std.mem.startsWith(u8, occ.symbol, "cog/import/")) continue;
+        if (std.mem.eql(u8, occ.symbol["cog/import/".len..], label)) return;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "indexFile JavaScript anchors member calls to the property" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\function helper() {}
+        \\function run() {
+        \\    service.helper();
+        \\}
+    ;
+
+    const config = findBuiltinConfig("javascript") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/app.js", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    const call = try expectCallOccurrence(doc, "helper");
+    try std.testing.expectEqual(@as(i32, 2), call.range.start_line);
+    try std.testing.expect(call.enclosing_range != null);
+}
+
+test "indexFile Java emits imports constructors fields and calls" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\import java.util.List;
+        \\import static java.util.Collections.emptyList;
+        \\class Widget {
+        \\    private int count;
+        \\    Widget() { helper(); }
+        \\    void helper() {}
+        \\    void run() { this.helper(); }
+        \\}
+    ;
+
+    const config = findBuiltinConfig("java") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/Widget.java", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    var found_class = false;
+    var found_constructor = false;
+    var found_field = false;
+    for (doc.symbols) |sym| {
+        if (std.mem.eql(u8, sym.display_name, "Widget") and sym.kind == 7) found_class = true;
+        if (std.mem.eql(u8, sym.display_name, "Widget") and sym.kind == 9) found_constructor = true;
+        if (std.mem.eql(u8, sym.display_name, "count") and sym.kind == 15) found_field = true;
+    }
+    try std.testing.expect(found_class);
+    try std.testing.expect(found_constructor);
+    try std.testing.expect(found_field);
+    _ = try expectSymbolKind(doc, "helper", 26);
+    _ = try expectSymbolKind(doc, "run", 26);
+    _ = try expectCallOccurrence(doc, "helper");
+    try expectImportOccurrence(doc, "java.util.List");
+    try expectImportOccurrence(doc, "java.util.Collections.emptyList");
+}
+
+test "indexFile C emits calls inside complete function ranges" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\void helper(void) {}
+        \\void run(void) {
+        \\    helper();
+        \\}
+    ;
+
+    const config = findBuiltinConfig("c") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/main.c", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    _ = try expectSymbolKind(doc, "helper", 17);
+    _ = try expectSymbolKind(doc, "run", 17);
+    const call = try expectCallOccurrence(doc, "helper");
+    try std.testing.expect(call.enclosing_range != null);
+    try std.testing.expectEqual(@as(i32, 3), call.enclosing_range.?.end_line);
+}
+
+test "indexFile C++ emits free and member calls" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\void helper() {}
+        \\struct Worker { void work() {} };
+        \\void run(Worker &worker) {
+        \\    helper();
+        \\    worker.work();
+        \\}
+    ;
+
+    const config = findBuiltinConfig("cpp") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/main.cpp", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    _ = try expectCallOccurrence(doc, "helper");
+    _ = try expectCallOccurrence(doc, "work");
+}
+
+test "indexFile Rust keeps valid new symbol" {
+    const allocator = std.testing.allocator;
+    var indexer = Indexer.init();
+    defer indexer.deinit();
+
+    const source =
+        \\fn new() {}
+        \\fn run() { new(); }
+    ;
+
+    const config = findBuiltinConfig("rust") orelse return error.TestUnexpectedResult;
+    const result = try indexer.indexFile(allocator, source, "src/lib.rs", config);
+    const doc = result.doc;
+    defer {
+        for (doc.symbols) |sym| {
+            allocator.free(sym.documentation);
+            allocator.free(sym.relationships);
+        }
+        allocator.free(doc.occurrences);
+        allocator.free(doc.symbols);
+        allocator.free(result.string_data);
+    }
+
+    _ = try expectSymbolKind(doc, "new", 17);
+    _ = try expectCallOccurrence(doc, "new");
+}
+
 test "indexFile Markdown" {
     const allocator = std.testing.allocator;
     var indexer = Indexer.init();
