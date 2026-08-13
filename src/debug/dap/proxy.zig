@@ -6,14 +6,30 @@ const types = @import("../types.zig");
 const driver_mod = @import("../driver.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
+const debug_log = @import("../../debug_log.zig");
+const paths = @import("../../paths.zig");
 
 // Debug logging to file (stderr not visible when running as MCP subprocess)
 var dap_log_file: ?std.fs.File = null;
 
 fn dapLog(comptime fmt: []const u8, args: anytype) void {
     if (dap_log_file == null) {
-        dap_log_file = std.fs.cwd().createFile("/tmp/cog-dap-debug.log", .{ .truncate = false }) catch null;
-        if (dap_log_file) |f| f.seekFromEnd(0) catch {};
+        const path = paths.getDapLogPath(std.heap.page_allocator) catch |err| {
+            debug_log.log("dapLog: failed to resolve diagnostic log path: {s}", .{@errorName(err)});
+            return;
+        };
+        defer std.heap.page_allocator.free(path);
+        debug_log.log("dapLog: opening diagnostic log {s}", .{path});
+        dap_log_file = std.fs.createFileAbsolute(path, .{ .truncate = false, .mode = 0o600 }) catch |err| blk: {
+            debug_log.log("dapLog: failed to open {s}: {s}", .{ path, @errorName(err) });
+            break :blk null;
+        };
+        if (dap_log_file) |f| {
+            if (@import("builtin").os.tag != .windows) f.chmod(0o600) catch |err| {
+                debug_log.log("dapLog: failed to restrict {s}: {s}", .{ path, @errorName(err) });
+            };
+            f.seekFromEnd(0) catch |err| debug_log.log("dapLog: failed to seek {s}: {s}", .{ path, @errorName(err) });
+        }
     }
     const f = dap_log_file orelse return;
     var buf: [128]u8 = undefined;

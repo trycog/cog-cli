@@ -16,8 +16,22 @@ var server_log_file: ?std.fs.File = null;
 
 fn serverLog(comptime fmt: []const u8, args: anytype) void {
     if (server_log_file == null) {
-        server_log_file = std.fs.cwd().createFile("/tmp/cog-dap-debug.log", .{ .truncate = false }) catch null;
-        if (server_log_file) |f| f.seekFromEnd(0) catch {};
+        const path = paths.getDapLogPath(std.heap.page_allocator) catch |err| {
+            debug_log.log("serverLog: failed to resolve diagnostic log path: {s}", .{@errorName(err)});
+            return;
+        };
+        defer std.heap.page_allocator.free(path);
+        debug_log.log("serverLog: opening diagnostic log {s}", .{path});
+        server_log_file = std.fs.createFileAbsolute(path, .{ .truncate = false, .mode = 0o600 }) catch |err| blk: {
+            debug_log.log("serverLog: failed to open {s}: {s}", .{ path, @errorName(err) });
+            break :blk null;
+        };
+        if (server_log_file) |f| {
+            if (@import("builtin").os.tag != .windows) f.chmod(0o600) catch |err| {
+                debug_log.log("serverLog: failed to restrict {s}: {s}", .{ path, @errorName(err) });
+            };
+            f.seekFromEnd(0) catch |err| debug_log.log("serverLog: failed to seek {s}: {s}", .{ path, @errorName(err) });
+        }
     }
     const f = server_log_file orelse return;
     var buf: [128]u8 = undefined;
