@@ -5429,6 +5429,83 @@ test "CodeIndex build resolves later cross-document calls and uses smallest encl
     try std.testing.expectEqualStrings("local src/caller.js:1", callers.items[0].symbol);
 }
 
+test "CodeIndex build canonicalizes later cross-document imports" {
+    const allocator = std.testing.allocator;
+
+    var importer_occurrences = try allocator.alloc(scip.Occurrence, 1);
+    importer_occurrences[0] = .{
+        .range = .{ .start_line = 0, .start_char = 20, .end_line = 0, .end_char = 28 },
+        .symbol = "cog/import/src/helper",
+        .symbol_roles = scip.SymbolRole.Import,
+        .syntax_kind = 0,
+    };
+
+    var importer_symbols = try allocator.alloc(scip.SymbolInformation, 1);
+    importer_symbols[0] = .{
+        .symbol = "local src/main.ts:0",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 17,
+        .display_name = "main",
+        .enclosing_symbol = "",
+    };
+
+    var target_occurrences = try allocator.alloc(scip.Occurrence, 1);
+    target_occurrences[0] = .{
+        .range = .{ .start_line = 0, .start_char = 0, .end_line = 0, .end_char = 6 },
+        .symbol = "local src/helper.ts:0",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 0, .start_char = 0, .end_line = 0, .end_char = 20 },
+    };
+
+    var target_symbols = try allocator.alloc(scip.SymbolInformation, 1);
+    target_symbols[0] = .{
+        .symbol = "local src/helper.ts:0",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 17,
+        .display_name = "helper",
+        .enclosing_symbol = "",
+    };
+
+    var documents = try allocator.alloc(scip.Document, 2);
+    documents[0] = .{
+        .language = "typescript",
+        .relative_path = "src/main.ts",
+        .occurrences = importer_occurrences,
+        .symbols = importer_symbols,
+    };
+    documents[1] = .{
+        .language = "typescript",
+        .relative_path = "src/helper.ts",
+        .occurrences = target_occurrences,
+        .symbols = target_symbols,
+    };
+
+    const index: scip.Index = .{
+        .metadata = .{
+            .version = 0,
+            .tool_info = .{ .name = "test", .version = "1.0" },
+            .project_root = "file:///test",
+            .text_document_encoding = 0,
+        },
+        .documents = documents,
+        .external_symbols = &.{},
+    };
+
+    var ci = try CodeIndex.build(allocator, index);
+    defer deinitTestIndex(&ci, allocator);
+
+    const imports = ci.getFileImports("src/main.ts") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), imports.items.len);
+    try std.testing.expectEqualStrings("src/helper.ts", imports.items[0].label);
+
+    const output = try queryImportsInner(allocator, &ci, null, "src/helper.ts", .incoming);
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "src/main.ts") != null);
+}
+
 // ── Disambiguation Tests ────────────────────────────────────────────────
 
 /// Helper to build a synthetic CodeIndex for disambiguation tests.
