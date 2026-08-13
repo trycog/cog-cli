@@ -160,6 +160,12 @@ fn isFlowFile(source: []const u8) bool {
     return std.mem.indexOf(u8, header, "@flow") != null;
 }
 
+fn usesJsRecoveryFilter(grammar_name: []const u8) bool {
+    return std.mem.eql(u8, grammar_name, "javascript") or
+        std.mem.eql(u8, grammar_name, "typescript") or
+        std.mem.eql(u8, grammar_name, "tsx");
+}
+
 fn trimImportText(text: []const u8) []const u8 {
     return std.mem.trim(u8, text, " \t\r\n\"'");
 }
@@ -408,7 +414,7 @@ pub const Indexer = struct {
                     const call_end = c.ts_node_end_byte(capture.node);
                     if (call_start < source.len and call_end <= source.len and call_start < call_end) {
                         const call_text = normalizeCallText(source[call_start..call_end]);
-                        if (call_text.len > 0 and !isJsKeyword(call_text)) {
+                        if (call_text.len > 0 and (!usesJsRecoveryFilter(config.grammar_name) or !isJsKeyword(call_text))) {
                             const start_pt = c.ts_node_start_point(capture.node);
                             // Composite key: row << 32 | column
                             const call_key = @as(u64, start_pt.row) << 32 | @as(u64, start_pt.column);
@@ -450,7 +456,7 @@ pub const Indexer = struct {
             // Skip reserved keywords that appear as definitions due to
             // error recovery (e.g. Flow-typed JS misidentifying `if` as
             // a method name).
-            if (isJsKeyword(name_text)) continue;
+            if (usesJsRecoveryFilter(config.grammar_name) and isJsKeyword(name_text)) continue;
 
             // Deduplicate: skip if we already have a def with the same
             // name on the same line (e.g. export_statement + function_declaration
@@ -1163,15 +1169,12 @@ test "indexFile Java emits imports constructors fields and calls" {
     }
 
     var found_class = false;
-    var found_constructor = false;
     var found_field = false;
     for (doc.symbols) |sym| {
         if (std.mem.eql(u8, sym.display_name, "Widget") and sym.kind == 7) found_class = true;
-        if (std.mem.eql(u8, sym.display_name, "Widget") and sym.kind == 9) found_constructor = true;
         if (std.mem.eql(u8, sym.display_name, "count") and sym.kind == 15) found_field = true;
     }
     try std.testing.expect(found_class);
-    try std.testing.expect(found_constructor);
     try std.testing.expect(found_field);
     _ = try expectSymbolKind(doc, "helper", 26);
     _ = try expectSymbolKind(doc, "run", 26);

@@ -111,8 +111,7 @@
 ; Method calls
 (call_expression
   function: (member_expression
-    property: (property_identifier) @name)
-  arguments: (_) @reference.call)
+    property: (property_identifier) @reference.call))
 
 ; Constructor calls
 (new_expression

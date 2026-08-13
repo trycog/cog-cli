@@ -2,7 +2,20 @@
 
 (declaration type: (union_specifier name: (type_identifier) @name)) @definition.class
 
-(function_declarator declarator: (identifier) @name) @definition.function
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @definition.function
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @name)) @definition.function
+
+(call_expression
+  function: (identifier) @reference.call)
+
+(call_expression
+  function: (field_expression
+    field: (field_identifier) @reference.call))
 
 (type_definition declarator: (type_identifier) @name) @definition.type
 

@@ -396,6 +396,7 @@ pub const builtins = [_]Extension{
             .scip_name = "java",
         } },
         .scip_indexer = .{ .command = "scip-java", .args = &.{ "{file}", "--output", "{output}" } },
+        .architecture = .{ .imports = true, .calls = true, .containment = true },
         .debug = .{ .dap = .{
             .adapter_command = "java",
             .adapter_args = &.{ "-cp", "{adapter_path}", "JdiDapServer" },
@@ -448,6 +449,7 @@ pub const builtins = [_]Extension{
             .query_source = @embedFile("queries/c.scm"),
             .scip_name = "c",
         } },
+        .architecture = .{ .calls = true, .containment = true },
         .debug = .{ .native = .{} },
     },
     // C++
@@ -460,6 +462,7 @@ pub const builtins = [_]Extension{
             .query_source = @embedFile("queries/cpp.scm"),
             .scip_name = "cpp",
         } },
+        .architecture = .{ .calls = true, .containment = true },
         .debug = .{ .native = .{} },
     },
     // Bash
