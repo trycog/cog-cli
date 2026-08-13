@@ -128,13 +128,14 @@ pub fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
     };
     defer runtime_dir.close();
 
-    var temp = fs_util.createSecureTempFile(runtime_dir, allocator, "debug-entitlements") catch |err| {
+    const temp = fs_util.createSecureTempFile(runtime_dir, allocator, "debug-entitlements") catch |err| {
         debug_log.log("ensureDebugEntitlements: failed to create entitlement file: {s}", .{@errorName(err)});
         printErr("error: could not create entitlement file\n");
         return error.Explained;
     };
     defer allocator.free(temp.name);
-    defer temp.file.close();
+    var temp_file_open = true;
+    defer if (temp_file_open) temp.file.close();
     defer runtime_dir.deleteFile(temp.name) catch |err| {
         debug_log.log("ensureDebugEntitlements: failed to remove {s}: {s}", .{ temp.name, @errorName(err) });
     };
@@ -150,6 +151,8 @@ pub fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
         printErr("error: could not sync entitlement file\n");
         return error.Explained;
     };
+    temp.file.close();
+    temp_file_open = false;
     const entitlement_path = std.fs.path.join(allocator, &.{ runtime_dir_path, temp.name }) catch |err| {
         debug_log.log("ensureDebugEntitlements: failed to resolve entitlement path: {s}", .{@errorName(err)});
         return error.Explained;
