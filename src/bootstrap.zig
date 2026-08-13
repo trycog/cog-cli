@@ -1751,12 +1751,12 @@ fn workerThread(shared: *WorkerShared) void {
 
         const result = runSubsystem(shared.allocator, subsystem, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug, shared.timeout_ms, shared.model, shared.bootstrap_prompt, shared.use_tui);
         if (result.success) {
-            shared.consecutive_errors.store(0, .release);
-            const done = shared.done_count.fetchAdd(1, .monotonic) + 1;
-            _ = shared.atomic_input_tokens.fetchAdd(result.input_tokens, .monotonic);
-            _ = shared.atomic_output_tokens.fetchAdd(result.output_tokens, .monotonic);
-            _ = shared.atomic_cost.fetchAdd(result.cost_microdollars, .monotonic);
-            const duped = shared.allocator.dupe(u8, subsystem.id) catch continue;
+            const duped = shared.allocator.dupe(u8, subsystem.id) catch |err| {
+                debug_log.log("workerThread: failed to allocate checkpoint key: {s}", .{@errorName(err)});
+                shared.checkpoint_failed.store(true, .release);
+                shared.abort.store(true, .release);
+                break;
+            };
             shared.checkpoint_mutex.lock();
             const checkpoint_result = blk: {
                 shared.processed.put(shared.allocator, duped, {}) catch |err| {
@@ -1773,6 +1773,11 @@ fn workerThread(shared: *WorkerShared) void {
                 shared.abort.store(true, .release);
                 break;
             }
+            shared.consecutive_errors.store(0, .release);
+            const done = shared.done_count.fetchAdd(1, .monotonic) + 1;
+            _ = shared.atomic_input_tokens.fetchAdd(result.input_tokens, .monotonic);
+            _ = shared.atomic_output_tokens.fetchAdd(result.output_tokens, .monotonic);
+            _ = shared.atomic_cost.fetchAdd(result.cost_microdollars, .monotonic);
 
             if (shared.use_tui) {
                 shared.tui_mutex.lock();
