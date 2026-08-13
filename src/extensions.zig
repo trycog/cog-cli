@@ -2059,7 +2059,58 @@ test "prepareInstallResult frees partial ownership on allocation failure" {
     );
 }
 
-test "writeInstallMetadata writes pretty JSON atomically" {
+test "parseSha256Digest accepts canonical GitHub asset digests" {
+    const digest = try parseSha256Digest("sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+        },
+        &digest,
+    );
+    try std.testing.expectError(error.InvalidArtifactDigest, parseSha256Digest("sha512:abcd"));
+    try std.testing.expectError(error.InvalidArtifactDigest, parseSha256Digest("sha256:not-hex"));
+}
+
+test "chooseRelease requires one digest-bearing tar archive asset" {
+    const releases = [_]ReleaseInfo{
+        .{
+            .tag_name = "v1.2.3",
+            .tarball_url = "https://api.github.com/repos/example/cog-safe/tarball/v1.2.3",
+            .draft = false,
+            .prerelease = false,
+            .assets = &.{
+                .{ .name = "cog-safe-1.2.3.tar.gz", .download_url = "https://github.com/example/cog-safe/releases/download/v1.2.3/cog-safe-1.2.3.tar.gz", .digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+            },
+        },
+    };
+    const selected = try chooseReleaseArtifact(&releases[0]);
+    try std.testing.expectEqualStrings("cog-safe-1.2.3.tar.gz", selected.name);
+    try std.testing.expectError(error.MissingArtifactDigest, chooseReleaseArtifact(&.{
+        .tag_name = "v1.2.3",
+        .tarball_url = "unused",
+        .draft = false,
+        .prerelease = false,
+        .assets = &.{
+            .{ .name = "cog-safe-1.2.3.tar.gz", .download_url = "https://example.com/archive.tar.gz", .digest = null },
+        },
+    }));
+    try std.testing.expectError(error.AmbiguousReleaseArchive, chooseReleaseArtifact(&.{
+        .tag_name = "v1.2.3",
+        .tarball_url = "unused",
+        .draft = false,
+        .prerelease = false,
+        .assets = &.{
+            .{ .name = "one.tar.gz", .download_url = "https://example.com/one.tar.gz", .digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+            .{ .name = "two.tgz", .download_url = "https://example.com/two.tgz", .digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+        },
+    }));
+}
+
+test "writeInstallMetadata writes verified digest as pretty atomic JSON" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2069,7 +2120,8 @@ test "writeInstallMetadata writes pretty JSON atomically" {
     const release: ResolvedRelease = .{
         .tag_name = @constCast("v1.2.3"),
         .version = @constCast("1.2.3"),
-        .tarball_url = @constCast("https://example.com/archive.tar.gz"),
+        .archive_url = @constCast("https://example.com/archive.tar.gz"),
+        .archive_sha256 = @constCast("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
     };
 
     try writeInstallMetadata(allocator, ext_dir, "https://github.com/example/cog-safe", release);
@@ -2080,10 +2132,15 @@ test "writeInstallMetadata writes pretty JSON atomically" {
         \\{
         \\  "source_url": "https://github.com/example/cog-safe",
         \\  "version": "1.2.3",
-        \\  "tag": "v1.2.3"
+        \\  "tag": "v1.2.3",
+        \\  "archive_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         \\}
         \\
     , contents);
+
+    const metadata = try readInstallMetadata(allocator, ext_dir);
+    defer freeInstallMetadata(allocator, &metadata);
+    try std.testing.expectEqualStrings(release.archive_sha256, metadata.archive_sha256.?);
 
     var dir = try tmp.dir.openDir(".", .{ .iterate = true });
     defer dir.close();
@@ -2091,6 +2148,41 @@ test "writeInstallMetadata writes pretty JSON atomically" {
     while (try iterator.next()) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".cog-extension-install.json.tmp-"));
     }
+}
+
+test "readInstallMetadata accepts legacy metadata without digest for refresh" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = install_metadata_filename,
+        .data =
+        \\{
+        \\  "source_url": "https://github.com/example/cog-safe",
+        \\  "version": "1.2.3",
+        \\  "tag": "v1.2.3"
+        \\}
+        ,
+    });
+    const ext_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ext_dir);
+
+    const metadata = try readInstallMetadata(allocator, ext_dir);
+    defer freeInstallMetadata(allocator, &metadata);
+    try std.testing.expect(metadata.archive_sha256 == null);
+    try std.testing.expect(extensionNeedsUpdate(&metadata, "v1.2.3", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+}
+
+test "extensionNeedsUpdate compares both release tag and verified digest" {
+    const metadata: InstallMetadata = .{
+        .source_url = @constCast("https://github.com/example/cog-safe"),
+        .version = @constCast("1.2.3"),
+        .tag = @constCast("v1.2.3"),
+        .archive_sha256 = @constCast("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+    };
+    try std.testing.expect(!extensionNeedsUpdate(&metadata, "v1.2.3", metadata.archive_sha256.?));
+    try std.testing.expect(extensionNeedsUpdate(&metadata, "v1.2.4", metadata.archive_sha256.?));
+    try std.testing.expect(extensionNeedsUpdate(&metadata, "v1.2.3", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
 }
 
 test "resolveByExtension finds built-in for .go" {
