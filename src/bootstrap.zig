@@ -501,6 +501,9 @@ fn memInfo(allocator: std.mem.Allocator) !void {
     printErr("\n");
 }
 
+const active_engram_filter =
+    "deprecated_at IS NULL AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))";
+
 fn countBrainQuery(db: *sqlite.Db, sql: [*:0]const u8, brain_id: []const u8) i64 {
     var stmt = db.prepare(sql) catch return 0;
     defer stmt.finalize();
@@ -508,6 +511,61 @@ fn countBrainQuery(db: *sqlite.Db, sql: [*:0]const u8, brain_id: []const u8) i64
     const result = stmt.step() catch return 0;
     if (result == .row) return stmt.columnInt(0);
     return 0;
+}
+
+fn countUpgradeableEngrams(db: *sqlite.Db, brain_id: []const u8) i64 {
+    return countBrainQuery(db, "SELECT count(*) FROM engrams WHERE brain_id = ? AND " ++ active_engram_filter, brain_id);
+}
+
+fn countUpgradeableSynapses(db: *sqlite.Db, brain_id: []const u8) i64 {
+    return countBrainQuery(db,
+        \\SELECT count(*) FROM synapses s
+        \\JOIN engrams source ON source.id = s.source_id
+        \\JOIN engrams target ON target.id = s.target_id
+        \\WHERE s.brain_id = ?
+        \\  AND source.deprecated_at IS NULL AND (source.expires_at IS NULL OR datetime(source.expires_at) > datetime('now'))
+        \\  AND target.deprecated_at IS NULL AND (target.expires_at IS NULL OR datetime(target.expires_at) > datetime('now'))
+    , brain_id);
+}
+
+fn countInactiveEngrams(db: *sqlite.Db, brain_id: []const u8) i64 {
+    return countBrainQuery(db,
+        \\SELECT count(*) FROM engrams
+        \\WHERE brain_id = ?
+        \\  AND (deprecated_at IS NOT NULL OR (expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')))
+    , brain_id);
+}
+
+fn prepareUpgradeableEngrams(db: *sqlite.Db, brain_id: []const u8, after_rowid: i64) !sqlite.Stmt {
+    var stmt = try db.prepare("SELECT rowid, id, term, definition, memory_term, weight FROM engrams WHERE brain_id = ? AND " ++ active_engram_filter ++ " AND rowid > ? ORDER BY rowid");
+    errdefer stmt.finalize();
+    try stmt.bindText(1, brain_id);
+    try stmt.bindInt(2, after_rowid);
+    return stmt;
+}
+
+fn prepareUpgradeableSynapses(db: *sqlite.Db, brain_id: []const u8, after_rowid: i64) !sqlite.Stmt {
+    var stmt = try db.prepare(
+        \\SELECT s.rowid, s.id, s.source_id, s.target_id, s.relation, s.weight,
+        \\       source.term AS source_term, target.term AS target_term
+        \\FROM synapses s
+        \\JOIN engrams source ON s.source_id = source.id
+        \\JOIN engrams target ON s.target_id = target.id
+        \\WHERE s.brain_id = ?
+        \\  AND source.deprecated_at IS NULL AND (source.expires_at IS NULL OR datetime(source.expires_at) > datetime('now'))
+        \\  AND target.deprecated_at IS NULL AND (target.expires_at IS NULL OR datetime(target.expires_at) > datetime('now'))
+        \\  AND s.rowid > ?
+        \\ORDER BY s.rowid
+    );
+    errdefer stmt.finalize();
+    try stmt.bindText(1, brain_id);
+    try stmt.bindInt(2, after_rowid);
+    return stmt;
+}
+
+fn shouldOfferLocalBrainDeletion(inactive_count: i64) bool {
+    _ = inactive_count;
+    return false;
 }
 
 fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -565,8 +623,9 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         return error.Explained;
     };
 
-    const total_engrams: usize = @intCast(@max(countBrainQuery(&db, "SELECT count(*) FROM engrams WHERE brain_id = ?", local.brain_id), 0));
-    const total_synapses: usize = @intCast(@max(countBrainQuery(&db, "SELECT count(*) FROM synapses WHERE brain_id = ?", local.brain_id), 0));
+    const total_engrams: usize = @intCast(@max(countUpgradeableEngrams(&db, local.brain_id), 0));
+    const total_synapses: usize = @intCast(@max(countUpgradeableSynapses(&db, local.brain_id), 0));
+    const inactive_engrams = countInactiveEngrams(&db, local.brain_id);
 
     printErr(bold ++ "  Upgrade to Hosted Memory" ++ reset ++ "\n\n");
     printErr(bold ++ "  Local brain: " ++ reset);
@@ -712,14 +771,16 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         const cp_host = try allocator.dupe(u8, host);
 
         checkpoint = UploadCheckpoint{
-            .version = 1,
+            .version = 2,
             .target_url = target_url,
             .username = cp_username,
             .brain_name = cp_brain_name,
             .host = cp_host,
             .engrams_uploaded = 0,
+            .engram_cursor = 0,
             .total_engrams = total_engrams,
             .synapses_uploaded = 0,
+            .synapse_cursor = 0,
             .total_synapses = total_synapses,
         };
         try saveUploadCheckpoint(allocator, checkpoint_path, &checkpoint.?);
@@ -737,151 +798,130 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     defer allocator.free(assoc_url);
 
     // ── Engrams ──
-    if (cp.engrams_uploaded < total_engrams) {
-        debug_log.log("memUpgrade: uploading engrams ({d}/{d})", .{ cp.engrams_uploaded, total_engrams });
+    debug_log.log("memUpgrade: uploading engrams ({d}/{d}) after rowid={d}", .{ cp.engrams_uploaded, total_engrams, cp.engram_cursor });
 
-        var engram_stmt = db.prepare("SELECT id, term, definition, memory_term, weight FROM engrams WHERE brain_id = ?") catch {
-            printErr("  error: failed to query engrams\n");
+    var engram_stmt = prepareUpgradeableEngrams(&db, local.brain_id, cp.engram_cursor) catch {
+        printErr("  error: failed to query engrams\n");
+        return error.Explained;
+    };
+    defer engram_stmt.finalize();
+
+    var uploaded: usize = cp.engrams_uploaded;
+    while (true) {
+        const row = engram_stmt.step() catch |err| {
+            debug_log.log("memUpgrade: engram query failed: {s}", .{@errorName(err)});
+            printErr("\n  error: failed while reading engrams\n");
             return error.Explained;
         };
-        defer engram_stmt.finalize();
-        engram_stmt.bindText(1, local.brain_id) catch {
-            printErr("  error: failed to bind brain_id\n");
+        if (row != .row) break;
+
+        const rowid = engram_stmt.columnInt(0);
+        const term = engram_stmt.columnText(2) orelse "";
+        const definition = engram_stmt.columnText(3) orelse "";
+        const memory_term = engram_stmt.columnText(4) orelse "long";
+
+        // Build single-item payload
+        var aw: std.io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var s: json.Stringify = .{ .writer = &aw.writer };
+        s.beginObject() catch break;
+        s.objectField("items") catch break;
+        s.beginArray() catch break;
+        s.beginObject() catch break;
+        s.objectField("term") catch break;
+        s.write(term) catch break;
+        s.objectField("definition") catch break;
+        s.write(definition) catch break;
+        s.objectField("memory_term") catch break;
+        s.write(memory_term) catch break;
+        s.endObject() catch break;
+        s.endArray() catch break;
+        s.endObject() catch break;
+        const body = aw.toOwnedSlice() catch break;
+        defer allocator.free(body);
+
+        debug_log.log("memUpgrade: POST engram {d}/{d}", .{ uploaded + 1, total_engrams });
+        const resp = client.apiPost(allocator, learn_url, api_key, body) catch {
+            printErr("\n  error: failed to upload engram\n");
             return error.Explained;
         };
+        defer allocator.free(resp.body);
 
-        // Skip already-uploaded rows
-        var skip: usize = cp.engrams_uploaded;
-        while (skip > 0) : (skip -= 1) {
-            const row = engram_stmt.step() catch break;
-            if (row != .row) break;
+        if (resp.status_code != 200 and resp.status_code != 201) {
+            printFmtErr(allocator, "\n  error: learn failed (HTTP {d})\n", .{resp.status_code});
+            return error.Explained;
         }
 
-        var uploaded: usize = cp.engrams_uploaded;
-        while (true) {
-            const row = engram_stmt.step() catch break;
-            if (row != .row) break;
-
-            const term = engram_stmt.columnText(1) orelse "";
-            const definition = engram_stmt.columnText(2) orelse "";
-            const memory_term = engram_stmt.columnText(3) orelse "long";
-
-            // Build single-item payload
-            var aw: std.io.Writer.Allocating = .init(allocator);
-            defer aw.deinit();
-            var s: json.Stringify = .{ .writer = &aw.writer };
-            s.beginObject() catch break;
-            s.objectField("items") catch break;
-            s.beginArray() catch break;
-            s.beginObject() catch break;
-            s.objectField("term") catch break;
-            s.write(term) catch break;
-            s.objectField("definition") catch break;
-            s.write(definition) catch break;
-            s.objectField("memory_term") catch break;
-            s.write(memory_term) catch break;
-            s.endObject() catch break;
-            s.endArray() catch break;
-            s.endObject() catch break;
-            const body = aw.toOwnedSlice() catch break;
-            defer allocator.free(body);
-
-            debug_log.log("memUpgrade: POST engram {d}/{d}", .{ uploaded + 1, total_engrams });
-            const resp = client.apiPost(allocator, learn_url, api_key, body) catch {
-                printErr("\n  error: failed to upload engram\n");
-                return error.Explained;
-            };
-            defer allocator.free(resp.body);
-
-            if (resp.status_code != 200 and resp.status_code != 201) {
-                printFmtErr(allocator, "\n  error: learn failed (HTTP {d})\n", .{resp.status_code});
-                return error.Explained;
-            }
-
-            uploaded += 1;
-            cp.engrams_uploaded = uploaded;
-            try saveUploadCheckpoint(allocator, checkpoint_path, cp);
-            tui.uploadProgressUpdate(uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
-        }
+        uploaded += 1;
+        cp.engrams_uploaded = uploaded;
+        cp.engram_cursor = rowid;
+        try saveUploadCheckpoint(allocator, checkpoint_path, cp);
+        tui.uploadProgressUpdate(uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
     }
 
     // ── Synapses ──
-    if (cp.synapses_uploaded < total_synapses) {
-        debug_log.log("memUpgrade: uploading synapses ({d}/{d})", .{ cp.synapses_uploaded, total_synapses });
+    debug_log.log("memUpgrade: uploading synapses ({d}/{d}) after rowid={d}", .{ cp.synapses_uploaded, total_synapses, cp.synapse_cursor });
 
-        var synapse_stmt = db.prepare(
-            "SELECT s.source_id, s.target_id, s.relation, s.weight, " ++
-                "e1.term as source_term, e2.term as target_term " ++
-                "FROM synapses s " ++
-                "JOIN engrams e1 ON s.source_id = e1.id " ++
-                "JOIN engrams e2 ON s.target_id = e2.id " ++
-                "WHERE s.brain_id = ?",
-        ) catch {
-            printErr("  error: failed to query synapses\n");
+    var synapse_stmt = prepareUpgradeableSynapses(&db, local.brain_id, cp.synapse_cursor) catch {
+        printErr("  error: failed to query synapses\n");
+        return error.Explained;
+    };
+    defer synapse_stmt.finalize();
+
+    uploaded = cp.synapses_uploaded;
+    while (true) {
+        const row = synapse_stmt.step() catch |err| {
+            debug_log.log("memUpgrade: synapse query failed: {s}", .{@errorName(err)});
+            printErr("\n  error: failed while reading synapses\n");
             return error.Explained;
         };
-        defer synapse_stmt.finalize();
-        synapse_stmt.bindText(1, local.brain_id) catch {
-            printErr("  error: failed to bind brain_id\n");
+        if (row != .row) break;
+
+        const rowid = synapse_stmt.columnInt(0);
+        const source_term = synapse_stmt.columnText(6) orelse "";
+        const target_term = synapse_stmt.columnText(7) orelse "";
+        const relation = synapse_stmt.columnText(4) orelse "related_to";
+        const weight = synapse_stmt.columnReal(5);
+
+        // Build single-item payload
+        var aw: std.io.Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var s: json.Stringify = .{ .writer = &aw.writer };
+        s.beginObject() catch break;
+        s.objectField("items") catch break;
+        s.beginArray() catch break;
+        s.beginObject() catch break;
+        s.objectField("source") catch break;
+        s.write(source_term) catch break;
+        s.objectField("target") catch break;
+        s.write(target_term) catch break;
+        s.objectField("relation") catch break;
+        s.write(relation) catch break;
+        s.objectField("weight") catch break;
+        s.write(weight) catch break;
+        s.endObject() catch break;
+        s.endArray() catch break;
+        s.endObject() catch break;
+        const body = aw.toOwnedSlice() catch break;
+        defer allocator.free(body);
+
+        debug_log.log("memUpgrade: POST synapse {d}/{d}", .{ uploaded + 1, total_synapses });
+        const resp = client.apiPost(allocator, assoc_url, api_key, body) catch {
+            printErr("\n  error: failed to upload synapse\n");
             return error.Explained;
         };
+        defer allocator.free(resp.body);
 
-        // Skip already-uploaded rows
-        var skip: usize = cp.synapses_uploaded;
-        while (skip > 0) : (skip -= 1) {
-            const row = synapse_stmt.step() catch break;
-            if (row != .row) break;
+        if (resp.status_code != 200 and resp.status_code != 201) {
+            printFmtErr(allocator, "\n  error: associate failed (HTTP {d})\n", .{resp.status_code});
+            return error.Explained;
         }
 
-        var uploaded: usize = cp.synapses_uploaded;
-        while (true) {
-            const row = synapse_stmt.step() catch break;
-            if (row != .row) break;
-
-            const source_term = synapse_stmt.columnText(4) orelse "";
-            const target_term = synapse_stmt.columnText(5) orelse "";
-            const relation = synapse_stmt.columnText(2) orelse "related_to";
-            const weight = synapse_stmt.columnReal(3);
-
-            // Build single-item payload
-            var aw: std.io.Writer.Allocating = .init(allocator);
-            defer aw.deinit();
-            var s: json.Stringify = .{ .writer = &aw.writer };
-            s.beginObject() catch break;
-            s.objectField("items") catch break;
-            s.beginArray() catch break;
-            s.beginObject() catch break;
-            s.objectField("source") catch break;
-            s.write(source_term) catch break;
-            s.objectField("target") catch break;
-            s.write(target_term) catch break;
-            s.objectField("relation") catch break;
-            s.write(relation) catch break;
-            s.objectField("weight") catch break;
-            s.write(weight) catch break;
-            s.endObject() catch break;
-            s.endArray() catch break;
-            s.endObject() catch break;
-            const body = aw.toOwnedSlice() catch break;
-            defer allocator.free(body);
-
-            debug_log.log("memUpgrade: POST synapse {d}/{d}", .{ uploaded + 1, total_synapses });
-            const resp = client.apiPost(allocator, assoc_url, api_key, body) catch {
-                printErr("\n  error: failed to upload synapse\n");
-                return error.Explained;
-            };
-            defer allocator.free(resp.body);
-
-            if (resp.status_code != 200 and resp.status_code != 201) {
-                printFmtErr(allocator, "\n  error: associate failed (HTTP {d})\n", .{resp.status_code});
-                return error.Explained;
-            }
-
-            uploaded += 1;
-            cp.synapses_uploaded = uploaded;
-            try saveUploadCheckpoint(allocator, checkpoint_path, cp);
-            tui.uploadProgressUpdate(cp.engrams_uploaded, total_engrams, uploaded, total_synapses);
-        }
+        uploaded += 1;
+        cp.synapses_uploaded = uploaded;
+        cp.synapse_cursor = rowid;
+        try saveUploadCheckpoint(allocator, checkpoint_path, cp);
+        tui.uploadProgressUpdate(cp.engrams_uploaded, total_engrams, uploaded, total_synapses);
     }
 
     tui.uploadProgressFinish(cp.engrams_uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
@@ -894,7 +934,7 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     debug_log.log("memUpgrade: POST stats at {s}", .{stats_url});
     const stats_resp = client.apiPost(allocator, stats_url, api_key, "{}") catch {
         printErr("skipped (connection error)\n\n");
-        return upgradeFinalize(allocator, cp, checkpoint_path, local.path);
+        return upgradeFinalize(allocator, cp, checkpoint_path, local.path, inactive_engrams);
     };
     defer allocator.free(stats_resp.body);
 
@@ -937,7 +977,7 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         printFmtErr(allocator, "{d})\n", .{stats_resp.status_code});
     }
 
-    return upgradeFinalize(allocator, cp, checkpoint_path, local.path);
+    return upgradeFinalize(allocator, cp, checkpoint_path, local.path, inactive_engrams);
 }
 
 // ── Upload checkpoint ─────────────────────────────────────────────────
@@ -949,8 +989,10 @@ const UploadCheckpoint = struct {
     brain_name: []const u8,
     host: []const u8,
     engrams_uploaded: usize,
+    engram_cursor: i64,
     total_engrams: usize,
     synapses_uploaded: usize,
+    synapse_cursor: i64,
     total_synapses: usize,
 };
 
@@ -966,6 +1008,11 @@ fn loadUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8) ?UploadC
 
     if (parsed.value != .object) return null;
     const obj = parsed.value.object;
+    const version = if (obj.get("version")) |value| (if (value == .integer) value.integer else return null) else return null;
+    if (version != 2) {
+        debug_log.log("loadUploadCheckpoint: rejecting unsupported version={d}", .{version});
+        return null;
+    }
 
     const target_url = if (obj.get("target_url")) |v| (if (v == .string) allocator.dupe(u8, v.string) catch return null else return null) else return null;
     errdefer allocator.free(target_url);
@@ -976,19 +1023,23 @@ fn loadUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8) ?UploadC
     const host = if (obj.get("host")) |v| (if (v == .string) allocator.dupe(u8, v.string) catch return null else return null) else return null;
 
     const eu: usize = if (obj.get("engrams_uploaded")) |v| (if (v == .integer) @intCast(@max(v.integer, 0)) else 0) else 0;
+    const ec: i64 = if (obj.get("engram_cursor")) |v| (if (v == .integer) @max(v.integer, 0) else 0) else 0;
     const te: usize = if (obj.get("total_engrams")) |v| (if (v == .integer) @intCast(@max(v.integer, 0)) else 0) else 0;
     const su: usize = if (obj.get("synapses_uploaded")) |v| (if (v == .integer) @intCast(@max(v.integer, 0)) else 0) else 0;
+    const sc: i64 = if (obj.get("synapse_cursor")) |v| (if (v == .integer) @max(v.integer, 0) else 0) else 0;
     const ts: usize = if (obj.get("total_synapses")) |v| (if (v == .integer) @intCast(@max(v.integer, 0)) else 0) else 0;
 
     return .{
-        .version = 1,
+        .version = 2,
         .target_url = target_url,
         .username = username,
         .brain_name = brain_name,
         .host = host,
         .engrams_uploaded = eu,
+        .engram_cursor = ec,
         .total_engrams = te,
         .synapses_uploaded = su,
+        .synapse_cursor = sc,
         .total_synapses = ts,
     };
 }
@@ -1007,7 +1058,7 @@ fn saveUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8, cp: *con
     var s: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
     try s.beginObject();
     try s.objectField("version");
-    try s.write(@as(i64, 1));
+    try s.write(@as(i64, 2));
     try s.objectField("target_url");
     try s.write(cp.target_url);
     try s.objectField("username");
@@ -1018,10 +1069,14 @@ fn saveUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8, cp: *con
     try s.write(cp.host);
     try s.objectField("engrams_uploaded");
     try s.write(@as(i64, @intCast(cp.engrams_uploaded)));
+    try s.objectField("engram_cursor");
+    try s.write(cp.engram_cursor);
     try s.objectField("total_engrams");
     try s.write(@as(i64, @intCast(cp.total_engrams)));
     try s.objectField("synapses_uploaded");
     try s.write(@as(i64, @intCast(cp.synapses_uploaded)));
+    try s.objectField("synapse_cursor");
+    try s.write(cp.synapse_cursor);
     try s.objectField("total_synapses");
     try s.write(@as(i64, @intCast(cp.total_synapses)));
     try s.endObject();
@@ -1039,7 +1094,7 @@ fn deleteUploadCheckpoint(path: []const u8) void {
     std.fs.cwd().deleteFile(path) catch {};
 }
 
-fn upgradeFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, checkpoint_path: []const u8, local_path: []const u8) !void {
+fn upgradeFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, checkpoint_path: []const u8, local_path: []const u8, inactive_engrams: i64) !void {
     printErr("\n");
     const brain_url = try std.fmt.allocPrint(allocator, "https://{s}/{s}/{s}", .{ cp.host, cp.username, cp.brain_name });
     defer allocator.free(brain_url);
@@ -1053,17 +1108,13 @@ fn upgradeFinalize(allocator: std.mem.Allocator, cp: *const UploadCheckpoint, ch
 
     deleteUploadCheckpoint(checkpoint_path);
 
-    const del_confirmed = tui.confirm("Delete local brain.db?") catch false;
-    if (del_confirmed) {
-        std.fs.deleteFileAbsolute(local_path) catch {
-            printErr("  warning: failed to delete local brain file\n");
-            return;
-        };
-        printErr("  ");
-        tui.checkmark();
-        printErr(" Deleted ");
-        printErr(local_path);
-        printErr("\n");
+    if (!shouldOfferLocalBrainDeletion(inactive_engrams)) {
+        debug_log.log("memUpgrade: retaining lifecycle history at {s}; inactive_count={d}", .{ local_path, inactive_engrams });
+        if (inactive_engrams > 0) {
+            printFmtErr(allocator, "  Retained {s}: {d} deprecated or expired memories were not uploaded.\n", .{ local_path, inactive_engrams });
+        } else {
+            printFmtErr(allocator, "  Retained {s} as the local lifecycle history archive.\n", .{local_path});
+        }
     }
 
     printErr("\n  Upgrade complete.\n\n");
@@ -3684,6 +3735,66 @@ fn loadCustomPrompt(allocator: std.mem.Allocator, cog_dir: []const u8, filename:
 }
 
 // Tests
+test "memory upgrade never deletes a lifecycle-filtered local database" {
+    try std.testing.expect(!shouldOfferLocalBrainDeletion(0));
+    try std.testing.expect(!shouldOfferLocalBrainDeletion(1));
+}
+
+test "memory upgrade resumes from stable rowid cursors" {
+    var db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('cursor-a', 'test', 'Cursor A', 'Active')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('cursor-b', 'test', 'Cursor B', 'Active')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('cursor-c', 'test', 'Cursor C', 'Active')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('cursor-link-a', 'test', 'cursor-a', 'cursor-b')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('cursor-link-b', 'test', 'cursor-b', 'cursor-c')");
+
+    var first_engrams = try prepareUpgradeableEngrams(&db, "test", 0);
+    defer first_engrams.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try first_engrams.step());
+    const first_engram_rowid = first_engrams.columnInt(0);
+    try std.testing.expectEqualStrings("cursor-a", first_engrams.columnText(1).?);
+
+    var first_synapses = try prepareUpgradeableSynapses(&db, "test", 0);
+    defer first_synapses.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try first_synapses.step());
+    const first_synapse_rowid = first_synapses.columnInt(0);
+    try std.testing.expectEqualStrings("cursor-link-a", first_synapses.columnText(1).?);
+
+    try db.exec("UPDATE engrams SET deprecated_at = datetime('now') WHERE id = 'cursor-a'");
+
+    var resumed_engrams = try prepareUpgradeableEngrams(&db, "test", first_engram_rowid);
+    defer resumed_engrams.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try resumed_engrams.step());
+    try std.testing.expectEqualStrings("cursor-b", resumed_engrams.columnText(1).?);
+    try std.testing.expectEqual(sqlite.StepResult.row, try resumed_engrams.step());
+    try std.testing.expectEqualStrings("cursor-c", resumed_engrams.columnText(1).?);
+
+    var resumed_synapses = try prepareUpgradeableSynapses(&db, "test", first_synapse_rowid);
+    defer resumed_synapses.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try resumed_synapses.step());
+    try std.testing.expectEqualStrings("cursor-link-b", resumed_synapses.columnText(1).?);
+}
+
+test "memory upgrade excludes inactive history and its synapses" {
+    var db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('upgrade-active-a', 'test', 'Active A', 'Active')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('upgrade-active-b', 'test', 'Active B', 'Active')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, deprecated_at) VALUES ('upgrade-deprecated', 'test', 'Deprecated', 'Historical', datetime('now'))");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, expires_at) VALUES ('upgrade-expired', 'test', 'Expired', 'Historical', '2020-01-01T00:00:00Z')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('upgrade-active-link', 'test', 'upgrade-active-a', 'upgrade-active-b')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('upgrade-deprecated-link', 'test', 'upgrade-active-a', 'upgrade-deprecated')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('upgrade-expired-link', 'test', 'upgrade-active-a', 'upgrade-expired')");
+
+    try std.testing.expectEqual(@as(i64, 2), countUpgradeableEngrams(&db, "test"));
+    try std.testing.expectEqual(@as(i64, 1), countUpgradeableSynapses(&db, "test"));
+}
+
 test "memInfo does not create a configured missing brain database" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3704,6 +3815,39 @@ test "memInfo does not create a configured missing brain database" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(".cog/brain.db", .{}));
 }
 
+test "loadUploadCheckpoint rejects positional version 1 checkpoints" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".cog/upgrade-checkpoint.json",
+        .data =
+        \\{
+        \\  "version": 1,
+        \\  "target_url": "https://trycog.ai/user/brain",
+        \\  "username": "user",
+        \\  "brain_name": "brain",
+        \\  "host": "trycog.ai",
+        \\  "engrams_uploaded": 2,
+        \\  "total_engrams": 4,
+        \\  "synapses_uploaded": 1,
+        \\  "total_synapses": 3
+        \\}
+        ,
+    });
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expect(loadUploadCheckpoint(allocator, ".cog/upgrade-checkpoint.json") == null);
+}
+
 test "saveUploadCheckpoint writes pretty JSON and preserves restrictive mode" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
@@ -3721,14 +3865,16 @@ test "saveUploadCheckpoint writes pretty JSON and preserves restrictive mode" {
     try tmp.dir.setAsCwd();
 
     const cp = UploadCheckpoint{
-        .version = 1,
+        .version = 2,
         .target_url = "https://trycog.ai/user/brain",
         .username = "user",
         .brain_name = "brain",
         .host = "trycog.ai",
         .engrams_uploaded = 2,
+        .engram_cursor = 12,
         .total_engrams = 4,
         .synapses_uploaded = 1,
+        .synapse_cursor = 7,
         .total_synapses = 3,
     };
     try saveUploadCheckpoint(allocator, ".cog/upgrade-checkpoint.json", &cp);
@@ -3739,6 +3885,8 @@ test "saveUploadCheckpoint writes pretty JSON and preserves restrictive mode" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("engrams_uploaded").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), parsed.value.object.get("engram_cursor").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("synapse_cursor").?.integer);
     const stat = try std.fs.cwd().statFile(".cog/upgrade-checkpoint.json");
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
 }
