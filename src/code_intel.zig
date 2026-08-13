@@ -2437,11 +2437,11 @@ fn removeDocument(allocator: std.mem.Allocator, index: *scip.Index, rel_path: []
     }
 }
 
-fn documentIndexByPath(documents: []const scip.Document, rel_path: []const u8) ?usize {
-    for (documents, 0..) |doc, i| {
-        if (std.mem.eql(u8, doc.relative_path, rel_path)) return i;
+fn pathListContains(file_paths: []const []const u8, rel_path: []const u8) bool {
+    for (file_paths) |file_path| {
+        if (std.mem.eql(u8, file_path, rel_path)) return true;
     }
-    return null;
+    return false;
 }
 
 fn pathMatchesConfiguredPatterns(file_path: []const u8, patterns: []const []const u8) bool {
@@ -2662,7 +2662,7 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     batch.appendSliceAssumeCapacity(current_files.items);
     for (master_index.documents) |doc| {
         if (!pathMatchesConfiguredPatterns(doc.relative_path, patterns)) continue;
-        if (documentIndexByPath(current_files.items, doc.relative_path) != null) continue;
+        if (pathListContains(current_files.items, doc.relative_path)) continue;
         batch.appendAssumeCapacity(doc.relative_path);
     }
     debug_log.log("reindexConfiguredFiles: reconciliation current={d} batch={d}", .{ current_files.items.len, batch.items.len });
