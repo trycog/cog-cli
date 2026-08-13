@@ -6,6 +6,7 @@ const agents_mod = @import("agents.zig");
 const build_options = @import("build_options");
 const debug_log = @import("debug_log.zig");
 const fs_util = @import("fs_util.zig");
+const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -15,6 +16,23 @@ const reset = "\x1B[0m";
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+const max_host_config_bytes: usize = 1048576;
+
+const HostConfigKind = union(enum) {
+    json: []const HostConfigField,
+    toml,
+};
+
+const HostConfigFieldType = enum {
+    object,
+    array,
+};
+
+const HostConfigField = struct {
+    name: []const u8,
+    expected: HostConfigFieldType,
+};
+
 fn printErr(msg: []const u8) void {
     var buf: [4096]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
@@ -22,8 +40,28 @@ fn printErr(msg: []const u8) void {
     w.interface.flush() catch {};
 }
 
+fn reportHostConfigError(path: []const u8, detail: []const u8) void {
+    printErr("  error: host config ");
+    printErr(path);
+    printErr(" ");
+    printErr(detail);
+    printErr("; fix or remove the file, then retry\n");
+}
+
+fn reportHostConfigFieldTypeError(path: []const u8, field: []const u8, expected: HostConfigFieldType) void {
+    printErr("  error: host config ");
+    printErr(path);
+    printErr(" field '");
+    printErr(field);
+    printErr("' must be a JSON ");
+    printErr(@tagName(expected));
+    printErr("; fix or remove the file, then retry\n");
+}
+
 fn ensureDir(path: []const u8) !void {
-    std.fs.cwd().makePath(path) catch {
+    debug_log.log("hooks.ensureDir: path={s}", .{path});
+    std.fs.cwd().makePath(path) catch |err| {
+        debug_log.log("hooks.ensureDir: failed path={s} error={s}", .{ path, @errorName(err) });
         printErr("  error: failed to create directory ");
         printErr(path);
         printErr("\n");
@@ -32,13 +70,15 @@ fn ensureDir(path: []const u8) !void {
 }
 
 fn writeCwdFile(filename: []const u8, content: []const u8) !void {
-    debug_log.log("hooks.writeCwdFile: path={s}", .{filename});
-    fs_util.writeFileAtomic(std.fs.cwd(), std.heap.page_allocator, filename, content) catch {
+    debug_log.log("hooks.writeCwdFile: path={s} bytes={d}", .{ filename, content.len });
+    fs_util.writeFileAtomic(std.fs.cwd(), std.heap.page_allocator, filename, content) catch |err| {
+        debug_log.log("hooks.writeCwdFile: failed path={s} error={s}", .{ filename, @errorName(err) });
         printErr("  error: failed to write ");
         printErr(filename);
         printErr("\n");
         return error.Explained;
     };
+    debug_log.log("hooks.writeCwdFile: committed path={s}", .{filename});
 }
 
 pub fn fileExistsInCwd(path: []const u8) bool {
@@ -47,10 +87,90 @@ pub fn fileExistsInCwd(path: []const u8) bool {
     return true;
 }
 
-fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
-    const f = std.fs.cwd().openFile(filename, .{}) catch return null;
+fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) !?[]const u8 {
+    debug_log.log("hooks.readCwdFile: open path={s}", .{filename});
+    const f = std.fs.cwd().openFile(filename, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            debug_log.log("hooks.readCwdFile: missing path={s}", .{filename});
+            return null;
+        },
+        else => {
+            debug_log.log("hooks.readCwdFile: unreadable path={s} error={s}", .{ filename, @errorName(err) });
+            reportHostConfigError(filename, "could not be read");
+            return error.HostConfigUnreadable;
+        },
+    };
     defer f.close();
-    return f.readToEndAlloc(allocator, 1048576) catch return null;
+
+    const content = f.readToEndAlloc(allocator, max_host_config_bytes) catch |err| switch (err) {
+        error.FileTooBig => {
+            debug_log.log("hooks.readCwdFile: oversized path={s} cap={d}", .{ filename, max_host_config_bytes });
+            reportHostConfigError(filename, "exceeds the 1 MiB size limit");
+            return error.HostConfigTooLarge;
+        },
+        else => {
+            debug_log.log("hooks.readCwdFile: read failed path={s} error={s}", .{ filename, @errorName(err) });
+            reportHostConfigError(filename, "could not be read");
+            return error.HostConfigUnreadable;
+        },
+    };
+    debug_log.log("hooks.readCwdFile: read path={s} bytes={d}", .{ filename, content.len });
+    return content;
+}
+
+fn validateHostConfig(path: []const u8, kind: HostConfigKind, content: []const u8) !void {
+    debug_log.log("hooks.validateHostConfig: parse path={s} kind={s} bytes={d}", .{ path, @tagName(kind), content.len });
+    switch (kind) {
+        .json => |field_validations| {
+            const parsed = json.parseFromSlice(json.Value, std.heap.page_allocator, content, .{}) catch {
+                debug_log.log("hooks.validateHostConfig: malformed path={s} kind=json", .{path});
+                reportHostConfigError(path, "contains malformed JSON");
+                return error.MalformedHostConfig;
+            };
+            defer parsed.deinit();
+            if (parsed.value != .object) {
+                debug_log.log("hooks.validateHostConfig: invalid root path={s} kind=json", .{path});
+                reportHostConfigError(path, "must contain a JSON object at the root");
+                return error.InvalidHostConfig;
+            }
+
+            for (field_validations) |validation| {
+                if (parsed.value.object.get(validation.name)) |value| {
+                    const valid_type = switch (validation.expected) {
+                        .object => value == .object,
+                        .array => value == .array,
+                    };
+                    if (!valid_type) {
+                        debug_log.log("hooks.validateHostConfig: invalid field path={s} field={s} expected={s}", .{ path, validation.name, @tagName(validation.expected) });
+                        reportHostConfigFieldTypeError(path, validation.name, validation.expected);
+                        return error.InvalidHostConfig;
+                    }
+                }
+            }
+        },
+        .toml => {
+            if (!tree_sitter_indexer.isSyntaxValid("toml", content)) {
+                debug_log.log("hooks.validateHostConfig: malformed path={s} kind=toml", .{path});
+                reportHostConfigError(path, "contains malformed TOML");
+                return error.MalformedHostConfig;
+            }
+        },
+    }
+    debug_log.log("hooks.validateHostConfig: valid path={s} kind={s}", .{ path, @tagName(kind) });
+}
+
+fn readValidatedHostConfig(allocator: std.mem.Allocator, path: []const u8, kind: HostConfigKind) !?[]const u8 {
+    const existing = try readCwdFile(allocator, path);
+    errdefer if (existing) |content| allocator.free(content);
+    if (existing) |content| try validateHostConfig(path, kind, content);
+    debug_log.log("hooks.readValidatedHostConfig: decision path={s} state={s}", .{ path, if (existing == null) "missing" else "existing-valid" });
+    return existing;
+}
+
+fn parseJsonObject(allocator: std.mem.Allocator, content: []const u8) !json.Parsed(json.Value) {
+    const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
+    std.debug.assert(parsed.value == .object);
+    return parsed;
 }
 
 // ── MCP Config Generation ───────────────────────────────────────────────
@@ -75,7 +195,8 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
         try ensureDir(parent);
     }
 
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{.{ .name = key, .expected = .object }};
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -84,7 +205,7 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
     try s.beginObject();
 
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 var iter = parsed.value.object.iterator();
@@ -94,7 +215,7 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
                     try s.write(entry.value_ptr.*);
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     try s.objectField(key);
@@ -102,7 +223,7 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
 
     // Preserve existing entries under the key, except "cog"
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 if (parsed.value.object.get(key)) |servers| {
@@ -116,7 +237,7 @@ fn writeJsonMcp(allocator: std.mem.Allocator, path: []const u8, key: []const u8)
                     }
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     const include_stdio_type = std.mem.eql(u8, path, ".mcp.json") or
@@ -153,7 +274,8 @@ fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
         try ensureDir(parent);
     }
 
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{.{ .name = "mcpServers", .expected = .object }};
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -163,7 +285,7 @@ fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // Preserve existing top-level keys except mcpServers
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 var iter = parsed.value.object.iterator();
@@ -173,7 +295,7 @@ fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
                     try s.write(entry.value_ptr.*);
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     try s.objectField("mcpServers");
@@ -181,7 +303,7 @@ fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
 
     // Preserve existing servers except cog
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 if (parsed.value.object.get("mcpServers")) |servers| {
@@ -195,7 +317,7 @@ fn writeJsonPi(allocator: std.mem.Allocator, path: []const u8) !void {
                     }
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     // Add cog server entry with directTools so Pi registers tools individually
@@ -225,7 +347,8 @@ fn writeJsonAmp(allocator: std.mem.Allocator, path: []const u8) !void {
         try ensureDir(parent);
     }
 
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{.{ .name = "amp.mcpServers", .expected = .object }};
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -234,7 +357,7 @@ fn writeJsonAmp(allocator: std.mem.Allocator, path: []const u8) !void {
     try s.beginObject();
 
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 var iter = parsed.value.object.iterator();
@@ -244,7 +367,7 @@ fn writeJsonAmp(allocator: std.mem.Allocator, path: []const u8) !void {
                     try s.write(entry.value_ptr.*);
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     try s.objectField("amp.mcpServers");
@@ -269,7 +392,11 @@ fn writeJsonAmp(allocator: std.mem.Allocator, path: []const u8) !void {
 
 fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
     debug_log.log("hooks.writeJsonOpenCode: path={s}", .{path});
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{
+        .{ .name = "mcp", .expected = .object },
+        .{ .name = "plugin", .expected = .array },
+    };
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -278,7 +405,7 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
     try s.beginObject();
 
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 var iter = parsed.value.object.iterator();
@@ -288,14 +415,14 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
                     try s.write(entry.value_ptr.*);
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     try s.objectField("mcp");
     try s.beginObject();
 
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 if (parsed.value.object.get("mcp")) |mcp| {
@@ -309,7 +436,7 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
                     }
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     try s.objectField("cog");
@@ -331,7 +458,7 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
     var already_has_memory = false;
     var already_has_debug = false;
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 if (parsed.value.object.get("plugin")) |plugins| {
@@ -351,7 +478,7 @@ fn writeJsonOpenCode(allocator: std.mem.Allocator, path: []const u8) !void {
                     }
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     if (!already_has_override) {
@@ -378,7 +505,7 @@ fn writeTomlMcp(allocator: std.mem.Allocator, path: []const u8) !void {
         try ensureDir(parent);
     }
 
-    const existing = readCwdFile(allocator, path);
+    const existing = try readValidatedHostConfig(allocator, path, .toml);
     defer if (existing) |e| allocator.free(e);
 
     const toml_section = "\n[mcp_servers.cog]\ncommand = \"cog\"\nargs = [\"mcp\"]\n";
@@ -504,7 +631,11 @@ fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
     const path = ".claude/settings.json";
     try ensureDir(".claude");
 
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{
+        .{ .name = "permissions", .expected = .object },
+        .{ .name = "enabledMcpjsonServers", .expected = .array },
+    };
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -519,7 +650,7 @@ fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
     defer if (parsed_holder) |p| p.deinit();
 
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             parsed_holder = parsed;
             if (parsed.value == .object) {
                 // Copy all non-permissions top-level keys
@@ -543,7 +674,7 @@ fn writeClaudePermissions(allocator: std.mem.Allocator) !void {
                     existing_enabled_mcpjson_servers = enabled;
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     try s.objectField("permissions");
@@ -620,7 +751,8 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
     const path = ".claude/settings.json";
     try ensureDir(".claude/hooks");
 
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{.{ .name = "hooks", .expected = .object }};
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var parsed_holder: ?json.Parsed(json.Value) = null;
@@ -628,12 +760,12 @@ fn writeClaudeRuntimeHooks(allocator: std.mem.Allocator) !void {
 
     var existing_hooks: ?json.Value = null;
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             parsed_holder = parsed;
             if (parsed.value == .object) {
                 existing_hooks = parsed.value.object.get("hooks");
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     var aw: Writer.Allocating = .init(allocator);
@@ -908,13 +1040,14 @@ fn writeClaudeCogHookArray(
 
 fn writeGeminiTrust(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
     debug_log.log("hooks.writeGeminiTrust: path={s}", .{mcp_path});
-    const existing = readCwdFile(allocator, mcp_path) orelse return;
+    const fields = [_]HostConfigField{.{ .name = "mcpServers", .expected = .object }};
+    const existing = (try readValidatedHostConfig(allocator, mcp_path, .{ .json = &fields })) orelse return;
     defer allocator.free(existing);
 
-    const parsed = json.parseFromSlice(json.Value, allocator, existing, .{}) catch return;
+    const parsed = try parseJsonObject(allocator, existing);
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
+    std.debug.assert(parsed.value == .object);
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -968,12 +1101,13 @@ fn writeGeminiRuntimeHooks(allocator: std.mem.Allocator, mcp_path: []const u8) !
     debug_log.log("hooks.writeGeminiRuntimeHooks: path={s}", .{mcp_path});
     try ensureDir(".gemini/hooks");
 
-    const existing = readCwdFile(allocator, mcp_path) orelse return;
+    const fields = [_]HostConfigField{.{ .name = "hooks", .expected = .object }};
+    const existing = (try readValidatedHostConfig(allocator, mcp_path, .{ .json = &fields })) orelse return;
     defer allocator.free(existing);
 
-    const parsed = json.parseFromSlice(json.Value, allocator, existing, .{}) catch return;
+    const parsed = try parseJsonObject(allocator, existing);
     defer parsed.deinit();
-    if (parsed.value != .object) return;
+    std.debug.assert(parsed.value == .object);
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -1075,13 +1209,14 @@ fn writeGeminiBeforeToolHookArray(s: *Stringify, existing_value: ?json.Value) !v
 
 fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
     debug_log.log("hooks.writeAmpPermissions: path={s}", .{mcp_path});
-    const existing = readCwdFile(allocator, mcp_path) orelse return;
+    const fields = [_]HostConfigField{.{ .name = "amp.permissions", .expected = .array }};
+    const existing = (try readValidatedHostConfig(allocator, mcp_path, .{ .json = &fields })) orelse return;
     defer allocator.free(existing);
 
-    const parsed = json.parseFromSlice(json.Value, allocator, existing, .{}) catch return;
+    const parsed = try parseJsonObject(allocator, existing);
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
+    std.debug.assert(parsed.value == .object);
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -1146,13 +1281,13 @@ fn writeAmpPermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void
 
 fn writeOpenCodePermissions(allocator: std.mem.Allocator, mcp_path: []const u8) !void {
     debug_log.log("hooks.writeOpenCodePermissions: path={s}", .{mcp_path});
-    const existing = readCwdFile(allocator, mcp_path) orelse return;
+    const existing = (try readValidatedHostConfig(allocator, mcp_path, .{ .json = &.{} })) orelse return;
     defer allocator.free(existing);
 
-    const parsed = json.parseFromSlice(json.Value, allocator, existing, .{}) catch return;
+    const parsed = try parseJsonObject(allocator, existing);
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
+    std.debug.assert(parsed.value == .object);
 
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
@@ -1755,7 +1890,7 @@ fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8, section_name: 
         try ensureDir(parent);
     }
 
-    const existing = readCwdFile(allocator, path);
+    const existing = try readValidatedHostConfig(allocator, path, .toml);
     defer if (existing) |e| allocator.free(e);
 
     const section_marker = try std.fmt.allocPrint(allocator, "[agents.{s}]", .{section_name});
@@ -1828,7 +1963,8 @@ fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8, slug: []const u
     else
         &empty_groups;
 
-    const existing = readCwdFile(allocator, path);
+    const fields = [_]HostConfigField{.{ .name = "customModes", .expected = .array }};
+    const existing = try readValidatedHostConfig(allocator, path, .{ .json = &fields });
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -1842,7 +1978,7 @@ fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8, slug: []const u
     var found_existing = false;
 
     if (existing) |content| {
-        if (json.parseFromSlice(json.Value, allocator, content, .{})) |parsed| {
+        if (parseJsonObject(allocator, content)) |parsed| {
             defer parsed.deinit();
             if (parsed.value == .object) {
                 if (parsed.value.object.get("customModes")) |modes| {
@@ -1882,7 +2018,7 @@ fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8, slug: []const u
                     }
                 }
             }
-        } else |_| {}
+        } else |err| return err;
     }
 
     if (!found_existing) {
@@ -2007,24 +2143,18 @@ test "host permission and runtime mergers reject malformed existing JSON" {
 test "shared host config specialist mergers reject malformed existing configs" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const codex = agents_mod.agents[5];
-            const roo = agents_mod.agents[8];
-            const configure_functions = .{
-                configureAgentFile,
-                configureDebugAgentFile,
-                configureMemAgentFile,
-                configureValidateAgentFile,
-                configureObserveAgentFile,
-            };
+            const codex_path = ".codex/config.toml";
+            const roo_path = ".roomodes";
+            const slugs = [_][]const u8{ "cog-code-query", "cog-debug", "cog-mem", "cog-mem-validate", "cog-observe" };
 
-            inline for (configure_functions) |configure_fn| {
-                try resetMalformedHostConfig(codex.agent_file_path.?, "[broken");
-                try std.testing.expectError(error.MalformedHostConfig, configure_fn(allocator, codex));
-                try expectHostConfigUnchanged(allocator, codex.agent_file_path.?, "[broken", 0o600);
+            for (slugs) |slug| {
+                try resetMalformedHostConfig(codex_path, "[broken");
+                try std.testing.expectError(error.MalformedHostConfig, writeTomlAgent(allocator, codex_path, slug, "Cog specialist", "instructions"));
+                try expectHostConfigUnchanged(allocator, codex_path, "[broken", 0o600);
 
-                try resetMalformedHostConfig(roo.agent_file_path.?, "{broken");
-                try std.testing.expectError(error.MalformedHostConfig, configure_fn(allocator, roo));
-                try expectHostConfigUnchanged(allocator, roo.agent_file_path.?, "{broken", 0o600);
+                try resetMalformedHostConfig(roo_path, "{broken");
+                try std.testing.expectError(error.MalformedHostConfig, writeRooAgent(allocator, roo_path, slug, "Cog Specialist", "instructions"));
+                try expectHostConfigUnchanged(allocator, roo_path, "{broken", 0o600);
             }
         }
     }.run);
@@ -2076,6 +2206,44 @@ test "host JSON config mergers reject non-object roots" {
     }.run);
 }
 
+test "host JSON mergers reject malformed owned fields without overwriting" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const mcp_invalid = "{\"mcpServers\":[]}";
+            try writeHostConfigFixture("mcp.json", mcp_invalid, 0o640);
+            try std.testing.expectError(error.InvalidHostConfig, writeJsonMcp(allocator, "mcp.json", "mcpServers"));
+            try expectHostConfigUnchanged(allocator, "mcp.json", mcp_invalid, 0o640);
+
+            const opencode_invalid = "{\"mcp\":[],\"plugin\":{}}";
+            try writeHostConfigFixture("opencode.json", opencode_invalid, 0o640);
+            try std.testing.expectError(error.InvalidHostConfig, writeJsonOpenCode(allocator, "opencode.json"));
+            try expectHostConfigUnchanged(allocator, "opencode.json", opencode_invalid, 0o640);
+
+            const roo_invalid = "{\"customModes\":{}}";
+            try writeHostConfigFixture(".roomodes", roo_invalid, 0o640);
+            try std.testing.expectError(error.InvalidHostConfig, writeRooAgent(allocator, ".roomodes", "cog-code-query", "Cog Code Query", "instructions"));
+            try expectHostConfigUnchanged(allocator, ".roomodes", roo_invalid, 0o640);
+        }
+    }.run);
+}
+
+test "global-only hosts do not read or write repository config" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const windsurf = agents_mod.agents[3];
+            const goose = agents_mod.agents[7];
+            try std.testing.expectEqual(agents_mod.McpFormat.global_only, windsurf.mcp_format);
+            try std.testing.expectEqual(agents_mod.McpFormat.global_only, goose.mcp_format);
+
+            try configureMcp(allocator, windsurf);
+            try configureMcp(allocator, goose);
+
+            try std.testing.expect(!fileExistsInCwd(".codeium/windsurf/mcp_config.json"));
+            try std.testing.expect(!fileExistsInCwd(".config/goose/config.yaml"));
+        }
+    }.run);
+}
+
 test "writeJsonMcp atomically preserves mode and existing content" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
@@ -2091,7 +2259,7 @@ test "writeJsonMcp atomically preserves mode and existing content" {
 
             try writeJsonMcp(allocator, ".mcp.json", "mcpServers");
 
-            const updated = readCwdFile(allocator, ".mcp.json") orelse return error.TestUnexpectedResult;
+            const updated = (try readCwdFile(allocator, ".mcp.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(updated);
             const parsed = try json.parseFromSlice(json.Value, allocator, updated, .{});
             defer parsed.deinit();
@@ -2119,7 +2287,7 @@ test "writeJsonMcp preserves existing non-cog entries" {
 
             try writeJsonMcp(allocator, ".mcp.json", "mcpServers");
 
-            const updated = readCwdFile(allocator, ".mcp.json") orelse return error.TestUnexpectedResult;
+            const updated = (try readCwdFile(allocator, ".mcp.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(updated);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, updated, .{});
@@ -2156,7 +2324,7 @@ test "writeJsonOpenCode merges root and rewrites mcp.cog" {
 
             try writeJsonOpenCode(allocator, "opencode.json");
 
-            const updated = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const updated = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(updated);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, updated, .{});
@@ -2196,7 +2364,7 @@ test "writeJsonOpenCode is idempotent for plugin registration" {
             try writeJsonOpenCode(allocator, "opencode.json");
             try writeJsonOpenCode(allocator, "opencode.json");
 
-            const updated = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const updated = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(updated);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, updated, .{});
@@ -2222,7 +2390,7 @@ test "writeOpenCodePermissions adds cog allow rule" {
 
             try writeOpenCodePermissions(allocator, "opencode.json");
 
-            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2257,7 +2425,7 @@ test "writeOpenCodePermissions preserves existing rules" {
 
             try writeOpenCodePermissions(allocator, "opencode.json");
 
-            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2294,7 +2462,7 @@ test "writeOpenCodePermissions upgrades string permission" {
 
             try writeOpenCodePermissions(allocator, "opencode.json");
 
-            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2328,7 +2496,7 @@ test "writeOpenCodePermissions preserves general subagent rules" {
 
             try writeOpenCodePermissions(allocator, "opencode.json");
 
-            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2351,7 +2519,7 @@ test "writeOpenCodeOverridePlugin creates strict override plugin" {
             _ = allocator;
             try writeOpenCodeOverridePlugin(".opencode/plugins/cog-override.ts");
 
-            const content = readCwdFile(std.testing.allocator, ".opencode/plugins/cog-override.ts") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".opencode/plugins/cog-override.ts")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "\"tool.definition\"") != null);
@@ -2370,7 +2538,7 @@ test "writeOpenCodeDebugPlugin creates debug workflow plugin" {
             _ = allocator;
             try writeOpenCodeDebugPlugin(".opencode/plugins/cog-debug.ts");
 
-            const content = readCwdFile(std.testing.allocator, ".opencode/plugins/cog-debug.ts") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".opencode/plugins/cog-debug.ts")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "cog_debug_launch") != null);
@@ -2387,7 +2555,7 @@ test "writeOpenCodeMemoryPlugin creates provenance-aware memory plugin" {
             _ = allocator;
             try writeOpenCodeMemoryPlugin(".opencode/plugins/cog-memory.ts");
 
-            const content = readCwdFile(std.testing.allocator, ".opencode/plugins/cog-memory.ts") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".opencode/plugins/cog-memory.ts")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "recentSymbols") != null);
@@ -2407,7 +2575,7 @@ test "writeRuntimePolicyAsset creates Claude hook asset" {
             _ = allocator;
             try writeRuntimePolicyAsset(".claude/hooks/cog-pretooluse.sh", claude_pretooluse_hook_content);
 
-            const content = readCwdFile(std.testing.allocator, ".claude/hooks/cog-pretooluse.sh") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".claude/hooks/cog-pretooluse.sh")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "transcript_path") != null);
@@ -2425,7 +2593,7 @@ test "writeRuntimePolicyAsset creates Gemini hook asset" {
             _ = allocator;
             try writeRuntimePolicyAsset(".gemini/hooks/cog-before-tool.sh", gemini_before_tool_hook_content);
 
-            const content = readCwdFile(std.testing.allocator, ".gemini/hooks/cog-before-tool.sh") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".gemini/hooks/cog-before-tool.sh")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "run_shell_command") != null);
@@ -2441,7 +2609,7 @@ test "writeRuntimePolicyAsset creates Amp plugin asset" {
             _ = allocator;
             try writeRuntimePolicyAsset(".amp/plugins/cog.ts", amp_cog_plugin_content);
 
-            const content = readCwdFile(std.testing.allocator, ".amp/plugins/cog.ts") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".amp/plugins/cog.ts")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "tool.call") != null);
@@ -2487,7 +2655,7 @@ test "writeTomlMcp appends once and is idempotent" {
             try writeTomlMcp(allocator, "config.toml");
             try writeTomlMcp(allocator, "config.toml");
 
-            const updated = readCwdFile(allocator, "config.toml") orelse return error.TestUnexpectedResult;
+            const updated = (try readCwdFile(allocator, "config.toml")) orelse return error.TestUnexpectedResult;
             defer allocator.free(updated);
 
             const marker = "[mcp_servers.cog]";
@@ -2503,7 +2671,7 @@ test "writeClaudePermissions creates correct JSON" {
         fn run(allocator: std.mem.Allocator) !void {
             try writeClaudePermissions(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2530,7 +2698,7 @@ test "writeClaudePermissions merges with existing permissions" {
 
             try writeClaudePermissions(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2563,7 +2731,7 @@ test "writeClaudePermissions is idempotent" {
             try writeClaudePermissions(allocator);
             try writeClaudePermissions(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2591,7 +2759,7 @@ test "writeClaudePermissions preserves existing enabledMcpjsonServers" {
 
             try writeClaudePermissions(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2611,7 +2779,7 @@ test "writeClaudeRuntimeHooks adds pretooluse hook" {
         fn run(allocator: std.mem.Allocator) !void {
             try writeClaudeRuntimeHooks(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2641,7 +2809,7 @@ test "writeClaudeRuntimeHooks preserves existing hooks" {
 
             try writeClaudeRuntimeHooks(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2661,7 +2829,7 @@ test "writeClaudeRuntimeHooks is idempotent for stop hook" {
             try writeClaudeRuntimeHooks(allocator);
             try writeClaudeRuntimeHooks(allocator);
 
-            const content = readCwdFile(allocator, ".claude/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2680,7 +2848,7 @@ test "writeRuntimePolicyAsset creates Claude stop hook asset" {
             _ = allocator;
             try writeRuntimePolicyAsset(".claude/hooks/cog-stop-memory.sh", claude_stop_memory_hook_content);
 
-            const content = readCwdFile(std.testing.allocator, ".claude/hooks/cog-stop-memory.sh") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(std.testing.allocator, ".claude/hooks/cog-stop-memory.sh")) orelse return error.TestUnexpectedResult;
             defer std.testing.allocator.free(content);
 
             try std.testing.expect(std.mem.indexOf(u8, content, "stop_hook_active") != null);
@@ -2703,7 +2871,7 @@ test "writeGeminiTrust adds trust field to cog entry" {
 
             try writeGeminiTrust(allocator, ".gemini/settings.json");
 
-            const content = readCwdFile(allocator, ".gemini/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".gemini/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2738,7 +2906,7 @@ test "writeGeminiRuntimeHooks adds before tool hook" {
 
             try writeGeminiRuntimeHooks(allocator, ".gemini/settings.json");
 
-            const content = readCwdFile(allocator, ".gemini/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".gemini/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2763,7 +2931,7 @@ test "writeGeminiRuntimeHooks preserves existing hooks" {
 
             try writeGeminiRuntimeHooks(allocator, ".gemini/settings.json");
 
-            const content = readCwdFile(allocator, ".gemini/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".gemini/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2787,7 +2955,7 @@ test "writeAmpPermissions adds permissions array" {
 
             try writeAmpPermissions(allocator, ".amp/settings.json");
 
-            const content = readCwdFile(allocator, ".amp/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".amp/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2823,7 +2991,7 @@ test "writeAmpPermissions is idempotent" {
             try writeAmpPermissions(allocator, ".amp/settings.json");
             try writeAmpPermissions(allocator, ".amp/settings.json");
 
-            const content = readCwdFile(allocator, ".amp/settings.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".amp/settings.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2847,7 +3015,7 @@ test "writeMarkdownAgent creates correct file" {
 
             try writeMarkdownAgent(allocator, ".claude/agents/cog-code-query.md", header, build_options.agent_body);
 
-            const content = readCwdFile(allocator, ".claude/agents/cog-code-query.md") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".claude/agents/cog-code-query.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             // Contains the header
@@ -2870,7 +3038,7 @@ test "writeJsonOpenCode adds cog plugins" {
 
             try writeJsonOpenCode(allocator, "opencode.json");
 
-            const content = readCwdFile(allocator, "opencode.json") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, "opencode.json")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -2906,11 +3074,11 @@ test "writeMarkdownAgent is idempotent" {
             ;
 
             try writeMarkdownAgent(allocator, ".test/agent.md", header, build_options.agent_body);
-            const first = readCwdFile(allocator, ".test/agent.md") orelse return error.TestUnexpectedResult;
+            const first = (try readCwdFile(allocator, ".test/agent.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(first);
 
             try writeMarkdownAgent(allocator, ".test/agent.md", header, build_options.agent_body);
-            const second = readCwdFile(allocator, ".test/agent.md") orelse return error.TestUnexpectedResult;
+            const second = (try readCwdFile(allocator, ".test/agent.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(second);
 
             try std.testing.expectEqualStrings(first, second);
@@ -2933,7 +3101,7 @@ test "writeTomlAgent appends section" {
 
             try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
 
-            const content = readCwdFile(allocator, ".codex/config.toml") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".codex/config.toml")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             // Has the original content
@@ -2996,12 +3164,12 @@ test "skill-based prompt-only agents get host-specific content" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             try configureAgentFile(allocator, agents_mod.agents[3]); // windsurf
-            const windsurf = readCwdFile(allocator, ".windsurf/skills/cog-code-query/SKILL.md") orelse return error.TestUnexpectedResult;
+            const windsurf = (try readCwdFile(allocator, ".windsurf/skills/cog-code-query/SKILL.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(windsurf);
             try std.testing.expect(std.mem.indexOf(u8, windsurf, "Windsurf cannot hard-deny tools per specialist") != null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[7]); // goose
-            const goose = readCwdFile(allocator, ".goose/skills/cog-mem/SKILL.md") orelse return error.TestUnexpectedResult;
+            const goose = (try readCwdFile(allocator, ".goose/skills/cog-mem/SKILL.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(goose);
             try std.testing.expect(std.mem.indexOf(u8, goose, "Goose cannot hard-deny tools per specialist") != null);
             try std.testing.expect(std.mem.indexOf(u8, goose, "engram IDs") != null);
@@ -3013,10 +3181,10 @@ test "prompt-only dedicated agents get host-specific content" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             try configureAgentFile(allocator, agents_mod.agents[4]); // cursor
-            try std.testing.expect(readCwdFile(allocator, ".cursor/agents/cog-code-query.md") == null);
+            try std.testing.expect((try readCwdFile(allocator, ".cursor/agents/cog-code-query.md")) == null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[2]); // copilot
-            const copilot = readCwdFile(allocator, ".github/agents/cog-mem.agent.md") orelse return error.TestUnexpectedResult;
+            const copilot = (try readCwdFile(allocator, ".github/agents/cog-mem.agent.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(copilot);
             try std.testing.expect(std.mem.indexOf(u8, copilot, "GitHub Copilot cannot hard-deny tools per specialist") != null);
         }
@@ -3027,12 +3195,12 @@ test "config-scoped dedicated agents get host-specific content" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             try configureAgentFile(allocator, agents_mod.agents[1]); // gemini
-            const query = readCwdFile(allocator, ".gemini/agents/cog-code-query.md") orelse return error.TestUnexpectedResult;
+            const query = (try readCwdFile(allocator, ".gemini/agents/cog-code-query.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(query);
             try std.testing.expect(std.mem.indexOf(u8, query, "Gemini CLI provides config-level tool scoping") != null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[0]); // claude
-            const mem = readCwdFile(allocator, ".claude/agents/cog-mem.md") orelse return error.TestUnexpectedResult;
+            const mem = (try readCwdFile(allocator, ".claude/agents/cog-mem.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(mem);
             try std.testing.expect(std.mem.indexOf(u8, mem, "config-level scoping for this memory specialist") != null);
             try std.testing.expect(std.mem.indexOf(u8, mem, "engram IDs") != null);
@@ -3049,7 +3217,7 @@ test "writeTomlAgent is idempotent" {
             try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
             try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
 
-            const content = readCwdFile(allocator, ".codex/config.toml") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".codex/config.toml")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const marker = "[agents.cog-code-query]";
@@ -3065,7 +3233,7 @@ test "writeRooAgent creates .roomodes" {
         fn run(allocator: std.mem.Allocator) !void {
             try writeRooAgent(allocator, ".roomodes", "cog-code-query", "Cog Code Query", "You are a code index exploration agent.");
 
-            const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".roomodes")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -3102,7 +3270,7 @@ test "writeRooAgent merges with existing modes" {
 
             try writeRooAgent(allocator, ".roomodes", "cog-code-query", "Cog Code Query", "You are a code index exploration agent.");
 
-            const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".roomodes")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
@@ -3134,7 +3302,7 @@ test "writeRooAgent assigns mode-specific groups" {
             try writeRooAgent(allocator, ".roomodes", "cog-debug", "Cog Debug", "debug role");
             try writeRooAgent(allocator, ".roomodes", "cog-mem", "Cog Memory", "memory role");
 
-            const content = readCwdFile(allocator, ".roomodes") orelse return error.TestUnexpectedResult;
+            const content = (try readCwdFile(allocator, ".roomodes")) orelse return error.TestUnexpectedResult;
             defer allocator.free(content);
 
             const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});

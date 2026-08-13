@@ -54,6 +54,22 @@ pub fn getGrammar(name: []const u8) ?*c.TSLanguage {
     return null;
 }
 
+/// Parse structured source and report whether the grammar accepted it without
+/// error or missing nodes. This is intended for config validation when a full
+/// semantic decoder is unnecessary.
+pub fn isSyntaxValid(grammar_name: []const u8, source: []const u8) bool {
+    const language = getGrammar(grammar_name) orelse return false;
+    const parser = c.ts_parser_new() orelse return false;
+    defer c.ts_parser_delete(parser);
+
+    if (!c.ts_parser_set_language(parser, language)) return false;
+    const tree = c.ts_parser_parse_string(parser, null, source.ptr, @intCast(source.len)) orelse return false;
+    defer c.ts_tree_delete(tree);
+
+    const root = c.ts_tree_root_node(tree);
+    return !c.ts_node_has_error(root) and !c.ts_node_is_missing(root);
+}
+
 fn isDocumentGrammar(name: []const u8) bool {
     return std.mem.eql(u8, name, "markdown") or
         std.mem.eql(u8, name, "mdx") or
