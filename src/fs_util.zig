@@ -23,9 +23,11 @@ pub fn writeFileAtomicMode(
     const parent_path = std.fs.path.dirname(sub_path);
     var parent = if (parent_path) |path|
         try dir.openDir(path, .{})
+    else if (builtin.os.tag == .windows)
+        dir
     else
-        dir;
-    defer if (parent_path != null) parent.close();
+        try dir.openDir(".", .{});
+    defer if (parent_path != null or builtin.os.tag != .windows) parent.close();
 
     const mode = existingFileMode(parent, basename) catch |err| switch (err) {
         error.FileNotFound => create_mode,
@@ -171,6 +173,28 @@ test "writeFileAtomic creates a file" {
     try writeFileAtomic(tmp.dir, allocator, "settings.json", "{\"ok\":true}\n");
 
     const contents = try tmp.dir.readFileAlloc(allocator, "settings.json", 1024);
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", contents);
+}
+
+test "writeFileAtomic syncs files written through cwd" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(original);
+    const temporary = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(temporary);
+
+    try std.posix.chdir(temporary);
+    defer std.posix.chdir(original) catch {};
+
+    try writeFileAtomic(std.fs.cwd(), allocator, "settings.json", "{\"ok\":true}\n");
+
+    const contents = try std.fs.cwd().readFileAlloc(allocator, "settings.json", 1024);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("{\"ok\":true}\n", contents);
 }
