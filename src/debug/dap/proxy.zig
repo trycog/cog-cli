@@ -92,11 +92,47 @@ const DetachedProcess = struct {
     stdout: ?std.fs.File = null,
     stderr: ?std.fs.File = null,
 
-    fn kill(self: *DetachedProcess) !void {
-        std.posix.kill(self.id, std.posix.SIG.KILL) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
+    fn closePipes(self: *DetachedProcess) void {
+        if (self.stdin) |file| file.close();
+        if (self.stdout) |file| file.close();
+        if (self.stderr) |file| file.close();
+        self.stdin = null;
+        self.stdout = null;
+        self.stderr = null;
+    }
+
+    fn terminateAndReap(self: *DetachedProcess) void {
+        self.closePipes();
+        if (self.id == 0) return;
+
+        debug_log.log("dap.proxy: terminating adapter pid={d}", .{self.id});
+        std.posix.kill(self.id, std.posix.SIG.TERM) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => debug_log.log("dap.proxy: SIGTERM failed pid={d} error={s}", .{ self.id, @errorName(err) }),
         };
+
+        var reaped = false;
+        for (0..20) |_| {
+            const result = std.posix.waitpid(self.id, 1);
+            if (result.pid != 0) {
+                reaped = true;
+                break;
+            }
+            std.posix.nanosleep(0, 5_000_000);
+        }
+        if (!reaped) {
+            std.posix.kill(self.id, std.posix.SIG.KILL) catch |err| switch (err) {
+                error.ProcessNotFound => {},
+                else => debug_log.log("dap.proxy: SIGKILL failed pid={d} error={s}", .{ self.id, @errorName(err) }),
+            };
+            for (0..20) |_| {
+                const result = std.posix.waitpid(self.id, 1);
+                if (result.pid != 0) break;
+                std.posix.nanosleep(0, 5_000_000);
+            }
+        }
+        debug_log.log("dap.proxy: adapter cleanup complete pid={d} reaped={}", .{ self.id, reaped });
+        self.id = 0;
     }
 };
 
@@ -587,20 +623,10 @@ pub const DapProxy = struct {
         }
         switch (self.transport) {
             .none => {},
-            .stdio => |*t| {
-                if (t.process.id != 0) {
-                    const neg_pid: i32 = -@as(i32, @intCast(t.process.id));
-                    std.posix.kill(@bitCast(neg_pid), std.posix.SIG.TERM) catch {};
-                }
-                _ = t.process.kill() catch {};
-            },
+            .stdio => |*t| t.process.terminateAndReap(),
             .tcp => |*t| {
                 t.stream.close();
-                if (t.server_process.id != 0) {
-                    const neg_pid: i32 = -@as(i32, @intCast(t.server_process.id));
-                    std.posix.kill(@bitCast(neg_pid), std.posix.SIG.TERM) catch {};
-                }
-                _ = t.server_process.kill() catch {};
+                t.server_process.terminateAndReap();
             },
         }
         self.transport = .none;
@@ -1466,7 +1492,8 @@ pub const DapProxy = struct {
 
         // 1. Spawn the adapter process
         dapLog("[DAP launch] Spawning adapter process (TCP)...", .{});
-        const server_child = try spawnDetached(allocator, argv);
+        var server_child = try spawnDetached(allocator, argv);
+        errdefer server_child.terminateAndReap();
 
         // 2. Read stdout to get the listening port
         const port_prefix = cfg.port_stdout_prefix orelse return error.PortParseFailed;
@@ -3721,10 +3748,11 @@ pub const DapProxy = struct {
             if (cfg.transport == .tcp) {
                 // TCP restart: spawn new adapter, detect port, connect
                 const port_prefix = cfg.port_stdout_prefix orelse return error.PortParseFailed;
-                const child = spawnDetached(allocator, adapter_argv) catch |err| {
+                var child = spawnDetached(allocator, adapter_argv) catch |err| {
                     dapLog("[DAP restart] Failed to spawn adapter: {any}", .{err});
                     return err;
                 };
+                errdefer child.terminateAndReap();
                 const server_stdout = child.stdout orelse return error.NotInitialized;
                 var port_buf: [256]u8 = undefined;
                 var port_len: usize = 0;
@@ -4277,6 +4305,28 @@ test "DapProxy rejects invalid readMemory base64" {
     ;
 
     try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
+}
+
+test "DetachedProcess closes adapter pipes idempotently" {
+    const stdout_pipe = try std.posix.pipe();
+    const stdin_pipe = try std.posix.pipe();
+    const stderr_pipe = try std.posix.pipe();
+    defer std.posix.close(stdout_pipe[1]);
+    defer std.posix.close(stdin_pipe[0]);
+    defer std.posix.close(stderr_pipe[1]);
+
+    var process = DetachedProcess{
+        .id = 0,
+        .stdin = .{ .handle = stdin_pipe[1] },
+        .stdout = .{ .handle = stdout_pipe[0] },
+        .stderr = .{ .handle = stderr_pipe[0] },
+    };
+    process.closePipes();
+    process.closePipes();
+
+    try std.testing.expect(process.stdin == null);
+    try std.testing.expect(process.stdout == null);
+    try std.testing.expect(process.stderr == null);
 }
 
 test "DapProxy bounds notification event and output queues" {
