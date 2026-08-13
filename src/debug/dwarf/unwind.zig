@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const location = @import("location.zig");
 const process_mod = @import("process.zig");
+const binary = @import("binary.zig");
 const binary_macho = @import("binary_macho.zig");
 
 // ── Stack Unwinding ────────────────────────────────────────────────────
@@ -1004,6 +1005,7 @@ pub fn unwindStackCfa(
     section_pc_base: u64,
     start_pc: u64,
     start_sp: u64,
+    translation: binary.AddressTranslation,
     functions: []const parser.FunctionInfo,
     line_entries: []const parser.LineEntry,
     file_entries: []const parser.FileEntry,
@@ -1040,8 +1042,9 @@ pub fn unwindStackCfa(
     virt_ctx.virtual_regs[sp_reg] = start_sp;
 
     while (frame_idx < max_depth) {
-        const func_name = findFunctionForPC(functions, pc);
-        const loc = parser.resolveAddress(line_entries, file_entries, pc);
+        const dwarf_pc = translation.runtimeToDwarf(pc);
+        const func_name = findFunctionForPC(functions, dwarf_pc);
+        const loc = parser.resolveAddress(line_entries, file_entries, dwarf_pc);
 
         try frames.append(allocator, .{
             .address = pc,
@@ -1060,7 +1063,7 @@ pub fn unwindStackCfa(
         const result = unwindCfa(
             eh_frame_data,
             section_pc_base,
-            pc,
+            dwarf_pc,
             @ptrCast(&virt_ctx),
             &VirtualRegCtx.regReader,
             &VirtualRegCtx.memReader,
@@ -1134,7 +1137,8 @@ pub fn unwindStackFP(
     functions: []const parser.FunctionInfo,
     line_entries: []const parser.LineEntry,
     file_entries: []const parser.FileEntry,
-    process: *process_mod.ProcessControl,
+    access: process_mod.ProcessOrCoreAccess,
+    translation: binary.AddressTranslation,
     allocator: std.mem.Allocator,
     max_depth: u32,
 ) ![]UnwindFrame {
@@ -1151,19 +1155,19 @@ pub fn unwindStackFP(
     // current function's return address. The actual return address is in the LR register.
     var lr_return: ?u64 = null;
     if (builtin.cpu.arch == .aarch64) {
-        const regs = process.readRegisters() catch null;
+        const regs = access.readRegisters() catch null;
         if (regs) |r| {
             const lr = r.gprs[30]; // x30 = LR
             if (lr != 0) {
                 // Check if LR points to a different function than [FP+8].
                 // If so, this is a leaf function and LR is the correct return address.
                 const stack_ret = blk: {
-                    const ret_bytes = process.readMemory(fp + 8, 8, allocator) catch break :blk @as(u64, 0);
+                    const ret_bytes = access.readMemory(fp + 8, 8, allocator) catch break :blk @as(u64, 0);
                     defer allocator.free(ret_bytes);
                     break :blk std.mem.readInt(u64, ret_bytes[0..8], .little);
                 };
-                const lr_func = findFunctionForPC(functions, lr);
-                const stack_func = findFunctionForPC(functions, stack_ret);
+                const lr_func = findFunctionForPC(functions, translation.runtimeToDwarf(lr));
+                const stack_func = findFunctionForPC(functions, translation.runtimeToDwarf(stack_ret));
                 if (!std.mem.eql(u8, lr_func, stack_func) and
                     !std.mem.eql(u8, lr_func, "<unknown>"))
                 {
@@ -1174,11 +1178,12 @@ pub fn unwindStackFP(
     }
 
     while (frame_idx < max_depth and fp != 0) {
+        const dwarf_pc = translation.runtimeToDwarf(pc);
         // Find function name for this PC
-        const func_name = findFunctionForPC(functions, pc);
+        const func_name = findFunctionForPC(functions, dwarf_pc);
 
         // Find source location for this PC
-        const loc = parser.resolveAddress(line_entries, file_entries, pc);
+        const loc = parser.resolveAddress(line_entries, file_entries, dwarf_pc);
 
         try frames.append(allocator, .{
             .address = pc,
@@ -1206,11 +1211,11 @@ pub fn unwindStackFP(
         // Read saved frame pointer and return address from stack
         // On x86_64: [fp] = saved_fp, [fp+8] = return_addr
         // On aarch64: [fp] = saved_fp, [fp+8] = saved_lr (return addr)
-        const saved_fp_bytes = process.readMemory(fp, 8, allocator) catch break;
+        const saved_fp_bytes = access.readMemory(fp, 8, allocator) catch break;
         defer allocator.free(saved_fp_bytes);
         const saved_fp = std.mem.readInt(u64, saved_fp_bytes[0..8], .little);
 
-        const ret_addr_bytes = process.readMemory(fp + 8, 8, allocator) catch break;
+        const ret_addr_bytes = access.readMemory(fp + 8, 8, allocator) catch break;
         defer allocator.free(ret_addr_bytes);
         const ret_addr = std.mem.readInt(u64, ret_addr_bytes[0..8], .little);
 
@@ -1330,6 +1335,35 @@ test "eh_frame pcrel FDE uses section virtual address as PC base" {
     }
     const fde = index.findFde(0x401020) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0x401000), fde.initial_location);
+}
+
+test "unwindStackFP reads synthetic core memory through access abstraction" {
+    const allocator = std.testing.allocator;
+    const data = try allocator.alloc(u8, 20);
+    @memset(data, 0);
+    std.mem.writeInt(u64, data[4..12], 0x7100, .little);
+    std.mem.writeInt(u64, data[12..20], 0x401010, .little);
+    const segments = try allocator.alloc(@import("core_dump.zig").CoreDump.Segment, 1);
+    segments[0] = .{ .vaddr = 0x7000, .file_offset = 4, .file_size = 16, .mem_size = 16 };
+    var core = @import("core_dump.zig").CoreDump{
+        .data = data,
+        .segments = segments,
+        .registers = .{ .pc = 0x402010, .fp = 0x7000, .sp = 0x6ff0 },
+        .allocator = allocator,
+    };
+    defer core.deinit();
+
+    const functions = [_]parser.FunctionInfo{
+        .{ .name = "main", .low_pc = 0x401000, .high_pc = 0x401100 },
+        .{ .name = "worker", .low_pc = 0x402000, .high_pc = 0x402100 },
+    };
+    const access = process_mod.ProcessOrCoreAccess.fromCore(&core);
+    const frames = try unwindStackFP(0x402010, 0x7000, &functions, &.{}, &.{}, access, .{}, allocator, 8);
+    defer allocator.free(frames);
+
+    try std.testing.expectEqual(@as(usize, 2), frames.len);
+    try std.testing.expectEqualStrings("worker", frames[0].function_name);
+    try std.testing.expectEqualStrings("main", frames[1].function_name);
 }
 
 test "buildStackTrace produces ordered frame list" {

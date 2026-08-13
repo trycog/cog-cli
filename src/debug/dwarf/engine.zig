@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const driver_mod = @import("../driver.zig");
 const process_mod = @import("process.zig");
 const breakpoint_mod = @import("breakpoints.zig");
+const binary_common = @import("binary.zig");
 const binary_macho = @import("binary_macho.zig");
 const binary_elf = @import("binary_elf.zig");
 const parser = @import("parser.zig");
@@ -49,7 +50,8 @@ pub const DwarfEngine = struct {
     binary: ?binary_macho.MachoBinary = null,
     dsym_binary: ?binary_macho.MachoBinary = null,
     elf_binary: ?binary_elf.ElfBinary = null,
-    aslr_slide: i64 = 0,
+    /// Signed relocation between link-time DWARF addresses and runtime addresses.
+    address_translation: binary_common.AddressTranslation = .{},
     /// Track whether we just hit a breakpoint and need to step past it
     stepping_past_bp: ?u64 = null,
     /// Hardware watchpoint tracking (ARM64 supports up to 4 slots on Apple Silicon)
@@ -154,6 +156,32 @@ pub const DwarfEngine = struct {
         };
     }
 
+    fn readAccess(self: *DwarfEngine) process_mod.ProcessOrCoreAccess {
+        if (self.core_dump) |*core| return .fromCore(core);
+        return .fromProcess(&self.process);
+    }
+
+    fn runtimeToDwarf(self: *const DwarfEngine, address: u64) u64 {
+        return self.address_translation.runtimeToDwarf(address);
+    }
+
+    fn dwarfToRuntime(self: *const DwarfEngine, address: u64) u64 {
+        return self.address_translation.dwarfToRuntime(address);
+    }
+
+    fn relocateBreakpoints(self: *DwarfEngine, old_translation: binary_common.AddressTranslation) void {
+        if (old_translation.load_bias == self.address_translation.load_bias) return;
+        debug_log.log(
+            "dwarf.engine: relocating breakpoints old_bias={d} new_bias={d}",
+            .{ old_translation.load_bias, self.address_translation.load_bias },
+        );
+        for (self.bp_manager.breakpoints.items) |*bp| {
+            if (!bp.enabled) continue;
+            const dwarf_address = old_translation.runtimeToDwarf(bp.address);
+            bp.address = self.dwarfToRuntime(dwarf_address);
+        }
+    }
+
     const vtable = DriverVTable{
         .launchFn = engineLaunch,
         .runFn = engineRun,
@@ -225,51 +253,28 @@ pub const DwarfEngine = struct {
             return error.NoDebugInfo;
         }
 
-        // Compute ASLR slide and adjust line entry addresses
-        self.applyAslrSlide() catch {};
-        debug_log.log("dwarf.engine: ASLR slide={d}", .{self.aslr_slide});
+        // Keep parsed DWARF data in link-time address space and translate only at IO boundaries.
+        self.resolveAddressTranslation() catch {};
+        debug_log.log("dwarf.engine: load bias={d}", .{self.address_translation.load_bias});
     }
 
-    fn applyAslrSlide(self: *DwarfEngine) !void {
-        if (self.line_entries.len == 0) return;
-        const binary = self.binary orelse return;
-        if (binary.text_vmaddr == 0) return;
+    fn resolveAddressTranslation(self: *DwarfEngine) !void {
+        const actual_base = try self.process.getTextBase();
+        const preferred_base: u64 = if (self.binary) |bin|
+            bin.text_vmaddr
+        else if (self.elf_binary) |elf|
+            elf.preferred_base
+        else
+            0;
+        if (preferred_base == 0) return;
 
-        const actual_base = self.process.getTextBase() catch return;
-        if (actual_base == binary.text_vmaddr) return; // no slide
-
-        const slide: i64 = @as(i64, @intCast(actual_base)) - @as(i64, @intCast(binary.text_vmaddr));
-        self.aslr_slide = slide;
-
-        for (self.line_entries) |*entry| {
-            if (slide > 0) {
-                entry.address +%= @intCast(@as(u64, @intCast(slide)));
-            } else {
-                entry.address -%= @intCast(@as(u64, @intCast(-slide)));
-            }
-        }
-
-        // Also adjust function addresses
-        for (self.functions) |*func| {
-            if (slide > 0) {
-                func.low_pc +%= @intCast(@as(u64, @intCast(slide)));
-                if (func.high_pc > 0) func.high_pc +%= @intCast(@as(u64, @intCast(slide)));
-            } else {
-                func.low_pc -%= @intCast(@as(u64, @intCast(-slide)));
-                if (func.high_pc > 0) func.high_pc -%= @intCast(@as(u64, @intCast(-slide)));
-            }
-        }
-
-        // Also adjust inlined subroutine addresses
-        for (self.inlined_subs) |*isub| {
-            if (slide > 0) {
-                if (isub.low_pc > 0) isub.low_pc +%= @intCast(@as(u64, @intCast(slide)));
-                if (isub.high_pc > 0) isub.high_pc +%= @intCast(@as(u64, @intCast(slide)));
-            } else {
-                if (isub.low_pc > 0) isub.low_pc -%= @intCast(@as(u64, @intCast(-slide)));
-                if (isub.high_pc > 0) isub.high_pc -%= @intCast(@as(u64, @intCast(-slide)));
-            }
-        }
+        const runtime: i128 = actual_base;
+        const preferred: i128 = preferred_base;
+        self.address_translation.load_bias = @intCast(runtime - preferred);
+        debug_log.log(
+            "dwarf.engine: resolved address translation runtime_base=0x{x} preferred_base=0x{x} load_bias={d}",
+            .{ actual_base, preferred_base, self.address_translation.load_bias },
+        );
     }
 
     fn loadDebugInfo(self: *DwarfEngine, program: []const u8) !void {
@@ -931,6 +936,7 @@ pub const DwarfEngine = struct {
                 // Frame identity: use CFA if available, else SP (always available from registers)
                 const pre_cfa = self.computeCfa(original_regs);
                 const pre_frame_id = pre_cfa orelse original_regs.sp;
+                const original_dwarf_pc = self.runtimeToDwarf(original_regs.pc);
 
                 if (current_line != null and self.line_entries.len > 0) {
                     // Find current function range using original PC (before stepPastBreakpoint)
@@ -946,7 +952,7 @@ pub const DwarfEngine = struct {
                     var bp_count: usize = 0;
                     if (func_low != 0 and func_high != 0) {
                         bp_count = self.findAllLineAddressesInRange(
-                            original_regs.pc,
+                            original_dwarf_pc,
                             func_low,
                             func_high,
                             current_line.?,
@@ -957,7 +963,7 @@ pub const DwarfEngine = struct {
                     // Fallback: if no multi-BP targets, use single next-line
                     if (bp_count == 0) {
                         if (self.findNextLineAddress(original_regs.pc)) |addr| {
-                            bp_targets[0] = addr;
+                            bp_targets[0] = self.runtimeToDwarf(addr);
                             bp_count = 1;
                         }
                     }
@@ -965,7 +971,8 @@ pub const DwarfEngine = struct {
                     if (bp_count > 0) {
                         // Set temp BPs at all target addresses
                         var any_bp_set = false;
-                        for (bp_targets[0..bp_count]) |target_addr| {
+                        for (bp_targets[0..bp_count]) |dwarf_target| {
+                            const target_addr = self.dwarfToRuntime(dwarf_target);
                             const tmp_id = self.bp_manager.setTemporary(target_addr) catch continue;
                             self.bp_manager.writeBreakpoint(tmp_id, &self.process) catch continue;
                             any_bp_set = true;
@@ -1144,27 +1151,14 @@ pub const DwarfEngine = struct {
             .restart => {
                 self.process.kill() catch {};
                 if (self.program_path) |path| {
-                    const old_slide = self.aslr_slide;
+                    const old_translation = self.address_translation;
                     self.process.spawn(self.allocator, path, &.{}) catch {
                         return .{ .stop_reason = .exception };
                     };
-                    // Reload debug info fresh so ASLR slide is applied to un-slided data
-                    self.aslr_slide = 0;
+                    self.address_translation = .{};
                     self.loadDebugInfo(path) catch {};
-                    self.applyAslrSlide() catch {};
-                    // Adjust existing breakpoint addresses for new ASLR slide
-                    const slide_diff = self.aslr_slide - old_slide;
-                    if (slide_diff != 0) {
-                        for (self.bp_manager.breakpoints.items) |*bp| {
-                            if (bp.enabled) {
-                                if (slide_diff > 0) {
-                                    bp.address +%= @intCast(@as(u64, @intCast(slide_diff)));
-                                } else {
-                                    bp.address -%= @intCast(@as(u64, @intCast(-slide_diff)));
-                                }
-                            }
-                        }
-                    }
+                    self.resolveAddressTranslation() catch {};
+                    self.relocateBreakpoints(old_translation);
                     self.rearmAllBreakpoints();
                     self.stepping_past_bp = null;
                     self.stepping_past_wp = null;
@@ -1276,11 +1270,12 @@ pub const DwarfEngine = struct {
 
     fn getLineInfoForPC(self: *DwarfEngine, pc: u64) ?LineInfo {
         if (self.line_entries.len == 0) return null;
+        const dwarf_pc = self.runtimeToDwarf(pc);
         var lo: usize = 0;
         var hi: usize = self.line_entries.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.line_entries[mid].address <= pc) {
+            if (self.line_entries[mid].address <= dwarf_pc) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -1305,24 +1300,21 @@ pub const DwarfEngine = struct {
     fn findNextLineAddress(self: *DwarfEngine, pc: u64) ?u64 {
         if (self.line_entries.len == 0) return null;
         const current_line = self.getLineForPC(pc) orelse return null;
-        // Binary search: find first entry with address > pc
+        const dwarf_pc = self.runtimeToDwarf(pc);
         var lo: usize = 0;
         var hi: usize = self.line_entries.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.line_entries[mid].address <= pc) {
+            if (self.line_entries[mid].address <= dwarf_pc) {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        // Scan forward from lo for next statement with a different line
         for (self.line_entries[lo..]) |entry| {
             if (entry.end_sequence) continue;
             if (!entry.is_stmt) continue;
-            if (entry.line != current_line) {
-                return entry.address;
-            }
+            if (entry.line != current_line) return self.dwarfToRuntime(entry.address);
         }
         return null;
     }
@@ -1404,12 +1396,13 @@ pub const DwarfEngine = struct {
     /// Find the FunctionInfo (with address range) for a PC. Returns null if no function contains pc.
     fn findFunctionInfoForPC(self: *DwarfEngine, pc: u64) ?parser.FunctionInfo {
         if (self.functions.len == 0) return null;
+        const dwarf_pc = self.runtimeToDwarf(pc);
         // Binary search: find rightmost function with low_pc <= pc
         var lo: usize = 0;
         var hi: usize = self.functions.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.functions[mid].low_pc <= pc) {
+            if (self.functions[mid].low_pc <= dwarf_pc) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -1417,43 +1410,29 @@ pub const DwarfEngine = struct {
         }
         if (lo == 0) return null;
         const f = self.functions[lo - 1];
-        if (pc >= f.low_pc and (f.high_pc == 0 or pc < f.high_pc)) {
+        if (dwarf_pc >= f.low_pc and (f.high_pc == 0 or dwarf_pc < f.high_pc)) {
             return f;
         }
         return null;
     }
 
-    /// Find the nearest DWARF line address <= dwarf_pc using binary search.
-    /// Converts between runtime and DWARF address spaces via aslr_slide.
+    /// Find the nearest non-terminal DWARF line address <= dwarf_pc.
     fn findNearestDwarfLineAddress(self: *const DwarfEngine, dwarf_pc: u64) u64 {
         if (self.line_entries.len == 0) return 0;
-        // Convert DWARF PC to runtime PC for comparison against sorted line_entries
-        const runtime_pc = if (self.aslr_slide >= 0)
-            dwarf_pc +% @as(u64, @intCast(self.aslr_slide))
-        else
-            dwarf_pc -% @as(u64, @intCast(-self.aslr_slide));
-        // Binary search: find rightmost entry with address <= runtime_pc
         var lo: usize = 0;
         var hi: usize = self.line_entries.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.line_entries[mid].address <= runtime_pc) {
+            if (self.line_entries[mid].address <= dwarf_pc) {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        // Walk back to find non-end_sequence entry
         var i = lo;
         while (i > 0) {
             i -= 1;
-            if (!self.line_entries[i].end_sequence) {
-                // Convert back to DWARF address space
-                return if (self.aslr_slide >= 0)
-                    self.line_entries[i].address -% @as(u64, @intCast(self.aslr_slide))
-                else
-                    self.line_entries[i].address +% @as(u64, @intCast(-self.aslr_slide));
-            }
+            if (!self.line_entries[i].end_sequence) return self.line_entries[i].address;
         }
         return 0;
     }
@@ -1463,6 +1442,7 @@ pub const DwarfEngine = struct {
     /// Falls back to the first `is_stmt` entry if no prologue_end marker exists.
     fn findPrologueEndAddress(self: *DwarfEngine, pc: u64) ?u64 {
         if (self.line_entries.len == 0 or self.functions.len == 0) return null;
+        const dwarf_pc = self.runtimeToDwarf(pc);
 
         // Binary search: find the function containing this PC
         var func_start: u64 = 0;
@@ -1471,7 +1451,7 @@ pub const DwarfEngine = struct {
         var hi: usize = self.functions.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (self.functions[mid].low_pc <= pc) {
+            if (self.functions[mid].low_pc <= dwarf_pc) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -1479,7 +1459,7 @@ pub const DwarfEngine = struct {
         }
         if (lo > 0) {
             const f = self.functions[lo - 1];
-            if (pc >= f.low_pc and (f.high_pc == 0 or pc < f.high_pc)) {
+            if (dwarf_pc >= f.low_pc and (f.high_pc == 0 or dwarf_pc < f.high_pc)) {
                 func_start = f.low_pc;
                 func_end = f.high_pc;
             }
@@ -1504,16 +1484,14 @@ pub const DwarfEngine = struct {
             if (func_end > 0 and entry.address >= func_end) break;
             if (entry.end_sequence) continue;
 
-            if (entry.prologue_end) {
-                return entry.address;
-            }
+            if (entry.prologue_end) return self.dwarfToRuntime(entry.address);
             if (entry.is_stmt and first_stmt == null and entry.address >= func_start) {
                 first_stmt = entry.address;
             }
         }
 
-        // Fall back to first is_stmt entry in the function
-        return first_stmt;
+        // Fall back to first is_stmt entry in the function.
+        return if (first_stmt) |address| self.dwarfToRuntime(address) else null;
     }
 
     /// Read the return address from the current stack frame.
@@ -1525,7 +1503,7 @@ pub const DwarfEngine = struct {
             if (lr != 0) return lr;
             // Try reading from stack
             if (regs.fp != 0) {
-                const mem = self.process.readMemory(regs.fp + 8, 8, self.allocator) catch return null;
+                const mem = self.readAccess().readMemory(regs.fp + 8, 8, self.allocator) catch return null;
                 defer self.allocator.free(mem);
                 return std.mem.readInt(u64, mem[0..8], .little);
             }
@@ -1533,7 +1511,7 @@ pub const DwarfEngine = struct {
         } else {
             // On x86_64, return address is at [RBP+8]
             if (regs.fp == 0) return null;
-            const mem = self.process.readMemory(regs.fp + 8, 8, self.allocator) catch return null;
+            const mem = self.readAccess().readMemory(regs.fp + 8, 8, self.allocator) catch return null;
             defer self.allocator.free(mem);
             return std.mem.readInt(u64, mem[0..8], .little);
         }
@@ -1709,12 +1687,13 @@ pub const DwarfEngine = struct {
 
         const locals = self.buildLocals(regs) catch &.{};
 
+        const dwarf_pc = self.runtimeToDwarf(regs.pc);
         // Resolve function name for location
-        const func_name = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, regs.pc) else "";
+        const func_name = if (self.functions.len > 0) unwind.findFunctionForPC(self.functions, dwarf_pc) else "";
 
         // Resolve location from PC
         const loc = if (self.line_entries.len > 0 and self.file_entries.len > 0)
-            parser.resolveAddress(self.line_entries, self.file_entries, regs.pc)
+            parser.resolveAddress(self.line_entries, self.file_entries, dwarf_pc)
         else
             null;
 
@@ -1741,13 +1720,15 @@ pub const DwarfEngine = struct {
     fn buildStackTrace(self: *DwarfEngine, regs: process_mod.RegisterState) ![]const types.StackFrame {
         if (self.functions.len == 0) return &.{};
 
+        const access = self.readAccess();
         const fp_frames = try unwind.unwindStackFP(
             regs.pc,
             regs.fp,
             self.functions,
             self.line_entries,
             self.file_entries,
-            &self.process,
+            access,
+            self.address_translation,
             self.allocator,
             50,
         );
@@ -1763,7 +1744,7 @@ pub const DwarfEngine = struct {
             if (self.resolveFrameData()) |frame_data| {
                 var cfa_ctx = CfaReaderCtx{
                     .regs = regs,
-                    .process = &self.process,
+                    .access = access,
                     .allocator = self.allocator,
                 };
                 const cfa_frames = unwind.unwindStackCfa(
@@ -1771,6 +1752,7 @@ pub const DwarfEngine = struct {
                     frame_data.pc_base,
                     regs.pc,
                     regs.sp,
+                    self.address_translation,
                     self.functions,
                     self.line_entries,
                     self.file_entries,
@@ -1809,7 +1791,7 @@ pub const DwarfEngine = struct {
             if (self.inlined_subs.len > 0) {
                 const inlined = parser.findInlinedSubroutines(
                     self.inlined_subs,
-                    uf.address,
+                    self.runtimeToDwarf(uf.address),
                     self.allocator,
                 ) catch &.{};
                 defer if (inlined.len > 0) self.allocator.free(inlined);
@@ -2024,11 +2006,10 @@ pub const DwarfEngine = struct {
     }
 
     /// Context for CFA register/memory reader callbacks.
-    /// Holds a snapshot of register state and a reference to the process
-    /// so that plain (non-capturing) function pointers can access them.
+    /// Holds a register snapshot and generic live-process or core-dump access.
     const CfaReaderCtx = struct {
         regs: process_mod.RegisterState,
-        process: *ProcessControl,
+        access: process_mod.ProcessOrCoreAccess,
         allocator: std.mem.Allocator,
 
         fn regReader(ctx_opaque: *anyopaque, reg: u64) ?u64 {
@@ -2059,7 +2040,7 @@ pub const DwarfEngine = struct {
 
         fn memReader(ctx_opaque: *anyopaque, addr: u64, size: usize) ?u64 {
             const self: *CfaReaderCtx = @ptrCast(@alignCast(ctx_opaque));
-            const data = self.process.readMemory(addr, size, self.allocator) catch return null;
+            const data = self.access.readMemory(addr, size, self.allocator) catch return null;
             defer self.allocator.free(data);
             if (data.len < 8) return null;
             return std.mem.readInt(u64, data[0..8], .little);
@@ -2070,17 +2051,11 @@ pub const DwarfEngine = struct {
     /// Uses the existing unwind infrastructure (EhFrameIndex, CieCache) for O(log n) lookup.
     fn computeCfa(self: *DwarfEngine, regs: process_mod.RegisterState) ?u64 {
         const frame_data = self.resolveFrameData() orelse return null;
-        // For .debug_frame, FDE addresses are absolute DWARF addresses.
-        // Convert runtime PC to DWARF space for correct FDE lookup and CFA execution.
-        const target_pc: u64 = if (self.is_debug_frame and self.aslr_slide != 0) blk: {
-            break :blk if (self.aslr_slide >= 0)
-                regs.pc -% @as(u64, @intCast(self.aslr_slide))
-            else
-                regs.pc +% @as(u64, @intCast(-self.aslr_slide));
-        } else regs.pc;
+        // FDE ranges stay in link-time DWARF space for both frame-section formats.
+        const target_pc = self.runtimeToDwarf(regs.pc);
         var cfa_ctx = CfaReaderCtx{
             .regs = regs,
-            .process = &self.process,
+            .access = self.readAccess(),
             .allocator = self.allocator,
         };
         const result = unwind.unwindCfa(
@@ -2101,19 +2076,11 @@ pub const DwarfEngine = struct {
     fn buildLocals(self: *DwarfEngine, regs: process_mod.RegisterState) ![]const types.Variable {
         const dd = self.resolveDebugData() orelse return &.{};
 
-        // Compute DWARF PC (un-slide)
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            regs.pc +% @as(u64, @intCast(-self.aslr_slide));
-
-        debug_log.log("dwarf.engine: buildLocals pc=0x{x} slide={d} dwarf_pc=0x{x} has_loc={} has_loclists={}", .{
-            regs.pc,
-            self.aslr_slide,
-            dwarf_pc,
-            dd.loc_data != null,
-            dd.loclists_data != null,
-        });
+        const dwarf_pc = self.runtimeToDwarf(regs.pc);
+        debug_log.log(
+            "dwarf.engine: build locals runtime_pc=0x{x} dwarf_pc=0x{x} has_loc={} has_loclists={}",
+            .{ regs.pc, dwarf_pc, dd.loc_data != null, dd.loclists_data != null },
+        );
 
         var scoped = parser.parseScopedVariables(
             dd.info_data,
@@ -2171,7 +2138,7 @@ pub const DwarfEngine = struct {
         // Build register and memory adapters
         var reg_adapter = RegisterAdapter{ .regs = regs };
         const reg_provider = reg_adapter.provider();
-        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = self.allocator };
+        var mem_adapter = MemoryAdapter{ .access = self.readAccess(), .allocator = self.allocator };
         const mem_reader = mem_adapter.reader();
 
         // Evaluate frame base (pass real CFA from .eh_frame for DW_OP_call_frame_cfa)
@@ -2189,13 +2156,10 @@ pub const DwarfEngine = struct {
         var locals = std.ArrayListUnmanaged(types.Variable).empty;
         errdefer locals.deinit(self.allocator);
 
-        debug_log.log("dwarf.engine: buildLocals frame_base={?} cfa={?} sp=0x{x} fp=0x{x} variables={d}", .{
-            frame_base,
-            self.computeCfa(regs),
-            regs.sp,
-            regs.fp,
-            scoped.variables.len,
-        });
+        debug_log.log(
+            "dwarf.engine: evaluate locals frame_base={?} cfa={?} sp=0x{x} fp=0x{x} variables={d}",
+            .{ frame_base, self.computeCfa(regs), regs.sp, regs.fp, scoped.variables.len },
+        );
 
         for (scoped.variables) |v| {
             if (v.location_expr.len == 0) continue;
@@ -2205,14 +2169,7 @@ pub const DwarfEngine = struct {
             debug_log.log("dwarf.engine: local name={s} expr_len={d} result={s}", .{
                 v.name,
                 v.location_expr.len,
-                switch (loc) {
-                    .address => "address",
-                    .register => "register",
-                    .value => "value",
-                    .empty => "empty",
-                    .implicit_pointer => "implicit_pointer",
-                    .composite => "composite",
-                },
+                @tagName(loc),
             });
 
             var fmt_buf: [64]u8 = undefined;
@@ -2316,10 +2273,13 @@ pub const DwarfEngine = struct {
         if (self.core_dump != null) return error.NotSupported; // core dumps are read-only
 
         if (self.line_entries.len > 0) {
-            // Resolve file:line to address via DWARF line table
-            const bp = try self.bp_manager.resolveAndSetEx(file, line, self.line_entries, self.file_entries, condition, hit_condition, log_message);
+            // Resolve in DWARF space, then translate before touching process memory.
+            var bp = try self.bp_manager.resolveAndSetEx(file, line, self.line_entries, self.file_entries, condition, hit_condition, log_message);
+            const runtime_address = self.dwarfToRuntime(bp.address);
+            if (self.bp_manager.findById(bp.id)) |stored| stored.address = runtime_address;
+            bp.address = runtime_address;
 
-            // Write INT3 into the process
+            // Write INT3 into the process.
             self.bp_manager.writeBreakpoint(bp.id, &self.process) catch |err| {
                 // If write fails, remove the breakpoint and propagate
                 self.bp_manager.remove(bp.id) catch {};
@@ -2431,58 +2391,29 @@ pub const DwarfEngine = struct {
             }
         }
 
-        // 1. Read registers to get current PC
-        const regs = self.process.readRegisters() catch {
-            return .{ .result = "<no process>", .type = "" };
+        // 1. Read registers and debug sections through format-neutral accessors.
+        const regs = self.readAccess().readRegisters() catch {
+            return .{ .result = "<no process or core>", .type = "" };
         };
-
-        // 2. Find a debug binary with debug_info section (prefer dSYM, then main binary)
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return .{ .result = "<no debug info>", .type = "" };
-        };
-
-        // 3. Extract section data
-        const info_section = debug_binary.sections.debug_info orelse return .{ .result = "<no debug info>", .type = "" };
-        const abbrev_section = debug_binary.sections.debug_abbrev orelse return .{ .result = "<no debug info>", .type = "" };
-        const info_data = debug_binary.getSectionData(info_section) orelse return .{ .result = "<no debug info>", .type = "" };
-        const abbrev_data = debug_binary.getSectionData(abbrev_section) orelse return .{ .result = "<no debug info>", .type = "" };
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
+        const debug_data = self.resolveDebugData() orelse return .{ .result = "<no debug info>", .type = "" };
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
+        const str_offsets_data = debug_data.str_offsets_data;
+        const addr_data = debug_data.addr_data;
 
         // 4. Determine the PC to use for variable lookup
         // If frame_id is provided, look up that frame's PC from the cached stack trace
         const target_pc: u64 = if (request.frame_id) |frame_id| blk: {
             for (self.cached_stack_trace) |frame| {
                 if (frame.id == frame_id) {
-                    // Use the frame's stored address directly (un-slide for DWARF comparison)
-                    if (frame.address != 0) {
-                        break :blk if (self.aslr_slide >= 0)
-                            frame.address -% @as(u64, @intCast(self.aslr_slide))
-                        else
-                            frame.address +% @as(u64, @intCast(-self.aslr_slide));
-                    }
+                    if (frame.address != 0) break :blk self.runtimeToDwarf(frame.address);
                     break;
                 }
             }
-            // Fall back to current PC if frame not found
-            break :blk if (self.aslr_slide >= 0)
-                regs.pc -% @as(u64, @intCast(self.aslr_slide))
-            else
-                regs.pc +% @as(u64, @intCast(-self.aslr_slide));
-        } else blk: {
-            // No frame_id: use current PC (un-slide for DWARF comparison)
-            break :blk if (self.aslr_slide >= 0)
-                regs.pc -% @as(u64, @intCast(self.aslr_slide))
-            else
-                regs.pc +% @as(u64, @intCast(-self.aslr_slide));
-        };
+            // Fall back to current PC if frame not found.
+            break :blk self.runtimeToDwarf(regs.pc);
+        } else self.runtimeToDwarf(regs.pc);
 
         // 5. Parse scoped variables for the target function
         var scoped = parser.parseScopedVariables(
@@ -2492,10 +2423,10 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = debug_data.ranges_data,
+                .debug_rnglists = debug_data.rnglists_data,
+                .debug_loc = debug_data.loc_data,
+                .debug_loclists = debug_data.loclists_data,
             },
             target_pc,
             allocator,
@@ -2546,10 +2477,10 @@ pub const DwarfEngine = struct {
                     .{
                         .debug_str_offsets = str_offsets_data,
                         .debug_addr = addr_data,
-                        .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                        .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                        .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                        .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                        .debug_ranges = debug_data.ranges_data,
+                        .debug_rnglists = debug_data.rnglists_data,
+                        .debug_loc = debug_data.loc_data,
+                        .debug_loclists = debug_data.loclists_data,
                     },
                     best_addr,
                     allocator,
@@ -2637,7 +2568,7 @@ pub const DwarfEngine = struct {
         const reg_provider = reg_adapter.provider();
 
         // 10. Build memory adapter
-        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
+        var mem_adapter = MemoryAdapter{ .access = self.readAccess(), .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
         // 11. Evaluate frame base expression (pass real CFA for DW_OP_call_frame_cfa)
@@ -2671,7 +2602,7 @@ pub const DwarfEngine = struct {
         // Build adapters
         var reg_adapter = RegisterAdapter{ .regs = regs };
         const reg_provider = reg_adapter.provider();
-        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
+        var mem_adapter = MemoryAdapter{ .access = self.readAccess(), .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
         // Evaluate frame base (pass real CFA for DW_OP_call_frame_cfa)
@@ -2829,12 +2760,12 @@ pub const DwarfEngine = struct {
     };
 
     const MemoryAdapter = struct {
-        process: *ProcessControl,
+        access: process_mod.ProcessOrCoreAccess,
         allocator: std.mem.Allocator,
 
         fn readMem(ctx: *anyopaque, addr: u64, size: usize) ?u64 {
             const self: *MemoryAdapter = @ptrCast(@alignCast(ctx));
-            const buf = self.process.readMemory(addr, size, self.allocator) catch return null;
+            const buf = self.access.readMemory(addr, size, self.allocator) catch return null;
             defer self.allocator.free(buf);
             if (buf.len == 0) return null;
             return switch (buf.len) {
@@ -3026,30 +2957,13 @@ pub const DwarfEngine = struct {
     /// current DWARF state (registers, memory, scoped variables at current PC).
     /// The caller must call condition_context.deinit() when done.
     fn buildConditionEvaluator(self: *DwarfEngine, regs: process_mod.RegisterState) ?BreakpointManager.ConditionEvaluator {
-        // Find debug binary with debug_info section
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return null;
-        };
-
-        const info_section = debug_binary.sections.debug_info orelse return null;
-        const abbrev_section = debug_binary.sections.debug_abbrev orelse return null;
-        const info_data = debug_binary.getSectionData(info_section) orelse return null;
-        const abbrev_data = debug_binary.getSectionData(abbrev_section) orelse return null;
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
-
-        // Compute DWARF PC (un-slide)
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+        const debug_data = self.resolveDebugData() orelse return null;
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
+        const str_offsets_data = debug_data.str_offsets_data;
+        const addr_data = debug_data.addr_data;
+        const dwarf_pc = self.runtimeToDwarf(regs.pc);
 
         const scoped = parser.parseScopedVariables(
             info_data,
@@ -3058,10 +2972,10 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = debug_data.ranges_data,
+                .debug_rnglists = debug_data.rnglists_data,
+                .debug_loc = debug_data.loc_data,
+                .debug_loclists = debug_data.loclists_data,
             },
             dwarf_pc,
             self.allocator,
@@ -3094,7 +3008,7 @@ pub const DwarfEngine = struct {
         self.condition_context = .{
             .variables = scoped.variables,
             .reg_adapter = .{ .regs = regs },
-            .mem_adapter = .{ .process = &self.process, .allocator = self.allocator },
+            .mem_adapter = .{ .access = self.readAccess(), .allocator = self.allocator },
             .frame_base = frame_base,
             .scoped_result = scoped,
             .allocator = self.allocator,
@@ -3108,30 +3022,13 @@ pub const DwarfEngine = struct {
 
     /// Evaluate a log point message template, replacing {varname} with variable values.
     fn evaluateLogMessage(self: *DwarfEngine, template: []const u8, regs: process_mod.RegisterState) ?[]const u8 {
-        // Get DWARF sections for variable resolution
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return self.allocator.dupe(u8, template) catch null;
-        };
-
-        const info_section = debug_binary.sections.debug_info orelse return self.allocator.dupe(u8, template) catch null;
-        const abbrev_section = debug_binary.sections.debug_abbrev orelse return self.allocator.dupe(u8, template) catch null;
-        const info_data = debug_binary.getSectionData(info_section) orelse return self.allocator.dupe(u8, template) catch null;
-        const abbrev_data = debug_binary.getSectionData(abbrev_section) orelse return self.allocator.dupe(u8, template) catch null;
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
-
-        // Compute DWARF PC
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+        const debug_data = self.resolveDebugData() orelse return self.allocator.dupe(u8, template) catch null;
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
+        const str_offsets_data = debug_data.str_offsets_data;
+        const addr_data = debug_data.addr_data;
+        const dwarf_pc = self.runtimeToDwarf(regs.pc);
 
         const scoped = parser.parseScopedVariables(
             info_data,
@@ -3140,10 +3037,10 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = debug_data.ranges_data,
+                .debug_rnglists = debug_data.rnglists_data,
+                .debug_loc = debug_data.loc_data,
+                .debug_loclists = debug_data.loclists_data,
             },
             dwarf_pc,
             self.allocator,
@@ -3155,7 +3052,7 @@ pub const DwarfEngine = struct {
 
         var reg_adapter = RegisterAdapter{ .regs = regs };
         const reg_provider = reg_adapter.provider();
-        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = self.allocator };
+        var mem_adapter = MemoryAdapter{ .access = self.readAccess(), .allocator = self.allocator };
         const mem_reader = mem_adapter.reader();
 
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) fb_blk: {
@@ -3547,7 +3444,7 @@ pub const DwarfEngine = struct {
 
     fn engineStackTrace(ctx: *anyopaque, allocator: std.mem.Allocator, _: u32, start_frame: u32, levels: u32) anyerror![]const types.StackFrame {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        const regs = try self.process.readRegisters();
+        const regs = try self.readAccess().readRegisters();
         const all_frames = self.buildStackTrace(regs) catch return &.{};
         debug_log.log("dwarf.engine: getStackTrace frame_count={d}", .{all_frames.len});
 
@@ -3570,10 +3467,7 @@ pub const DwarfEngine = struct {
 
     fn engineReadMemory(ctx: *anyopaque, allocator: std.mem.Allocator, address: u64, size: u64) anyerror![]const u8 {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        const data = if (self.core_dump) |*cd|
-            try cd.readMemory(address, @intCast(size), allocator)
-        else
-            try self.process.readMemory(address, @intCast(size), allocator);
+        const data = try self.readAccess().readMemory(address, @intCast(size), allocator);
         // Convert to hex string
         const hex = try allocator.alloc(u8, data.len * 2);
         for (data, 0..) |byte, i| {
@@ -3604,7 +3498,7 @@ pub const DwarfEngine = struct {
         var i: u32 = 0;
         while (i < count) : (i += 1) {
             const read_size: usize = if (is_arm) 4 else 16; // x86 instructions up to 15 bytes
-            const bytes = self.process.readMemory(addr, read_size, allocator) catch break;
+            const bytes = self.readAccess().readMemory(addr, read_size, allocator) catch break;
             defer allocator.free(bytes);
 
             // Substitute original bytes if a breakpoint is patched at this address
@@ -3782,6 +3676,7 @@ pub const DwarfEngine = struct {
                 }
             }
 
+            bp_addr = self.dwarfToRuntime(bp_addr);
             const bp_id = self.bp_manager.setAtAddressEx(bp_addr, func.name, bp_line, condition) catch |err| {
                 debug_log.log("dwarf.engine: function breakpoint failed for {s}: {s}", .{ func.name, @errorName(err) });
                 continue;
@@ -3852,36 +3747,19 @@ pub const DwarfEngine = struct {
             }
         }
 
-        // Find debug binary
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return error.NoDebugInfo;
-        };
-
-        const info_data = debug_binary.getSectionData(debug_binary.sections.debug_info orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
-        const abbrev_data = debug_binary.getSectionData(debug_binary.sections.debug_abbrev orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
-
-        // Use target frame's PC for variable lookup
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            frame_regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            frame_regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+        const debug_data = self.resolveDebugData() orelse return error.NoDebugInfo;
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
+        const dwarf_pc = self.runtimeToDwarf(frame_regs.pc);
 
         const extra_sections = parser.ExtraSections{
-            .debug_str_offsets = str_offsets_data,
-            .debug_addr = addr_data,
-            .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-            .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-            .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-            .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+            .debug_str_offsets = debug_data.str_offsets_data,
+            .debug_addr = debug_data.addr_data,
+            .debug_ranges = debug_data.ranges_data,
+            .debug_rnglists = debug_data.rnglists_data,
+            .debug_loc = debug_data.loc_data,
+            .debug_loclists = debug_data.loclists_data,
         };
 
         var scoped = try parser.parseScopedVariables(
@@ -3900,7 +3778,7 @@ pub const DwarfEngine = struct {
         // Build adapters using target frame registers
         var reg_adapter = RegisterAdapter{ .regs = frame_regs };
         const reg_provider = reg_adapter.provider();
-        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
+        var mem_adapter = MemoryAdapter{ .access = self.readAccess(), .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
@@ -4116,7 +3994,7 @@ pub const DwarfEngine = struct {
         if (executable_path) |exe| {
             self.program_path = try allocator.dupe(u8, exe);
             self.loadDebugInfo(exe) catch {};
-            // No ASLR slide for core dumps — addresses in core match the process at crash time
+            debug_log.log("dwarf.engine: loaded core executable {s}; runtime translation remains explicit", .{exe});
         }
     }
 
@@ -4125,27 +4003,15 @@ pub const DwarfEngine = struct {
     fn engineScopes(ctx: *anyopaque, allocator: std.mem.Allocator, _: u32) anyerror![]const types.Scope {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
 
-        const regs = try self.process.readRegisters();
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return error.NoDebugInfo;
-        };
+        const regs = try self.readAccess().readRegisters();
+        const debug_data = self.resolveDebugData() orelse return error.NoDebugInfo;
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
+        const str_offsets_data = debug_data.str_offsets_data;
+        const addr_data = debug_data.addr_data;
 
-        const info_data = debug_binary.getSectionData(debug_binary.sections.debug_info orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
-        const abbrev_data = debug_binary.getSectionData(debug_binary.sections.debug_abbrev orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
-
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+        const dwarf_pc = self.runtimeToDwarf(regs.pc);
 
         const scoped = parser.parseScopedVariables(
             info_data,
@@ -4154,10 +4020,10 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = debug_data.ranges_data,
+                .debug_rnglists = debug_data.rnglists_data,
+                .debug_loc = debug_data.loc_data,
+                .debug_loclists = debug_data.loclists_data,
             },
             dwarf_pc,
             allocator,
@@ -4201,37 +4067,40 @@ pub const DwarfEngine = struct {
 
     // ── Capabilities ────────────────────────────────────────────────
 
-    fn engineCapabilities(_: *anyopaque) types.DebugCapabilities {
+    fn engineCapabilities(ctx: *anyopaque) types.DebugCapabilities {
+        const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        const read_only = self.core_dump != null;
+        debug_log.log("dwarf.engine: capabilities read_only={}", .{read_only});
         return .{
-            .supports_conditional_breakpoints = true,
-            .supports_hit_conditional_breakpoints = true,
-            .supports_log_points = true,
-            .supports_function_breakpoints = true,
-            .supports_data_breakpoints = (builtin.cpu.arch == .aarch64),
+            .supports_conditional_breakpoints = !read_only,
+            .supports_hit_conditional_breakpoints = !read_only,
+            .supports_log_points = !read_only,
+            .supports_function_breakpoints = !read_only,
+            .supports_data_breakpoints = !read_only and builtin.cpu.arch == .aarch64,
             .supports_step_back = false,
             .supports_restart_frame = false,
-            .supports_goto_targets = true,
+            .supports_goto_targets = false,
             .supports_completions = true,
             .supports_modules = true,
-            .supports_set_variable = true,
-            .supports_set_expression = true,
-            .supports_terminate = true,
+            .supports_set_variable = !read_only,
+            .supports_set_expression = !read_only,
+            .supports_terminate = !read_only,
             .supports_read_memory = true,
-            .supports_write_memory = true,
+            .supports_write_memory = !read_only,
             .supports_disassemble = true,
-            .supports_instruction_breakpoints = true,
-            .supports_stepping_granularity = true,
-            .supports_cancel_request = true,
-            .supports_terminate_threads = true,
+            .supports_instruction_breakpoints = !read_only,
+            .supports_stepping_granularity = !read_only,
+            .supports_cancel_request = false,
+            .supports_terminate_threads = false,
             .supports_breakpoint_locations = true,
-            .supports_step_in_targets = true,
+            .supports_step_in_targets = false,
             .supports_evaluate_for_hovers = true,
             .supports_value_formatting = true,
             .supports_loaded_sources = true,
-            .supports_restart_request = true,
-            .supports_single_thread_execution_requests = true,
-            .supports_exception_options = true,
-            .support_terminate_debuggee = true,
+            .supports_restart_request = !read_only,
+            .supports_single_thread_execution_requests = false,
+            .supports_exception_options = !read_only,
+            .support_terminate_debuggee = !read_only,
             .supports_clipboard_context = true,
         };
     }
@@ -4244,29 +4113,15 @@ pub const DwarfEngine = struct {
         var items = std.ArrayListUnmanaged(types.CompletionItem).empty;
         errdefer items.deinit(allocator);
 
-        // Match variable names from current scope
-        const regs = self.process.readRegisters() catch return try items.toOwnedSlice(allocator);
-
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return try items.toOwnedSlice(allocator);
-        };
-
-        const info_data = debug_binary.getSectionData(debug_binary.sections.debug_info orelse return try items.toOwnedSlice(allocator)) orelse return try items.toOwnedSlice(allocator);
-        const abbrev_data = debug_binary.getSectionData(debug_binary.sections.debug_abbrev orelse return try items.toOwnedSlice(allocator)) orelse return try items.toOwnedSlice(allocator);
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null;
-
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            regs.pc +% @as(u64, @intCast(-self.aslr_slide));
+        // Match variable names from current scope.
+        const regs = self.readAccess().readRegisters() catch return try items.toOwnedSlice(allocator);
+        const debug_data = self.resolveDebugData() orelse return try items.toOwnedSlice(allocator);
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
+        const str_offsets_data = debug_data.str_offsets_data;
+        const addr_data = debug_data.addr_data;
+        const dwarf_pc = self.runtimeToDwarf(regs.pc);
 
         const scoped = parser.parseScopedVariables(
             info_data,
@@ -4275,10 +4130,10 @@ pub const DwarfEngine = struct {
             .{
                 .debug_str_offsets = str_offsets_data,
                 .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                .debug_ranges = debug_data.ranges_data,
+                .debug_rnglists = debug_data.rnglists_data,
+                .debug_loc = debug_data.loc_data,
+                .debug_loclists = debug_data.loclists_data,
             },
             dwarf_pc,
             allocator,
@@ -4531,37 +4386,24 @@ pub const DwarfEngine = struct {
             }
         }
 
-        // Find the variable using DWARF info
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_info != null) break :blk bin;
-            }
-            return error.NoDebugInfo;
-        };
-
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            frame_regs.pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            frame_regs.pc +% @as(u64, @intCast(-self.aslr_slide));
-
-        const info_data = debug_binary.getSectionData(debug_binary.sections.debug_info orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
-        const abbrev_data = debug_binary.getSectionData(debug_binary.sections.debug_abbrev orelse return error.NoDebugInfo) orelse return error.NoDebugInfo;
-        const str_data = if (debug_binary.sections.debug_str) |s| debug_binary.getSectionData(s) else null;
+        // Find the variable using format-neutral DWARF data.
+        const debug_data = self.resolveDebugData() orelse return error.NoDebugInfo;
+        const dwarf_pc = self.runtimeToDwarf(frame_regs.pc);
+        const info_data = debug_data.info_data;
+        const abbrev_data = debug_data.abbrev_data;
+        const str_data = debug_data.str_data;
 
         const scoped = try parser.parseScopedVariables(
             info_data,
             abbrev_data,
             str_data,
             .{
-                .debug_str_offsets = if (debug_binary.sections.debug_str_offsets) |s| debug_binary.getSectionData(s) else null,
-                .debug_addr = if (debug_binary.sections.debug_addr) |s| debug_binary.getSectionData(s) else null,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| debug_binary.getSectionData(s) else null,
-                .debug_loc = if (debug_binary.sections.debug_loc) |s| debug_binary.getSectionData(s) else null,
-                .debug_loclists = if (debug_binary.sections.debug_loclists) |s| debug_binary.getSectionData(s) else null,
+                .debug_str_offsets = debug_data.str_offsets_data,
+                .debug_addr = debug_data.addr_data,
+                .debug_ranges = debug_data.ranges_data,
+                .debug_rnglists = debug_data.rnglists_data,
+                .debug_loc = debug_data.loc_data,
+                .debug_loclists = debug_data.loclists_data,
             },
             dwarf_pc,
             allocator,
@@ -4573,7 +4415,7 @@ pub const DwarfEngine = struct {
 
         var reg_adapter = RegisterAdapter{ .regs = frame_regs };
         const reg_provider = reg_adapter.provider();
-        var mem_adapter = MemoryAdapter{ .process = &self.process, .allocator = allocator };
+        var mem_adapter = MemoryAdapter{ .access = self.readAccess(), .allocator = allocator };
         const mem_reader = mem_adapter.reader();
 
         const frame_base: ?u64 = if (scoped.frame_base_expr.len > 0) blk: {
@@ -4755,10 +4597,7 @@ pub const DwarfEngine = struct {
     fn engineReadRegisters(ctx: *anyopaque, allocator: std.mem.Allocator, _: u32) anyerror![]const types.RegisterInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
 
-        const regs = if (self.core_dump) |*cd|
-            cd.readRegisters()
-        else
-            try self.process.readRegisters();
+        const regs = try self.readAccess().readRegisters();
         const is_arm = builtin.cpu.arch == .aarch64;
 
         var items = std.ArrayListUnmanaged(types.RegisterInfo).empty;
@@ -4786,33 +4625,36 @@ pub const DwarfEngine = struct {
             }
         }
 
-        // Append floating point / SIMD registers when available
-        if (self.process.readFloatRegisters()) |fp_regs| {
-            for (0..fp_regs.count) |i| {
-                // Low 64 bits
-                var lo_buf: [12]u8 = undefined;
-                const lo_name = if (fp_regs.is_arm)
-                    std.fmt.bufPrint(&lo_buf, "v{d}_lo", .{i}) catch "v?_lo"
-                else
-                    std.fmt.bufPrint(&lo_buf, "xmm{d}_lo", .{i}) catch "xmm?_lo";
-                try items.append(allocator, .{
-                    .name = try allocator.dupe(u8, lo_name),
-                    .value = fp_regs.regs[i][0],
-                });
+        // Core parsing currently captures only general-purpose registers.
+        if (self.core_dump == null) {
+            // Append floating point / SIMD registers when available.
+            if (self.process.readFloatRegisters()) |fp_regs| {
+                for (0..fp_regs.count) |i| {
+                    // Low 64 bits
+                    var lo_buf: [12]u8 = undefined;
+                    const lo_name = if (fp_regs.is_arm)
+                        std.fmt.bufPrint(&lo_buf, "v{d}_lo", .{i}) catch "v?_lo"
+                    else
+                        std.fmt.bufPrint(&lo_buf, "xmm{d}_lo", .{i}) catch "xmm?_lo";
+                    try items.append(allocator, .{
+                        .name = try allocator.dupe(u8, lo_name),
+                        .value = fp_regs.regs[i][0],
+                    });
 
-                // High 64 bits
-                var hi_buf: [12]u8 = undefined;
-                const hi_name = if (fp_regs.is_arm)
-                    std.fmt.bufPrint(&hi_buf, "v{d}_hi", .{i}) catch "v?_hi"
-                else
-                    std.fmt.bufPrint(&hi_buf, "xmm{d}_hi", .{i}) catch "xmm?_hi";
-                try items.append(allocator, .{
-                    .name = try allocator.dupe(u8, hi_name),
-                    .value = fp_regs.regs[i][1],
-                });
+                    // High 64 bits
+                    var hi_buf: [12]u8 = undefined;
+                    const hi_name = if (fp_regs.is_arm)
+                        std.fmt.bufPrint(&hi_buf, "v{d}_hi", .{i}) catch "v?_hi"
+                    else
+                        std.fmt.bufPrint(&hi_buf, "xmm{d}_hi", .{i}) catch "xmm?_hi";
+                    try items.append(allocator, .{
+                        .name = try allocator.dupe(u8, hi_name),
+                        .value = fp_regs.regs[i][1],
+                    });
+                }
+            } else |_| {
+                // FP register reading not available — skip silently
             }
-        } else |_| {
-            // FP register reading not available — skip silently
         }
 
         return try items.toOwnedSlice(allocator);
@@ -5052,8 +4894,7 @@ pub const DwarfEngine = struct {
         // We need the program path to restart
         const path = self.program_path orelse return error.NotSupported;
 
-        // Save old ASLR slide before restarting
-        const old_slide = self.aslr_slide;
+        const old_translation = self.address_translation;
 
         // Kill current process
         self.process.kill() catch {};
@@ -5066,19 +4907,7 @@ pub const DwarfEngine = struct {
         self.launched = false;
         try engineLaunch(ctx, allocator, config);
 
-        // Adjust existing breakpoint addresses for new ASLR slide and re-arm
-        const slide_diff = self.aslr_slide - old_slide;
-        if (slide_diff != 0) {
-            for (self.bp_manager.breakpoints.items) |*bp| {
-                if (bp.enabled) {
-                    if (slide_diff > 0) {
-                        bp.address +%= @intCast(@as(u64, @intCast(slide_diff)));
-                    } else {
-                        bp.address -%= @intCast(@as(u64, @intCast(-slide_diff)));
-                    }
-                }
-            }
-        }
+        self.relocateBreakpoints(old_translation);
         self.rearmAllBreakpoints();
         self.stepping_past_bp = null;
         self.stepping_past_wp = null;
@@ -5139,8 +4968,8 @@ pub const DwarfEngine = struct {
     fn engineVariableLocation(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, _: u32) anyerror!types.VariableLocationInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
 
-        // Read current register state
-        const regs = self.process.readRegisters() catch {
+        // Read current or captured register state.
+        const regs = self.readAccess().readRegisters() catch {
             return .{
                 .name = try allocator.dupe(u8, name),
                 .location_type = try allocator.dupe(u8, "unknown"),
@@ -5159,11 +4988,7 @@ pub const DwarfEngine = struct {
             .location_type = try allocator.dupe(u8, "unknown"),
         };
 
-        // Compute un-slid PC for DWARF lookup
-        const dwarf_pc: u64 = if (self.aslr_slide >= 0)
-            pc -% @as(u64, @intCast(self.aslr_slide))
-        else
-            pc +% @as(u64, @intCast(-self.aslr_slide));
+        const dwarf_pc = self.runtimeToDwarf(pc);
 
         // Parse scoped variables at current PC
         const scoped = parser.parseScopedVariables(
