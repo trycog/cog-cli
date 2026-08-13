@@ -37,9 +37,12 @@ const RemoteTool = struct {
 const ToolTier = debug_server_mod.ToolTier;
 
 const MAX_HANDLER_CONCURRENCY: usize = 8;
+const handler_wait_poll_ns: u64 = 10 * std.time.ns_per_ms;
+const handler_shutdown_grace_ns: u64 = 2 * std.time.ns_per_s;
 
 const HandlerThreads = struct {
     const State = enum { empty, running, complete };
+    const DrainResult = enum { complete, timed_out };
 
     const Slot = struct {
         state: State = .empty,
@@ -49,6 +52,7 @@ const HandlerThreads = struct {
     slots: [MAX_HANDLER_CONCURRENCY]Slot = [_]Slot{.{}} ** MAX_HANDLER_CONCURRENCY,
     limit: usize,
     accepting: bool = true,
+    capacity_waiters: usize = 0,
     mutex: std.Thread.Mutex = .{},
     available: std.Thread.Condition = .{},
 
@@ -63,7 +67,7 @@ const HandlerThreads = struct {
             var completed_slot: usize = 0;
 
             self.mutex.lock();
-            if (!self.accepting) {
+            if (!self.accepting or shutdown_requested.load(.acquire)) {
                 self.mutex.unlock();
                 debug_log_mod.log("mcp.handlers: rejecting request after shutdown", .{});
                 return null;
@@ -94,8 +98,13 @@ const HandlerThreads = struct {
                 }
             }
 
-            debug_log_mod.log("mcp.handlers: concurrency cap reached limit={d}; waiting", .{self.limit});
-            self.available.wait(&self.mutex);
+            debug_log_mod.log("mcp.handlers: concurrency cap reached limit={d}; timed wait", .{self.limit});
+            self.capacity_waiters += 1;
+            self.available.timedWait(&self.mutex, handler_wait_poll_ns) catch |err| switch (err) {
+                error.Timeout => debug_log_mod.log("mcp.handlers: capacity wait timed out; rechecking shutdown", .{}),
+            };
+            self.capacity_waiters -= 1;
+            self.available.broadcast();
             self.mutex.unlock();
         }
     }
@@ -143,14 +152,20 @@ const HandlerThreads = struct {
         debug_log_mod.log("mcp.handlers: stopped accepting requests", .{});
     }
 
-    fn drain(self: *HandlerThreads) void {
-        debug_log_mod.log("mcp.handlers: draining in-flight requests", .{});
+    fn drain(self: *HandlerThreads, timeout_ns: u64) DrainResult {
+        debug_log_mod.log("mcp.handlers: draining in-flight requests timeout_ns={d}", .{timeout_ns});
+        var timer = std.time.Timer.start() catch {
+            debug_log_mod.log("mcp.handlers: shutdown timer unavailable; refusing unbounded drain", .{});
+            return .timed_out;
+        };
+
         while (true) {
             var completed_thread: ?std.Thread = null;
             var completed_slot: usize = 0;
             var has_in_flight = false;
 
             self.mutex.lock();
+            if (self.capacity_waiters > 0) has_in_flight = true;
             for (self.slots[0..self.limit], 0..) |*slot, i| {
                 if (slot.state == .complete and slot.thread != null) {
                     completed_thread = slot.thread;
@@ -171,11 +186,22 @@ const HandlerThreads = struct {
             if (!has_in_flight) {
                 self.mutex.unlock();
                 debug_log_mod.log("mcp.handlers: drain complete", .{});
-                return;
+                return .complete;
             }
 
-            debug_log_mod.log("mcp.handlers: waiting for in-flight request completion", .{});
-            self.available.wait(&self.mutex);
+            const elapsed_ns = timer.read();
+            if (elapsed_ns >= timeout_ns) {
+                self.mutex.unlock();
+                debug_log_mod.log("mcp.handlers: drain deadline exceeded elapsed_ns={d}; process exit required", .{elapsed_ns});
+                return .timed_out;
+            }
+
+            const remaining_ns = timeout_ns - elapsed_ns;
+            const wait_ns = @min(remaining_ns, handler_wait_poll_ns);
+            debug_log_mod.log("mcp.handlers: timed wait for in-flight completion wait_ns={d}", .{wait_ns});
+            self.available.timedWait(&self.mutex, wait_ns) catch |err| switch (err) {
+                error.Timeout => {},
+            };
             self.mutex.unlock();
         }
     }
@@ -425,7 +451,14 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
 
     var handler_threads = HandlerThreads.init(MAX_HANDLER_CONCURRENCY);
     var handler_threads_drained = false;
-    defer drainHandlerThreads(&handler_threads, &handler_threads_drained);
+    defer {
+        if (!drainHandlerThreads(&handler_threads, &handler_threads_drained)) {
+            // An error path must not unwind stack-owned runtime state while a
+            // timed-out worker can still access it.
+            debug_log_mod.log("mcp.serve: error cleanup deadline reached; exiting without stack unwind", .{});
+            std.process.exit(1);
+        }
+    }
     debug_log_mod.log("mcp.handlers: initialized concurrency limit={d}", .{MAX_HANDLER_CONCURRENCY});
 
     var input_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -527,7 +560,13 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
     }
 
-    drainHandlerThreads(&handler_threads, &handler_threads_drained);
+    const handlers_drained = drainHandlerThreads(&handler_threads, &handler_threads_drained);
+    if (!handlers_drained) {
+        // Stack-owned runtime state must remain alive while hung workers may still
+        // reference it. Skip all stack unwinding and let process exit reclaim it.
+        debug_log_mod.log("mcp.serve: handler shutdown deadline reached; exiting without runtime teardown", .{});
+        std.process.exit(0);
+    }
 
     // Clean up debug sessions before exiting — kills adapter process groups
     // to prevent orphaned debugpy/launcher/debuggee processes.
@@ -541,13 +580,29 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     std.process.exit(0);
 }
 
-fn drainHandlerThreads(handler_threads: *HandlerThreads, drained: *bool) void {
-    if (drained.*) return;
+fn drainHandlerThreads(handler_threads: *HandlerThreads, drained: *bool) bool {
+    if (drained.*) return true;
     debug_log_mod.log("mcp.serve: shutdown requested; stopping handler intake", .{});
     handler_threads.stopAccepting();
-    handler_threads.drain();
-    drained.* = true;
-    debug_log_mod.log("mcp.serve: handlers drained before runtime teardown", .{});
+    return drainHandlerThreadsWithin(handler_threads, drained, handler_shutdown_grace_ns);
+}
+
+// Returns false instead of exiting so helper and library tests can validate the
+// deadline policy without terminating their process. serve() owns the exit
+// decision because only it knows stack-owned Runtime must remain live.
+fn drainHandlerThreadsWithin(handler_threads: *HandlerThreads, drained: *bool, timeout_ns: u64) bool {
+    if (drained.*) return true;
+    return switch (handler_threads.drain(timeout_ns)) {
+        .complete => {
+            drained.* = true;
+            debug_log_mod.log("mcp.serve: handlers drained before runtime teardown", .{});
+            return true;
+        },
+        .timed_out => {
+            debug_log_mod.log("mcp.serve: handlers still active at shutdown deadline", .{});
+            return false;
+        },
+    };
 }
 
 fn setupSignalHandler() void {
@@ -806,7 +861,8 @@ fn processMessage(runtime: *Runtime, line: []const u8, stdout: StdoutWriter) !vo
         reply.markNotification(); // No response needed
     } else {
         if (id != null) {
-            reply.sendError(-32601, "Method not found") catch {};
+            debug_log_mod.log("mcp.dispatch: unknown method={s}; sending method-not-found error", .{method});
+            try reply.sendError(-32601, "Method not found");
         } else {
             reply.markNotification();
         }
@@ -2299,10 +2355,24 @@ test "handler drain guard is idempotent across normal and error cleanup" {
     var handlers = HandlerThreads.init(1);
     var drained = false;
 
-    drainHandlerThreads(&handlers, &drained);
+    try std.testing.expect(drainHandlerThreadsWithin(&handlers, &drained, 10 * std.time.ns_per_ms));
     try std.testing.expect(drained);
 
-    drainHandlerThreads(&handlers, &drained);
+    try std.testing.expect(drainHandlerThreadsWithin(&handlers, &drained, 10 * std.time.ns_per_ms));
+    try std.testing.expect(drained);
+}
+
+test "handler drain guard reports deadline without exiting test process" {
+    var handlers = HandlerThreads.init(1);
+    const reserved_slot = handlers.begin().?;
+    var drained = false;
+
+    handlers.stopAccepting();
+    try std.testing.expect(!drainHandlerThreadsWithin(&handlers, &drained, 1 * std.time.ns_per_ms));
+    try std.testing.expect(!drained);
+
+    handlers.cancel(reserved_slot);
+    try std.testing.expect(drainHandlerThreadsWithin(&handlers, &drained, 10 * std.time.ns_per_ms));
     try std.testing.expect(drained);
 }
 
@@ -2314,6 +2384,23 @@ test "dispatch write failures propagate to request handler" {
     });
 
     try std.testing.expectError(error.WriteFailure, handleDispatchError(&reply, error.WriteFailure));
+}
+
+test "unknown method write failures propagate to request handler" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var closed_file = try tmp.dir.createFile("closed-unknown-method", .{});
+    closed_file.close();
+
+    var mutex: std.Thread.Mutex = .{};
+    var runtime = testRuntime(std.testing.allocator);
+    defer runtime.deinit();
+
+    try std.testing.expectError(error.WriteFailure, processMessage(
+        &runtime,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"unknown/method\"}",
+        .{ .file = closed_file, .mutex = &mutex },
+    ));
 }
 
 test "shutdown remains requested when its response write fails" {
@@ -2379,7 +2466,101 @@ test "HandlerThreads caps active handlers" {
     handlers.cancel(reused_slot);
     handlers.cancel(second_slot);
     handlers.stopAccepting();
-    handlers.drain();
+    try std.testing.expectEqual(HandlerThreads.DrainResult.complete, handlers.drain(10 * std.time.ns_per_ms));
+}
+
+test "HandlerThreads begin observes shutdown while waiting at capacity" {
+    shutdown_requested.store(false, .release);
+    defer shutdown_requested.store(false, .release);
+
+    var handlers = HandlerThreads.init(1);
+    const reserved_slot = handlers.begin().?;
+
+    var begin_started = std.atomic.Value(bool).init(false);
+    var begin_finished = std.atomic.Value(bool).init(false);
+    var acquired_slot = std.atomic.Value(usize).init(MAX_HANDLER_CONCURRENCY);
+    const Acquirer = struct {
+        fn run(handler_threads: *HandlerThreads, started: *std.atomic.Value(bool), finished: *std.atomic.Value(bool), slot: *std.atomic.Value(usize)) void {
+            started.store(true, .release);
+            const result = handler_threads.begin();
+            slot.store(result orelse MAX_HANDLER_CONCURRENCY, .release);
+            finished.store(true, .release);
+        }
+    };
+    const acquire_thread = try std.Thread.spawn(.{}, Acquirer.run, .{ &handlers, &begin_started, &begin_finished, &acquired_slot });
+    defer acquire_thread.join();
+
+    while (!begin_started.load(.acquire)) std.Thread.yield() catch {};
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!begin_finished.load(.acquire));
+
+    shutdown_requested.store(true, .release);
+    const deadline = 250 * std.time.ns_per_ms;
+    var timer = try std.time.Timer.start();
+    while (!begin_finished.load(.acquire) and timer.read() < deadline) std.Thread.yield() catch {};
+
+    try std.testing.expect(begin_finished.load(.acquire));
+    try std.testing.expectEqual(MAX_HANDLER_CONCURRENCY, acquired_slot.load(.acquire));
+
+    handlers.cancel(reserved_slot);
+    handlers.stopAccepting();
+    try std.testing.expectEqual(HandlerThreads.DrainResult.complete, handlers.drain(10 * std.time.ns_per_ms));
+}
+
+test "HandlerThreads begin wakes when intake stops at capacity" {
+    shutdown_requested.store(false, .release);
+
+    var handlers = HandlerThreads.init(1);
+    const reserved_slot = handlers.begin().?;
+
+    var begin_started = std.atomic.Value(bool).init(false);
+    var begin_finished = std.atomic.Value(bool).init(false);
+    var acquired_slot = std.atomic.Value(usize).init(MAX_HANDLER_CONCURRENCY);
+    const Acquirer = struct {
+        fn run(handler_threads: *HandlerThreads, started: *std.atomic.Value(bool), finished: *std.atomic.Value(bool), slot: *std.atomic.Value(usize)) void {
+            started.store(true, .release);
+            const result = handler_threads.begin();
+            slot.store(result orelse MAX_HANDLER_CONCURRENCY, .release);
+            finished.store(true, .release);
+        }
+    };
+    const acquire_thread = try std.Thread.spawn(.{}, Acquirer.run, .{ &handlers, &begin_started, &begin_finished, &acquired_slot });
+    defer acquire_thread.join();
+
+    while (!begin_started.load(.acquire)) std.Thread.yield() catch {};
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!begin_finished.load(.acquire));
+
+    handlers.stopAccepting();
+    const deadline = 250 * std.time.ns_per_ms;
+    var timer = try std.time.Timer.start();
+    while (!begin_finished.load(.acquire) and timer.read() < deadline) std.Thread.yield() catch {};
+
+    try std.testing.expect(begin_finished.load(.acquire));
+    try std.testing.expectEqual(MAX_HANDLER_CONCURRENCY, acquired_slot.load(.acquire));
+
+    handlers.cancel(reserved_slot);
+    try std.testing.expectEqual(HandlerThreads.DrainResult.complete, handlers.drain(10 * std.time.ns_per_ms));
+}
+
+test "HandlerThreads drain times out with a hung worker" {
+    var handlers = HandlerThreads.init(1);
+    const slot_index = handlers.begin().?;
+
+    var allow_finish = std.atomic.Value(bool).init(false);
+    const Handler = struct {
+        fn run(handler_threads: *HandlerThreads, slot: usize, finish: *std.atomic.Value(bool)) void {
+            while (!finish.load(.acquire)) std.Thread.yield() catch {};
+            handler_threads.finish(slot);
+        }
+    };
+    handlers.track(slot_index, try std.Thread.spawn(.{}, Handler.run, .{ &handlers, slot_index, &allow_finish }));
+    handlers.stopAccepting();
+
+    try std.testing.expectEqual(HandlerThreads.DrainResult.timed_out, handlers.drain(5 * std.time.ns_per_ms));
+
+    allow_finish.store(true, .release);
+    try std.testing.expectEqual(HandlerThreads.DrainResult.complete, handlers.drain(250 * std.time.ns_per_ms));
 }
 
 test "HandlerThreads stop accepting and drain tracked handlers" {
@@ -2400,8 +2581,8 @@ test "HandlerThreads stop accepting and drain tracked handlers" {
     var drain_complete = std.atomic.Value(bool).init(false);
     const Drainer = struct {
         fn run(handler_threads: *HandlerThreads, complete: *std.atomic.Value(bool)) void {
-            handler_threads.drain();
-            complete.store(true, .release);
+            const result = handler_threads.drain(250 * std.time.ns_per_ms);
+            complete.store(result == .complete, .release);
         }
     };
     const drain_thread = try std.Thread.spawn(.{}, Drainer.run, .{ &handlers, &drain_complete });
