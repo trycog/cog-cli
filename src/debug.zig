@@ -53,7 +53,7 @@ pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const 
     if (std.mem.eql(u8, subcmd, "debug:sign")) return debugSign(allocator, args);
     if (std.mem.eql(u8, subcmd, "debug:dashboard")) return debugDashboard(allocator, args);
     if (std.mem.eql(u8, subcmd, "debug:status")) return debugStatus(allocator, args);
-    if (std.mem.eql(u8, subcmd, "debug:kill")) return debugKill(args);
+    if (std.mem.eql(u8, subcmd, "debug:kill")) return debugKill(allocator, args);
 
     // debug:send moved to MCP tools (debug_*).
     if (std.mem.eql(u8, subcmd, "debug:send")) {
@@ -209,13 +209,13 @@ fn debugStatus(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     try cli.statusCommand(allocator);
 }
 
-fn debugKill(args: []const [:0]const u8) !void {
+fn debugKill(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
         printCommandHelp(help.debug_kill);
         return;
     }
 
-    try cli.killCommand();
+    try cli.killCommand(allocator);
 }
 
 fn debugDashboard(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {

@@ -3,6 +3,8 @@ const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const posix = std.posix;
+const debug_log = @import("../debug_log.zig");
+const paths = @import("../paths.zig");
 const server_mod = @import("server.zig");
 const DebugServer = server_mod.DebugServer;
 const ToolResult = server_mod.ToolResult;
@@ -33,16 +35,26 @@ pub const DaemonServer = struct {
             posix.close(fd);
             self.socket_fd = null;
         }
-        // Clean up socket and pid files
-        var path_buf: [128]u8 = undefined;
-        if (getSocketPath(&path_buf)) |path| {
-            std.fs.deleteFileAbsolute(path) catch {};
-        }
-        var pid_buf: [128]u8 = undefined;
-        if (getPidPath(&pid_buf)) |path| {
-            std.fs.deleteFileAbsolute(path) catch {};
-        }
+        self.deleteRuntimeFile(paths.getDaemonSocketPath, "socket");
+        self.deleteRuntimeFile(paths.getDaemonPidPath, "PID file");
         self.server.deinit();
+    }
+
+    fn deleteRuntimeFile(
+        self: *DaemonServer,
+        comptime path_fn: fn (std.mem.Allocator) anyerror![]const u8,
+        description: []const u8,
+    ) void {
+        const path = path_fn(self.allocator) catch |err| {
+            debug_log.log("DaemonServer.deinit: failed to resolve {s}: {s}", .{ description, @errorName(err) });
+            return;
+        };
+        defer self.allocator.free(path);
+        debug_log.log("DaemonServer.deinit: removing {s} {s}", .{ description, path });
+        std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => debug_log.log("DaemonServer.deinit: failed to remove {s}: {s}", .{ path, @errorName(err) }),
+        };
     }
 
     pub fn run(self: *DaemonServer) !void {
@@ -56,18 +68,25 @@ pub const DaemonServer = struct {
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
         errdefer posix.close(sock);
 
-        var path_buf: [128]u8 = undefined;
-        const sock_path = getSocketPath(&path_buf) orelse return error.PathTooLong;
+        const sock_path = try paths.getDaemonSocketPath(self.allocator);
+        defer self.allocator.free(sock_path);
+        try paths.validateUnixSocketPath(sock_path);
 
         // Remove stale socket if it exists
-        std.fs.deleteFileAbsolute(sock_path) catch {};
+        debug_log.log("DaemonServer.run: removing stale socket {s}", .{sock_path});
+        std.fs.deleteFileAbsolute(sock_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => debug_log.log("DaemonServer.run: failed to remove stale socket {s}: {s}", .{ sock_path, @errorName(err) }),
+        };
 
         var addr: posix.sockaddr.un = .{ .path = undefined };
         @memset(&addr.path, 0);
         @memcpy(addr.path[0..sock_path.len], sock_path);
 
+        debug_log.log("DaemonServer.run: binding socket {s}", .{sock_path});
         try posix.bind(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
         try posix.listen(sock, 8);
+        if (@import("builtin").os.tag != .windows) try std.posix.fchmod(sock, 0o600);
 
         self.socket_fd = sock;
 
@@ -288,52 +307,24 @@ pub const DaemonServer = struct {
     }
 
     fn writePidFile(self: *DaemonServer) !void {
-        _ = self;
-        var pid_buf: [128]u8 = undefined;
-        const pid_path = getPidPath(&pid_buf) orelse return error.PathTooLong;
+        const pid_path = try paths.getDaemonPidPath(self.allocator);
+        defer self.allocator.free(pid_path);
 
-        var f = try std.fs.createFileAbsolute(pid_path, .{});
+        debug_log.log("DaemonServer.writePidFile: creating {s}", .{pid_path});
+        var f = try std.fs.createFileAbsolute(pid_path, .{ .mode = 0o600 });
         defer f.close();
+        if (@import("builtin").os.tag != .windows) try f.chmod(0o600);
 
         var buf: [32]u8 = undefined;
         const c_fns = struct {
             extern fn getpid() i32;
         };
         const s = std.fmt.bufPrint(&buf, "{d}", .{c_fns.getpid()}) catch return;
-        var write_buf: [64]u8 = undefined;
-        var w = f.writer(&write_buf);
-        w.interface.writeAll(s) catch {};
-        w.interface.flush() catch {};
+        try f.writeAll(s);
+        try f.sync();
+        debug_log.log("DaemonServer.writePidFile: wrote PID to {s}", .{pid_path});
     }
 };
-
-// ── Socket / PID Path Helpers ───────────────────────────────────────────
-
-fn getUid() u32 {
-    const builtin = @import("builtin");
-    if (builtin.os.tag == .linux) {
-        return std.os.linux.getuid();
-    } else if (builtin.os.tag == .macos) {
-        return getMacosUid();
-    } else {
-        return 0;
-    }
-}
-
-fn getMacosUid() u32 {
-    const c_fns = struct {
-        extern fn getuid() u32;
-    };
-    return c_fns.getuid();
-}
-
-pub fn getSocketPath(buf: []u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/cog-debug-{d}.sock", .{getUid()}) catch null;
-}
-
-pub fn getPidPath(buf: []u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/cog-debug-{d}.pid", .{getUid()}) catch null;
-}
 
 // ── Signal Handling ─────────────────────────────────────────────────────
 
@@ -362,22 +353,4 @@ fn setupSignalHandler() void {
 
 fn sigHandler(_: c_int) callconv(.c) void {
     g_shutdown_requested = true;
-}
-
-// ── Tests ───────────────────────────────────────────────────────────────
-
-test "getSocketPath returns valid path" {
-    var buf: [128]u8 = undefined;
-    const path = getSocketPath(&buf);
-    try std.testing.expect(path != null);
-    try std.testing.expect(std.mem.startsWith(u8, path.?, "/tmp/cog-debug-"));
-    try std.testing.expect(std.mem.endsWith(u8, path.?, ".sock"));
-}
-
-test "getPidPath returns valid path" {
-    var buf: [128]u8 = undefined;
-    const path = getPidPath(&buf);
-    try std.testing.expect(path != null);
-    try std.testing.expect(std.mem.startsWith(u8, path.?, "/tmp/cog-debug-"));
-    try std.testing.expect(std.mem.endsWith(u8, path.?, ".pid"));
 }

@@ -1,5 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
+const debug_log = @import("../debug_log.zig");
+const paths = @import("../paths.zig");
 
 // ── ANSI Styles ─────────────────────────────────────────────────────────
 
@@ -273,8 +275,7 @@ pub const DashboardTui = struct {
     global_log: RingLog,
     running: bool,
 
-    socket_path_buf: [128]u8,
-    socket_path_len: usize,
+    socket_path: ?[]const u8,
 
     original_termios: ?posix.termios,
 
@@ -299,8 +300,7 @@ pub const DashboardTui = struct {
             .focused = 0,
             .global_log = .{},
             .running = true,
-            .socket_path_buf = undefined,
-            .socket_path_len = 0,
+            .socket_path = null,
             .original_termios = null,
             .term_width = getTerminalSize().width,
             .term_height = getTerminalSize().height,
@@ -321,8 +321,14 @@ pub const DashboardTui = struct {
             posix.close(l);
         }
         // Remove socket file
-        if (self.socket_path_len > 0) {
-            std.fs.deleteFileAbsolute(self.socket_path_buf[0..self.socket_path_len]) catch {};
+        if (self.socket_path) |path| {
+            debug_log.log("DashboardTui.deinit: removing socket {s}", .{path});
+            std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => debug_log.log("DashboardTui.deinit: failed to remove {s}: {s}", .{ path, @errorName(err) }),
+            };
+            self.allocator.free(path);
+            self.socket_path = null;
         }
         // Restore terminal
         if (self.original_termios) |orig| {
@@ -334,18 +340,21 @@ pub const DashboardTui = struct {
     }
 
     pub fn run(self: *DashboardTui) !void {
-        // Build socket path: /tmp/cog-debug-dashboard-{uid}.sock
-        const path = std.fmt.bufPrint(&self.socket_path_buf, "/tmp/cog-debug-dashboard-{d}.sock", .{getUid()}) catch return error.PathTooLong;
-        self.socket_path_len = path.len;
+        const path = try paths.getDashboardSocketPath(self.allocator);
+        errdefer self.allocator.free(path);
+        try paths.validateUnixSocketPath(path);
+        self.socket_path = path;
 
         // Copy to global for signal handler
+        if (path.len >= g_socket_path.len) return error.PathTooLong;
         @memcpy(g_socket_path[0..path.len], path);
         g_socket_path_len = path.len;
 
         // Remove stale socket if it exists
+        debug_log.log("DashboardTui.run: removing stale socket {s}", .{path});
         std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
-            else => {},
+            else => debug_log.log("DashboardTui.run: failed to remove stale socket {s}: {s}", .{ path, @errorName(err) }),
         };
 
         // Create listener socket
@@ -354,9 +363,9 @@ pub const DashboardTui = struct {
 
         var addr: std.posix.sockaddr.un = .{ .path = undefined };
         @memset(&addr.path, 0);
-        if (path.len > addr.path.len) return error.PathTooLong;
         @memcpy(addr.path[0..path.len], path);
 
+        debug_log.log("DashboardTui.run: binding socket {s}", .{path});
         posix.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
             if (err == error.AddressInUse) {
                 printErr("error: Another dashboard is already running\n");
@@ -365,6 +374,7 @@ pub const DashboardTui = struct {
             return err;
         };
         try posix.listen(sock, 5);
+        if (@import("builtin").os.tag != .windows) try std.posix.fchmod(sock, 0o600);
         self.listener = sock;
 
         // Enter raw terminal mode
@@ -1727,31 +1737,6 @@ fn getTerminalSize() TerminalSize {
     return .{ .width = 80, .height = 24 };
 }
 
-fn getUid() u32 {
-    const builtin = @import("builtin");
-    if (builtin.os.tag == .linux) {
-        return std.os.linux.getuid();
-    } else if (builtin.os.tag == .macos) {
-        return getMacosUid();
-    } else {
-        return 0;
-    }
-}
-
-fn getMacosUid() u32 {
-    const c_fns = struct {
-        extern fn getuid() u32;
-    };
-    return c_fns.getuid();
-}
-
-// ── Socket Path Helper ──────────────────────────────────────────────────
-
-/// Get the well-known socket path. Used by server to connect.
-pub fn getSocketPath(buf: []u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/cog-debug-dashboard-{d}.sock", .{getUid()}) catch null;
-}
-
 // ── I/O Helpers ─────────────────────────────────────────────────────────
 
 var render_buf: [65536]u8 = undefined;
@@ -1942,14 +1927,6 @@ test "processEvent multiple sessions with focus management" {
     try std.testing.expectEqual(@as(usize, 1), tui.session_count);
     try std.testing.expectEqual(@as(usize, 0), tui.focused);
     try std.testing.expectEqualStrings("session-2", tui.sessions[0].sessionIdSlice());
-}
-
-test "getSocketPath returns valid path" {
-    var buf: [128]u8 = undefined;
-    const path = getSocketPath(&buf);
-    try std.testing.expect(path != null);
-    try std.testing.expect(std.mem.startsWith(u8, path.?, "/tmp/cog-debug-dashboard-"));
-    try std.testing.expect(std.mem.endsWith(u8, path.?, ".sock"));
 }
 
 test "RingLog wraps around correctly" {

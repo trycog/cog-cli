@@ -3,7 +3,8 @@ const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const posix = std.posix;
-const daemon_mod = @import("daemon.zig");
+const debug_log = @import("../debug_log.zig");
+const paths = @import("../paths.zig");
 
 // ── Arg Schema Types ────────────────────────────────────────────────────
 
@@ -1036,8 +1037,9 @@ fn findTool(name: []const u8) ?*const CliToolDef {
 // ── Daemon Connection ───────────────────────────────────────────────────
 
 fn connectToDaemon(allocator: std.mem.Allocator) !posix.socket_t {
-    var path_buf: [128]u8 = undefined;
-    const sock_path = daemon_mod.getSocketPath(&path_buf) orelse return error.PathTooLong;
+    const sock_path = try paths.getDaemonSocketPath(allocator);
+    defer allocator.free(sock_path);
+    try paths.validateUnixSocketPath(sock_path);
 
     // Try connecting first
     if (tryConnect(sock_path)) |sock| return sock;
@@ -1056,17 +1058,24 @@ fn connectToDaemon(allocator: std.mem.Allocator) !posix.socket_t {
 }
 
 fn tryConnect(sock_path: []const u8) ?posix.socket_t {
-    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return null;
+    paths.validateUnixSocketPath(sock_path) catch return null;
+    debug_log.log("debug.cli.tryConnect: connecting to {s}", .{sock_path});
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        debug_log.log("debug.cli.tryConnect: socket creation failed: {s}", .{@errorName(err)});
+        return null;
+    };
 
     var addr: posix.sockaddr.un = .{ .path = undefined };
     @memset(&addr.path, 0);
     @memcpy(addr.path[0..sock_path.len], sock_path);
 
-    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+        debug_log.log("debug.cli.tryConnect: connection to {s} failed: {s}", .{ sock_path, @errorName(err) });
         posix.close(sock);
         return null;
     };
 
+    debug_log.log("debug.cli.tryConnect: connected to {s}", .{sock_path});
     return sock;
 }
 
@@ -1087,16 +1096,23 @@ fn startDaemon(allocator: std.mem.Allocator) !void {
     child.stderr_behavior = .Close;
     child.pgid = 0;
 
+    debug_log.log("debug.cli.startDaemon: spawning {s} debug:serve --daemon", .{exe_owned});
     try child.spawn();
+    debug_log.log("debug.cli.startDaemon: spawned daemon process", .{});
     // Don't wait — the daemon runs in the background
 }
 
 // ── Status and Kill Commands ────────────────────────────────────────────
 
 pub fn statusCommand(allocator: std.mem.Allocator) !void {
-    var path_buf: [128]u8 = undefined;
-    const sock_path = daemon_mod.getSocketPath(&path_buf) orelse {
+    const sock_path = paths.getDaemonSocketPath(allocator) catch |err| {
+        debug_log.log("debug.cli.statusCommand: failed to resolve socket path: {s}", .{@errorName(err)});
         printErr("error: could not determine socket path\n");
+        return error.Explained;
+    };
+    defer allocator.free(sock_path);
+    paths.validateUnixSocketPath(sock_path) catch {
+        printErr("error: daemon socket path is too long\n");
         return error.Explained;
     };
 
@@ -1146,14 +1162,16 @@ pub fn statusCommand(allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn killCommand() !void {
-    var pid_buf: [128]u8 = undefined;
-    const pid_path = daemon_mod.getPidPath(&pid_buf) orelse {
+pub fn killCommand(allocator: std.mem.Allocator) !void {
+    const pid_path = paths.getDaemonPidPath(allocator) catch |err| {
+        debug_log.log("debug.cli.killCommand: failed to resolve PID path: {s}", .{@errorName(err)});
         printErr("error: could not determine pid path\n");
         return error.Explained;
     };
+    defer allocator.free(pid_path);
 
     // Read PID from file
+    debug_log.log("debug.cli.killCommand: opening {s}", .{pid_path});
     var f = std.fs.openFileAbsolute(pid_path, .{}) catch {
         printErr("error: no daemon running (no pid file)\n");
         return error.Explained;
@@ -1185,7 +1203,11 @@ pub fn killCommand() !void {
     writeStdout("{\"killed\":true}\n");
 
     // Clean up pid file
-    std.fs.deleteFileAbsolute(pid_path) catch {};
+    debug_log.log("debug.cli.killCommand: removing {s}", .{pid_path});
+    std.fs.deleteFileAbsolute(pid_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => debug_log.log("debug.cli.killCommand: failed to remove {s}: {s}", .{ pid_path, @errorName(err) }),
+    };
 }
 
 // ── I/O Helpers ─────────────────────────────────────────────────────────

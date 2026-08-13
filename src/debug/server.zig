@@ -7,9 +7,9 @@ const types = @import("types.zig");
 const session_mod = @import("session.zig");
 const driver_mod = @import("driver.zig");
 const dashboard_mod = @import("dashboard.zig");
-const dashboard_tui = @import("dashboard_tui.zig");
 const extensions = @import("../extensions.zig");
 const debug_log = @import("../debug_log.zig");
+const paths = @import("../paths.zig");
 
 // Debug logging to file
 var server_log_file: ?std.fs.File = null;
@@ -2843,22 +2843,34 @@ pub const DebugServer = struct {
     /// Attempt to connect to the standalone dashboard TUI.
     /// Silently continues if no TUI is running.
     pub fn connectDashboardSocket(self: *DebugServer) void {
-        var path_buf: [128]u8 = undefined;
-        const path = dashboard_tui.getSocketPath(&path_buf) orelse return;
+        const path = paths.getDashboardSocketPath(self.allocator) catch |err| {
+            debug_log.log("DebugServer.connectDashboardSocket: failed to resolve path: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(path);
+        paths.validateUnixSocketPath(path) catch |err| {
+            debug_log.log("DebugServer.connectDashboardSocket: rejected path {s}: {s}", .{ path, @errorName(err) });
+            return;
+        };
 
-        const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return;
+        const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+            debug_log.log("DebugServer.connectDashboardSocket: socket creation failed: {s}", .{@errorName(err)});
+            return;
+        };
         errdefer posix.close(sock);
 
         var addr: posix.sockaddr.un = .{ .path = undefined };
         @memset(&addr.path, 0);
-        if (path.len > addr.path.len) return;
         @memcpy(addr.path[0..path.len], path);
 
-        posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch {
+        debug_log.log("DebugServer.connectDashboardSocket: connecting to {s}", .{path});
+        posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
+            debug_log.log("DebugServer.connectDashboardSocket: connection failed: {s}", .{@errorName(err)});
             posix.close(sock);
             return;
         };
 
+        debug_log.log("DebugServer.connectDashboardSocket: connected to {s}", .{path});
         self.dashboard_socket = sock;
     }
 
