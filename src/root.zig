@@ -8,6 +8,7 @@ pub const scip_encode = @import("scip_encode.zig");
 pub const code_intel = @import("code_intel.zig");
 pub const settings = @import("settings.zig");
 pub const paths = @import("paths.zig");
+pub const fs_util = @import("fs_util.zig");
 pub const extensions = @import("extensions.zig");
 pub const help_text = @import("help_text.zig");
 pub const debug = @import("debug.zig");
@@ -38,6 +39,7 @@ test {
     _ = code_intel;
     _ = settings;
     _ = paths;
+    _ = fs_util;
     _ = extensions;
     _ = help_text;
     _ = debug;
