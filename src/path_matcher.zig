@@ -211,6 +211,16 @@ pub const PathMatcher = struct {
         }
     }
 
+    pub fn allowsPhysicalPath(self: *const PathMatcher, physical_path: []const u8) bool {
+        const canonical = std.fs.realpathAlloc(self.allocator, physical_path) catch return false;
+        defer self.allocator.free(canonical);
+        return self.isAllowedCanonical(canonical);
+    }
+
+    pub fn recursionLimit(self: *const PathMatcher) usize {
+        return self.max_depth;
+    }
+
     pub fn freeMatchedPaths(self: *const PathMatcher, paths: []const MatchedPath) void {
         for (paths) |path| {
             self.allocator.free(path.logical_path);

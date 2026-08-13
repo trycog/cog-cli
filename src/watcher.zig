@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const paths = @import("paths.zig");
 const settings_mod = @import("settings.zig");
-const code_intel = @import("code_intel.zig");
+const path_matcher = @import("path_matcher.zig");
 const debug_log = @import("debug_log.zig");
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -95,8 +95,7 @@ pub const Watcher = struct {
     pipe_write: posix.fd_t,
     thread: ?std.Thread,
     stop_flag: std.atomic.Value(bool),
-    project_root: []const u8,
-    index_patterns: []const []const u8,
+    matcher: path_matcher.PathMatcher,
     read_buf: [4096]u8,
     decoder: LineDecoder,
     overflow_pending: std.atomic.Value(bool),
@@ -125,11 +124,15 @@ pub const Watcher = struct {
 
         // Derive project root (parent of .cog)
         const project_root = std.fs.path.dirname(cog_dir) orelse return null;
-        const owned_root = allocator.dupe(u8, project_root) catch return null;
+        var matcher = path_matcher.PathMatcher.init(allocator, .{
+            .project_root = project_root,
+            .patterns = patterns,
+            .external_roots = if (s.code) |code| code.external_roots orelse &.{} else &.{},
+        }) catch return null;
 
         // Create pipe for inter-thread communication
         const pipe_fds = posix.pipe() catch {
-            allocator.free(owned_root);
+            matcher.deinit();
             return null;
         };
 
@@ -140,7 +143,7 @@ pub const Watcher = struct {
         setNonBlock(pipe_fds[0]);
         setNonBlock(pipe_fds[1]);
 
-        debug_log.log("Watcher.init: root={s}, {d} patterns", .{ owned_root, patterns.len });
+        debug_log.log("Watcher.init: root={s}, {d} patterns", .{ project_root, patterns.len });
 
         return .{
             .allocator = allocator,
@@ -148,8 +151,7 @@ pub const Watcher = struct {
             .pipe_write = pipe_fds[1],
             .thread = null,
             .stop_flag = std.atomic.Value(bool).init(false),
-            .project_root = owned_root,
-            .index_patterns = patterns,
+            .matcher = matcher,
             .read_buf = undefined,
             .decoder = .{},
             .overflow_pending = std.atomic.Value(bool).init(false),
@@ -187,9 +189,7 @@ pub const Watcher = struct {
 
         posix.close(self.pipe_read);
         posix.close(self.pipe_write);
-        self.allocator.free(self.project_root);
-        for (self.index_patterns) |p| self.allocator.free(p);
-        self.allocator.free(self.index_patterns);
+        self.matcher.deinit();
     }
 
     /// File descriptor for the read end of the pipe, for use with poll().
@@ -215,45 +215,25 @@ pub const Watcher = struct {
 
 // ── Shared Filtering ────────────────────────────────────────────────────
 
-fn shouldWatchPath(rel_path: []const u8, patterns: []const []const u8) bool {
-    // Quick reject: hidden files/dirs
-    var it = std.mem.splitScalar(u8, rel_path, '/');
-    while (it.next()) |component| {
-        if (component.len == 0) continue;
-        if (component[0] == '.') return false;
-    }
-
-    // Match against configured index patterns
-    for (patterns) |pattern| {
-        if (code_intel.globMatch(pattern, rel_path)) return true;
-    }
-    return false;
+fn collectLogicalEvents(
+    matcher: *path_matcher.PathMatcher,
+    physical_path: []const u8,
+    logical_paths: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try matcher.mapPhysicalToLogical(physical_path, logical_paths);
 }
 
-fn isExcludedDir(name: []const u8) bool {
-    const excluded = [_][]const u8{
-        "node_modules",
-        "vendor",
-        "target",
-        "zig-out",
-        "zig-cache",
-        ".zig-cache",
-        "build",
-        "dist",
-        "__pycache__",
-    };
-    for (excluded) |e| {
-        if (std.mem.eql(u8, name, e)) return true;
+fn emitPhysicalPath(self: *Watcher, physical_path: []const u8) void {
+    var logical_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical_paths.items) |path| self.allocator.free(path);
+        logical_paths.deinit(self.allocator);
     }
-    return false;
-}
-
-fn makeRelative(abs_path: []const u8, root: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, abs_path, root)) return null;
-    var rest = abs_path[root.len..];
-    if (rest.len > 0 and rest[0] == '/') rest = rest[1..];
-    if (rest.len == 0) return null;
-    return rest;
+    collectLogicalEvents(&self.matcher, physical_path, &logical_paths) catch return;
+    for (logical_paths.items) |logical_path| {
+        debug_log.log("Watcher.emit: physical={s} logical={s}", .{ physical_path, logical_path });
+        _ = emitWatcherRecord(self, logical_path);
+    }
 }
 
 fn setNonBlock(fd: posix.fd_t) void {
@@ -471,17 +451,35 @@ fn watcherThreadMacos(self: *Watcher) void {
     // Check if shutdown was requested while we were loading frameworks.
     if (self.stop_flag.load(.acquire)) return;
 
-    // Create CFString from project root
-    const root_z = self.allocator.dupeZ(u8, self.project_root) catch return;
-    defer self.allocator.free(root_z);
+    var watch_roots: std.ArrayListUnmanaged(path_matcher.WatchRoot) = .empty;
+    defer {
+        self.matcher.freeWatchRoots(watch_roots.items);
+        watch_roots.deinit(self.allocator);
+    }
+    self.matcher.watchRoots(&watch_roots) catch return;
+    if (watch_roots.items.len == 0) return;
 
-    const cf_path = cf.CFStringCreateWithCString(null, root_z.ptr, CF.kCFStringEncodingUTF8) orelse return;
-    defer cf.CFRelease(cf_path);
+    var cf_strings: std.ArrayListUnmanaged(CF.CFStringRef) = .empty;
+    defer {
+        for (cf_strings.items) |cf_string| cf.CFRelease(cf_string);
+        cf_strings.deinit(self.allocator);
+    }
+    var path_values: std.ArrayListUnmanaged(?*const anyopaque) = .empty;
+    defer path_values.deinit(self.allocator);
+    for (watch_roots.items) |root| {
+        const root_z = self.allocator.dupeZ(u8, root.physical_path) catch return;
+        defer self.allocator.free(root_z);
+        const cf_path = cf.CFStringCreateWithCString(null, root_z.ptr, CF.kCFStringEncodingUTF8) orelse return;
+        cf_strings.append(self.allocator, cf_path) catch {
+            cf.CFRelease(cf_path);
+            return;
+        };
+        path_values.append(self.allocator, cf_path) catch return;
+    }
 
-    // Create CFArray with single path
-    var path_values = [_]?*const anyopaque{cf_path};
-    const cf_paths = cf.CFArrayCreate(null, &path_values, 1, null) orelse return;
+    const cf_paths = cf.CFArrayCreate(null, path_values.items.ptr, @intCast(path_values.items.len), null) orelse return;
     defer cf.CFRelease(cf_paths);
+    debug_log.log("Watcher.macos: watching {d} approved physical roots", .{watch_roots.items.len});
 
     // Create stream context pointing to self
     var context = CF.FSEventStreamContext{
@@ -559,11 +557,7 @@ fn fseventsCallback(
         if (flags & interesting == 0) continue;
 
         const abs_path = std.mem.span(event_paths[i]);
-        const rel_path = makeRelative(abs_path, self.project_root) orelse continue;
-
-        if (!shouldWatchPath(rel_path, self.index_patterns)) continue;
-
-        _ = emitWatcherRecord(self, rel_path);
+        emitPhysicalPath(self, abs_path);
     }
 }
 
@@ -591,8 +585,16 @@ fn watcherThreadLinux(self: *Watcher) void {
     const watch_mask: u32 = linux.IN.MODIFY | linux.IN.CREATE | linux.IN.DELETE |
         linux.IN.MOVED_TO | linux.IN.MOVED_FROM;
 
-    // Recursively add watches starting from project root
-    addWatchRecursive(self, inotify_fd, watch_mask, self.project_root, &wd_map);
+    var watch_roots: std.ArrayListUnmanaged(path_matcher.WatchRoot) = .empty;
+    defer {
+        self.matcher.freeWatchRoots(watch_roots.items);
+        watch_roots.deinit(self.allocator);
+    }
+    self.matcher.watchRoots(&watch_roots) catch return;
+    for (watch_roots.items) |root| {
+        addWatchRecursive(self, inotify_fd, watch_mask, root.physical_path, &wd_map, 0);
+    }
+    debug_log.log("Watcher.linux: watching {d} approved physical roots", .{watch_roots.items.len});
 
     // Event buffer
     var event_buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
@@ -624,30 +626,20 @@ fn watcherThreadLinux(self: *Watcher) void {
             const name = event.getName() orelse continue;
             const dir_path = wd_map.get(event.wd) orelse continue;
 
-            // Build full relative path
-            const rel_dir = makeRelative(dir_path, self.project_root) orelse "";
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const rel_path = if (rel_dir.len > 0)
-                std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ rel_dir, name }) catch continue
-            else
-                std.fmt.bufPrint(&path_buf, "{s}", .{name}) catch continue;
+            const abs_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name }) catch continue;
+            defer self.allocator.free(abs_path);
 
             // If a directory is created or moved in, add a watch for it.
-            if (event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0 and event.mask & linux.IN.ISDIR != 0) {
-                if (!isExcludedDir(name) and name[0] != '.') {
-                    const abs_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name }) catch continue;
-                    addWatchRecursive(self, inotify_fd, watch_mask, abs_path, &wd_map);
-                    self.allocator.free(abs_path);
-                }
+            if (event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0 and
+                event.mask & linux.IN.ISDIR != 0)
+            {
+                addWatchRecursive(self, inotify_fd, watch_mask, abs_path, &wd_map, 0);
                 continue;
             }
 
-            // Only process file events
+            // Only process file events.
             if (event.mask & linux.IN.ISDIR != 0) continue;
-
-            if (!shouldWatchPath(rel_path, self.index_patterns)) continue;
-
-            _ = emitWatcherRecord(self, rel_path);
+            emitPhysicalPath(self, abs_path);
         }
     }
 }
@@ -658,26 +650,37 @@ fn addWatchRecursive(
     mask: u32,
     dir_path: []const u8,
     wd_map: *std.AutoHashMap(i32, []const u8),
+    depth: usize,
 ) void {
     if (builtin.os.tag != .linux) return;
+    if (depth > self.matcher.recursionLimit()) {
+        debug_log.log("Watcher.linux: depth cap path={s} depth={d}", .{ dir_path, depth });
+        return;
+    }
+
+    const canonical_dir = std.fs.realpathAlloc(self.allocator, dir_path) catch return;
+    defer self.allocator.free(canonical_dir);
+    if (!self.matcher.allowsPhysicalPath(canonical_dir)) {
+        debug_log.log("Watcher.linux: rejected directory target={s}", .{canonical_dir});
+        return;
+    }
 
     const linux = std.os.linux;
 
-    const path_z = self.allocator.dupeZ(u8, dir_path) catch return;
+    const path_z = self.allocator.dupeZ(u8, canonical_dir) catch return;
     defer self.allocator.free(path_z);
 
     const rc = linux.inotify_add_watch(inotify_fd, path_z.ptr, mask);
     const wd: i32 = @intCast(@as(isize, @bitCast(rc)));
     if (wd < 0) return;
 
-    const owned_path = self.allocator.dupe(u8, dir_path) catch return;
-    wd_map.put(wd, owned_path) catch {
-        self.allocator.free(owned_path);
-        return;
-    };
+    const owned_path = self.allocator.dupe(u8, canonical_dir) catch return;
+    if (wd_map.fetchPut(wd, owned_path) catch null) |previous| {
+        self.allocator.free(previous.value);
+    }
 
     // Recurse into subdirectories
-    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    var dir = std.fs.openDirAbsolute(canonical_dir, .{ .iterate = true }) catch return;
     defer dir.close();
 
     var iter = dir.iterate();
@@ -689,14 +692,12 @@ fn addWatchRecursive(
         } else entry.kind;
         if (kind != .directory) continue;
         if (entry.name[0] == '.') continue;
-        if (isExcludedDir(entry.name)) continue;
 
-        const child = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const child = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ canonical_dir, entry.name }) catch continue;
         defer self.allocator.free(child);
-        addWatchRecursive(self, inotify_fd, mask, child, wd_map);
+        addWatchRecursive(self, inotify_fd, mask, child, wd_map, depth + 1);
     }
 }
-
 test "BatchState flushes on size threshold" {
     var state: BatchState = .{};
     state.noteEvent(0);
@@ -767,4 +768,64 @@ test "line decoder handles many records from one read" {
         }
     }
     try std.testing.expectEqual(record_count + 1, decoded_count);
+}
+
+fn writeTestFile(dir: std.fs.Dir, path: []const u8, contents: []const u8) !void {
+    if (std.fs.path.dirname(path)) |parent| try dir.makePath(parent);
+    const file = try dir.createFile(path, .{});
+    defer file.close();
+    try file.writeAll(contents);
+}
+
+test "watcher events match initial PathMatcher collection" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var external = std.testing.tmpDir(.{});
+    defer external.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, "src/generated/skip.zig", "const skip = true;\n");
+    try writeTestFile(external.dir, "shared.zig", "pub const shared = true;\n");
+    const external_root = try external.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(external_root);
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+    try project.dir.symLink(external_root, "shared-link", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+    var matcher = try path_matcher.PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{ "**/*.zig", "!**/generated/**" },
+        .external_roots = &.{external_root},
+    });
+    defer matcher.deinit();
+
+    var collected: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer {
+        matcher.freeMatchedPaths(collected.items);
+        collected.deinit(allocator);
+    }
+    try matcher.collect(&collected);
+
+    var watched = std.StringHashMapUnmanaged(void){};
+    defer {
+        var it = watched.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        watched.deinit(allocator);
+    }
+    for (collected.items) |file| {
+        var mapped: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (mapped.items) |path| allocator.free(path);
+            mapped.deinit(allocator);
+        }
+        try collectLogicalEvents(&matcher, file.physical_path, &mapped);
+        for (mapped.items) |path| {
+            if (!watched.contains(path)) try watched.put(allocator, try allocator.dupe(u8, path), {});
+        }
+    }
+
+    try std.testing.expectEqual(collected.items.len, watched.count());
+    for (collected.items) |file| try std.testing.expect(watched.contains(file.logical_path));
 }
