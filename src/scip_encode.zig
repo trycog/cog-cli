@@ -1,7 +1,23 @@
 const std = @import("std");
 const scip = @import("scip.zig");
 const protobuf = @import("protobuf.zig");
+const debug_log = @import("debug_log.zig");
 const Encoder = protobuf.Encoder;
+
+const EncodedItem = struct {
+    key: []const u8,
+    bytes: []const u8,
+};
+
+fn encodedItemLessThan(_: void, a: EncodedItem, b: EncodedItem) bool {
+    const key_order = std.mem.order(u8, a.key, b.key);
+    if (key_order != .eq) return key_order == .lt;
+    return std.mem.order(u8, a.bytes, b.bytes) == .lt;
+}
+
+fn stringsLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
 
 fn int32Varint(value: i32) u64 {
     return @bitCast(@as(i64, value));
@@ -9,6 +25,7 @@ fn int32Varint(value: i32) u64 {
 
 /// Encode a SCIP Index to protobuf bytes. Caller owns the returned slice.
 pub fn encodeIndex(allocator: std.mem.Allocator, index: scip.Index) ![]const u8 {
+    debug_log.log("scip_encode.encodeIndex: documents={d} external_symbols={d}", .{ index.documents.len, index.external_symbols.len });
     var enc = Encoder.init(allocator);
     defer enc.deinit();
 
@@ -19,18 +36,32 @@ pub fn encodeIndex(allocator: std.mem.Allocator, index: scip.Index) ![]const u8 
         try enc.writeLengthDelimited(1, meta_bytes);
     }
 
-    // field 2: documents (repeated)
-    for (index.documents) |doc| {
-        const doc_bytes = try encodeDocument(allocator, doc);
-        defer allocator.free(doc_bytes);
-        try enc.writeLengthDelimited(2, doc_bytes);
+    // Repeated message fields are encoded in canonical key/byte order so the
+    // same logical index has the same byte representation across runs.
+    const document_items = try allocator.alloc(EncodedItem, index.documents.len);
+    defer allocator.free(document_items);
+    var encoded_document_count: usize = 0;
+    defer for (document_items[0..encoded_document_count]) |item| allocator.free(item.bytes);
+    for (index.documents, 0..) |doc, i| {
+        document_items[i] = .{ .key = doc.relative_path, .bytes = try encodeDocument(allocator, doc) };
+        encoded_document_count += 1;
+    }
+    std.mem.sort(EncodedItem, document_items, {}, encodedItemLessThan);
+    for (document_items) |item| {
+        try enc.writeLengthDelimited(2, item.bytes);
     }
 
-    // field 3: external_symbols (repeated)
-    for (index.external_symbols) |sym| {
-        const sym_bytes = try encodeSymbolInformation(allocator, sym);
-        defer allocator.free(sym_bytes);
-        try enc.writeLengthDelimited(3, sym_bytes);
+    const external_items = try allocator.alloc(EncodedItem, index.external_symbols.len);
+    defer allocator.free(external_items);
+    var encoded_external_count: usize = 0;
+    defer for (external_items[0..encoded_external_count]) |item| allocator.free(item.bytes);
+    for (index.external_symbols, 0..) |sym, i| {
+        external_items[i] = .{ .key = sym.symbol, .bytes = try encodeSymbolInformation(allocator, sym) };
+        encoded_external_count += 1;
+    }
+    std.mem.sort(EncodedItem, external_items, {}, encodedItemLessThan);
+    for (external_items) |item| {
+        try enc.writeLengthDelimited(3, item.bytes);
     }
 
     return enc.toOwnedSlice();
@@ -81,18 +112,30 @@ pub fn encodeDocument(allocator: std.mem.Allocator, doc: scip.Document) ![]const
     // field 1: relative_path
     try enc.writeString(1, doc.relative_path);
 
-    // field 2: occurrences (repeated)
-    for (doc.occurrences) |occ| {
-        const occ_bytes = try encodeOccurrence(allocator, occ);
-        defer allocator.free(occ_bytes);
-        try enc.writeLengthDelimited(2, occ_bytes);
+    const occurrence_items = try allocator.alloc(EncodedItem, doc.occurrences.len);
+    defer allocator.free(occurrence_items);
+    var encoded_occurrence_count: usize = 0;
+    defer for (occurrence_items[0..encoded_occurrence_count]) |item| allocator.free(item.bytes);
+    for (doc.occurrences, 0..) |occ, i| {
+        occurrence_items[i] = .{ .key = occ.symbol, .bytes = try encodeOccurrence(allocator, occ) };
+        encoded_occurrence_count += 1;
+    }
+    std.mem.sort(EncodedItem, occurrence_items, {}, encodedItemLessThan);
+    for (occurrence_items) |item| {
+        try enc.writeLengthDelimited(2, item.bytes);
     }
 
-    // field 3: symbols (repeated)
-    for (doc.symbols) |sym| {
-        const sym_bytes = try encodeSymbolInformation(allocator, sym);
-        defer allocator.free(sym_bytes);
-        try enc.writeLengthDelimited(3, sym_bytes);
+    const symbol_items = try allocator.alloc(EncodedItem, doc.symbols.len);
+    defer allocator.free(symbol_items);
+    var encoded_symbol_count: usize = 0;
+    defer for (symbol_items[0..encoded_symbol_count]) |item| allocator.free(item.bytes);
+    for (doc.symbols, 0..) |sym, i| {
+        symbol_items[i] = .{ .key = sym.symbol, .bytes = try encodeSymbolInformation(allocator, sym) };
+        encoded_symbol_count += 1;
+    }
+    std.mem.sort(EncodedItem, symbol_items, {}, encodedItemLessThan);
+    for (symbol_items) |item| {
+        try enc.writeLengthDelimited(3, item.bytes);
     }
 
     // field 4: language
@@ -144,16 +187,26 @@ pub fn encodeSymbolInformation(allocator: std.mem.Allocator, sym: scip.SymbolInf
     // field 1: symbol
     try enc.writeString(1, sym.symbol);
 
-    // field 3: documentation (repeated string)
-    for (sym.documentation) |doc_str| {
+    // Documentation and relationships are sets for query purposes. Canonical
+    // ordering keeps their protobuf representation stable.
+    const documentation = try allocator.dupe([]const u8, sym.documentation);
+    defer allocator.free(documentation);
+    std.mem.sort([]const u8, documentation, {}, stringsLessThan);
+    for (documentation) |doc_str| {
         try enc.writeString(3, doc_str);
     }
 
-    // field 4: relationships (repeated)
-    for (sym.relationships) |rel| {
-        const rel_bytes = try encodeRelationship(allocator, rel);
-        defer allocator.free(rel_bytes);
-        try enc.writeLengthDelimited(4, rel_bytes);
+    const relationship_items = try allocator.alloc(EncodedItem, sym.relationships.len);
+    defer allocator.free(relationship_items);
+    var encoded_relationship_count: usize = 0;
+    defer for (relationship_items[0..encoded_relationship_count]) |item| allocator.free(item.bytes);
+    for (sym.relationships, 0..) |rel, i| {
+        relationship_items[i] = .{ .key = rel.symbol, .bytes = try encodeRelationship(allocator, rel) };
+        encoded_relationship_count += 1;
+    }
+    std.mem.sort(EncodedItem, relationship_items, {}, encodedItemLessThan);
+    for (relationship_items) |item| {
+        try enc.writeLengthDelimited(4, item.bytes);
     }
 
     // field 5: kind
