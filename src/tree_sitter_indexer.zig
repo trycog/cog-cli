@@ -462,7 +462,7 @@ pub const Indexer = struct {
             // name on the same line (e.g. export_statement + function_declaration
             // both capturing the same identifier).
             const this_row = c.ts_node_start_point(name_n).row;
-            const def_key = @as(u64, this_row) << 32 | @as(u64, std.hash.Wyhash.hash(0, name_text));
+            const def_key = @as(u64, this_row) << 32 | @as(u64, std.hash.Wyhash.hash(@intCast(kind), name_text));
             const def_gop = def_seen.getOrPut(allocator, def_key) catch continue;
             if (def_gop.found_existing) continue;
 
@@ -1169,12 +1169,15 @@ test "indexFile Java emits imports constructors fields and calls" {
     }
 
     var found_class = false;
+    var found_constructor = false;
     var found_field = false;
     for (doc.symbols) |sym| {
         if (std.mem.eql(u8, sym.display_name, "Widget") and sym.kind == 7) found_class = true;
+        if (std.mem.eql(u8, sym.display_name, "Widget") and sym.kind == 9) found_constructor = true;
         if (std.mem.eql(u8, sym.display_name, "count") and sym.kind == 15) found_field = true;
     }
     try std.testing.expect(found_class);
+    try std.testing.expect(found_constructor);
     try std.testing.expect(found_field);
     _ = try expectSymbolKind(doc, "helper", 26);
     _ = try expectSymbolKind(doc, "run", 26);
