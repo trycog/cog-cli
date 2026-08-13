@@ -133,12 +133,18 @@ pub fn replaceDirectoryTransactional(
         error.FileNotFound => had_live = false,
         else => return err,
     };
-    errdefer if (had_live) parent.rename(backup_name, live_name) catch {};
 
     debug_log.log("fs_util.replaceDirectoryTransactional: promoting {s} to {s}", .{ staged_name, live_name });
-    parent.rename(staged_name, live_name) catch |err| {
-        debug_log.log("fs_util.replaceDirectoryTransactional: promotion failed for {s}: {s}", .{ live_name, @errorName(err) });
-        return err;
+    parent.rename(staged_name, live_name) catch |promotion_err| {
+        debug_log.log("fs_util.replaceDirectoryTransactional: promotion failed for {s}: {s}", .{ live_name, @errorName(promotion_err) });
+        if (had_live) {
+            parent.rename(backup_name, live_name) catch |rollback_err| {
+                debug_log.log("fs_util.replaceDirectoryTransactional: rollback failed for {s}: {s}", .{ live_name, @errorName(rollback_err) });
+                return error.DirectoryRollbackFailed;
+            };
+            try syncDirectory(parent);
+        }
+        return promotion_err;
     };
     try syncDirectory(parent);
 
