@@ -127,11 +127,18 @@ const DetachedProcess = struct {
             };
             for (0..20) |_| {
                 const result = std.posix.waitpid(self.id, 1);
-                if (result.pid != 0) break;
+                if (result.pid != 0) {
+                    reaped = true;
+                    break;
+                }
                 std.posix.nanosleep(0, 5_000_000);
             }
         }
-        debug_log.log("dap.proxy: adapter cleanup complete pid={d} reaped={}", .{ self.id, reaped });
+        if (!reaped) {
+            debug_log.log("dap.proxy: adapter cleanup deadline expired pid={d}", .{self.id});
+            return;
+        }
+        debug_log.log("dap.proxy: adapter cleanup complete pid={d} reaped=true", .{self.id});
         self.id = 0;
     }
 };
@@ -4455,6 +4462,21 @@ test "DetachedProcess closes adapter pipes idempotently" {
     try std.testing.expect(process.stdin == null);
     try std.testing.expect(process.stdout == null);
     try std.testing.expect(process.stderr == null);
+}
+
+test "DetachedProcess repeatedly launches stops and reaps adapter fixture" {
+    const allocator = std.testing.allocator;
+    for (0..16) |_| {
+        var process = try spawnDetached(allocator, &.{ "/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done" });
+        const pid = process.id;
+        process.terminateAndReap();
+
+        try std.testing.expectEqual(@as(std.posix.pid_t, 0), process.id);
+        try std.testing.expect(process.stdin == null);
+        try std.testing.expect(process.stdout == null);
+        try std.testing.expect(process.stderr == null);
+        try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, 0));
+    }
 }
 
 test "DapProxy bounds notification event and output queues" {
