@@ -258,7 +258,6 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     }
 
     debug_log_mod.log("mcp.serve: starting version={s} debug_tools={s}", .{ version, @tagName(debug_tool_tier) });
-    debugLogInit();
     setupSignalHandler();
 
     var runtime = Runtime.init(allocator, debug_tool_tier);
@@ -266,9 +265,9 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     // The thread captures a pointer to runtime.watcher, so it must not move.
     if (runtime.watcher != null) {
         runtime.watcher.?.start();
-        debugLog("File watcher started", .{});
+        debug_log_mod.log("File watcher started", .{});
     }
-    debugLog("Runtime initialized, mem_config={s}, entering main loop", .{if (runtime.mem_config != null) "present" else "null"});
+    debug_log_mod.log("Runtime initialized, mem_config={s}, entering main loop", .{if (runtime.mem_config != null) "present" else "null"});
 
     const stdin = std.fs.File.stdin();
 
@@ -302,14 +301,14 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
             }
 
             if (fds[0].revents & posix.POLL.ERR != 0) {
-                debugLog("poll: POLLERR on stdin, exiting", .{});
+                debug_log_mod.log("poll: POLLERR on stdin, exiting", .{});
                 break;
             }
             if (fds[0].revents & posix.POLL.IN == 0) {
                 // If stdin is hung up and there's no readable data left,
                 // terminate the server loop.
                 if (fds[0].revents & posix.POLL.HUP != 0) {
-                    debugLog("poll: POLLHUP on stdin, exiting", .{});
+                    debug_log_mod.log("poll: POLLHUP on stdin, exiting", .{});
                     break;
                 }
                 continue;
@@ -317,15 +316,14 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
 
         const n = stdin.read(&read_buf) catch |err| {
-            debugLog("stdin read error: {s}", .{@errorName(err)});
+            debug_log_mod.log("stdin read error: {s}", .{@errorName(err)});
             break;
         };
         if (n == 0) {
-            debugLog("stdin EOF (read returned 0)", .{});
+            debug_log_mod.log("stdin EOF (read returned 0)", .{});
             break;
         }
-        debugLog("Read {d} bytes from stdin", .{n});
-        debugLogBytes("RAW stdin bytes: ", read_buf[0..n]);
+        debug_log_mod.log("Read {d} bytes from stdin", .{n});
         if (std.mem.indexOfScalar(u8, read_buf[0..n], 0x03) != null) {
             shutdown_requested.store(true, .release);
             break;
@@ -351,13 +349,11 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
     }
 
-    debugLog("=== MCP server shutting down ===", .{});
+    debug_log_mod.log("mcp.serve: shutting down", .{});
 
     // Clean up debug sessions before exiting — kills adapter process groups
     // to prevent orphaned debugpy/launcher/debuggee processes.
     runtime.debug_server.deinit();
-
-    debugLogDeinit();
 
     // Force-exit the process. On macOS the file-watcher thread can get
     // stuck in CFRunLoop's mach_msg2_trap, making thread-join hang
@@ -482,10 +478,9 @@ fn handleRequest(runtime: *Runtime, msg: []const u8, stdout: StdoutWriter) void 
 
 fn processMessage(runtime: *Runtime, line: []const u8, stdout: StdoutWriter) !void {
     const allocator = runtime.allocator;
-    debugLogBytes(">>> RECV: ", line);
 
     const parsed = json.parseFromSlice(json.Value, allocator, line, .{}) catch {
-        debugLog("Parse error on incoming message", .{});
+        debug_log_mod.log("Parse error on incoming message", .{});
         try writeError(allocator, null, -32700, "Parse error", stdout);
         return;
     };
@@ -506,7 +501,7 @@ fn processMessage(runtime: *Runtime, line: []const u8, stdout: StdoutWriter) !vo
         return;
     }
     const method = method_val.string;
-    debugLog("Method: {s}", .{method});
+    debug_log_mod.log("Method: {s}", .{method});
 
     // Get request id (may be null for notifications)
     const id = root.object.get("id");
@@ -591,7 +586,6 @@ const StdoutWriter = struct {
             debug_log_mod.log("stdout_writer: mutex released", .{});
         }
         debug_log_mod.log("stdout_writer: mutex acquired", .{});
-        debugLogBytes("<<< SEND: ", data);
         var buf: [8192]u8 = undefined;
         var w = self.file.writerStreaming(&buf);
         w.interface.writeAll(data) catch return error.WriteFailure;
@@ -659,7 +653,7 @@ const ReplyOnce = struct {
     fn sendInternalError(self: *ReplyOnce, err: anyerror) void {
         if (self.responded) return;
         if (self.id == null) return;
-        debugLog("Handler error: {s}, sending internal error response", .{@errorName(err)});
+        debug_log_mod.log("Handler error: {s}, sending internal error response", .{@errorName(err)});
         self.responded = true;
         writeError(self.allocator, self.id, -32603, "Internal error", self.stdout) catch {};
     }
@@ -670,7 +664,7 @@ const ReplyOnce = struct {
         if (self.is_notification) return;
         if (self.responded) return;
         if (self.id == null) return;
-        debugLog("ReplyOnce: handler returned without responding, sending fallback error", .{});
+        debug_log_mod.log("ReplyOnce: handler returned without responding, sending fallback error", .{});
         writeError(self.allocator, self.id, -32603, "Internal error: no response produced", self.stdout) catch {};
     }
 };
@@ -1153,7 +1147,7 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
             // Lazily discover remote memory tools on first tools/list
             if (runtime.remote_tools == null) {
                 discoverRemoteTools(runtime) catch |err| {
-                    debugLog("Remote tool discovery failed: {s}", .{@errorName(err)});
+                    debug_log_mod.log("Remote tool discovery failed: {s}", .{@errorName(err)});
                 };
             }
             if (runtime.remote_tools) |tools| {
@@ -1453,7 +1447,7 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
     }
 
     runtime.remote_tools = try tool_list.toOwnedSlice(allocator);
-    debugLog("Discovered {d} remote memory tools", .{runtime.remote_tools.?.len});
+    debug_log_mod.log("Discovered {d} remote memory tools", .{runtime.remote_tools.?.len});
     debug_log_mod.log("discoverRemoteTools: found {d} tools", .{runtime.remote_tools.?.len});
     debug_log_mod.log(
         "discoverRemoteTools: enhanced_write={s} provenance={any} rationale_trace={any}",
@@ -1526,7 +1520,7 @@ fn callRemoteMcpTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.
     defer allocator.free(args_json);
 
     const response = client.mcpCallTool(allocator, endpoint, cfg.api_key, runtime.mcp_session_id, rname, args_json) catch |err| {
-        debugLog("MCP tool call failed for {s}: {s}", .{ tool_name, @errorName(err) });
+        debug_log_mod.log("MCP tool call failed for {s}: {s}", .{ tool_name, @errorName(err) });
         return error.Explained;
     };
     defer allocator.free(response.body);
@@ -1829,12 +1823,12 @@ fn reindexInProcess(allocator: std.mem.Allocator, file_paths: []const []const u8
         };
         if (exists) {
             if (code_intel.reindexFile(allocator, path_copy)) {
-                debugLog("Watcher: reindexed {s}", .{path_copy});
+                debug_log_mod.log("Watcher: reindexed {s}", .{path_copy});
                 changed = true;
             }
         } else {
             if (code_intel.removeFileFromIndex(allocator, path_copy)) {
-                debugLog("Watcher: removed {s}", .{path_copy});
+                debug_log_mod.log("Watcher: removed {s}", .{path_copy});
                 changed = true;
             }
         }
@@ -1843,10 +1837,10 @@ fn reindexInProcess(allocator: std.mem.Allocator, file_paths: []const []const u8
 }
 
 fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
-    debugLog("callDebugTool: dispatching {s}", .{tool_name});
+    debug_log_mod.log("callDebugTool: dispatching {s}", .{tool_name});
     const allocator = runtime.allocator;
     const result = runtime.debug_server.callTool(allocator, tool_name, arguments) catch return error.Explained;
-    debugLog("callDebugTool: {s} returned", .{tool_name});
+    debug_log_mod.log("callDebugTool: {s} returned", .{tool_name});
     return switch (result) {
         .ok => |payload| payload,
         .ok_static => |payload| try allocator.dupe(u8, payload),
@@ -1855,10 +1849,10 @@ fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Valu
 }
 
 fn callObserveTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
-    debugLog("callObserveTool: dispatching {s}", .{tool_name});
+    debug_log_mod.log("callObserveTool: dispatching {s}", .{tool_name});
     const allocator = runtime.allocator;
     const result = runtime.observe_server.callTool(allocator, tool_name, arguments) catch return error.Explained;
-    debugLog("callObserveTool: {s} returned", .{tool_name});
+    debug_log_mod.log("callObserveTool: {s} returned", .{tool_name});
     return switch (result) {
         .ok => |payload| payload,
         .ok_static => |payload| try allocator.dupe(u8, payload),
@@ -2056,55 +2050,6 @@ fn logErr(prefix: []const u8, err: anyerror) void {
     w.interface.writeAll(@errorName(err)) catch {};
     w.interface.writeByte('\n') catch {};
     w.interface.flush() catch {};
-}
-
-// ── Debug File Logger ────────────────────────────────────────────────────
-
-var debug_log_file: ?std.fs.File = null;
-
-fn debugLogInit() void {
-    debug_log_file = std.fs.cwd().createFile("/tmp/cog-mcp.log", .{ .truncate = false }) catch null;
-    if (debug_log_file) |f| {
-        f.seekFromEnd(0) catch {};
-    }
-    debugLog("=== MCP server starting (version {s}) ===", .{server_version});
-}
-
-fn debugLogDeinit() void {
-    debugLog("=== MCP server shutting down ===", .{});
-    if (debug_log_file) |f| f.close();
-    debug_log_file = null;
-}
-
-fn debugLog(comptime fmt: []const u8, args: anytype) void {
-    const f = debug_log_file orelse return;
-    var buf: [4096]u8 = undefined;
-    const ts = std.time.timestamp();
-    const prefix = std.fmt.bufPrint(&buf, "[{d}] ", .{ts}) catch return;
-    f.writeAll(prefix) catch return;
-    var msg_buf: [8192]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, fmt, args) catch return;
-    f.writeAll(msg) catch return;
-    f.writeAll("\n") catch return;
-}
-
-fn debugLogBytes(prefix: []const u8, data: []const u8) void {
-    const f = debug_log_file orelse return;
-    var buf: [128]u8 = undefined;
-    const ts = std.time.timestamp();
-    const ts_str = std.fmt.bufPrint(&buf, "[{d}] ", .{ts}) catch return;
-    f.writeAll(ts_str) catch return;
-    f.writeAll(prefix) catch return;
-    const max_len: usize = 500;
-    if (data.len <= max_len) {
-        f.writeAll(data) catch return;
-    } else {
-        f.writeAll(data[0..max_len]) catch return;
-        var trunc_buf: [64]u8 = undefined;
-        const trunc_msg = std.fmt.bufPrint(&trunc_buf, "... ({d} bytes total)", .{data.len}) catch return;
-        f.writeAll(trunc_msg) catch return;
-    }
-    f.writeAll("\n") catch return;
 }
 
 test "nextMessageFromBuffer extracts newline-delimited JSON" {
