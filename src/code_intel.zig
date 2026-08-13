@@ -451,6 +451,7 @@ pub const CodeIndex = struct {
                         rel.symbol,
                         rel_kind,
                         &symbol_to_defs,
+                        &path_to_doc_idx,
                         &file_to_imports,
                         &symbol_to_calls,
                         &symbol_to_callers,
@@ -479,7 +480,7 @@ pub const CodeIndex = struct {
                     const imports_entry = try file_to_imports.getOrPut(allocator, doc.relative_path);
                     if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
                     try appendUniqueImport(allocator, imports_entry.value_ptr, .{
-                        .label = displayLabelForSymbol(occ.symbol, &symbol_to_defs),
+                        .label = resolveImportLabel(displayLabelForSymbol(occ.symbol, &symbol_to_defs), &path_to_doc_idx),
                         .symbol = occ.symbol,
                     });
                 } else if (std.mem.startsWith(u8, occ.symbol, "cog/call/")) {
@@ -626,6 +627,7 @@ pub const CodeIndex = struct {
         target_symbol: []const u8,
         kind: []const u8,
         defs: *const std.StringHashMapUnmanaged(DefInfo),
+        indexed_paths: *const std.StringHashMapUnmanaged(usize),
         file_to_imports: *std.StringHashMapUnmanaged(FileImportList),
         symbol_to_calls: *std.StringHashMapUnmanaged(RelationshipList),
         symbol_to_callers: *std.StringHashMapUnmanaged(RelationshipList),
@@ -636,10 +638,40 @@ pub const CodeIndex = struct {
             const imports_entry = try file_to_imports.getOrPut(allocator, document_path);
             if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
             try appendUniqueImport(allocator, imports_entry.value_ptr, .{
-                .label = displayLabelForSymbol(target_symbol, defs),
+                .label = resolveImportLabel(displayLabelForSymbol(target_symbol, defs), indexed_paths),
                 .symbol = target_symbol,
             });
         }
+    }
+
+    fn resolveImportLabel(label: []const u8, indexed_paths: *const std.StringHashMapUnmanaged(usize)) []const u8 {
+        if (indexed_paths.getKey(label)) |canonical| return canonical;
+
+        const extensions_to_try = [_][]const u8{
+            ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".java", ".py", ".go", ".rs", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
+        };
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        for (&extensions_to_try) |extension| {
+            if (label.len + extension.len > buffer.len) continue;
+            @memcpy(buffer[0..label.len], label);
+            @memcpy(buffer[label.len..][0..extension.len], extension);
+            if (indexed_paths.getKey(buffer[0 .. label.len + extension.len])) |canonical| return canonical;
+        }
+
+        const index_files = [_][]const u8{
+            "index.js", "index.jsx", "index.mjs", "index.cjs", "index.ts", "index.tsx", "index.mts",
+        };
+        for (&index_files) |index_file| {
+            const separator_len: usize = if (label.len > 0 and label[label.len - 1] == '/') 0 else 1;
+            if (label.len + separator_len + index_file.len > buffer.len) continue;
+            @memcpy(buffer[0..label.len], label);
+            if (separator_len == 1) buffer[label.len] = '/';
+            const index_start = label.len + separator_len;
+            @memcpy(buffer[index_start..][0..index_file.len], index_file);
+            if (indexed_paths.getKey(buffer[0 .. index_start + index_file.len])) |canonical| return canonical;
+        }
+
+        return label;
     }
 
     fn displayLabelForSymbol(symbol: []const u8, defs: *const std.StringHashMapUnmanaged(DefInfo)) []const u8 {
