@@ -145,7 +145,9 @@ pub const DaemonServer = struct {
         }
     }
 
-    fn reapOrphanedSessions(self: *DaemonServer) void {
+    pub fn reapOrphanedSessions(self: *DaemonServer) void {
+        self.server.mutex.lock();
+        defer self.server.mutex.unlock();
         if (self.server.session_manager.sessionCount() == 0) return;
 
         const now = std.time.milliTimestamp();
@@ -184,27 +186,21 @@ pub const DaemonServer = struct {
         }
 
         for (ids.items) |id| {
-            // Use sessions.get directly to avoid updating last_activity
-            if (self.server.session_manager.sessions.get(id)) |session| {
-                switch (session.orphan_action) {
-                    .terminate => {
-                        session.driver.stop(self.allocator) catch {
-                            session.driver.terminate(self.allocator) catch {};
-                        };
-                    },
-                    .detach => {
-                        session.driver.detach(self.allocator) catch {};
-                    },
-                    .none => {
-                        // Idle-expired sessions with no orphan_action: terminate the driver
-                        session.driver.stop(self.allocator) catch {
-                            session.driver.terminate(self.allocator) catch {};
-                        };
-                    },
-                }
-                self.server.dashboard.onStop(id);
+            const session = self.server.session_manager.sessions.get(id) orelse continue;
+            const mode: DebugServer.EndMode = switch (session.orphan_action) {
+                .detach => .detach,
+                .terminate, .none => .terminate,
+            };
+            debug_log.log("DaemonServer.reapOrphanedSessions: ending session_id={s} mode={s} active={}", .{ id, @tagName(mode), session.pending_run != null });
+            const result = self.server.endSessionLocked(self.allocator, id, mode, true) catch |err| {
+                debug_log.log("DaemonServer.reapOrphanedSessions: failed session_id={s}: {s}", .{ id, @errorName(err) });
+                continue;
+            };
+            switch (result) {
+                .ok => |raw| self.allocator.free(raw),
+                .ok_static => {},
+                .err => |tool_err| debug_log.log("DaemonServer.reapOrphanedSessions: rejected session_id={s}: {s}", .{ id, tool_err.message }),
             }
-            _ = self.server.session_manager.destroySession(id);
         }
     }
 
@@ -330,6 +326,37 @@ pub const DaemonServer = struct {
 };
 
 // ── Signal Handling ─────────────────────────────────────────────────────
+
+test "orphan reaper synchronizes active run teardown" {
+    const allocator = std.testing.allocator;
+    var daemon = DaemonServer.init(allocator, 1);
+    defer daemon.deinit();
+
+    var mock = @import("driver.zig").MockDriver{};
+    mock.setBlockRun(true);
+    const session_id = try daemon.server.session_manager.createSession(mock.activeDriver(), null, .terminate);
+    const session = daemon.server.session_manager.getSession(session_id).?;
+    session.status = .stopped;
+
+    const run_args = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","action":"continue","timeout_ms":0}
+    , .{});
+    defer run_args.deinit();
+    const run_result = try daemon.server.callTool(allocator, "debug_run", run_args.value);
+    switch (run_result) {
+        .ok => |raw| allocator.free(raw),
+        .ok_static => {},
+        .err => unreachable,
+    }
+    mock.waitForRunEntered();
+
+    session.last_activity = std.time.milliTimestamp() - 10;
+    daemon.reapOrphanedSessions();
+
+    try std.testing.expectEqual(@as(usize, 0), daemon.server.session_manager.sessionCount());
+    try std.testing.expect(mock.terminated);
+    try std.testing.expect(mock.deinitialized);
+}
 
 var g_daemon_socket_path: [128]u8 = undefined;
 var g_daemon_socket_path_len: usize = 0;

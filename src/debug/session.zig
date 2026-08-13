@@ -3,6 +3,7 @@ const posix = std.posix;
 const driver_mod = @import("driver.zig");
 const types = @import("types.zig");
 const ActiveDriver = driver_mod.ActiveDriver;
+const debug_log = @import("../debug_log.zig");
 
 pub const Session = struct {
     id: []const u8,
@@ -11,35 +12,67 @@ pub const Session = struct {
     owner_pid: ?posix.pid_t = null,
     orphan_action: OrphanAction = .none,
     last_activity: i64 = 0,
-    pending_run: ?PendingRun = null,
+    pending_run: ?*PendingRun = null,
 
     pub const Status = enum {
         launching,
         running,
         stopped,
+        ending,
         terminated,
     };
 
-    /// Tracks a background execution control operation (continue, step, etc.).
-    /// The background thread writes stop_state/error_msg then does
-    /// result.store(.release). The main thread checks result.load(.acquire)
-    /// before reading fields — release/acquire ordering guarantees visibility.
+    /// Heap-owned execution state shared by the session lifecycle owner and an
+    /// optional synchronous waiter. The stable pointer is published before the
+    /// worker starts, and exactly one caller claims the thread join.
     pub const PendingRun = struct {
-        thread: std.Thread,
+        thread: ?std.Thread = null,
         /// 0 = running, 1 = completed, 2 = error
         result: std.atomic.Value(u8) = .init(0),
         stop_state: ?types.StopState = null,
         error_msg: ?[]const u8 = null,
-        session_id: []const u8 = "",
-        action_name: []const u8 = "",
-        allocator: ?std.mem.Allocator = null,
+        session_id: []const u8,
+        action_name: []const u8,
+        allocator: std.mem.Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        joined: std.atomic.Value(bool) = .init(false),
+        waiter_owns_completion: std.atomic.Value(bool) = .init(false),
 
-        /// Free owned copies of session_id and action_name.
-        pub fn deinit(self: *PendingRun) void {
-            if (self.allocator) |a| {
-                if (self.session_id.len > 0) a.free(self.session_id);
-                if (self.action_name.len > 0) a.free(self.action_name);
-            }
+        pub fn create(allocator: std.mem.Allocator, session_id: []const u8, action_name: []const u8) !*PendingRun {
+            debug_log.log("PendingRun.create: session_id={s} action={s}", .{ session_id, action_name });
+            const self = try allocator.create(PendingRun);
+            errdefer allocator.destroy(self);
+
+            const owned_session_id = try allocator.dupe(u8, session_id);
+            errdefer allocator.free(owned_session_id);
+            const owned_action_name = try allocator.dupe(u8, action_name);
+
+            self.* = .{
+                .session_id = owned_session_id,
+                .action_name = owned_action_name,
+                .allocator = allocator,
+            };
+            return self;
+        }
+
+        pub fn retain(self: *PendingRun) void {
+            _ = self.references.fetchAdd(1, .monotonic);
+        }
+
+        pub fn join(self: *PendingRun) void {
+            if (self.joined.swap(true, .acq_rel)) return;
+            debug_log.log("PendingRun.join: session_id={s} action={s}", .{ self.session_id, self.action_name });
+            if (self.thread) |thread| thread.join();
+        }
+
+        pub fn release(self: *PendingRun) void {
+            if (self.references.fetchSub(1, .release) != 1) return;
+            _ = self.references.load(.acquire);
+            std.debug.assert(self.thread == null or self.joined.load(.acquire));
+            if (self.stop_state) |*state| state.deinit(self.allocator);
+            self.allocator.free(self.session_id);
+            self.allocator.free(self.action_name);
+            self.allocator.destroy(self);
         }
     };
 
@@ -66,10 +99,12 @@ pub const SessionManager = struct {
         var iter = self.sessions.iterator();
         while (iter.next()) |entry| {
             const session = entry.value_ptr.*;
-            // Join any pending background run thread before destroying
-            if (session.pending_run) |*pr| {
-                pr.thread.join();
-                pr.deinit();
+            if (session.pending_run) |run| {
+                var driver = session.driver;
+                debug_log.log("SessionManager.deinit: interrupting active run session_id={s}", .{session.id});
+                driver.interruptRun();
+                run.join();
+                run.release();
                 session.pending_run = null;
             }
             session.driver.deinit();
@@ -108,21 +143,35 @@ pub const SessionManager = struct {
         return session;
     }
 
-    pub fn destroySession(self: *SessionManager, id: []const u8) bool {
-        if (self.sessions.fetchRemove(id)) |kv| {
-            const session = kv.value;
-            // Join any pending background run thread before destroying
-            if (session.pending_run) |*pr| {
-                pr.thread.join();
-                pr.deinit();
-                session.pending_run = null;
-            }
-            session.driver.deinit();
-            self.allocator.free(kv.key);
-            self.allocator.destroy(session);
-            return true;
+    pub const RemovedSession = struct {
+        key: []const u8,
+        session: *Session,
+    };
+
+    pub fn removeSession(self: *SessionManager, id: []const u8) ?RemovedSession {
+        const kv = self.sessions.fetchRemove(id) orelse return null;
+        return .{ .key = kv.key, .session = kv.value };
+    }
+
+    pub fn destroyRemovedSession(self: *SessionManager, removed: RemovedSession) void {
+        const session = removed.session;
+        if (session.pending_run) |run| {
+            var driver = session.driver;
+            debug_log.log("SessionManager.destroyRemovedSession: interrupting active run session_id={s}", .{session.id});
+            driver.interruptRun();
+            run.join();
+            run.release();
+            session.pending_run = null;
         }
-        return false;
+        session.driver.deinit();
+        self.allocator.free(removed.key);
+        self.allocator.destroy(session);
+    }
+
+    pub fn destroySession(self: *SessionManager, id: []const u8) bool {
+        const removed = self.removeSession(id) orelse return false;
+        self.destroyRemovedSession(removed);
+        return true;
     }
 
     pub fn sessionCount(self: *const SessionManager) usize {

@@ -23,6 +23,15 @@ pub const StackFrame = struct {
     fp: u64 = 0,
     sp: u64 = 0,
 
+    pub fn deinitSlice(allocator: std.mem.Allocator, frames: []const StackFrame) void {
+        if (frames.len == 0) return;
+        for (frames) |frame| {
+            if (frame.name.len > 0) allocator.free(frame.name);
+            if (frame.source.len > 0) allocator.free(frame.source);
+        }
+        allocator.free(frames);
+    }
+
     pub fn jsonStringify(self: *const StackFrame, jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("id");
@@ -488,6 +497,31 @@ pub const StopState = struct {
     const max_stop_output = 10;
     /// Max length of variable values in stop responses. Use cog_debug_inspect for full values.
     const max_value_len = 200;
+
+    /// Free heap-backed payloads returned by debug drivers. Drivers must return
+    /// allocator-owned slices for every non-empty dynamic field.
+    pub fn deinit(self: *StopState, allocator: std.mem.Allocator) void {
+        StackFrame.deinitSlice(allocator, self.stack_trace);
+        if (self.locals.len > 0) {
+            for (self.locals) |local| {
+                if (local.value.len > 0) allocator.free(local.value);
+            }
+            allocator.free(self.locals);
+        }
+        if (self.log_messages.len > 0) {
+            for (self.log_messages) |msg| if (msg.len > 0) allocator.free(msg);
+            allocator.free(self.log_messages);
+        }
+        if (self.output.len > 0) {
+            for (self.output) |entry| {
+                if (entry.category.len > 0) allocator.free(entry.category);
+                if (entry.text.len > 0) allocator.free(entry.text);
+            }
+            allocator.free(self.output);
+        }
+        if (self.hit_breakpoint_ids.len > 0) allocator.free(self.hit_breakpoint_ids);
+        self.* = .{ .stop_reason = self.stop_reason };
+    }
 
     pub fn jsonStringify(self: *const StopState, jw: anytype) !void {
         try jw.beginObject();

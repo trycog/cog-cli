@@ -225,6 +225,7 @@ pub const DwarfEngine = struct {
         .loadCoreFn = engineLoadCore,
         .stepInTargetsFn = engineStepInTargets,
         .getPidFn = engineGetPid,
+        .interruptRunFn = engineInterruptRun,
         .cancelFn = engineCancel,
         .terminateThreadsFn = engineTerminateThreads,
     };
@@ -1783,7 +1784,13 @@ pub const DwarfEngine = struct {
 
         // Build frames, inserting virtual inlined frames where applicable
         var frame_list = std.ArrayListUnmanaged(types.StackFrame).empty;
-        errdefer frame_list.deinit(self.allocator);
+        errdefer {
+            for (frame_list.items) |frame| {
+                if (frame.name.len > 0) self.allocator.free(frame.name);
+                if (frame.source.len > 0) self.allocator.free(frame.source);
+            }
+            frame_list.deinit(self.allocator);
+        }
 
         var next_id: u32 = 0;
         for (unwind_frames) |uf| {
@@ -1802,10 +1809,14 @@ pub const DwarfEngine = struct {
                         getFileName(self.file_entries, isub.call_file)
                     else
                         uf.file;
+                    const name_owned = try self.allocator.dupe(u8, isub.name orelse "[inlined]");
+                    errdefer self.allocator.free(name_owned);
+                    const source_owned = try self.allocator.dupe(u8, source_name);
+                    errdefer self.allocator.free(source_owned);
                     try frame_list.append(self.allocator, .{
                         .id = next_id,
-                        .name = isub.name orelse "[inlined]",
-                        .source = source_name,
+                        .name = name_owned,
+                        .source = source_owned,
                         .line = isub.call_line,
                         .column = isub.call_column,
                     });
@@ -1814,10 +1825,14 @@ pub const DwarfEngine = struct {
             }
 
             // Add the physical frame (SP is set to 0 initially; corrected below via CFA chain)
+            const name_owned = try self.allocator.dupe(u8, uf.function_name);
+            errdefer self.allocator.free(name_owned);
+            const source_owned = try self.allocator.dupe(u8, uf.file);
+            errdefer self.allocator.free(source_owned);
             try frame_list.append(self.allocator, .{
                 .id = next_id,
-                .name = uf.function_name,
-                .source = uf.file,
+                .name = name_owned,
+                .source = source_owned,
                 .line = uf.line,
                 .address = uf.address,
                 .fp = uf.fp,
@@ -2154,7 +2169,12 @@ pub const DwarfEngine = struct {
 
         // Evaluate each variable
         var locals = std.ArrayListUnmanaged(types.Variable).empty;
-        errdefer locals.deinit(self.allocator);
+        errdefer {
+            for (locals.items) |local| {
+                if (local.value.len > 0) self.allocator.free(local.value);
+            }
+            locals.deinit(self.allocator);
+        }
 
         debug_log.log(
             "dwarf.engine: evaluate locals frame_base={?} cfa={?} sp=0x{x} fp=0x{x} variables={d}",
@@ -2202,6 +2222,7 @@ pub const DwarfEngine = struct {
             };
 
             const value_owned = try self.allocator.dupe(u8, value_str);
+            errdefer self.allocator.free(value_owned);
             try locals.append(self.allocator, .{
                 .name = v.name,
                 .value = value_owned,
@@ -2213,16 +2234,13 @@ pub const DwarfEngine = struct {
     }
 
     fn cacheStackTrace(self: *DwarfEngine, stack_trace: []const types.StackFrame) void {
-        // Free previous cached trace
-        if (self.cached_stack_trace.len > 0) {
-            self.allocator.free(self.cached_stack_trace);
-        }
-        // Duplicate the new trace for caching
-        if (stack_trace.len > 0) {
-            self.cached_stack_trace = self.allocator.dupe(types.StackFrame, stack_trace) catch &.{};
-        } else {
-            self.cached_stack_trace = &.{};
-        }
+        // The cache borrows frame strings from engine debug metadata and owns
+        // only its shallow frame slice. StopState owns independent deep copies.
+        if (self.cached_stack_trace.len > 0) self.allocator.free(self.cached_stack_trace);
+        self.cached_stack_trace = if (stack_trace.len > 0)
+            self.allocator.dupe(types.StackFrame, stack_trace) catch &.{}
+        else
+            &.{};
     }
 
     fn stepPastBreakpoint(self: *DwarfEngine, bp_addr: u64) !void {
@@ -3457,9 +3475,26 @@ pub const DwarfEngine = struct {
 
         if (start == 0 and count == all_frames.len) return all_frames;
 
-        // Return a slice copy so the caller owns it
-        const result = try allocator.dupe(types.StackFrame, all_frames[start..][0..count]);
-        self.allocator.free(all_frames);
+        // Return a deep slice copy so caller cleanup is independent.
+        const result = try allocator.alloc(types.StackFrame, count);
+        var copied: usize = 0;
+        errdefer {
+            for (result[0..copied]) |frame| {
+                if (frame.name.len > 0) allocator.free(frame.name);
+                if (frame.source.len > 0) allocator.free(frame.source);
+            }
+            allocator.free(result);
+        }
+        for (all_frames[start..][0..count], 0..) |frame, i| {
+            const name_owned = try allocator.dupe(u8, frame.name);
+            errdefer allocator.free(name_owned);
+            const source_owned = try allocator.dupe(u8, frame.source);
+            result[i] = frame;
+            result[i].name = name_owned;
+            result[i].source = source_owned;
+            copied += 1;
+        }
+        types.StackFrame.deinitSlice(self.allocator, all_frames);
         return result;
     }
 
@@ -4672,6 +4707,15 @@ pub const DwarfEngine = struct {
     fn engineGetPid(ctx: *anyopaque) ?std.posix.pid_t {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         return self.process.pid;
+    }
+
+    fn engineInterruptRun(ctx: *anyopaque) void {
+        const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
+        debug_log.log("dwarf.engine: interrupt active run", .{});
+        self.process.kill() catch |err| {
+            debug_log.log("dwarf.engine: active run interrupt failed: {s}", .{@errorName(err)});
+        };
+        self.launched = false;
     }
 
     // ── Goto Targets ──────────────────────────────────────────────

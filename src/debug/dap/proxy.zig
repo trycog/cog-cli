@@ -523,6 +523,7 @@ pub const DapProxy = struct {
         .rawRequestFn = proxyRawRequest,
         .sendPauseFn = proxySendPause,
         .getPidFn = proxyGetPid,
+        .interruptRunFn = proxyInterruptRun,
     };
 
     fn nextSeq(self: *DapProxy) i64 {
@@ -1235,7 +1236,13 @@ pub const DapProxy = struct {
         if (frames_val != .array) return error.InvalidResponse;
 
         var frames: std.ArrayListUnmanaged(StackFrame) = .empty;
-        errdefer frames.deinit(allocator);
+        errdefer {
+            for (frames.items) |frame| {
+                if (frame.name.len > 0) allocator.free(frame.name);
+                if (frame.source.len > 0) allocator.free(frame.source);
+            }
+            frames.deinit(allocator);
+        }
 
         for (frames_val.array.items) |item| {
             if (item != .object) continue;
@@ -1250,6 +1257,7 @@ pub const DapProxy = struct {
                 .string => try allocator.dupe(u8, v.string),
                 else => try allocator.dupe(u8, "<unknown>"),
             } else try allocator.dupe(u8, "<unknown>");
+            errdefer allocator.free(name);
 
             const source = if (obj.get("source")) |s| blk: {
                 if (s == .object) {
@@ -2092,7 +2100,7 @@ pub const DapProxy = struct {
             defer allocator.free(exit_data);
             var exit_state = try translateExitedEvent(allocator, exit_data);
             // Attach captured output (traceback, stderr) so the caller can
-            // see why the program exited.
+            // see why the program exited. Ownership transfers to StopState.
             if (self.output_buffer.items.len > 0) {
                 exit_state.output = self.output_buffer.toOwnedSlice(self.allocator) catch &.{};
             }
@@ -2146,7 +2154,8 @@ pub const DapProxy = struct {
             }
         } else |_| {}
 
-        // Attach captured output to state and clear buffer
+        // Attach captured output to state. toOwnedSlice transfers both the
+        // backing slice and every owned entry string to StopState.deinit().
         if (self.output_buffer.items.len > 0) {
             state.output = self.output_buffer.toOwnedSlice(self.allocator) catch &.{};
         }
@@ -2854,6 +2863,12 @@ pub const DapProxy = struct {
     fn proxyGetPid(ctx: *anyopaque) ?std.posix.pid_t {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         return self.transportGetPid();
+    }
+
+    fn proxyInterruptRun(ctx: *anyopaque) void {
+        const self: *DapProxy = @ptrCast(@alignCast(ctx));
+        dapLog("[DAP interruptRun] Closing transport to unblock active reader", .{});
+        self.transportKill();
     }
 
     fn proxyStop(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!void {
