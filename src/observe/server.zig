@@ -432,6 +432,7 @@ pub const ObserveServer = struct {
         errdefer aw.deinit();
         var jw: Stringify = .{ .writer = &aw.writer };
         var row_count: usize = 0;
+        var result_bytes: usize = 0;
 
         jw.beginObject() catch return error.OutOfMemory;
         jw.objectField("rows") catch return error.OutOfMemory;
@@ -455,6 +456,13 @@ pub const ObserveServer = struct {
             var col: usize = 0;
             while (col < col_count) : (col += 1) {
                 const text = stmt.columnText(@intCast(col));
+                if (text) |value| {
+                    if (value.len > MAX_QUERY_CELL_BYTES or result_bytes > MAX_QUERY_RESULT_BYTES -| value.len) {
+                        debug_log.log("toolQuery: rejecting oversized result row={d} column={d}", .{ row_count, col });
+                        return .{ .err = .{ .code = INVALID_PARAMS, .message = "SQL query result exceeds output bounds" } };
+                    }
+                    result_bytes += value.len;
+                }
                 jw.write(text) catch return error.OutOfMemory;
             }
             jw.endArray() catch return error.OutOfMemory;
@@ -486,6 +494,8 @@ fn okJson(allocator: std.mem.Allocator, value: anytype) !ToolResult {
 const MAX_SQL_BYTES: usize = 64 * 1024;
 const MAX_QUERY_ROWS: usize = 1000;
 const MAX_QUERY_COLUMNS: usize = 256;
+const MAX_QUERY_CELL_BYTES: usize = 256 * 1024;
+const MAX_QUERY_RESULT_BYTES: usize = 4 * 1024 * 1024;
 
 fn parseBoundedInteger(value: ?json.Value, default_value: i64, min: i64, max: i64) ?i64 {
     const result = if (value) |v| switch (v) {
