@@ -148,10 +148,8 @@ fn signalValidatedLinuxProcess(pid: posix.pid_t, signal: u8) !void {
         .SUCCESS => @as(posix.fd_t, @intCast(open_result)),
         .SRCH => return error.ProcessNotAlive,
         .NOSYS => {
-            debug_log.log("debug IPC: pidfd unavailable; using validated numeric pid={d}", .{pid});
-            try validateProcessIdentity(pid);
-            try posix.kill(pid, signal);
-            return;
+            debug_log.log("debug IPC: pidfd unavailable; refusing numeric pid signal for pid={d}", .{pid});
+            return error.ProcessIdentityUnavailable;
         },
         .PERM, .ACCES => return error.ProcessWrongUser,
         else => |err| return posix.unexpectedErrno(err),
