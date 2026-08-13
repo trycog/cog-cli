@@ -1662,7 +1662,7 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
     const response = try client.mcpCall(allocator, endpoint, cfg.api_key, runtime.mcp_session_id, body);
     defer allocator.free(response.body);
 
-    _ = updateRemoteSessionId(runtime, response.session_id);
+    _ = try updateRemoteSessionId(runtime, response.session_id);
 
     // Parse response: {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
     const parsed = json.parseFromSlice(json.Value, allocator, response.body, .{}) catch return error.InvalidResponse;
@@ -1671,24 +1671,7 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
     const root = parsed.value;
     if (root != .object) return error.InvalidResponse;
 
-    const result_val = root.object.get("result") orelse return error.InvalidResponse;
-    if (result_val != .object) return error.InvalidResponse;
-
-    const tools_val = result_val.object.get("tools") orelse return error.InvalidResponse;
-    if (tools_val != .array) return error.InvalidResponse;
-
-    if (runtime.remote_tools) |tools| {
-        freeRemoteToolSlice(allocator, tools);
-        runtime.remote_tools = null;
-    }
-    runtime.remote_memory_capabilities.deinit(allocator);
-    runtime.remote_memory_capabilities = .{};
-
-    var tool_list: std.ArrayListUnmanaged(RemoteTool) = .empty;
-    errdefer freeRemoteTools(allocator, &tool_list);
-    try collectRemoteTools(allocator, tools_val.array.items, &runtime.remote_memory_capabilities, &tool_list);
-
-    runtime.remote_tools = try tool_list.toOwnedSlice(allocator);
+    try installRemoteToolsFromResponse(runtime, root);
     debug_log_mod.log("Discovered {d} remote memory tools", .{runtime.remote_tools.?.len});
     debug_log_mod.log("discoverRemoteTools: found {d} tools", .{runtime.remote_tools.?.len});
     debug_log_mod.log(
@@ -1699,6 +1682,24 @@ fn discoverRemoteTools(runtime: *Runtime) !void {
             runtime.remote_memory_capabilities.supports_rationale_trace,
         },
     );
+}
+
+fn installRemoteToolsFromResponse(runtime: *Runtime, root: json.Value) !void {
+    if (root != .object) return error.InvalidResponse;
+    const result_val = root.object.get("result") orelse return error.InvalidResponse;
+    if (result_val != .object) return error.InvalidResponse;
+    const tools_val = result_val.object.get("tools") orelse return error.InvalidResponse;
+    if (tools_val != .array) return error.InvalidResponse;
+
+    if (runtime.remote_tools) |tools| freeRemoteToolSlice(runtime.allocator, tools);
+    runtime.remote_tools = null;
+    runtime.remote_memory_capabilities.deinit(runtime.allocator);
+    runtime.remote_memory_capabilities = .{};
+
+    var tool_list: std.ArrayListUnmanaged(RemoteTool) = .empty;
+    errdefer freeRemoteTools(runtime.allocator, &tool_list);
+    try collectRemoteTools(runtime.allocator, tools_val.array.items, &runtime.remote_memory_capabilities, &tool_list);
+    runtime.remote_tools = try tool_list.toOwnedSlice(runtime.allocator);
 }
 
 fn collectRemoteTools(
@@ -1763,8 +1764,14 @@ fn freeRemoteTool(allocator: std.mem.Allocator, tool: RemoteTool) void {
     allocator.free(tool.input_schema);
 }
 
+const HostedCallMode = enum { legacy, enhanced };
+
+fn selectHostedCallMode(tool_name: []const u8, capabilities: *const memory_envelope_mod.RemoteMemoryCapabilities) HostedCallMode {
+    return if (memory_envelope_mod.isWriteTool(tool_name) and memory_envelope_mod.supportsEnhancedWrite(capabilities)) .enhanced else .legacy;
+}
+
 fn callRemoteHostedTool(runtime: *Runtime, session_ctx: *session_context_mod.SessionContext, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
-    if (!memory_envelope_mod.isWriteTool(tool_name) or !memory_envelope_mod.supportsEnhancedWrite(&runtime.remote_memory_capabilities)) {
+    if (selectHostedCallMode(tool_name, &runtime.remote_memory_capabilities) == .legacy) {
         debug_log_mod.log("callRemoteHostedTool: using legacy remote path tool={s} enhanced_supported={any}", .{ tool_name, memory_envelope_mod.supportsEnhancedWrite(&runtime.remote_memory_capabilities) });
         return callRemoteMcpTool(runtime, tool_name, arguments);
     }
@@ -1804,8 +1811,8 @@ fn callEnhancedRemoteHostedWrite(runtime: *Runtime, session_ctx: *session_contex
         &write_context,
     );
     defer allocator.free(response.body);
-    _ = updateRemoteSessionId(runtime, response.session_id);
-    const retry_legacy = memory_envelope_mod.isExplicitUnsupportedEnhancedResponse(allocator, response.body);
+    _ = try updateRemoteSessionId(runtime, response.session_id);
+    const retry_legacy = isExplicitEnhancedWriteUnsupported(response.body);
     if (retry_legacy) {
         debug_log_mod.log("callEnhancedRemoteHostedWrite: explicit unsupported enhanced response tool={s}", .{tool_name});
     }
@@ -1851,11 +1858,15 @@ fn callRemoteMcpTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.
     };
     defer allocator.free(response.body);
 
-    _ = updateRemoteSessionId(runtime, response.session_id);
+    _ = try updateRemoteSessionId(runtime, response.session_id);
     return parseRemoteToolTextResponse(allocator, response.body);
 }
 
-fn updateRemoteSessionId(runtime: *Runtime, new_session_id: ?[]const u8) bool {
+fn isExplicitEnhancedWriteUnsupported(body: []const u8) bool {
+    return memory_envelope_mod.isExplicitUnsupportedEnhancedResponse(std.heap.page_allocator, body);
+}
+
+fn updateRemoteSessionId(runtime: *Runtime, new_session_id: ?[]const u8) !bool {
     const new_sid = new_session_id orelse return false;
     if (runtime.mcp_session_id) |old_sid| {
         if (std.mem.eql(u8, old_sid, new_sid)) {
@@ -1866,7 +1877,8 @@ fn updateRemoteSessionId(runtime: *Runtime, new_session_id: ?[]const u8) bool {
     }
     runtime.mcp_session_id = new_sid;
     clearSessionContexts(runtime);
-    debug_log_mod.log("updateRemoteSessionId: remote session changed; session context will rebind", .{});
+    _ = try runtime.ensureSessionContext();
+    debug_log_mod.log("updateRemoteSessionId: remote session changed; session context rebound", .{});
     return true;
 }
 
@@ -2832,6 +2844,30 @@ test "nextMessageFromBuffer tags an oversized partial line and discards through 
     }
 }
 
+fn testSessionContext(allocator: std.mem.Allocator, session_id: []const u8) !session_context_mod.SessionContext {
+    var repo_context = repo_context_mod.RepoContext{
+        .cwd = try allocator.dupe(u8, "/tmp/project"),
+        .repo_root = null,
+        .repo_remote_origin = null,
+        .repo_head_sha = null,
+        .repo_fingerprint = null,
+    };
+    defer repo_context.deinit(allocator);
+
+    return session_context_mod.initSessionContext(
+        allocator,
+        session_id,
+        "test-host",
+        null,
+        null,
+        "/tmp/project",
+        "https://trycog.ai/acme/brain",
+        "acme",
+        "brain",
+        &repo_context,
+    );
+}
+
 fn testRuntime(allocator: std.mem.Allocator) !Runtime {
     return .{
         .allocator = allocator,
@@ -2876,6 +2912,70 @@ test "runtimeCallTool rejects observe dispatch when observe is disabled" {
     runtime.observe_enabled = false;
 
     try std.testing.expectError(error.ObserveDisabled, runtimeCallTool(&runtime, "observe_status", null));
+}
+
+test "remote tool discovery registers capability-only tools without exposing them" {
+    const allocator = std.testing.allocator;
+    var runtime = try testRuntime(allocator);
+    defer runtime.deinit();
+
+    const response = try json.parseFromSlice(json.Value, allocator,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[
+        \\  {"name":"cog_memory_record","description":"enhanced write proxy","inputSchema":{"type":"object"}},
+        \\  {"name":"cog_learn","description":"learn a memory","inputSchema":{"type":"object","properties":{"term":{"type":"string"}}}}
+        \\]}}
+    , .{});
+    defer response.deinit();
+
+    try installRemoteToolsFromResponse(&runtime, response.value);
+
+    try std.testing.expect(memory_envelope_mod.supportsEnhancedWrite(&runtime.remote_memory_capabilities));
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_tools.?.len);
+    try std.testing.expectEqualStrings("mem_learn", runtime.remote_tools.?[0].name);
+    try std.testing.expectEqualStrings("cog_learn", runtime.remote_tools.?[0].remote_name);
+}
+
+test "hosted writes use envelopes only when supported" {
+    var capabilities = memory_envelope_mod.RemoteMemoryCapabilities{};
+    defer capabilities.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(HostedCallMode.legacy, selectHostedCallMode("mem_learn", &capabilities));
+    try memory_envelope_mod.registerCapabilityTool(&capabilities, std.testing.allocator, "cog_memory_record");
+    try std.testing.expectEqual(HostedCallMode.enhanced, selectHostedCallMode("mem_learn", &capabilities));
+    try std.testing.expectEqual(HostedCallMode.legacy, selectHostedCallMode("mem_recall", &capabilities));
+}
+
+test "enhanced write fallback is limited to explicit unsupported responses" {
+    try std.testing.expect(isExplicitEnhancedWriteUnsupported(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Tool cog_memory_record is not supported"}}
+    ));
+    try std.testing.expect(isExplicitEnhancedWriteUnsupported(
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"input schema validation failed: unknown field provenance"}],"isError":true}}
+    ));
+    try std.testing.expect(!isExplicitEnhancedWriteUnsupported(
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"temporary upstream failure"}}
+    ));
+    try std.testing.expect(!isExplicitEnhancedWriteUnsupported("not-json"));
+}
+
+test "remote session changes rebind the active context" {
+    const allocator = std.testing.allocator;
+    var runtime = try testRuntime(allocator);
+    defer runtime.deinit();
+
+    try runtime.session_contexts.ensureTotalCapacity(allocator, 1);
+    var old_ctx = try testSessionContext(allocator, "remote-old");
+    const old_key = try allocator.dupe(u8, "remote-old");
+    runtime.session_contexts.putAssumeCapacity(old_key, old_ctx);
+    runtime.mcp_session_id = try allocator.dupe(u8, "remote-old");
+
+    const new_sid = try allocator.dupe(u8, "remote-new");
+    _ = try updateRemoteSessionId(&runtime, new_sid);
+
+    try std.testing.expect(runtime.session_contexts.get("remote-old") == null);
+    const rebound = runtime.session_contexts.getPtr("remote-new") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("remote-new", rebound.session_id);
+    old_ctx = undefined;
 }
 
 test "runtimeCallTool keeps runtime mutex held across remote calls and event recording" {
@@ -2945,7 +3045,7 @@ test "remote session changes rebind hosted session context" {
     const owned_key = try allocator.dupe(u8, "remote-old");
     try runtime.session_contexts.put(allocator, owned_key, context);
 
-    try std.testing.expect(updateRemoteSessionId(&runtime, try allocator.dupe(u8, "remote-new")));
+    try std.testing.expect(try updateRemoteSessionId(&runtime, try allocator.dupe(u8, "remote-new")));
     try std.testing.expectEqualStrings("remote-new", runtime.mcp_session_id.?);
     try std.testing.expect(runtime.session_contexts.get("remote-old") == null);
 }
