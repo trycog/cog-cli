@@ -211,7 +211,11 @@ cog ext:update
 cog ext:update cog-zig
 ```
 
-Cog installs from GitHub release tarballs, not the repository default branch. By default it resolves the latest stable release tag, downloads that source tarball to `~/.config/cog/extensions/cog-zig/`, runs the build command, and verifies the binary exists. `--version` selects an exact released version after optional `v` prefix normalization (`0.75.0` matches `v0.75.0`). `cog ext:update` upgrades either all installed extensions or one named extension to the latest stable release available from their recorded source repositories. Once installed, the extension is automatically used for matching file types.
+Cog installs from an uploaded GitHub release asset, not the repository default branch or GitHub's generated source archive. Each release must contain exactly one `.tar.gz` or `.tgz` asset with GitHub's `sha256:` digest metadata. Cog streams the archive within its download limit, verifies that SHA-256 digest before extraction, and only then validates, builds, and transactionally promotes the staged extension. A digest mismatch leaves the previous installed version untouched.
+
+`--version` selects an exact released version after optional `v` prefix normalization (`0.75.0` matches `v0.75.0`). The verified digest is stored in pretty, atomically written `cog-extension-install.json` metadata. `cog ext:update` compares both the latest release tag and its archive digest; legacy installs without a recorded digest are refreshed even when the tag is unchanged.
+
+`--trust-build` is separate from artifact authenticity. Digest verification proves the downloaded bytes match GitHub's immutable release-asset record, while `--trust-build` is explicit consent to execute the archive's manifest shell build command. Authentic bytes are not automatically trusted code, and build consent never bypasses digest verification.
 
 Installed extensions take priority over built-in ones. If your extension handles `.py` files, it overrides the built-in `scip-python`.
 
