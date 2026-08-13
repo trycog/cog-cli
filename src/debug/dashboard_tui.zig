@@ -156,6 +156,8 @@ const RingLogIter = struct {
 };
 
 const TuiSession = struct {
+    source_id: [32]u8 = undefined,
+    source_id_len: usize = 0,
     session_id: [32]u8 = undefined,
     session_id_len: usize = 0,
     program: [128]u8 = undefined,
@@ -195,6 +197,10 @@ const TuiSession = struct {
 
     // Per-session log
     log: RingLog = .{},
+
+    fn sourceIdSlice(self: *const TuiSession) []const u8 {
+        return self.source_id[0..self.source_id_len];
+    }
 
     fn sessionIdSlice(self: *const TuiSession) []const u8 {
         return self.session_id[0..self.session_id_len];
@@ -770,20 +776,23 @@ pub const DashboardTui = struct {
     }
 
     fn handleLaunchEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse return;
-        if (self.findSession(session_id)) |session| {
+        const status = getStr(obj, "status") orelse "stopped";
+        if (self.findSession(source_id, session_id)) |session| {
             if (obj.get("program")) |v| {
                 if (v == .string) copyInto(&session.program, &session.program_len, v.string);
             }
             if (obj.get("driver")) |v| {
                 if (v == .string) copyInto(&session.driver_type, &session.driver_type_len, v.string);
             }
-            copyInto(&session.status, &session.status_len, "stopped");
+            copyInto(&session.status, &session.status_len, status);
             return;
         }
         if (self.session_count >= MAX_SESSIONS) return;
 
         var session: TuiSession = .{};
+        copyInto(&session.source_id, &session.source_id_len, source_id);
         copyInto(&session.session_id, &session.session_id_len, session_id);
         if (obj.get("program")) |v| {
             if (v == .string) copyInto(&session.program, &session.program_len, v.string);
@@ -791,7 +800,7 @@ pub const DashboardTui = struct {
         if (obj.get("driver")) |v| {
             if (v == .string) copyInto(&session.driver_type, &session.driver_type_len, v.string);
         }
-        copyInto(&session.status, &session.status_len, "stopped");
+        copyInto(&session.status, &session.status_len, status);
 
         self.sessions[self.session_count] = session;
         self.session_count += 1;
@@ -812,39 +821,38 @@ pub const DashboardTui = struct {
     }
 
     fn handleBreakpointEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse return;
         const action = getStr(obj, "action") orelse return;
-        const session = self.findSession(session_id) orelse return;
+        const session = self.findSession(source_id, session_id) orelse return;
 
         if (std.mem.eql(u8, action, "set")) {
             if (obj.get("bp")) |bp_val| {
                 if (bp_val == .object) {
                     const bp_obj = bp_val.object;
-                    if (session.bp_count < MAX_BREAKPOINTS) {
-                        var bp: BpInfo = .{};
-                        if (bp_obj.get("id")) |v| {
-                            if (v == .integer) bp.id = @intCast(v.integer);
-                        }
-                        if (bp_obj.get("file")) |v| {
-                            if (v == .string) copyInto(&bp.file, &bp.file_len, v.string);
-                        }
-                        if (bp_obj.get("line")) |v| {
-                            if (v == .integer) bp.line = @intCast(v.integer);
-                        }
-                        if (bp_obj.get("verified")) |v| {
-                            if (v == .bool) bp.verified = v.bool;
-                        }
-                        var replaced = false;
-                        for (session.breakpoints[0..session.bp_count]) |*existing| {
-                            if (existing.id != bp.id) continue;
-                            existing.* = bp;
-                            replaced = true;
-                            break;
-                        }
-                        if (!replaced) {
-                            session.breakpoints[session.bp_count] = bp;
-                            session.bp_count += 1;
-                        }
+                    var bp: BpInfo = .{};
+                    if (bp_obj.get("id")) |v| {
+                        if (v == .integer) bp.id = @intCast(v.integer);
+                    }
+                    if (bp_obj.get("file")) |v| {
+                        if (v == .string) copyInto(&bp.file, &bp.file_len, v.string);
+                    }
+                    if (bp_obj.get("line")) |v| {
+                        if (v == .integer) bp.line = @intCast(v.integer);
+                    }
+                    if (bp_obj.get("verified")) |v| {
+                        if (v == .bool) bp.verified = v.bool;
+                    }
+                    var replaced = false;
+                    for (session.breakpoints[0..session.bp_count]) |*existing| {
+                        if (existing.id != bp.id) continue;
+                        existing.* = bp;
+                        replaced = true;
+                        break;
+                    }
+                    if (!replaced and session.bp_count < MAX_BREAKPOINTS) {
+                        session.breakpoints[session.bp_count] = bp;
+                        session.bp_count += 1;
                     }
                 }
             }
@@ -883,8 +891,9 @@ pub const DashboardTui = struct {
     }
 
     fn handleStopEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse return;
-        const session = self.findSession(session_id) orelse return;
+        const session = self.findSession(source_id, session_id) orelse return;
 
         copyInto(&session.status, &session.status_len, "stopped");
 
@@ -1006,8 +1015,9 @@ pub const DashboardTui = struct {
     }
 
     fn handleInspectEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse return;
-        const session = self.findSession(session_id) orelse return;
+        const session = self.findSession(source_id, session_id) orelse return;
 
         const expression = getStr(obj, "expression") orelse "(unknown)";
         const result_str = getStr(obj, "result") orelse "";
@@ -1024,8 +1034,9 @@ pub const DashboardTui = struct {
     }
 
     fn handleRunEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse return;
-        const session = self.findSession(session_id) orelse return;
+        const session = self.findSession(source_id, session_id) orelse return;
         const action = getStr(obj, "action") orelse "continue";
 
         copyInto(&session.status, &session.status_len, "running");
@@ -1040,6 +1051,7 @@ pub const DashboardTui = struct {
     }
 
     fn handleSessionEndEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse return;
 
         // Log before removing
@@ -1053,7 +1065,9 @@ pub const DashboardTui = struct {
         // Remove session
         var i: usize = 0;
         while (i < self.session_count) {
-            if (std.mem.eql(u8, self.sessions[i].sessionIdSlice(), session_id)) {
+            if (std.mem.eql(u8, self.sessions[i].sourceIdSlice(), source_id) and
+                std.mem.eql(u8, self.sessions[i].sessionIdSlice(), session_id))
+            {
                 var j: usize = i;
                 while (j + 1 < self.session_count) : (j += 1) {
                     self.sessions[j] = self.sessions[j + 1];
@@ -1073,6 +1087,7 @@ pub const DashboardTui = struct {
     }
 
     fn handleErrorEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse "";
         const method = getStr(obj, "method") orelse "unknown";
         const message = getStr(obj, "message") orelse "unknown error";
@@ -1082,12 +1097,13 @@ pub const DashboardTui = struct {
         copyInto(&entry.summary, &entry.summary_len, truncate(message, 80));
         self.global_log.push(entry);
 
-        if (self.findSession(session_id)) |session| {
+        if (self.findSession(source_id, session_id)) |session| {
             session.log.push(entry);
         }
     }
 
     fn handleActivityEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const source_id = getStr(obj, "source_id") orelse "";
         const session_id = getStr(obj, "session_id") orelse "";
         const tool = getStr(obj, "tool") orelse "unknown";
         const summary_str = getStr(obj, "summary") orelse "";
@@ -1097,14 +1113,15 @@ pub const DashboardTui = struct {
         copyInto(&entry.summary, &entry.summary_len, truncate(summary_str, 80));
         self.global_log.push(entry);
 
-        if (self.findSession(session_id)) |session| {
+        if (self.findSession(source_id, session_id)) |session| {
             session.log.push(entry);
         }
     }
 
-    fn findSession(self: *DashboardTui, session_id: []const u8) ?*TuiSession {
+    fn findSession(self: *DashboardTui, source_id: []const u8, session_id: []const u8) ?*TuiSession {
         for (self.sessions[0..self.session_count]) |*s| {
-            if (std.mem.eql(u8, s.sessionIdSlice(), session_id)) return s;
+            if (std.mem.eql(u8, s.sourceIdSlice(), source_id) and
+                std.mem.eql(u8, s.sessionIdSlice(), session_id)) return s;
         }
         return null;
     }
@@ -1225,10 +1242,10 @@ pub const DashboardTui = struct {
             } else {
                 stderrWrite(dim ++ bullet_open ++ " " ++ reset);
             }
-            stderrWrite(s.sessionIdSlice());
+            stderrWriteSafe(s.sessionIdSlice());
             stderrWrite(reset);
             stderrWrite("  ");
-            stderrWrite(s.statusSlice());
+            stderrWriteSafe(s.statusSlice());
             if (i + 1 < self.session_count) {
                 stderrWrite("  " ++ dim ++ vv ++ reset ++ " ");
             }
@@ -1256,7 +1273,7 @@ pub const DashboardTui = struct {
                 const path = s.sourceFileSlice();
                 const max_path = if (source_width > 14) source_width - 14 else 1;
                 const display_path = truncate(path, max_path);
-                stderrWrite(display_path);
+                stderrWriteSafe(display_path);
                 path_chars = display_path.len;
             }
         }
@@ -1378,7 +1395,7 @@ pub const DashboardTui = struct {
         const line_text = sl.textSlice();
         const display_text = truncate(line_text, text_width);
 
-        stderrWrite(display_text);
+        stderrWriteSafe(display_text);
 
         // Pad to fill source_width (important for background highlight)
         if (display_text.len < text_width) {
@@ -1448,9 +1465,9 @@ pub const DashboardTui = struct {
             stderrWrite(" " ++ dim);
             stderrWrite(idx_str);
             stderrWrite(reset ++ "  " ++ cyan ++ bold);
-            stderrWrite(truncate(f.nameSlice(), 16));
+            stderrWriteSafe(truncate(f.nameSlice(), 16));
             stderrWrite(reset ++ "  " ++ dim);
-            stderrWrite(truncate(f.sourceSlice(), 20));
+            stderrWriteSafe(truncate(f.sourceSlice(), 20));
             stderrWrite(":");
             stderrWrite(fline_str);
             stderrWrite(reset);
@@ -1470,13 +1487,13 @@ pub const DashboardTui = struct {
 
             stderrWrite(" " ++ bold);
             const name_display = truncate(l.nameSlice(), 14);
-            stderrWrite(name_display);
+            stderrWriteSafe(name_display);
             stderrWrite(reset ++ "  " ++ yellow);
             const val_display = truncate(l.valueSlice(), 14);
-            stderrWrite(val_display);
+            stderrWriteSafe(val_display);
             stderrWrite(reset ++ "  " ++ dim);
             const type_display = truncate(l.typeSlice(), 10);
-            stderrWrite(type_display);
+            stderrWriteSafe(type_display);
             stderrWrite(reset);
 
             // Pad to sidebar_width
@@ -1497,7 +1514,7 @@ pub const DashboardTui = struct {
                 const file_display = truncate(bp.fileSlice(), 20);
 
                 stderrWrite(" ");
-                stderrWrite(file_display);
+                stderrWriteSafe(file_display);
                 stderrWrite(":" ++ cyan);
                 stderrWrite(bpline_str);
                 stderrWrite(reset);
@@ -1596,7 +1613,7 @@ pub const DashboardTui = struct {
 
                 stderrWrite(bold);
                 const name = entry.toolNameSlice();
-                stderrWrite(name);
+                stderrWriteSafe(name);
                 stderrWrite(reset);
 
                 // Pad tool name to 18 chars
@@ -1609,7 +1626,7 @@ pub const DashboardTui = struct {
                 // Remaining width: content_width - 3(glyph) - max(18,name.len) - 2(gap)
                 const prefix_len: usize = 3 + @max(@as(usize, 18), name.len) + 2;
                 const remaining = if (content_width > prefix_len) content_width - prefix_len else 1;
-                stderrWrite(truncate(summary, remaining));
+                stderrWriteSafe(truncate(summary, remaining));
 
                 // Pad to fill
                 const text_len = @min(summary.len, remaining);
@@ -1658,9 +1675,11 @@ pub const DashboardTui = struct {
 
     fn writePadded(self: *const DashboardTui, text: []const u8, width: usize) void {
         const display = truncate(text, width);
-        stderrWrite(display);
-        if (display.len < width) {
-            self.writeSpaces(width - display.len);
+        var safe_buf: [SOURCE_LINE_LEN]u8 = undefined;
+        const safe = sanitizeTerminalText(&safe_buf, display);
+        stderrWrite(safe);
+        if (safe.len < width) {
+            self.writeSpaces(width - safe.len);
         }
     }
 
@@ -1832,31 +1851,68 @@ fn printErr(data: []const u8) void {
 }
 
 fn copyInto(dest: []u8, len: *usize, src: []const u8) void {
+    const copy_len = @min(dest.len, src.len);
+    @memcpy(dest[0..copy_len], src[0..copy_len]);
+    len.* = copy_len;
+}
+
+fn sanitizeTerminalText(dest: []u8, src: []const u8) []const u8 {
     var written: usize = 0;
-    const EscapeState = enum { none, started, csi };
+    const EscapeState = enum { none, escaped, csi, osc, osc_escaped };
     var escape_state: EscapeState = .none;
     for (src) |byte| {
         switch (escape_state) {
-            .started => {
-                escape_state = if (byte == '[') .csi else .none;
+            .escaped => {
+                escape_state = switch (byte) {
+                    '[' => .csi,
+                    ']' => .osc,
+                    else => .none,
+                };
                 continue;
             },
             .csi => {
                 if (byte >= 0x40 and byte <= 0x7e) escape_state = .none;
                 continue;
             },
+            .osc => {
+                escape_state = switch (byte) {
+                    0x07 => .none,
+                    0x1b => .osc_escaped,
+                    else => .osc,
+                };
+                continue;
+            },
+            .osc_escaped => {
+                escape_state = if (byte == '\\') .none else .osc;
+                continue;
+            },
             .none => {},
         }
         if (byte == 0x1b) {
-            escape_state = .started;
+            escape_state = .escaped;
             continue;
         }
-        if (byte < 0x20 or byte == 0x7f) continue;
+        if (byte == 0x9b) {
+            escape_state = .csi;
+            continue;
+        }
+        if (byte == '\t') {
+            const space_count = @min(@as(usize, 4), dest.len - written);
+            @memset(dest[written..][0..space_count], ' ');
+            written += space_count;
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f or (byte >= 0x80 and byte <= 0x9f)) continue;
         if (written == dest.len) break;
         dest[written] = byte;
         written += 1;
     }
-    len.* = written;
+    return dest[0..written];
+}
+
+fn stderrWriteSafe(data: []const u8) void {
+    var safe_buf: [SOURCE_LINE_LEN]u8 = undefined;
+    stderrWrite(sanitizeTerminalText(&safe_buf, data));
 }
 
 fn truncate(s: []const u8, max: usize) []const u8 {
@@ -1932,10 +1988,13 @@ test "copyInto preserves semantic source bytes" {
     try std.testing.expectEqualStrings("\tindented\ttext", dest[0..len]);
 }
 
-test "terminal sanitizer strips escape and control sequences" {
-    var dest: [64]u8 = undefined;
-    const sanitized = sanitizeTerminalText(&dest, "safe\x1b[2J\r\n\ttext\x07");
-    try std.testing.expectEqualStrings("safetext", sanitized);
+test "terminal sanitizer strips escapes and safely expands tabs" {
+    var dest: [128]u8 = undefined;
+    const sanitized = sanitizeTerminalText(
+        &dest,
+        "safe\x1b[2J\r\n\ttext\x07\x1b]0;owned\x07done\x9b2Jend",
+    );
+    try std.testing.expectEqualStrings("safe    textdoneend", sanitized);
 }
 
 test "DashboardTui initializes with empty state" {
