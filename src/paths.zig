@@ -116,7 +116,40 @@ pub fn getRuntimePath(allocator: std.mem.Allocator, basename: []const u8) ![]con
 
     const runtime_dir = try getRuntimeDir(allocator);
     defer allocator.free(runtime_dir);
-    return std.fs.path.join(allocator, &.{ runtime_dir, basename });
+    const path = try std.fs.path.join(allocator, &.{ runtime_dir, basename });
+    debug_log.log("getRuntimePath: resolved {s} to {s}", .{ basename, path });
+    return path;
+}
+
+/// Resolve the debug daemon Unix socket path. Caller owns the returned path.
+pub fn getDaemonSocketPath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimePath(allocator, "daemon.sock");
+}
+
+/// Resolve the debug daemon PID file path. Caller owns the returned path.
+pub fn getDaemonPidPath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimePath(allocator, "daemon.pid");
+}
+
+/// Resolve the debug dashboard Unix socket path. Caller owns the returned path.
+pub fn getDashboardSocketPath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimePath(allocator, "dashboard.sock");
+}
+
+/// Resolve the DAP diagnostic log path. Caller owns the returned path.
+pub fn getDapLogPath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimePath(allocator, "dap.log");
+}
+
+/// Ensure a Unix socket pathname leaves room for the required NUL terminator.
+pub fn validateUnixSocketPath(path: []const u8) !void {
+    const addr: std.posix.sockaddr.un = .{ .path = undefined };
+    const capacity = addr.path.len;
+    if (path.len >= capacity) {
+        debug_log.log("validateUnixSocketPath: rejected {d}-byte path (capacity {d})", .{ path.len, capacity });
+        return error.PathTooLong;
+    }
+    debug_log.log("validateUnixSocketPath: accepted {d}-byte path", .{path.len});
 }
 
 fn ensurePrivateRuntimeDir(path: []const u8) !void {
@@ -337,6 +370,62 @@ test "getRuntimeDir ignores a relative XDG runtime path" {
 test "getRuntimePath accepts only basenames" {
     try std.testing.expectError(error.InvalidRuntimeBasename, getRuntimePath(std.testing.allocator, "../daemon.sock"));
     try std.testing.expectError(error.InvalidRuntimeBasename, getRuntimePath(std.testing.allocator, "nested/daemon.sock"));
+}
+
+test "named runtime paths are allocator-owned private paths" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original_home = std.posix.getenv("HOME");
+    const original_xdg = std.posix.getenv("XDG_RUNTIME_DIR");
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(home);
+    try setEnv("HOME", home);
+    unsetEnv("XDG_RUNTIME_DIR");
+    defer {
+        if (original_home) |value| setEnv("HOME", value) catch {} else unsetEnv("HOME");
+        if (original_xdg) |value| setEnv("XDG_RUNTIME_DIR", value) catch {} else unsetEnv("XDG_RUNTIME_DIR");
+    }
+
+    const runtime_dir = try getRuntimeDir(allocator);
+    defer allocator.free(runtime_dir);
+    const daemon_socket = try getDaemonSocketPath(allocator);
+    defer allocator.free(daemon_socket);
+    const daemon_pid = try getDaemonPidPath(allocator);
+    defer allocator.free(daemon_pid);
+    const dashboard_socket = try getDashboardSocketPath(allocator);
+    defer allocator.free(dashboard_socket);
+    const dap_log = try getDapLogPath(allocator);
+    defer allocator.free(dap_log);
+
+    try std.testing.expectEqualStrings("daemon.sock", std.fs.path.basename(daemon_socket));
+    try std.testing.expectEqualStrings("daemon.pid", std.fs.path.basename(daemon_pid));
+    try std.testing.expectEqualStrings("dashboard.sock", std.fs.path.basename(dashboard_socket));
+    try std.testing.expectEqualStrings("dap.log", std.fs.path.basename(dap_log));
+    try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(daemon_socket).?);
+    try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(daemon_pid).?);
+    try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(dashboard_socket).?);
+    try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(dap_log).?);
+}
+
+test "unix socket path validation reserves NUL terminator" {
+    const addr: std.posix.sockaddr.un = .{ .path = undefined };
+    const exact_capacity = try allocatorFilledPath(std.testing.allocator, addr.path.len);
+    defer std.testing.allocator.free(exact_capacity);
+    const fits = try allocatorFilledPath(std.testing.allocator, addr.path.len - 1);
+    defer std.testing.allocator.free(fits);
+
+    try std.testing.expectError(error.PathTooLong, validateUnixSocketPath(exact_capacity));
+    try validateUnixSocketPath(fits);
+}
+
+fn allocatorFilledPath(allocator: std.mem.Allocator, len: usize) ![]u8 {
+    const path = try allocator.alloc(u8, len);
+    @memset(path, 'x');
+    return path;
 }
 
 fn setEnv(name: []const u8, value: []const u8) !void {
