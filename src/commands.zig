@@ -850,12 +850,19 @@ fn maybeRunProjectScan(allocator: std.mem.Allocator) !void {
                     }
                 }
 
-                // Install the extension
+                // Install the extension. The interactive confirmation above is
+                // explicit consent to execute the registry release's build command.
                 printErr("  Installing ");
                 printErr(ext_name);
                 printErr("...");
-                debug_log.log("maybeRunProjectScan: installing {s} from {s}", .{ ext_name, registry_entry.repo_url });
-                const install_result = extensions_mod.installExtensionToDir(allocator, registry_entry.repo_url, null, null) catch {
+                debug_log.log("maybeRunProjectScan: installing trusted registry extension {s} from {s}", .{ ext_name, registry_entry.repo_url });
+                const install_result = extensions_mod.installExtensionToDir(
+                    allocator,
+                    registry_entry.repo_url,
+                    null,
+                    null,
+                    .{ .trust_build = true },
+                ) catch {
                     printErr(" failed\n");
                     continue;
                 };
