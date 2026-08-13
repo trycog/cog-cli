@@ -1,5 +1,6 @@
 const std = @import("std");
 const paths = @import("paths.zig");
+const fs_util = @import("fs_util.zig");
 const debug_log = @import("debug_log.zig");
 
 pub const count_file_name = "agent-selection-counts.json";
@@ -62,10 +63,8 @@ pub fn incrementCounts(allocator: std.mem.Allocator, ids: []const []const u8) !v
 
     const config_dir = try paths.getGlobalConfigDir(allocator);
     defer allocator.free(config_dir);
-    std.fs.makeDirAbsolute(config_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    debug_log.log("agent_usage.incrementCounts: ensuring {s}", .{config_dir});
+    try std.fs.cwd().makePath(config_dir);
 
     const count_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, count_file_name });
     defer allocator.free(count_path);
@@ -95,12 +94,52 @@ pub fn incrementCounts(allocator: std.mem.Allocator, ids: []const []const u8) !v
     const body = try aw.toOwnedSlice();
     defer allocator.free(body);
 
-    const file = try std.fs.createFileAbsolute(count_path, .{});
-    defer file.close();
-    try file.writeAll(body);
-    try file.writeAll("\n");
+    var persisted = std.ArrayListUnmanaged(u8).empty;
+    defer persisted.deinit(allocator);
+    try persisted.appendSlice(allocator, body);
+    try persisted.append(allocator, '\n');
+
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, count_path, persisted.items);
 }
 
 pub fn countFor(counts: *const Counts, id: []const u8) u64 {
     return counts.get(id) orelse 0;
+}
+
+test "incrementCounts persists sorted JSON atomically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original_home = std.posix.getenv("HOME");
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(home);
+    try setEnv("HOME", home);
+    defer if (original_home) |value| setEnv("HOME", value) catch {} else unsetEnv("HOME");
+
+    try incrementCounts(allocator, &.{ "zeta", "alpha", "alpha" });
+
+    const body = try tmp.dir.readFileAlloc(allocator, ".config/cog/agent-selection-counts.json", 4096);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("{\"alpha\":2,\"zeta\":1}\n", body);
+}
+
+fn setEnv(name: []const u8, value: []const u8) !void {
+    const c_fns = struct {
+        extern fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+    };
+    const name_z = try std.testing.allocator.dupeZ(u8, name);
+    defer std.testing.allocator.free(name_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, value);
+    defer std.testing.allocator.free(value_z);
+    if (c_fns.setenv(name_z, value_z, 1) != 0) return error.SetEnvFailed;
+}
+
+fn unsetEnv(name: []const u8) void {
+    const c_fns = struct {
+        extern fn unsetenv([*:0]const u8) c_int;
+    };
+    const name_z = std.testing.allocator.dupeZ(u8, name) catch return;
+    defer std.testing.allocator.free(name_z);
+    _ = c_fns.unsetenv(name_z);
 }
