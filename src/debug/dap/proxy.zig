@@ -2257,51 +2257,69 @@ pub const DapProxy = struct {
     }
 
     fn queueNotification(self: *DapProxy, method: []const u8, params_json: []const u8) void {
+        self.queueNotificationAlloc(method, params_json) catch |err| {
+            debug_log.log("dap.proxy: failed to buffer notification method={s} error={s}", .{ method, @errorName(err) });
+        };
+    }
+
+    fn queueNotificationAlloc(self: *DapProxy, method: []const u8, params_json: []const u8) !void {
         if (self.pending_notifications.items.len >= MAX_PENDING_NOTIFICATIONS) {
             self.dropped_notifications += 1;
             debug_log.log("dap.proxy: dropped notification method={s} total_dropped={d}", .{ method, self.dropped_notifications });
             return;
         }
-        const method_owned = self.allocator.dupe(u8, method) catch return;
+        const method_owned = try self.allocator.dupe(u8, method);
         errdefer self.allocator.free(method_owned);
-        const params_owned = self.allocator.dupe(u8, params_json) catch return;
+        const params_owned = try self.allocator.dupe(u8, params_json);
         errdefer self.allocator.free(params_owned);
-        self.pending_notifications.append(self.allocator, .{
+        try self.pending_notifications.append(self.allocator, .{
             .method = method_owned,
             .params_json = params_owned,
-        }) catch return;
+        });
     }
 
     fn bufferEvent(self: *DapProxy, event_name: []const u8, body: []const u8) void {
+        self.bufferEventAlloc(event_name, body) catch |err| {
+            debug_log.log("dap.proxy: failed to buffer event name={s} error={s}", .{ event_name, @errorName(err) });
+        };
+    }
+
+    fn bufferEventAlloc(self: *DapProxy, event_name: []const u8, body: []const u8) !void {
         if (self.buffered_events.items.len >= MAX_BUFFERED_EVENTS) {
             self.dropped_buffered_events += 1;
             debug_log.log("dap.proxy: dropped buffered event name={s} total_dropped={d}", .{ event_name, self.dropped_buffered_events });
             return;
         }
-        const event_owned = self.allocator.dupe(u8, event_name) catch return;
+        const event_owned = try self.allocator.dupe(u8, event_name);
         errdefer self.allocator.free(event_owned);
-        const body_owned = self.allocator.dupe(u8, body) catch return;
+        const body_owned = try self.allocator.dupe(u8, body);
         errdefer self.allocator.free(body_owned);
-        self.buffered_events.append(self.allocator, .{
+        try self.buffered_events.append(self.allocator, .{
             .event_name = event_owned,
             .body = body_owned,
-        }) catch return;
+        });
     }
 
     fn bufferOutput(self: *DapProxy, category: []const u8, text: []const u8) void {
+        self.bufferOutputAlloc(category, text) catch |err| {
+            debug_log.log("dap.proxy: failed to buffer output category={s} error={s}", .{ category, @errorName(err) });
+        };
+    }
+
+    fn bufferOutputAlloc(self: *DapProxy, category: []const u8, text: []const u8) !void {
         if (self.output_buffer.items.len >= MAX_OUTPUT_ENTRIES) {
             self.dropped_output_entries += 1;
             debug_log.log("dap.proxy: dropped output category={s} total_dropped={d}", .{ category, self.dropped_output_entries });
             return;
         }
-        const category_owned = self.allocator.dupe(u8, category) catch return;
+        const category_owned = try self.allocator.dupe(u8, category);
         errdefer self.allocator.free(category_owned);
-        const text_owned = self.allocator.dupe(u8, text) catch return;
+        const text_owned = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(text_owned);
-        self.output_buffer.append(self.allocator, .{
+        try self.output_buffer.append(self.allocator, .{
             .category = category_owned,
             .text = text_owned,
-        }) catch return;
+        });
     }
 
     /// Drain and return all pending notifications, transferring ownership to caller.
@@ -4432,6 +4450,19 @@ test "DapProxy bounds notification event and output queues" {
     try std.testing.expectEqual(@as(usize, 2), proxy.dropped_buffered_events);
     try std.testing.expectEqual(MAX_OUTPUT_ENTRIES, proxy.output_buffer.items.len);
     try std.testing.expectEqual(@as(usize, 1), proxy.dropped_output_entries);
+}
+
+fn exerciseBoundedQueueAllocationFailures(allocator: std.mem.Allocator) !void {
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    try proxy.queueNotificationAlloc("debug/output", "{}");
+    try proxy.bufferEventAlloc("stopped", "{}");
+    try proxy.bufferOutputAlloc("stdout", "x");
+}
+
+test "DapProxy bounded queues release partial allocations" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBoundedQueueAllocationFailures, .{});
 }
 
 test "DapProxy builds failure response for unsupported reverse request" {
