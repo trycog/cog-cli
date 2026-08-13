@@ -210,5 +210,137 @@ run_case "rejects missing release artifacts" failure "release artifact set does 
 run_case "rejects artifact source version drift" failure "reports version 1.2.2, expected 1.2.3" v1.2.3 wrong-version
 run_case "rejects wrong non-host artifact format" failure "has unexpected binary format" v1.2.3 wrong-format
 
+run_integrity_case() {
+    name=$1
+    expected_status=$2
+    expected_message=$3
+    integrity_mode=$4
+
+    fixture=$(mktemp -d "${TMPDIR:-/tmp}/cog-release-integrity.XXXXXX")
+    mkdir -p "$fixture/artifacts"
+
+    cp "$VALIDATOR" "$fixture/validate-release.sh"
+    cat > "$fixture/build.zig.zon" <<'ZON'
+.{
+    .name = .cog,
+    .version = "1.2.3",
+}
+ZON
+    cat > "$fixture/CHANGELOG.md" <<'CHANGELOG'
+# Changelog
+
+## [Unreleased]
+
+## [1.2.3] - 2026-08-13
+
+### Added
+
+- Release integrity coverage.
+CHANGELOG
+
+    create_artifacts "$fixture" good
+    ruby -rdigest -e '
+Dir.chdir(ARGV.fetch(0)) do
+  names = Dir.glob("cog-*.tar.gz").sort
+  File.write("SHA256SUMS", names.map { |name| "#{Digest::SHA256.file(name).hexdigest}  #{name}\n" }.join)
+end
+' "$fixture/artifacts"
+
+    case "$integrity_mode" in
+        good) ;;
+        bad-checksum)
+            ruby -pi -e 'sub(/\A./, "0") if $. == 1' "$fixture/artifacts/SHA256SUMS"
+            ;;
+        missing-checksum-entry)
+            ruby -e 'lines = File.readlines(ARGV.fetch(0)); File.write(ARGV.fetch(0), lines.drop(1).join)' "$fixture/artifacts/SHA256SUMS"
+            ;;
+        provenance-failure) ;;
+        *)
+            printf 'unknown integrity mode: %s\n' "$integrity_mode" >&2
+            exit 2
+            ;;
+    esac
+
+    printf '{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}\n' > "$fixture/provenance.json"
+    cat > "$fixture/fake-gh" <<'FAKE_GH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$GH_LOG"
+if [ "${PROVENANCE_FAILURE:-false}" = true ]; then
+    printf 'provenance verification failed\n' >&2
+    exit 1
+fi
+FAKE_GH
+    chmod +x "$fixture/fake-gh"
+
+    set +e
+    output=$(cd "$fixture" && \
+        GH="$fixture/fake-gh" \
+        GH_LOG="$fixture/gh.log" \
+        SOURCE_DIGEST=0123456789abcdef \
+        SOURCE_REPOSITORY=trycog/cog-cli \
+        SIGNER_WORKFLOW=trycog/cog-cli/.github/workflows/release.yml \
+        PROVENANCE_FAILURE=$(if [ "$integrity_mode" = provenance-failure ]; then printf true; else printf false; fi) \
+        ./validate-release.sh v1.2.3 "$fixture/artifacts" "$fixture/release-notes.md" "$fixture/provenance.json" 2>&1)
+    status=$?
+    set -e
+
+    gh_log=
+    if [ -f "$fixture/gh.log" ]; then
+        gh_log=$(cat "$fixture/gh.log")
+    fi
+    rm -rf "$fixture"
+
+    if [ "$expected_status" = success ]; then
+        if [ "$status" -eq 0 ] && printf '%s' "$output" | grep -F "$expected_message" >/dev/null && \
+            printf '%s' "$gh_log" | grep -F -- '--source-ref refs/tags/v1.2.3' >/dev/null && \
+            printf '%s' "$gh_log" | grep -F -- '--source-digest 0123456789abcdef' >/dev/null; then
+            printf 'ok - %s\n' "$name"
+            pass=$((pass + 1))
+        else
+            printf 'not ok - %s\n%s\n%s\n' "$name" "$output" "$gh_log"
+            fail=$((fail + 1))
+        fi
+    else
+        if [ "$status" -ne 0 ] && printf '%s' "$output" | grep -F "$expected_message" >/dev/null; then
+            printf 'ok - %s\n' "$name"
+            pass=$((pass + 1))
+        else
+            printf 'not ok - %s\n%s\n' "$name" "$output"
+            fail=$((fail + 1))
+        fi
+    fi
+}
+
+run_integrity_case "accepts checksums and provenance for release artifacts" success "Release integrity validated for source version 1.2.3" good
+run_integrity_case "rejects a checksum mismatch" failure "SHA256SUMS digest mismatch" bad-checksum
+run_integrity_case "rejects an incomplete checksum manifest" failure "SHA256SUMS must list exactly the release artifacts" missing-checksum-entry
+run_integrity_case "rejects provenance verification failure" failure "provenance verification failed" provenance-failure
+
+workflow="$ROOT/.github/workflows/release.yml"
+ci_workflow="$ROOT/.github/workflows/ci.yml"
+workflow_checks=$(ruby -e '
+release = File.read(ARGV.fetch(0))
+ci = File.read(ARGV.fetch(1))
+checks = {
+  "release CI runs unit tests" => release.include?("- name: Run tests\n        run: zig build test"),
+  "release CI runs indexing integration tests" => release.include?("- name: Run indexing integration tests\n        run: zig build test-indexing-integration"),
+  "artifact build waits for release CI" => release.match?(/\n  build:\n    needs: ci\n/),
+  "publication waits for artifact build" => release.match?(/\n  release:\n    needs: build\n/),
+  "checksums precede provenance" => release.index("- name: Generate SHA-256 checksums").to_i < release.index("- name: Generate build provenance").to_i,
+  "provenance verification precedes draft publication" => release.index("- name: Verify build provenance and release checksums").to_i < release.index("- name: Create draft GitHub Release").to_i,
+  "regular CI tests release validation" => ci.include?("./test/release/validate-release.sh"),
+}
+checks.each { |name, ok| puts "#{ok ? "ok" : "not ok"} - #{name}" }
+exit 1 unless checks.values.all?
+' "$workflow" "$ci_workflow" 2>&1) || workflow_status=$?
+workflow_status=${workflow_status:-0}
+printf '%s\n' "$workflow_checks"
+workflow_count=$(printf '%s\n' "$workflow_checks" | grep -c '^ok - ' || true)
+pass=$((pass + workflow_count))
+if [ "$workflow_status" -ne 0 ]; then
+    workflow_failures=$(printf '%s\n' "$workflow_checks" | grep -c '^not ok - ' || true)
+    fail=$((fail + workflow_failures))
+fi
+
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
