@@ -1751,28 +1751,19 @@ fn workerThread(shared: *WorkerShared) void {
 
         const result = runSubsystem(shared.allocator, subsystem, shared.project_root, shared.selected_agent, shared.custom_cmd, shared.debug, shared.timeout_ms, shared.model, shared.bootstrap_prompt, shared.use_tui);
         if (result.success) {
-            const duped = shared.allocator.dupe(u8, subsystem.id) catch |err| {
-                debug_log.log("workerThread: failed to allocate checkpoint key: {s}", .{@errorName(err)});
-                shared.checkpoint_failed.store(true, .release);
-                shared.abort.store(true, .release);
-                break;
-            };
-            shared.checkpoint_mutex.lock();
-            const checkpoint_result = blk: {
-                shared.processed.put(shared.allocator, duped, {}) catch |err| {
-                    shared.allocator.free(duped);
-                    break :blk err;
-                };
-                saveCheckpoint(shared.allocator, shared.checkpoint_path, shared.processed, shared.all_subsystems) catch |err| break :blk err;
-                break :blk null;
-            };
-            shared.checkpoint_mutex.unlock();
-            if (checkpoint_result) |err| {
+            recordProcessedCheckpoint(
+                shared.allocator,
+                shared.checkpoint_path,
+                shared.processed,
+                shared.all_subsystems,
+                shared.checkpoint_mutex,
+                subsystem.id,
+            ) catch |err| {
                 debug_log.log("workerThread: failed to persist bootstrap checkpoint: {s}", .{@errorName(err)});
                 shared.checkpoint_failed.store(true, .release);
                 shared.abort.store(true, .release);
                 break;
-            }
+            };
             shared.consecutive_errors.store(0, .release);
             const done = shared.done_count.fetchAdd(1, .monotonic) + 1;
             _ = shared.atomic_input_tokens.fetchAdd(result.input_tokens, .monotonic);
@@ -3594,6 +3585,25 @@ fn loadCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8) std
     return map;
 }
 
+fn recordProcessedCheckpoint(
+    allocator: std.mem.Allocator,
+    checkpoint_path: []const u8,
+    processed: *std.StringHashMapUnmanaged(void),
+    all_subsystems: []const Subsystem,
+    mutex: *std.Thread.Mutex,
+    subsystem_id: []const u8,
+) !void {
+    const duped = try allocator.dupe(u8, subsystem_id);
+    mutex.lock();
+    defer mutex.unlock();
+
+    try processed.put(allocator, duped, {});
+    errdefer if (processed.fetchRemove(subsystem_id)) |removed| {
+        allocator.free(removed.key);
+    };
+    try saveCheckpoint(allocator, checkpoint_path, processed, all_subsystems);
+}
+
 fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, processed: *std.StringHashMapUnmanaged(void), all_subsystems: []const Subsystem) !void {
     // Build JSON manually in v2 format
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -3846,6 +3856,32 @@ test "buildSubsystemClusters grouping" {
     // With no valid SCIP dir, clusters won't form — this tests the null path
     const result = buildSubsystemClusters(allocator, &.{ "src/a.zig", "src/b.zig", "src/c.zig", "lib/d.zig" }, "/tmp/no-such-dir");
     try std.testing.expectEqual(@as(?[]Subsystem, null), result);
+}
+
+test "recordProcessedCheckpoint rolls back in-memory progress when persistence fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("checkpoint-dir");
+    const path = try tmp.dir.realpathAlloc(allocator, "checkpoint-dir");
+    defer allocator.free(path);
+
+    var processed: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = processed.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        processed.deinit(allocator);
+    }
+    var mutex: std.Thread.Mutex = .{};
+    const subsystems = [_]Subsystem{
+        .{ .id = "new-subsystem", .label = "new", .files = &.{"src/new.zig"}, .cross_file_context = "" },
+    };
+
+    try std.testing.expectError(
+        error.IsDir,
+        recordProcessedCheckpoint(allocator, path, &processed, &subsystems, &mutex, "new-subsystem"),
+    );
+    try std.testing.expect(!processed.contains("new-subsystem"));
 }
 
 test "saveCheckpoint writes deterministic pretty JSON and preserves mode" {
