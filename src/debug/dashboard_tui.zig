@@ -47,6 +47,7 @@ const MAX_BREAKPOINTS = 32;
 const LOG_SIZE = 16;
 const SOURCE_CONTEXT = 100; // 49 above + current + 50 below
 const SOURCE_LINE_LEN = 200;
+const MAX_DASHBOARD_EVENT_BYTES = 8192;
 
 const SourceLine = struct {
     text: [SOURCE_LINE_LEN]u8 = undefined,
@@ -266,8 +267,9 @@ pub const DashboardTui = struct {
     listener: ?posix.socket_t,
     clients: [MAX_SESSIONS]posix.socket_t,
     client_count: usize,
-    client_bufs: [MAX_SESSIONS][8192]u8,
+    client_bufs: [MAX_SESSIONS][MAX_DASHBOARD_EVENT_BYTES]u8,
     client_buf_lens: [MAX_SESSIONS]usize,
+    client_discarding: [MAX_SESSIONS]bool,
 
     sessions: [MAX_SESSIONS]TuiSession,
     session_count: usize,
@@ -296,6 +298,7 @@ pub const DashboardTui = struct {
             .client_count = 0,
             .client_bufs = undefined,
             .client_buf_lens = [_]usize{0} ** MAX_SESSIONS,
+            .client_discarding = [_]bool{false} ** MAX_SESSIONS,
             .sessions = [_]TuiSession{.{}} ** MAX_SESSIONS,
             .session_count = 0,
             .focused = 0,
@@ -510,17 +513,22 @@ pub const DashboardTui = struct {
 
         self.clients[self.client_count] = client_fd;
         self.client_buf_lens[self.client_count] = 0;
+        self.client_discarding[self.client_count] = false;
         self.client_count += 1;
+        debug_log.log("DashboardTui.acceptClient: accepted client fd={d} count={d}", .{ client_fd, self.client_count });
     }
 
     fn removeClient(self: *DashboardTui, idx: usize) void {
-        posix.close(self.clients[idx]);
+        const fd = self.clients[idx];
+        debug_log.log("DashboardTui.removeClient: closing client fd={d} idx={d}", .{ fd, idx });
+        posix.close(fd);
         // Shift remaining clients down
         var j: usize = idx;
         while (j + 1 < self.client_count) : (j += 1) {
             self.clients[j] = self.clients[j + 1];
             self.client_bufs[j] = self.client_bufs[j + 1];
             self.client_buf_lens[j] = self.client_buf_lens[j + 1];
+            self.client_discarding[j] = self.client_discarding[j + 1];
         }
         self.client_count -= 1;
     }
@@ -533,14 +541,21 @@ pub const DashboardTui = struct {
 
         const remaining = buf.len - buf_len.*;
         if (remaining == 0) {
-            // Buffer full, discard
+            debug_log.log("DashboardTui.readClient: full frame buffer fd={d}, entering newline resync", .{fd});
+            self.client_discarding[idx] = true;
             buf_len.* = 0;
-            return true;
         }
 
-        const n = posix.read(fd, buf[buf_len.*..]) catch return false;
-        if (n == 0) return false; // EOF
+        const n = posix.read(fd, buf[buf_len.*..]) catch |err| {
+            debug_log.log("DashboardTui.readClient: read failed fd={d}: {s}", .{ fd, @errorName(err) });
+            return false;
+        };
+        if (n == 0) {
+            debug_log.log("DashboardTui.readClient: EOF fd={d}", .{fd});
+            return false;
+        }
 
+        debug_log.log("DashboardTui.readClient: read fd={d} bytes={d}", .{ fd, n });
         buf_len.* += n;
 
         // Process complete lines
@@ -554,6 +569,20 @@ pub const DashboardTui = struct {
 
         var start: usize = 0;
         var i: usize = 0;
+
+        if (self.client_discarding[idx]) {
+            if (std.mem.indexOfScalar(u8, buf[0..buf_len.*], '\n')) |newline| {
+                debug_log.log("DashboardTui.processClientBuffer: resynchronized client idx={d} after dropping bytes={d}", .{ idx, newline + 1 });
+                self.client_discarding[idx] = false;
+                start = newline + 1;
+                i = start;
+            } else {
+                debug_log.log("DashboardTui.processClientBuffer: dropping oversized frame tail client idx={d} bytes={d}", .{ idx, buf_len.* });
+                buf_len.* = 0;
+                return;
+            }
+        }
+
         while (i < buf_len.*) : (i += 1) {
             if (buf[i] == '\n') {
                 const line = buf[start..i];
@@ -564,13 +593,18 @@ pub const DashboardTui = struct {
             }
         }
 
-        // Move remaining partial line to beginning
+        // Move remaining partial line to beginning. A buffer-sized partial line is
+        // oversized and must be discarded through the next newline before parsing.
         if (start > 0) {
             const remaining = buf_len.* - start;
             if (remaining > 0) {
                 std.mem.copyForwards(u8, buf[0..remaining], buf[start..buf_len.*]);
             }
             buf_len.* = remaining;
+        } else if (buf_len.* == buf.len) {
+            debug_log.log("DashboardTui.processClientBuffer: oversized frame client idx={d} limit={d}", .{ idx, buf.len });
+            self.client_discarding[idx] = true;
+            buf_len.* = 0;
         }
     }
 
@@ -736,12 +770,21 @@ pub const DashboardTui = struct {
     }
 
     fn handleLaunchEvent(self: *DashboardTui, obj: std.json.ObjectMap) void {
+        const session_id = getStr(obj, "session_id") orelse return;
+        if (self.findSession(session_id)) |session| {
+            if (obj.get("program")) |v| {
+                if (v == .string) copyInto(&session.program, &session.program_len, v.string);
+            }
+            if (obj.get("driver")) |v| {
+                if (v == .string) copyInto(&session.driver_type, &session.driver_type_len, v.string);
+            }
+            copyInto(&session.status, &session.status_len, "stopped");
+            return;
+        }
         if (self.session_count >= MAX_SESSIONS) return;
 
         var session: TuiSession = .{};
-        if (obj.get("session_id")) |v| {
-            if (v == .string) copyInto(&session.session_id, &session.session_id_len, v.string);
-        }
+        copyInto(&session.session_id, &session.session_id_len, session_id);
         if (obj.get("program")) |v| {
             if (v == .string) copyInto(&session.program, &session.program_len, v.string);
         }
@@ -791,8 +834,17 @@ pub const DashboardTui = struct {
                         if (bp_obj.get("verified")) |v| {
                             if (v == .bool) bp.verified = v.bool;
                         }
-                        session.breakpoints[session.bp_count] = bp;
-                        session.bp_count += 1;
+                        var replaced = false;
+                        for (session.breakpoints[0..session.bp_count]) |*existing| {
+                            if (existing.id != bp.id) continue;
+                            existing.* = bp;
+                            replaced = true;
+                            break;
+                        }
+                        if (!replaced) {
+                            session.breakpoints[session.bp_count] = bp;
+                            session.bp_count += 1;
+                        }
                     }
                 }
             }
@@ -1719,9 +1771,7 @@ fn loadSourceContext(session: *TuiSession, file_path: []const u8, target_line: u
         var sl = &session.source_lines[session.source_line_count];
         sl.* = .{};
         sl.line_num = @intCast(li + 1); // 1-based
-        const copy_len = @min(line_text.len, SOURCE_LINE_LEN);
-        @memcpy(sl.text[0..copy_len], line_text[0..copy_len]);
-        sl.text_len = copy_len;
+        copyInto(&sl.text, &sl.text_len, line_text);
 
         if (li == target_idx) {
             session.source_current_idx = session.source_line_count;
@@ -1757,13 +1807,22 @@ fn stderrWrite(data: []const u8) void {
         @memcpy(render_buf[render_len..][0..to_copy], data[0..to_copy]);
         render_len += to_copy;
     } else {
-        _ = posix.write(posix.STDERR_FILENO, data) catch {};
+        writeAllFd(posix.STDERR_FILENO, data) catch |err| debug_log.log("DashboardTui.stderrWrite: write failed: {s}", .{@errorName(err)});
+    }
+}
+
+fn writeAllFd(fd: posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const n = try posix.write(fd, data[written..]);
+        if (n == 0) return error.WriteFailed;
+        written += n;
     }
 }
 
 fn flushRenderBuffer() void {
     if (render_len > 0) {
-        _ = posix.write(posix.STDERR_FILENO, render_buf[0..render_len]) catch {};
+        writeAllFd(posix.STDERR_FILENO, render_buf[0..render_len]) catch |err| debug_log.log("DashboardTui.flushRenderBuffer: write failed: {s}", .{@errorName(err)});
         render_len = 0;
     }
 }
@@ -1773,9 +1832,31 @@ fn printErr(data: []const u8) void {
 }
 
 fn copyInto(dest: []u8, len: *usize, src: []const u8) void {
-    const n = @min(src.len, dest.len);
-    @memcpy(dest[0..n], src[0..n]);
-    len.* = n;
+    var written: usize = 0;
+    const EscapeState = enum { none, started, csi };
+    var escape_state: EscapeState = .none;
+    for (src) |byte| {
+        switch (escape_state) {
+            .started => {
+                escape_state = if (byte == '[') .csi else .none;
+                continue;
+            },
+            .csi => {
+                if (byte >= 0x40 and byte <= 0x7e) escape_state = .none;
+                continue;
+            },
+            .none => {},
+        }
+        if (byte == 0x1b) {
+            escape_state = .started;
+            continue;
+        }
+        if (byte < 0x20 or byte == 0x7f) continue;
+        if (written == dest.len) break;
+        dest[written] = byte;
+        written += 1;
+    }
+    len.* = written;
 }
 
 fn truncate(s: []const u8, max: usize) []const u8 {
@@ -1791,6 +1872,66 @@ fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+test "client framing preserves partial lines across reads" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    const idx: usize = 0;
+
+    const first =
+        \\{"type":"launch","session_id":"partial-1","program":"/tmp/
+    ;
+    @memcpy(tui.client_bufs[idx][0..first.len], first);
+    tui.client_buf_lens[idx] = first.len;
+    tui.processClientBuffer(idx);
+
+    try std.testing.expectEqual(@as(usize, 0), tui.session_count);
+    try std.testing.expectEqual(first.len, tui.client_buf_lens[idx]);
+
+    const second =
+        \\test","driver":"native"}
+        \\
+    ;
+    @memcpy(tui.client_bufs[idx][first.len..][0..second.len], second);
+    tui.client_buf_lens[idx] += second.len;
+    tui.processClientBuffer(idx);
+
+    try std.testing.expectEqual(@as(usize, 1), tui.session_count);
+    try std.testing.expectEqualStrings("partial-1", tui.sessions[0].sessionIdSlice());
+    try std.testing.expectEqualStrings("/tmp/test", tui.sessions[0].programSlice());
+    try std.testing.expectEqual(@as(usize, 0), tui.client_buf_lens[idx]);
+}
+
+test "client framing drops oversized lines and resynchronizes at newline" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    const idx: usize = 0;
+
+    @memset(&tui.client_bufs[idx], 'x');
+    tui.client_buf_lens[idx] = tui.client_bufs[idx].len;
+    tui.processClientBuffer(idx);
+    try std.testing.expect(tui.client_discarding[idx]);
+    try std.testing.expectEqual(@as(usize, 0), tui.client_buf_lens[idx]);
+
+    const tail_and_event =
+        \\tail of oversized event
+        \\{"type":"launch","session_id":"resynced","program":"/tmp/test","driver":"native"}
+        \\
+    ;
+    @memcpy(tui.client_bufs[idx][0..tail_and_event.len], tail_and_event);
+    tui.client_buf_lens[idx] = tail_and_event.len;
+    tui.processClientBuffer(idx);
+
+    try std.testing.expect(!tui.client_discarding[idx]);
+    try std.testing.expectEqual(@as(usize, 1), tui.session_count);
+    try std.testing.expectEqualStrings("resynced", tui.sessions[0].sessionIdSlice());
+    try std.testing.expectEqual(@as(usize, 0), tui.client_buf_lens[idx]);
+}
+
+test "copyInto strips terminal control characters" {
+    var dest: [64]u8 = undefined;
+    var len: usize = 0;
+    copyInto(&dest, &len, "safe\x1b[2J\r\n\ttext\x07");
+    try std.testing.expectEqualStrings("safetext", dest[0..len]);
+}
+
 test "DashboardTui initializes with empty state" {
     const tui = DashboardTui.init(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tui.session_count);
@@ -1798,6 +1939,20 @@ test "DashboardTui initializes with empty state" {
     try std.testing.expectEqual(@as(usize, 0), tui.focused);
     try std.testing.expect(tui.running);
     try std.testing.expect(tui.listener == null);
+}
+
+test "processEvent launch replay is idempotent" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    tui.processEvent(
+        \\{"type":"launch","session_id":"session-1","program":"/tmp/first","driver":"native"}
+    );
+    tui.processEvent(
+        \\{"type":"launch","session_id":"session-1","program":"/tmp/replayed","driver":"dap"}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tui.session_count);
+    try std.testing.expectEqualStrings("/tmp/replayed", tui.sessions[0].programSlice());
+    try std.testing.expectEqualStrings("dap", tui.sessions[0].driverTypeSlice());
 }
 
 test "processEvent handles launch event" {
@@ -1812,6 +1967,19 @@ test "processEvent handles launch event" {
     try std.testing.expectEqualStrings("/tmp/test", tui.sessions[0].programSlice());
     try std.testing.expectEqualStrings("native", tui.sessions[0].driverTypeSlice());
     try std.testing.expectEqualStrings("stopped", tui.sessions[0].statusSlice());
+}
+
+test "processEvent breakpoint replay is idempotent" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    tui.processEvent(
+        \\{"type":"launch","session_id":"session-1","program":"/tmp/test","driver":"native"}
+    );
+    const event =
+        \\{"type":"breakpoint","session_id":"session-1","action":"set","bp":{"id":1,"file":"/tmp/test.c","line":4,"verified":true}}
+    ;
+    tui.processEvent(event);
+    tui.processEvent(event);
+    try std.testing.expectEqual(@as(usize, 1), tui.sessions[0].bp_count);
 }
 
 test "processEvent handles breakpoint set event" {

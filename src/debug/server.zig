@@ -472,8 +472,15 @@ pub const DebugServer = struct {
     dashboard_socket: ?posix.socket_t = null,
     /// Whether a dashboard TUI is likely available (false after failed connection)
     dashboard_available: bool = true,
-    /// Timestamp of last failed dashboard connection attempt (for backoff)
-    last_dashboard_attempt: i64 = 0,
+    /// Millisecond timestamp of the last failed dashboard connection attempt.
+    last_dashboard_attempt_ms: i64 = 0,
+    /// Consecutive failed dashboard connection attempts, used for bounded backoff.
+    dashboard_failure_count: u8 = 0,
+    /// Stable state snapshot replayed when the dashboard reconnects.
+    dashboard_sessions: [8]DashboardSessionState = [_]DashboardSessionState{.{}} ** 8,
+    dashboard_session_count: usize = 0,
+    dashboard_breakpoints: [32]DashboardBreakpointState = [_]DashboardBreakpointState{.{}} ** 32,
+    dashboard_breakpoint_count: usize = 0,
     /// Serializes tool dispatch so the session map and session state are safely
     /// accessed from handler threads. Released during blocking runEx() calls.
     mutex: std.Thread.Mutex = .{},
@@ -2906,6 +2913,85 @@ pub const DebugServer = struct {
 
         debug_log.log("DebugServer.connectDashboardSocket: connected to {s}", .{path});
         self.dashboard_socket = sock;
+        self.dashboard_available = true;
+        self.dashboard_failure_count = 0;
+    }
+
+    fn rememberDashboardLaunch(self: *DebugServer, session_id: []const u8, program: []const u8, driver_type: []const u8) void {
+        for (self.dashboard_sessions[0..self.dashboard_session_count]) |*session| {
+            if (std.mem.eql(u8, session.sessionIdSlice(), session_id)) {
+                copyDashboardText(&session.program, &session.program_len, program);
+                copyDashboardText(&session.driver_type, &session.driver_type_len, driver_type);
+                return;
+            }
+        }
+        if (self.dashboard_session_count == self.dashboard_sessions.len) return;
+        const session = &self.dashboard_sessions[self.dashboard_session_count];
+        session.* = .{};
+        copyDashboardText(&session.session_id, &session.session_id_len, session_id);
+        copyDashboardText(&session.program, &session.program_len, program);
+        copyDashboardText(&session.driver_type, &session.driver_type_len, driver_type);
+        self.dashboard_session_count += 1;
+    }
+
+    fn forgetDashboardSession(self: *DebugServer, session_id: []const u8) void {
+        var index: usize = 0;
+        while (index < self.dashboard_session_count) : (index += 1) {
+            if (!std.mem.eql(u8, self.dashboard_sessions[index].sessionIdSlice(), session_id)) continue;
+            var shift = index;
+            while (shift + 1 < self.dashboard_session_count) : (shift += 1) {
+                self.dashboard_sessions[shift] = self.dashboard_sessions[shift + 1];
+            }
+            self.dashboard_session_count -= 1;
+            break;
+        }
+        var bp_index: usize = 0;
+        while (bp_index < self.dashboard_breakpoint_count) {
+            if (!std.mem.eql(u8, self.dashboard_breakpoints[bp_index].sessionIdSlice(), session_id)) {
+                bp_index += 1;
+                continue;
+            }
+            var shift = bp_index;
+            while (shift + 1 < self.dashboard_breakpoint_count) : (shift += 1) {
+                self.dashboard_breakpoints[shift] = self.dashboard_breakpoints[shift + 1];
+            }
+            self.dashboard_breakpoint_count -= 1;
+        }
+    }
+
+    fn rememberDashboardBreakpoint(self: *DebugServer, session_id: []const u8, action: []const u8, bp: types.BreakpointInfo) void {
+        if (std.mem.eql(u8, action, "remove")) {
+            var index: usize = 0;
+            while (index < self.dashboard_breakpoint_count) : (index += 1) {
+                const item = &self.dashboard_breakpoints[index];
+                if (item.id != bp.id or !std.mem.eql(u8, item.sessionIdSlice(), session_id)) continue;
+                var shift = index;
+                while (shift + 1 < self.dashboard_breakpoint_count) : (shift += 1) {
+                    self.dashboard_breakpoints[shift] = self.dashboard_breakpoints[shift + 1];
+                }
+                self.dashboard_breakpoint_count -= 1;
+                return;
+            }
+            return;
+        }
+        if (!std.mem.eql(u8, action, "set")) return;
+        for (self.dashboard_breakpoints[0..self.dashboard_breakpoint_count]) |*item| {
+            if (item.id == bp.id and std.mem.eql(u8, item.sessionIdSlice(), session_id)) {
+                item.verified = bp.verified;
+                item.line = bp.line;
+                copyDashboardText(&item.file, &item.file_len, bp.file);
+                return;
+            }
+        }
+        if (self.dashboard_breakpoint_count == self.dashboard_breakpoints.len) return;
+        const item = &self.dashboard_breakpoints[self.dashboard_breakpoint_count];
+        item.* = .{};
+        item.id = bp.id;
+        item.verified = bp.verified;
+        item.line = bp.line;
+        copyDashboardText(&item.session_id, &item.session_id_len, session_id);
+        copyDashboardText(&item.file, &item.file_len, bp.file);
+        self.dashboard_breakpoint_count += 1;
     }
 
     /// Write a JSON event line to the dashboard socket. Fire-and-forget.
@@ -2923,84 +3009,194 @@ pub const DebugServer = struct {
             }};
             const poll_result = posix.poll(&fds, 0) catch 0;
             if (poll_result > 0 and (fds[0].revents & (posix.POLL.HUP | posix.POLL.ERR) != 0)) {
-                posix.close(sock);
-                self.dashboard_socket = null;
+                debug_log.log("DebugServer.pushDashboardEvent: dashboard socket reported hangup/error fd={d}", .{sock});
+                self.markDashboardDisconnected();
             }
         }
 
         if (self.dashboard_socket == null) {
-            // Apply connection backoff: only retry every 5 seconds
             if (!self.dashboard_available) {
-                const now = std.time.timestamp();
-                if (now - self.last_dashboard_attempt < 5) return;
+                const now_ms = std.time.milliTimestamp();
+                const backoff_ms = dashboardBackoffMs(self.dashboard_failure_count);
+                const elapsed_ms = now_ms - self.last_dashboard_attempt_ms;
+                if (elapsed_ms < backoff_ms) {
+                    debug_log.log("DebugServer.pushDashboardEvent: reconnect deferred elapsed_ms={d} backoff_ms={d}", .{ elapsed_ms, backoff_ms });
+                    return;
+                }
             }
+            debug_log.log("DebugServer.pushDashboardEvent: reconnecting dashboard", .{});
             self.connectDashboardSocket();
             if (self.dashboard_socket != null) {
-                self.dashboard_available = true;
+                if (!self.replayDashboardState()) {
+                    self.markDashboardDisconnected();
+                    return;
+                }
             } else {
-                self.dashboard_available = false;
-                self.last_dashboard_attempt = std.time.timestamp();
+                self.noteDashboardFailure();
                 return;
             }
         }
 
         if (self.sendDashboardData(event_json)) return;
 
-        // Send failed — connection is stale. Reconnect and retry once.
-        if (self.dashboard_socket) |sock| {
-            posix.close(sock);
-            self.dashboard_socket = null;
-        }
+        // Send failed — connection is stale. Reconnect, replay state, and retry once.
+        self.markDashboardDisconnected();
+        debug_log.log("DebugServer.pushDashboardEvent: reconnecting after send failure", .{});
         self.connectDashboardSocket();
         if (self.dashboard_socket != null) {
-            self.dashboard_available = true;
-            _ = self.sendDashboardData(event_json);
-        } else {
-            self.dashboard_available = false;
-            self.last_dashboard_attempt = std.time.timestamp();
+            if (self.replayDashboardState() and self.sendDashboardData(event_json)) return;
+            self.markDashboardDisconnected();
+        }
+        self.noteDashboardFailure();
+    }
+
+    fn noteDashboardFailure(self: *DebugServer) void {
+        self.dashboard_available = false;
+        self.last_dashboard_attempt_ms = std.time.milliTimestamp();
+        self.dashboard_failure_count +|= 1;
+        debug_log.log("DebugServer.noteDashboardFailure: failures={d} backoff_ms={d}", .{ self.dashboard_failure_count, dashboardBackoffMs(self.dashboard_failure_count) });
+    }
+
+    fn markDashboardDisconnected(self: *DebugServer) void {
+        if (self.dashboard_socket) |sock| {
+            debug_log.log("DebugServer.markDashboardDisconnected: closing socket fd={d}", .{sock});
+            posix.close(sock);
+            self.dashboard_socket = null;
         }
     }
 
-    /// Send event data + newline on the dashboard socket in a single writev. Returns true on success.
+    /// Send a complete newline-delimited event, handling short writes.
     fn sendDashboardData(self: *DebugServer, event_json: []const u8) bool {
         const sock = self.dashboard_socket orelse return false;
-        const iovecs = [_]posix.iovec_const{
-            .{ .base = event_json.ptr, .len = event_json.len },
-            .{ .base = "\n", .len = 1 },
-        };
-        _ = posix.writev(sock, &iovecs) catch {
-            posix.close(sock);
-            self.dashboard_socket = null;
-            return false;
-        };
+        var bytes_written: usize = 0;
+        while (bytes_written < event_json.len) {
+            const n = posix.write(sock, event_json[bytes_written..]) catch |err| {
+                debug_log.log("DebugServer.sendDashboardData: event write failed fd={d} offset={d}: {s}", .{ sock, bytes_written, @errorName(err) });
+                return false;
+            };
+            if (n == 0) {
+                debug_log.log("DebugServer.sendDashboardData: event write made no progress fd={d} offset={d}", .{ sock, bytes_written });
+                return false;
+            }
+            bytes_written += n;
+        }
+        var newline_written: usize = 0;
+        while (newline_written < 1) {
+            const n = posix.write(sock, "\n"[newline_written..]) catch |err| {
+                debug_log.log("DebugServer.sendDashboardData: newline write failed fd={d}: {s}", .{ sock, @errorName(err) });
+                return false;
+            };
+            if (n == 0) {
+                debug_log.log("DebugServer.sendDashboardData: newline write made no progress fd={d}", .{sock});
+                return false;
+            }
+            newline_written += n;
+        }
+        debug_log.log("DebugServer.sendDashboardData: sent event fd={d} bytes={d}", .{ sock, event_json.len + 1 });
         return true;
+    }
+
+    fn replayDashboardState(self: *DebugServer) bool {
+        debug_log.log("DebugServer.replayDashboardState: replaying sessions={d} breakpoints={d}", .{ self.dashboard_session_count, self.dashboard_breakpoint_count });
+        for (self.dashboard_sessions[0..self.dashboard_session_count]) |*session| {
+            const event = self.buildLaunchEvent(self.allocator, session.sessionIdSlice(), session.programSlice(), session.driverTypeSlice()) catch |err| {
+                debug_log.log("DebugServer.replayDashboardState: launch serialization failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            defer self.allocator.free(event);
+            if (!self.sendDashboardData(event)) return false;
+        }
+        for (self.dashboard_breakpoints[0..self.dashboard_breakpoint_count]) |*item| {
+            const replay_bp = types.BreakpointInfo{
+                .id = item.id,
+                .verified = item.verified,
+                .file = item.fileSlice(),
+                .line = item.line,
+            };
+            const event = buildBreakpointEvent(self.allocator, item.sessionIdSlice(), "set", replay_bp) catch |err| {
+                debug_log.log("DebugServer.replayDashboardState: breakpoint serialization failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            defer self.allocator.free(event);
+            if (!self.sendDashboardData(event)) return false;
+        }
+        return true;
+    }
+
+    fn buildLaunchEvent(self: *DebugServer, allocator: std.mem.Allocator, session_id: []const u8, program: []const u8, driver_type: []const u8) ![]u8 {
+        _ = self;
+        var aw: Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("launch");
+        try jw.objectField("session_id");
+        try jw.write(truncateStr(session_id, 32));
+        try jw.objectField("program");
+        try jw.write(truncateStr(program, 200));
+        try jw.objectField("driver");
+        try jw.write(truncateStr(driver_type, 16));
+        try jw.endObject();
+        return try aw.toOwnedSlice();
     }
 
     /// Emit a launch event to the dashboard TUI.
     fn emitLaunchEvent(self: *DebugServer, session_id: []const u8, program: []const u8, driver_type: []const u8) void {
-        if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [512]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"launch","session_id":"{s}","program":"{s}","driver":"{s}"}}
-        , .{ truncateStr(session_id, 32), truncateStr(program, 200), truncateStr(driver_type, 16) }) catch return;
+        if (self.dashboard_socket == null and !self.dashboard_available) {
+            self.rememberDashboardLaunch(session_id, program, driver_type);
+            return;
+        }
+        const event = self.buildLaunchEvent(self.allocator, session_id, program, driver_type) catch |err| {
+            debug_log.log("DebugServer.emitLaunchEvent: serialization failed: {s}", .{@errorName(err)});
+            self.rememberDashboardLaunch(session_id, program, driver_type);
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
+        self.rememberDashboardLaunch(session_id, program, driver_type);
+    }
+
+    fn buildBreakpointEvent(allocator: std.mem.Allocator, session_id: []const u8, action: []const u8, bp: types.BreakpointInfo) ![]u8 {
+        var aw: Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write("breakpoint");
+        try jw.objectField("session_id");
+        try jw.write(truncateStr(session_id, 32));
+        try jw.objectField("action");
+        try jw.write(truncateStr(action, 16));
+        try jw.objectField("bp");
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(bp.id);
+        try jw.objectField("file");
+        try jw.write(truncateStr(bp.file, 200));
+        try jw.objectField("line");
+        try jw.write(bp.line);
+        try jw.objectField("verified");
+        try jw.write(bp.verified);
+        try jw.endObject();
+        try jw.endObject();
+        return try aw.toOwnedSlice();
     }
 
     /// Emit a breakpoint event to the dashboard TUI.
     fn emitBreakpointEvent(self: *DebugServer, session_id: []const u8, action: []const u8, bp: types.BreakpointInfo) void {
-        if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [512]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"breakpoint","session_id":"{s}","action":"{s}","bp":{{"id":{d},"file":"{s}","line":{d},"verified":{s}}}}}
-        , .{
-            truncateStr(session_id, 32),
-            truncateStr(action, 16),
-            bp.id,
-            truncateStr(bp.file, 200),
-            bp.line,
-            if (bp.verified) "true" else "false",
-        }) catch return;
+        if (self.dashboard_socket == null and !self.dashboard_available) {
+            self.rememberDashboardBreakpoint(session_id, action, bp);
+            return;
+        }
+        const event = buildBreakpointEvent(self.allocator, session_id, action, bp) catch |err| {
+            debug_log.log("DebugServer.emitBreakpointEvent: serialization failed: {s}", .{@errorName(err)});
+            self.rememberDashboardBreakpoint(session_id, action, bp);
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
+        self.rememberDashboardBreakpoint(session_id, action, bp);
     }
 
     /// Emit a stop event (richest event — carries stack trace + locals).
@@ -3072,61 +3268,150 @@ pub const DebugServer = struct {
         self.pushDashboardEvent(event);
     }
 
+    fn buildStringEvent(allocator: std.mem.Allocator, event_type: []const u8, fields: []const struct { name: []const u8, value: []const u8, max: usize }) ![]u8 {
+        var aw: Writer.Allocating = .init(allocator);
+        defer aw.deinit();
+        var jw: Stringify = .{ .writer = &aw.writer };
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(event_type);
+        for (fields) |field| {
+            try jw.objectField(field.name);
+            try jw.write(truncateStr(field.value, field.max));
+        }
+        try jw.endObject();
+        return try aw.toOwnedSlice();
+    }
+
     /// Emit an inspect event to the dashboard TUI.
     fn emitInspectEvent(self: *DebugServer, session_id: []const u8, expression: []const u8, result_str: []const u8, var_type: []const u8) void {
         if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [512]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"inspect","session_id":"{s}","expression":"{s}","result":"{s}","var_type":"{s}"}}
-        , .{
-            truncateStr(session_id, 32),
-            truncateStr(expression, 100),
-            truncateStr(result_str, 200),
-            truncateStr(var_type, 64),
-        }) catch return;
+        const event = buildStringEvent(self.allocator, "inspect", &.{
+            .{ .name = "session_id", .value = session_id, .max = 32 },
+            .{ .name = "expression", .value = expression, .max = 100 },
+            .{ .name = "result", .value = result_str, .max = 200 },
+            .{ .name = "var_type", .value = var_type, .max = 64 },
+        }) catch |err| {
+            debug_log.log("DebugServer.emitInspectEvent: serialization failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
     }
 
     /// Emit a session end event to the dashboard TUI.
     fn emitSessionEndEvent(self: *DebugServer, session_id: []const u8) void {
-        if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [128]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"session_end","session_id":"{s}"}}
-        , .{truncateStr(session_id, 32)}) catch return;
+        if (self.dashboard_socket == null and !self.dashboard_available) {
+            self.forgetDashboardSession(session_id);
+            return;
+        }
+        const event = buildStringEvent(self.allocator, "session_end", &.{
+            .{ .name = "session_id", .value = session_id, .max = 32 },
+        }) catch |err| {
+            debug_log.log("DebugServer.emitSessionEndEvent: serialization failed: {s}", .{@errorName(err)});
+            self.forgetDashboardSession(session_id);
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
+        self.forgetDashboardSession(session_id);
     }
 
     /// Emit an error event to the dashboard TUI.
     fn emitErrorEvent(self: *DebugServer, session_id: []const u8, method: []const u8, message: []const u8) void {
         if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [512]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"error","session_id":"{s}","method":"{s}","message":"{s}"}}
-        , .{ truncateStr(session_id, 32), truncateStr(method, 32), truncateStr(message, 200) }) catch return;
+        const event = buildStringEvent(self.allocator, "error", &.{
+            .{ .name = "session_id", .value = session_id, .max = 32 },
+            .{ .name = "method", .value = method, .max = 32 },
+            .{ .name = "message", .value = message, .max = 200 },
+        }) catch |err| {
+            debug_log.log("DebugServer.emitErrorEvent: serialization failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
     }
 
     /// Emit a generic activity event to the dashboard TUI.
     fn emitActivityEvent(self: *DebugServer, session_id: []const u8, tool: []const u8, summary: []const u8) void {
         if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [512]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"activity","session_id":"{s}","tool":"{s}","summary":"{s}"}}
-        , .{ truncateStr(session_id, 32), truncateStr(tool, 32), truncateStr(summary, 200) }) catch return;
+        const event = buildStringEvent(self.allocator, "activity", &.{
+            .{ .name = "session_id", .value = session_id, .max = 32 },
+            .{ .name = "tool", .value = tool, .max = 32 },
+            .{ .name = "summary", .value = summary, .max = 200 },
+        }) catch |err| {
+            debug_log.log("DebugServer.emitActivityEvent: serialization failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
     }
 
     /// Emit a run event (execution resumed, before stop).
     fn emitRunEvent(self: *DebugServer, session_id: []const u8, action: []const u8) void {
         if (self.dashboard_socket == null and !self.dashboard_available) return;
-        var buf: [256]u8 = undefined;
-        const event = std.fmt.bufPrint(&buf,
-            \\{{"type":"run","session_id":"{s}","action":"{s}"}}
-        , .{ truncateStr(session_id, 32), truncateStr(action, 32) }) catch return;
+        const event = buildStringEvent(self.allocator, "run", &.{
+            .{ .name = "session_id", .value = session_id, .max = 32 },
+            .{ .name = "action", .value = action, .max = 32 },
+        }) catch |err| {
+            debug_log.log("DebugServer.emitRunEvent: serialization failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer self.allocator.free(event);
         self.pushDashboardEvent(event);
     }
 };
+
+const DashboardSessionState = struct {
+    session_id: [32]u8 = undefined,
+    session_id_len: usize = 0,
+    program: [200]u8 = undefined,
+    program_len: usize = 0,
+    driver_type: [16]u8 = undefined,
+    driver_type_len: usize = 0,
+
+    fn sessionIdSlice(self: *const DashboardSessionState) []const u8 {
+        return self.session_id[0..self.session_id_len];
+    }
+
+    fn programSlice(self: *const DashboardSessionState) []const u8 {
+        return self.program[0..self.program_len];
+    }
+
+    fn driverTypeSlice(self: *const DashboardSessionState) []const u8 {
+        return self.driver_type[0..self.driver_type_len];
+    }
+};
+
+const DashboardBreakpointState = struct {
+    session_id: [32]u8 = undefined,
+    session_id_len: usize = 0,
+    id: u32 = 0,
+    verified: bool = false,
+    file: [200]u8 = undefined,
+    file_len: usize = 0,
+    line: u32 = 0,
+
+    fn sessionIdSlice(self: *const DashboardBreakpointState) []const u8 {
+        return self.session_id[0..self.session_id_len];
+    }
+
+    fn fileSlice(self: *const DashboardBreakpointState) []const u8 {
+        return self.file[0..self.file_len];
+    }
+};
+
+fn copyDashboardText(dest: []u8, len: *usize, src: []const u8) void {
+    const copy_len = @min(dest.len, src.len);
+    @memcpy(dest[0..copy_len], src[0..copy_len]);
+    len.* = copy_len;
+}
+
+fn dashboardBackoffMs(failure_count: u8) i64 {
+    if (failure_count == 0) return 0;
+    const shift: u3 = @intCast(@min(failure_count - 1, 5));
+    return @min(@as(i64, 250) << shift, 5000);
+}
 
 fn truncateStr(s: []const u8, max: usize) []const u8 {
     return if (s.len <= max) s else s[0..max];
@@ -3159,6 +3444,68 @@ fn interpreterToLanguage(basename: []const u8) ?[]const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "dashboard event JSON escapes adversarial strings" {
+    var server = DebugServer.init(std.testing.allocator);
+    defer server.deinit();
+
+    const event = try server.buildLaunchEvent(
+        std.testing.allocator,
+        "session-\"one\\two\nthree",
+        "/tmp/\x1b[2J\"quoted\"\\program\nline",
+        "native\tdebugger",
+    );
+    defer std.testing.allocator.free(event);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("launch", parsed.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("session-\"one\\two\nthree", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings("/tmp/\x1b[2J\"quoted\"\\program\nline", parsed.value.object.get("program").?.string);
+    try std.testing.expectEqualStrings("native\tdebugger", parsed.value.object.get("driver").?.string);
+    try std.testing.expect(std.mem.indexOfScalar(u8, event, '\n') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, event, 0x1b) == null);
+}
+
+test "dashboard send writes a complete JSON line" {
+    var sockets: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets));
+    defer posix.close(sockets[1]);
+
+    var server = DebugServer.init(std.testing.allocator);
+    defer server.deinit();
+    server.dashboard_socket = sockets[0];
+
+    try std.testing.expect(server.sendDashboardData("{\"type\":\"run\"}"));
+    var received: [64]u8 = undefined;
+    const count = try posix.read(sockets[1], &received);
+    try std.testing.expectEqualStrings("{\"type\":\"run\"}\n", received[0..count]);
+}
+
+test "dashboard replay retains session-scoped breakpoint state" {
+    var server = DebugServer.init(std.testing.allocator);
+    defer server.deinit();
+    server.rememberDashboardLaunch("session-1", "/tmp/app", "native");
+    server.rememberDashboardBreakpoint("session-1", "set", .{ .id = 7, .verified = true, .file = "/tmp/app.c", .line = 42 });
+
+    try std.testing.expectEqual(@as(usize, 1), server.dashboard_session_count);
+    try std.testing.expectEqualStrings("/tmp/app", server.dashboard_sessions[0].programSlice());
+    try std.testing.expectEqual(@as(usize, 1), server.dashboard_breakpoint_count);
+    try std.testing.expectEqualStrings("session-1", server.dashboard_breakpoints[0].sessionIdSlice());
+
+    server.rememberDashboardBreakpoint("session-1", "remove", .{ .id = 7, .verified = false, .file = "", .line = 0 });
+    server.forgetDashboardSession("session-1");
+    try std.testing.expectEqual(@as(usize, 0), server.dashboard_breakpoint_count);
+    try std.testing.expectEqual(@as(usize, 0), server.dashboard_session_count);
+}
+
+test "dashboard reconnect backoff grows and stays bounded" {
+    try std.testing.expectEqual(@as(i64, 250), dashboardBackoffMs(1));
+    try std.testing.expectEqual(@as(i64, 500), dashboardBackoffMs(2));
+    try std.testing.expectEqual(@as(i64, 4000), dashboardBackoffMs(5));
+    try std.testing.expectEqual(@as(i64, 5000), dashboardBackoffMs(20));
+}
 
 test "tool_definitions has 36 entries" {
     try std.testing.expectEqual(@as(usize, 36), tool_definitions.len);
