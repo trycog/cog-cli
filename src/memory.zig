@@ -1447,6 +1447,227 @@ test "get by id" {
     try std.testing.expect(std.mem.indexOf(u8, result, "My Definition") != null);
 }
 
+test "recall filters inactive history and records emitted metadata" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('active', 'test', 'Lifecycle active', 'Active definition')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, deprecated_at) VALUES ('deprecated', 'test', 'Lifecycle deprecated', 'Deprecated definition', datetime('now'))");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, expires_at) VALUES ('expired', 'test', 'Lifecycle expired', 'Expired definition', '2020-01-01T00:00:00Z')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, expires_at) VALUES ('future', 'test', 'Lifecycle future', 'Future definition', datetime('now', '+1 hour'))");
+
+    const args = try parseTestJson(
+        \\{"queries":["Lifecycle"]}
+    );
+    defer args.deinit();
+    const result = try toolRecall(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Lifecycle active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Lifecycle future") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Lifecycle deprecated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Lifecycle expired") == null);
+
+    var stmt = try db.prepare("SELECT recall_count, last_recalled_at FROM engrams WHERE id = ?");
+    defer stmt.finalize();
+    for ([_]struct { id: []const u8, count: i64, recalled: bool }{
+        .{ .id = "active", .count = 1, .recalled = true },
+        .{ .id = "future", .count = 1, .recalled = true },
+        .{ .id = "deprecated", .count = 0, .recalled = false },
+        .{ .id = "expired", .count = 0, .recalled = false },
+    }) |expected| {
+        try stmt.bindText(1, expected.id);
+        try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+        try std.testing.expectEqual(expected.count, stmt.columnInt(0));
+        try std.testing.expectEqual(expected.recalled, stmt.columnText(1) != null);
+        try stmt.reset();
+    }
+}
+
+test "get retains inactive history and lifecycle metadata" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, deprecated_at, recall_count, last_recalled_at) VALUES ('historical-deprecated', 'test', 'Historical deprecated', 'Deprecated history', datetime('now'), 3, datetime('now', '-1 minute'))");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, expires_at) VALUES ('historical-expired', 'test', 'Historical expired', 'Expired history', datetime('now', '-1 minute'))");
+
+    const args = try parseTestJson(
+        \\{"engram_ids":["historical-deprecated","historical-expired"]}
+    );
+    defer args.deinit();
+    const result = try toolGet(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "Historical deprecated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Historical expired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Recall count: 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Last recalled:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Deprecated:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Expires:") != null);
+}
+
+test "deprecate selects active duplicate and preserves history transactionally" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, deprecated_at) VALUES ('old-duplicate', 'test', 'Duplicate term', 'Old history', datetime('now', '-1 day'))");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, memory_term, created_at) VALUES ('active-duplicate', 'test', 'Duplicate term', 'Current definition', 'long', '2026-01-01 00:00:00')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('target', 'test', 'Target', 'Linked definition')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('duplicate-link', 'test', 'active-duplicate', 'target')");
+
+    const args = try parseTestJson(
+        \\{"term":"Duplicate term"}
+    );
+    defer args.deinit();
+    const result = try toolDeprecate(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    var stmt = try db.prepare("SELECT id, definition, memory_term, created_at, deprecated_at FROM engrams WHERE LOWER(term) = LOWER('Duplicate term') ORDER BY id");
+    defer stmt.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+    try std.testing.expectEqualStrings("active-duplicate", stmt.columnText(0).?);
+    try std.testing.expectEqualStrings("Current definition", stmt.columnText(1).?);
+    try std.testing.expectEqualStrings("long", stmt.columnText(2).?);
+    try std.testing.expectEqualStrings("2026-01-01 00:00:00", stmt.columnText(3).?);
+    try std.testing.expect(stmt.columnText(4) != null);
+    try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+    try std.testing.expectEqualStrings("old-duplicate", stmt.columnText(0).?);
+    try std.testing.expectEqualStrings("Old history", stmt.columnText(1).?);
+
+    try std.testing.expectEqual(@as(i64, 0), countQuery(&mem, "SELECT COUNT(*) FROM synapses WHERE brain_id = ?"));
+}
+
+test "deprecate rolls back link removal when marking fails" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('rollback-source', 'test', 'Rollback source', 'Must remain')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('rollback-target', 'test', 'Rollback target', 'Must remain linked')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('rollback-link', 'test', 'rollback-source', 'rollback-target')");
+    try db.exec("CREATE TRIGGER fail_deprecation BEFORE UPDATE OF deprecated_at ON engrams WHEN old.id = 'rollback-source' BEGIN SELECT RAISE(ABORT, 'forced failure'); END");
+
+    const args = try parseTestJson(
+        \\{"term":"Rollback source"}
+    );
+    defer args.deinit();
+    try std.testing.expectError(error.SqliteConstraint, toolDeprecate(&mem, args.value));
+
+    var stmt = try db.prepare("SELECT e.deprecated_at, COUNT(s.id) FROM engrams e LEFT JOIN synapses s ON s.source_id = e.id OR s.target_id = e.id WHERE e.id = 'rollback-source' GROUP BY e.id");
+    defer stmt.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+    try std.testing.expect(stmt.columnText(0) == null);
+    try std.testing.expectEqual(@as(i64, 1), stmt.columnInt(1));
+}
+
+test "active lifecycle operations preserve inactive history" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, memory_term, deprecated_at) VALUES ('retired', 'test', 'Shared term', 'Historical definition', 'short', datetime('now'))");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('active', 'test', 'Shared term', 'Active definition')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('active-target', 'test', 'Active target', 'Graph target')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, expires_at) VALUES ('expired-middle', 'test', 'Expired middle', 'Historical graph node', '2020-01-01T00:00:00Z')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('inactive-link', 'test', 'active', 'retired')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('trace-a', 'test', 'active', 'expired-middle')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('trace-b', 'test', 'expired-middle', 'active-target')");
+
+    const refactor_args = try parseTestJson(
+        \\{"term":"Shared term","definition":"Refactored active definition"}
+    );
+    defer refactor_args.deinit();
+    const refactor_result = try toolRefactor(&mem, refactor_args.value);
+    defer std.testing.allocator.free(refactor_result);
+
+    var definitions = try db.prepare("SELECT id, definition FROM engrams WHERE LOWER(term) = LOWER('Shared term') ORDER BY id");
+    defer definitions.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try definitions.step());
+    try std.testing.expectEqualStrings("active", definitions.columnText(0).?);
+    try std.testing.expectEqualStrings("Refactored active definition", definitions.columnText(1).?);
+    try std.testing.expectEqual(sqlite.StepResult.row, try definitions.step());
+    try std.testing.expectEqualStrings("retired", definitions.columnText(0).?);
+    try std.testing.expectEqualStrings("Historical definition", definitions.columnText(1).?);
+
+    const flush_args = try parseTestJson(
+        \\{"engram_ids":["retired"]}
+    );
+    defer flush_args.deinit();
+    const flush_result = try toolFlush(&mem, flush_args.value);
+    defer std.testing.allocator.free(flush_result);
+    try std.testing.expectEqual(@as(i64, 1), countQuery(&mem, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND id = 'retired'"));
+
+    const retired_id = try resolveEngramId(&mem, "retired");
+    try std.testing.expect(retired_id == null);
+    try std.testing.expectError(error.SqliteConstraint, createSynapse(&mem, "retired", "active-target", "related_to", 1.0));
+
+    const connection_args = try parseTestJson(
+        \\{"engram_ids":["active"]}
+    );
+    defer connection_args.deinit();
+    const connections = try toolConnections(&mem, connection_args.value);
+    defer std.testing.allocator.free(connections);
+    try std.testing.expect(std.mem.indexOf(u8, connections, "Shared term") == null);
+    try std.testing.expect(std.mem.indexOf(u8, connections, "Expired middle") == null);
+
+    const trace_args = try parseTestJson(
+        \\{"from":"active","to":"active-target"}
+    );
+    defer trace_args.deinit();
+    const trace = try toolTrace(&mem, trace_args.value);
+    defer std.testing.allocator.free(trace);
+    try std.testing.expect(std.mem.indexOf(u8, trace, "No path found") != null);
+}
+
+test "active discovery excludes inactive rows and inactive-only links" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, memory_term) VALUES ('visible', 'test', 'Visible active', 'Active', 'short')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, deprecated_at) VALUES ('hidden-deprecated', 'test', 'Hidden deprecated', 'Historical', datetime('now'))");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, expires_at) VALUES ('hidden-expired', 'test', 'Hidden expired', 'Historical', '2020-01-01T00:00:00Z')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id) VALUES ('inactive-only-link', 'test', 'visible', 'hidden-deprecated')");
+
+    const empty_args = try parseTestJson("{}");
+    defer empty_args.deinit();
+
+    const terms = try toolListTerms(&mem, empty_args.value);
+    defer std.testing.allocator.free(terms);
+    try std.testing.expect(std.mem.indexOf(u8, terms, "Visible active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, terms, "Hidden deprecated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, terms, "Hidden expired") == null);
+
+    const short_term = try toolListShortTerm(&mem, empty_args.value);
+    defer std.testing.allocator.free(short_term);
+    try std.testing.expect(std.mem.indexOf(u8, short_term, "Visible active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_term, "Hidden deprecated") == null);
+
+    const orphans = try toolOrphans(&mem, empty_args.value);
+    defer std.testing.allocator.free(orphans);
+    try std.testing.expect(std.mem.indexOf(u8, orphans, "Visible active") != null);
+    try std.testing.expect(std.mem.indexOf(u8, orphans, "Hidden deprecated") == null);
+    try std.testing.expect(std.mem.indexOf(u8, orphans, "Hidden expired") == null);
+
+    const stats = try toolStats(&mem);
+    defer std.testing.allocator.free(stats);
+    try std.testing.expect(std.mem.indexOf(u8, stats, "Engrams: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stats, "Synapses: 0") != null);
+
+    const connectivity = try toolConnectivity(&mem);
+    defer std.testing.allocator.free(connectivity);
+    try std.testing.expect(std.mem.indexOf(u8, connectivity, "Total concepts: 1") != null);
+}
+
 test "associate and connections" {
     var db = try Db.open(":memory:");
     defer db.close();
@@ -1608,6 +1829,130 @@ test "buildFtsQuery" {
 
 test "buildFtsQuery empty" {
     try std.testing.expect(buildFtsQuery(std.testing.allocator, "") == null);
+}
+
+test "recall limit defaults, clamps, and handles extreme floats" {
+    const default_args = try parseTestJson(
+        \\{"queries":["test"]}
+    );
+    defer default_args.deinit();
+    try std.testing.expectEqual(@as(i64, 5), recallLimit(default_args.value));
+
+    const capped_args = try parseTestJson(
+        \\{"queries":["test"],"limit":1000}
+    );
+    defer capped_args.deinit();
+    try std.testing.expectEqual(@as(i64, 100), recallLimit(capped_args.value));
+
+    const extreme_args = try parseTestJson(
+        \\{"queries":["test"],"limit":1e300}
+    );
+    defer extreme_args.deinit();
+    try std.testing.expectEqual(@as(i64, 100), recallLimit(extreme_args.value));
+
+    const minimum_args = try parseTestJson(
+        \\{"queries":["test"],"limit":0}
+    );
+    defer minimum_args.deinit();
+    try std.testing.expectEqual(@as(i64, 1), recallLimit(minimum_args.value));
+}
+
+test "recall combined rank lets memory weight reorder comparable matches" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, weight) VALUES ('rank-b', 'test', 'Ranked beta', 'shared ranking phrase', 1.0)");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, weight) VALUES ('rank-a', 'test', 'Ranked alpha', 'shared ranking phrase', 3.0)");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition, weight) VALUES ('rank-c', 'test', 'Ranking reference', 'Ranked appears only in this definition', 10.0)");
+
+    const args = try parseTestJson(
+        \\{"queries":["Ranked"],"limit":3}
+    );
+    defer args.deinit();
+    const result = try toolRecall(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    const alpha_pos = std.mem.indexOf(u8, result, "Ranked alpha").?;
+    const beta_pos = std.mem.indexOf(u8, result, "Ranked beta").?;
+    const reference_pos = std.mem.indexOf(u8, result, "Ranking reference").?;
+    try std.testing.expect(alpha_pos < beta_pos);
+    try std.testing.expect(reference_pos < beta_pos);
+}
+
+test "recall strengthens only results emitted before output cap" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    const large_definition = "x" ** max_definition_output_chars;
+    var insert = try db.prepare("INSERT INTO engrams (id, brain_id, term, definition) VALUES (?, 'test', ?, ?)");
+    defer insert.finalize();
+    for (0..6) |index| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "cap-{d}", .{index});
+        var term_buf: [32]u8 = undefined;
+        const term = try std.fmt.bufPrint(&term_buf, "Cap Result {d}", .{index});
+        try insert.bindText(1, id);
+        try insert.bindText(2, term);
+        try insert.bindText(3, large_definition);
+        _ = try insert.step();
+        try insert.reset();
+    }
+
+    const args = try parseTestJson(
+        \\{"queries":["Cap Result"],"limit":6}
+    );
+    defer args.deinit();
+    const result = try toolRecall(&mem, args.value);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.endsWith(u8, result, recall_truncation_notice));
+
+    var weights = try db.prepare("SELECT weight FROM engrams WHERE brain_id = 'test' ORDER BY id");
+    defer weights.finalize();
+    var strengthened: usize = 0;
+    while (try weights.step() == .row) {
+        if (weights.columnReal(0) > 1.0) strengthened += 1;
+    }
+    try std.testing.expect(strengthened > 0);
+    try std.testing.expect(strengthened < 6);
+    try std.testing.expectEqual(strengthened, std.mem.count(u8, result, "<stored-knowledge"));
+}
+
+test "recall expands one hop without duplicates or exceeding limit" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('seed-a', 'test', 'Graph Seed A', 'graph recall seed')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('seed-b', 'test', 'Graph Seed B', 'graph recall seed')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('neighbor', 'test', 'Shared Neighbor', 'connected concept')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('second-hop', 'test', 'Second Hop', 'must not be expanded')");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id, relation, weight) VALUES ('edge-a', 'test', 'seed-a', 'neighbor', 'requires', 0.4)");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id, relation, weight) VALUES ('edge-b', 'test', 'seed-b', 'neighbor', 'requires', 0.3)");
+    try db.exec("INSERT INTO synapses (id, brain_id, source_id, target_id, relation, weight) VALUES ('edge-hop', 'test', 'neighbor', 'second-hop', 'leads_to', 0.2)");
+
+    const args = try parseTestJson(
+        \\{"queries":["graph recall"],"limit":3}
+    );
+    defer args.deinit();
+    const result = try toolRecall(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result, "Shared Neighbor"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "Second Hop") == null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, result, "<stored-knowledge"));
+
+    var weights = try db.prepare("SELECT (SELECT weight FROM engrams WHERE id = 'seed-a'), (SELECT weight FROM engrams WHERE id = 'seed-b'), (SELECT weight FROM engrams WHERE id = 'neighbor'), (SELECT weight FROM synapses WHERE id = 'edge-a')");
+    defer weights.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try weights.step());
+    try std.testing.expectApproxEqAbs(@as(f64, 1.03), weights.columnReal(0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.03), weights.columnReal(1), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.03), weights.columnReal(2), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.43), weights.columnReal(3), 0.0001);
 }
 
 test "stale returns message" {
