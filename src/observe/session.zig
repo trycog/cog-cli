@@ -118,6 +118,9 @@ pub const SessionManager = struct {
         const backend = types.Backend.fromString(backend_text) orelse return error.CorruptSessionDatabase;
         const status = types.SessionStatus.fromString(status_text) orelse return error.CorruptSessionDatabase;
         if (self.sessions.contains(id_text)) return error.CorruptSessionDatabase;
+        const target_pid = if (stmt.columnText(2) != null) stmt.columnInt(2) else null;
+        const id = try self.allocator.dupe(u8, id_text);
+        errdefer self.allocator.free(id);
 
         const second_result = stmt.step() catch |err| {
             debug_log.log("SessionManager.discover: second row read failed path={s} error={s}", .{ db_path, @errorName(err) });
@@ -128,14 +131,12 @@ pub const SessionManager = struct {
             return error.CorruptSessionDatabase;
         }
 
-        const id = try self.allocator.dupe(u8, id_text);
-        errdefer self.allocator.free(id);
         const session = try self.allocator.create(Session);
         errdefer self.allocator.destroy(session);
         session.* = .{
             .id = id,
             .backend = backend,
-            .target_pid = if (stmt.columnText(2) != null) stmt.columnInt(2) else null,
+            .target_pid = target_pid,
             .status = status,
             .db = db,
             .db_path = db_path,
