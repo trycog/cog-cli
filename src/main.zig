@@ -21,6 +21,12 @@ const reset = "\x1B[0m";
 const ExtInstallOptions = struct {
     git_url: []const u8,
     version: ?[]const u8 = null,
+    trust_build: bool = false,
+};
+
+const ExtUpdateOptions = struct {
+    name: ?[]const u8 = null,
+    trust_build: bool = false,
 };
 
 pub fn main() void {
@@ -144,7 +150,10 @@ fn mainInner() !void {
                 return;
             }
             const install_options = try parseExtInstallOptions(cmd_args);
-            try extensions_mod.installExtension(allocator, install_options.git_url, install_options.version);
+            debug_log.log("dispatch ext:install trust_build={}", .{install_options.trust_build});
+            try extensions_mod.installExtension(allocator, install_options.git_url, install_options.version, .{
+                .trust_build = install_options.trust_build,
+            });
             return;
         }
         if (std.mem.eql(u8, subcmd, "ext:update")) {
@@ -153,12 +162,11 @@ fn mainInner() !void {
                 printErr(help.ext_update);
                 return;
             }
-            if (cmd_args.len > 1) {
-                printErr("error: cog ext:update accepts at most one extension name\n");
-                return error.Explained;
-            }
-            const ext_name = if (cmd_args.len == 1) cmd_args[0] else null;
-            try extensions_mod.updateExtensions(allocator, ext_name);
+            const update_options = try parseExtUpdateOptions(cmd_args);
+            debug_log.log("dispatch ext:update trust_build={}", .{update_options.trust_build});
+            try extensions_mod.updateExtensions(allocator, update_options.name, .{
+                .trust_build = update_options.trust_build,
+            });
             return;
         }
         printErr("error: unknown command '");
@@ -279,10 +287,15 @@ fn printCodeHelp() void {
 fn parseExtInstallOptions(args: []const [:0]const u8) !ExtInstallOptions {
     var git_url: ?[]const u8 = null;
     var requested_version: ?[]const u8 = null;
+    var trust_build = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (std.mem.eql(u8, arg, "--trust-build")) {
+            trust_build = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "--version=")) {
             const value = arg["--version=".len..];
             if (value.len == 0) {
@@ -319,7 +332,32 @@ fn parseExtInstallOptions(args: []const [:0]const u8) !ExtInstallOptions {
         return error.Explained;
     }
 
-    return .{ .git_url = git_url.?, .version = requested_version };
+    return .{ .git_url = git_url.?, .version = requested_version, .trust_build = trust_build };
+}
+
+fn parseExtUpdateOptions(args: []const [:0]const u8) !ExtUpdateOptions {
+    var name: ?[]const u8 = null;
+    var trust_build = false;
+
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--trust-build")) {
+            trust_build = true;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) {
+            printErr("error: unknown option '");
+            printErr(arg);
+            printErr("'\n");
+            return error.Explained;
+        }
+        if (name != null) {
+            printErr("error: cog ext:update accepts at most one extension name\n");
+            return error.Explained;
+        }
+        name = arg;
+    }
+
+    return .{ .name = name, .trust_build = trust_build };
 }
 
 fn printExtHelp() void {
@@ -395,4 +433,23 @@ test "parseExtInstallOptions supports split version flag" {
     });
     try std.testing.expect(parsed.version != null);
     try std.testing.expectEqualStrings("0.75.0", parsed.version.?);
+    try std.testing.expect(!parsed.trust_build);
+}
+
+test "parseExtInstallOptions requires explicit trust build flag" {
+    const parsed = try parseExtInstallOptions(&.{
+        "--trust-build",
+        "https://github.com/trycog/cog-zig",
+    });
+    try std.testing.expect(parsed.trust_build);
+}
+
+test "parseExtUpdateOptions parses optional name and trust build flag" {
+    const all = try parseExtUpdateOptions(&.{"--trust-build"});
+    try std.testing.expect(all.name == null);
+    try std.testing.expect(all.trust_build);
+
+    const one = try parseExtUpdateOptions(&.{ "cog-zig", "--trust-build" });
+    try std.testing.expectEqualStrings("cog-zig", one.name.?);
+    try std.testing.expect(one.trust_build);
 }

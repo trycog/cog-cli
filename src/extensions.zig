@@ -8,6 +8,8 @@ const fs_util = @import("fs_util.zig");
 const dim = "\x1B[2m";
 const reset = "\x1B[0m";
 
+var staging_counter = std.atomic.Value(u64).init(0);
+
 // ── Debug Config Types ──────────────────────────────────────────────────
 
 pub const DebuggerType = enum { native, dap };
@@ -1310,13 +1312,14 @@ fn metadataPath(allocator: std.mem.Allocator, ext_dir: []const u8) ![]u8 {
 }
 
 fn writeInstallMetadata(allocator: std.mem.Allocator, ext_dir: []const u8, source_url: []const u8, release: ResolvedRelease) !void {
-    const path = try metadataPath(allocator, ext_dir);
-    defer allocator.free(path);
-    debug_log.log("writeInstallMetadata: {s}", .{path});
+    debug_log.log("writeInstallMetadata: preparing atomic metadata in {s}", .{ext_dir});
 
     var aw: std.io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    var s: std.json.Stringify = .{ .writer = &aw.writer };
+    var s: std.json.Stringify = .{
+        .writer = &aw.writer,
+        .options = .{ .whitespace = .indent_2 },
+    };
     try s.beginObject();
     try s.objectField("source_url");
     try s.write(source_url);
@@ -1325,12 +1328,12 @@ fn writeInstallMetadata(allocator: std.mem.Allocator, ext_dir: []const u8, sourc
     try s.objectField("tag");
     try s.write(release.tag_name);
     try s.endObject();
-    const body = try aw.toOwnedSlice();
-    defer allocator.free(body);
+    try aw.writer.writeByte('\n');
 
-    const file = try std.fs.createFileAbsolute(path, .{});
-    defer file.close();
-    try file.writeAll(body);
+    var dir = try std.fs.openDirAbsolute(ext_dir, .{});
+    defer dir.close();
+    try fs_util.writeFileAtomic(dir, allocator, install_metadata_filename, aw.written());
+    debug_log.log("writeInstallMetadata: committed {s}/{s}", .{ ext_dir, install_metadata_filename });
 }
 
 fn readInstallMetadata(allocator: std.mem.Allocator, ext_dir: []const u8) !InstallMetadata {
@@ -1375,19 +1378,137 @@ fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
     try parent_dir.deleteTree(child_name);
 }
 
+fn validateRelativePath(path: []const u8, initial_depth: usize) !void {
+    if (path.len == 0 or std.fs.path.isAbsolute(path) or path[0] == '\\') return error.UnsafeArchivePath;
+    if (path.len >= 2 and path[1] == ':') return error.UnsafeArchivePath;
+
+    var depth = initial_depth;
+    var components = std.mem.tokenizeAny(u8, path, "/\\");
+    var saw_component = false;
+    while (components.next()) |component| {
+        saw_component = true;
+        if (std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (depth == 0) return error.UnsafeArchivePath;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    if (!saw_component) return error.UnsafeArchivePath;
+}
+
+fn validateArchiveEntryPath(path: []const u8) !void {
+    try validateRelativePath(path, 0);
+}
+
+fn validateExtensionName(name: []const u8) !void {
+    if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) {
+        return error.UnsafeExtensionName;
+    }
+    if (std.mem.indexOfAny(u8, name, "/\\") != null or std.mem.indexOfScalar(u8, name, ':') != null) {
+        return error.UnsafeExtensionName;
+    }
+}
+
+fn normalizedPathDepth(path: []const u8) !usize {
+    var depth: usize = 0;
+    var components = std.mem.tokenizeAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (depth == 0) return error.UnsafeArchivePath;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    return depth;
+}
+
+fn validateArchiveSymlink(entry_path: []const u8, link_name: []const u8) !void {
+    try validateArchiveEntryPath(entry_path);
+    if (link_name.len == 0 or std.fs.path.isAbsolute(link_name)) return error.UnsafeArchiveLink;
+    if (link_name[0] == '\\' or (link_name.len >= 2 and link_name[1] == ':')) {
+        return error.UnsafeArchiveLink;
+    }
+
+    const parent_path = std.fs.path.dirname(entry_path) orelse "";
+    const parent_depth = normalizedPathDepth(parent_path) catch return error.UnsafeArchiveLink;
+    validateRelativePath(link_name, parent_depth) catch return error.UnsafeArchiveLink;
+}
+
+fn stripArchiveRoot(path: []const u8) ![]const u8 {
+    const first_separator = std.mem.indexOfAny(u8, path, "/\\") orelse return "";
+    const stripped = path[first_separator + 1 ..];
+    if (stripped.len > 0) try validateArchiveEntryPath(stripped);
+    return stripped;
+}
+
+fn inspectTarballArchive(tarball_path: []const u8) !void {
+    var archive_file = try std.fs.openFileAbsolute(tarball_path, .{});
+    defer archive_file.close();
+    var archive_buffer: [16 * 1024]u8 = undefined;
+    var archive_reader = archive_file.reader(&archive_buffer);
+    var decompression_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(
+        &archive_reader.interface,
+        .gzip,
+        &decompression_buffer,
+    );
+
+    var file_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var link_name_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var iterator: std.tar.Iterator = .init(&decompressor.reader, .{
+        .file_name_buffer = &file_name_buffer,
+        .link_name_buffer = &link_name_buffer,
+    });
+
+    while (try iterator.next()) |entry| {
+        try validateArchiveEntryPath(entry.name);
+        const stripped = try stripArchiveRoot(entry.name);
+        if (entry.kind == .sym_link and stripped.len > 0) {
+            try validateArchiveSymlink(stripped, entry.link_name);
+        }
+    }
+    if (decompressor.err) |err| return err;
+}
+
+fn validateExtractedTree(allocator: std.mem.Allocator, output_dir: []const u8) !void {
+    var dir = try std.fs.openDirAbsolute(output_dir, .{ .iterate = true });
+    defer dir.close();
+
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .sym_link) continue;
+        var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const link_name = try entry.dir.readLink(entry.basename, &link_buffer);
+        validateArchiveSymlink(entry.path, link_name) catch {
+            debug_log.log("validateExtractedTree: rejected symlink path={s} target={s}", .{ entry.path, link_name });
+            return error.UnsafeArchiveLink;
+        };
+    }
+}
+
 fn extractTarball(allocator: std.mem.Allocator, tarball_path: []const u8, output_dir: []const u8) !void {
-    debug_log.log("extractTarball: {s} -> {s}", .{ tarball_path, output_dir });
+    debug_log.log("extractTarball: inspecting archive {s}", .{tarball_path});
+    try inspectTarballArchive(tarball_path);
+    debug_log.log("extractTarball: extracting {s} -> {s}", .{ tarball_path, output_dir });
     var tar = std.process.Child.init(&.{ "tar", "xzf", tarball_path, "--strip-components=1", "-C", output_dir }, allocator);
     tar.stdin_behavior = .Ignore;
     tar.stdout_behavior = .Inherit;
     tar.stderr_behavior = .Inherit;
+    debug_log.log("extractTarball: spawning tar", .{});
     try tar.spawn();
     const term = try tar.wait();
     if (term.Exited != 0) return error.ExtractFailed;
+    debug_log.log("extractTarball: validating extracted tree {s}", .{output_dir});
+    try validateExtractedTree(allocator, output_dir);
 }
 
 fn downloadReleaseTarball(allocator: std.mem.Allocator, tarball_url: []const u8, output_path: []const u8) !void {
-    debug_log.log("downloadReleaseTarball: {s}", .{tarball_url});
+    debug_log.log("downloadReleaseTarball: downloading {s} -> {s}", .{ tarball_url, output_path });
     const response = curl.get(allocator, tarball_url, &.{
         "Accept: application/vnd.github+json",
         "User-Agent: cog-cli",
@@ -1399,9 +1520,22 @@ fn downloadReleaseTarball(allocator: std.mem.Allocator, tarball_url: []const u8,
     const file = try std.fs.createFileAbsolute(output_path, .{});
     defer file.close();
     try file.writeAll(response.body);
+    debug_log.log("downloadReleaseTarball: wrote {d} bytes to {s}", .{ response.body.len, output_path });
 }
 
-pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, requested_version: ?[]const u8, install_dir_name: ?[]const u8) !InstallResult {
+fn ensureBuildTrusted(build_cmd: []const u8, options: InstallOptions) !void {
+    if (build_cmd.len == 0) {
+        debug_log.log("ensureBuildTrusted: no build command requested", .{});
+        return;
+    }
+    if (!options.trust_build) {
+        debug_log.log("ensureBuildTrusted: rejected untrusted downloaded build command", .{});
+        return error.UntrustedBuildCommand;
+    }
+    debug_log.log("ensureBuildTrusted: explicit trust granted for downloaded build command", .{});
+}
+
+pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, requested_version: ?[]const u8, install_dir_name: ?[]const u8, options: InstallOptions) !InstallResult {
     const resolved_name = install_dir_name orelse blk: {
         var name = std.fs.path.basename(git_url);
         if (std.mem.endsWith(u8, name, ".git")) {
@@ -1410,10 +1544,11 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
         break :blk name;
     };
 
-    if (resolved_name.len == 0) {
-        printErr("error: could not extract extension name from URL\n");
+    validateExtensionName(resolved_name) catch {
+        debug_log.log("installExtensionToDir: rejected unsafe install directory name {s}", .{resolved_name});
+        printErr("error: extension install directory name must be a safe basename\n");
         return error.Explained;
-    }
+    };
 
     const config_dir = paths.getGlobalConfigDir(allocator) catch {
         printErr("error: could not determine config directory\n");
@@ -1427,10 +1562,15 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
     const ext_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ext_base, resolved_name });
     defer allocator.free(ext_dir);
 
-    const tmp_dir = try std.fmt.allocPrint(allocator, "{s}/{s}.tmp", .{ ext_base, resolved_name });
-    defer allocator.free(tmp_dir);
+    const staging_sequence = staging_counter.fetchAdd(1, .monotonic);
+    const staged_name = try std.fmt.allocPrint(allocator, ".{s}.stage-{d}-{d}", .{ resolved_name, std.time.nanoTimestamp(), staging_sequence });
+    defer allocator.free(staged_name);
+    const staged_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ext_base, staged_name });
+    defer allocator.free(staged_dir);
 
-    const tarball_path = try std.fmt.allocPrint(allocator, "{s}/{s}.tar.gz", .{ ext_base, resolved_name });
+    const tarball_name = try std.fmt.allocPrint(allocator, ".{s}.download-{d}-{d}.tar.gz", .{ resolved_name, std.time.nanoTimestamp(), staging_sequence });
+    defer allocator.free(tarball_name);
+    const tarball_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ext_base, tarball_name });
     defer allocator.free(tarball_path);
 
     std.fs.makeDirAbsolute(config_dir) catch |err| switch (err) {
@@ -1451,75 +1591,77 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
     const release = try resolveGithubRelease(allocator, git_url, requested_version);
     defer freeResolvedRelease(allocator, &release);
 
-    deleteTreeIfExistsAbsolute(tmp_dir) catch {
-        printErr("error: failed to clean temporary extension directory\n");
+    debug_log.log("installExtensionToDir: creating unique stage {s}", .{staged_dir});
+    std.fs.makeDirAbsolute(staged_dir) catch {
+        printErr("error: failed to create temporary extension directory\n");
         return error.Explained;
     };
-    std.fs.deleteFileAbsolute(tarball_path) catch {};
-
-    std.fs.makeDirAbsolute(tmp_dir) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            printErr("error: failed to create temporary extension directory\n");
-            return error.Explained;
-        },
-    };
-    errdefer deleteTreeIfExistsAbsolute(tmp_dir) catch {};
+    errdefer deleteTreeIfExistsAbsolute(staged_dir) catch {};
     errdefer std.fs.deleteFileAbsolute(tarball_path) catch {};
 
     downloadReleaseTarball(allocator, release.tarball_url, tarball_path) catch {
         printErr("error: failed to download extension release tarball\n");
         return error.Explained;
     };
-    extractTarball(allocator, tarball_path, tmp_dir) catch {
+    extractTarball(allocator, tarball_path, staged_dir) catch {
         printErr("error: failed to extract extension release tarball\n");
         return error.Explained;
     };
     std.fs.deleteFileAbsolute(tarball_path) catch {};
 
-    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/cog-extension.json", .{tmp_dir});
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/cog-extension.json", .{staged_dir});
     defer allocator.free(manifest_path);
 
+    debug_log.log("installExtensionToDir: validating staged manifest {s}", .{manifest_path});
     const manifest = readManifest(allocator, manifest_path) catch {
         printErr("error: no valid cog-extension.json found in extension release\n");
         return error.Explained;
     };
     defer freeManifest(allocator, &manifest);
 
-    const build_args: []const []const u8 = &.{ "/bin/sh", "-c", manifest.build_cmd };
-    var build_proc = std.process.Child.init(build_args, allocator);
-    build_proc.stderr_behavior = .Inherit;
-    build_proc.stdout_behavior = .Inherit;
-    build_proc.cwd = tmp_dir;
-    debug_log.log("installExtensionToDir: build in {s}", .{tmp_dir});
-    try build_proc.spawn();
-    const build_term = try build_proc.wait();
-    if (build_term.Exited != 0) {
-        printErr("error: build command failed\n");
+    validateExtensionName(manifest.name) catch {
+        debug_log.log("installExtensionToDir: rejected unsafe manifest name {s}", .{manifest.name});
+        printErr("error: extension manifest name must be a safe binary basename\n");
         return error.Explained;
+    };
+    debug_log.log("installExtensionToDir: validated manifest name {s}", .{manifest.name});
+
+    ensureBuildTrusted(manifest.build_cmd, options) catch {
+        printErr("error: extension build command requires explicit --trust-build consent\n");
+        return error.Explained;
+    };
+    if (manifest.build_cmd.len > 0) {
+        const build_args: []const []const u8 = &.{ "/bin/sh", "-c", manifest.build_cmd };
+        var build_proc = std.process.Child.init(build_args, allocator);
+        build_proc.stderr_behavior = .Inherit;
+        build_proc.stdout_behavior = .Inherit;
+        build_proc.cwd = staged_dir;
+        debug_log.log("installExtensionToDir: spawning trusted build in {s}", .{staged_dir});
+        try build_proc.spawn();
+        const build_term = try build_proc.wait();
+        if (build_term.Exited != 0) {
+            printErr("error: build command failed\n");
+            return error.Explained;
+        }
+        debug_log.log("installExtensionToDir: trusted build completed", .{});
     }
 
-    const bin_path = try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ tmp_dir, manifest.name });
+    const bin_path = try std.fmt.allocPrint(allocator, "{s}/bin/{s}", .{ staged_dir, manifest.name });
     defer allocator.free(bin_path);
-    const bin_exists = blk: {
-        const f = std.fs.openFileAbsolute(bin_path, .{}) catch break :blk false;
-        f.close();
-        break :blk true;
-    };
-    if (!bin_exists) {
+    debug_log.log("installExtensionToDir: verifying staged binary {s}", .{bin_path});
+    const bin_stat = std.fs.cwd().statFile(bin_path) catch {
         printErr("error: build did not produce binary at bin/");
         printErr(manifest.name);
         printErr("\n");
         return error.Explained;
+    };
+    if (bin_stat.kind != .file) {
+        printErr("error: staged extension binary is not a regular file\n");
+        return error.Explained;
     }
 
-    writeInstallMetadata(allocator, tmp_dir, git_url, release) catch {
+    writeInstallMetadata(allocator, staged_dir, git_url, release) catch {
         printErr("error: failed to write extension install metadata\n");
-        return error.Explained;
-    };
-
-    deleteTreeIfExistsAbsolute(ext_dir) catch {
-        printErr("error: failed to replace existing extension install\n");
         return error.Explained;
     };
 
@@ -1528,10 +1670,13 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
         return error.Explained;
     };
     defer ext_parent_dir.close();
-    ext_parent_dir.rename(std.fs.path.basename(tmp_dir), std.fs.path.basename(ext_dir)) catch {
+    debug_log.log("installExtensionToDir: promoting {s} to live {s}", .{ staged_name, resolved_name });
+    fs_util.replaceDirectoryTransactional(ext_parent_dir, allocator, resolved_name, staged_name) catch |err| {
+        debug_log.log("installExtensionToDir: promotion failed: {s}", .{@errorName(err)});
         printErr("error: failed to finalize extension install\n");
         return error.Explained;
     };
+    debug_log.log("installExtensionToDir: promoted extension {s}", .{resolved_name});
 
     return .{
         .name = try allocator.dupe(u8, manifest.name),
@@ -1561,9 +1706,9 @@ fn printStdout(text: []const u8) void {
 // ── Extension Install ───────────────────────────────────────────────────
 
 /// Install an extension from a GitHub release tarball.
-pub fn installExtension(allocator: std.mem.Allocator, git_url: []const u8, requested_version: ?[]const u8) !void {
-    debug_log.log("installExtension: {s} version={?s}", .{ git_url, requested_version });
-    const install_result = try installExtensionToDir(allocator, git_url, requested_version, null);
+pub fn installExtension(allocator: std.mem.Allocator, git_url: []const u8, requested_version: ?[]const u8, options: InstallOptions) !void {
+    debug_log.log("installExtension: {s} version={?s} trust_build={}", .{ git_url, requested_version, options.trust_build });
+    const install_result = try installExtensionToDir(allocator, git_url, requested_version, null, options);
     defer freeInstallResult(allocator, &install_result);
 
     // Output JSON
@@ -1588,8 +1733,8 @@ pub fn installExtension(allocator: std.mem.Allocator, git_url: []const u8, reque
     printStdout(result);
 }
 
-pub fn updateExtensions(allocator: std.mem.Allocator, requested_name: ?[]const u8) !void {
-    debug_log.log("updateExtensions: start name={?s}", .{requested_name});
+pub fn updateExtensions(allocator: std.mem.Allocator, requested_name: ?[]const u8, options: InstallOptions) !void {
+    debug_log.log("updateExtensions: start name={?s} trust_build={}", .{ requested_name, options.trust_build });
     const config_dir = paths.getGlobalConfigDir(allocator) catch {
         printErr("error: could not determine config directory\n");
         return error.Explained;
@@ -1643,7 +1788,7 @@ pub fn updateExtensions(allocator: std.mem.Allocator, requested_name: ?[]const u
 
         debug_log.log("updateExtensions: {s} {s} -> {s}", .{ entry.name, metadata.tag, latest_release.tag_name });
 
-        const install_result = try installExtensionToDir(allocator, metadata.source_url, null, entry.name);
+        const install_result = try installExtensionToDir(allocator, metadata.source_url, null, entry.name, options);
         defer freeInstallResult(allocator, &install_result);
 
         try s.beginObject();
@@ -1684,18 +1829,124 @@ pub fn updateExtensions(allocator: std.mem.Allocator, requested_name: ?[]const u
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+const TestTarEntry = union(enum) {
+    file: struct {
+        path: []const u8,
+        contents: []const u8,
+    },
+    symlink: struct {
+        path: []const u8,
+        target: []const u8,
+    },
+};
+
+fn writeTestTarball(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    file_name: []const u8,
+    entries: []const TestTarEntry,
+) ![]u8 {
+    var tar_bytes: std.io.Writer.Allocating = .init(allocator);
+    defer tar_bytes.deinit();
+    var tar_writer: std.tar.Writer = .{ .underlying_writer = &tar_bytes.writer };
+    for (entries) |entry| {
+        switch (entry) {
+            .file => |file| try tar_writer.writeFileBytes(file.path, file.contents, .{}),
+            .symlink => |link| try tar_writer.writeLink(link.path, link.target, .{}),
+        }
+    }
+    try tar_writer.finishPedantically();
+
+    const tar_file_name = try std.fmt.allocPrint(allocator, "{s}.tar", .{file_name});
+    defer allocator.free(tar_file_name);
+    try dir.writeFile(.{ .sub_path = tar_file_name, .data = tar_bytes.written() });
+    defer dir.deleteFile(tar_file_name) catch {};
+
+    const tar_path = try dir.realpathAlloc(allocator, tar_file_name);
+    defer allocator.free(tar_path);
+    const archive_path = try dir.realpathAlloc(allocator, ".");
+    defer allocator.free(archive_path);
+    const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ archive_path, file_name });
+    errdefer allocator.free(output_path);
+
+    var gzip_proc = std.process.Child.init(&.{ "gzip", "-c", tar_path }, allocator);
+    gzip_proc.stdin_behavior = .Ignore;
+    gzip_proc.stdout_behavior = .Pipe;
+    gzip_proc.stderr_behavior = .Ignore;
+    try gzip_proc.spawn();
+    const gzip_output = try gzip_proc.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(gzip_output);
+    const term = try gzip_proc.wait();
+    if (term.Exited != 0) return error.TestGzipFailed;
+
+    try dir.writeFile(.{ .sub_path = file_name, .data = gzip_output });
+    return output_path;
+}
+
 test "validateArchiveEntryPath rejects traversal and absolute paths" {
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("../outside"));
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("root/../../outside"));
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("/tmp/outside"));
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("C:\\outside"));
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("\\outside"));
     try validateArchiveEntryPath("root/bin/cog-safe");
 }
 
 test "validateArchiveSymlink rejects links escaping the staged tree" {
-    try validateArchiveSymlink("root/bin/cog-safe", "../lib/cog-safe");
-    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("root/bin/cog-safe", "../../../outside"));
-    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("root/bin/cog-safe", "/tmp/outside"));
+    try validateArchiveSymlink("bin/cog-safe", "../lib/cog-safe");
+    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("bin/cog-safe", "../../outside"));
+    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("bin/cog-safe", "/tmp/outside"));
+    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("bin/cog-safe", "\\outside"));
+    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("nested/../bin/cog-safe", "../../outside"));
+}
+
+test "inspectTarballArchive rejects unsafe archive contents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const traversal_path = try writeTestTarball(allocator, tmp.dir, "traversal.tar.gz", &.{
+        .{ .file = .{ .path = "root/../outside", .contents = "unsafe" } },
+    });
+    defer allocator.free(traversal_path);
+    try std.testing.expectError(error.UnsafeArchivePath, inspectTarballArchive(traversal_path));
+
+    const absolute_path = try writeTestTarball(allocator, tmp.dir, "absolute.tar.gz", &.{
+        .{ .file = .{ .path = "/tmp/outside", .contents = "unsafe" } },
+    });
+    defer allocator.free(absolute_path);
+    try std.testing.expectError(error.UnsafeArchivePath, inspectTarballArchive(absolute_path));
+
+    const symlink_path = try writeTestTarball(allocator, tmp.dir, "symlink.tar.gz", &.{
+        .{ .symlink = .{ .path = "root/bin/cog-safe", .target = "../../outside" } },
+    });
+    defer allocator.free(symlink_path);
+    try std.testing.expectError(error.UnsafeArchiveLink, inspectTarballArchive(symlink_path));
+}
+
+test "inspectTarballArchive accepts contained archive contents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const archive_path = try writeTestTarball(allocator, tmp.dir, "safe.tar.gz", &.{
+        .{ .file = .{ .path = "root/cog-extension.json", .contents = "{}" } },
+        .{ .file = .{ .path = "root/bin/cog-safe", .contents = "binary" } },
+        .{ .symlink = .{ .path = "root/bin/cog-safe-link", .target = "cog-safe" } },
+    });
+    defer allocator.free(archive_path);
+    try inspectTarballArchive(archive_path);
+}
+
+test "validateExtensionName accepts basenames and rejects path syntax" {
+    try validateExtensionName("cog-safe");
+    try validateExtensionName("cog_safe.v2");
+    try std.testing.expectError(error.UnsafeExtensionName, validateExtensionName(""));
+    try std.testing.expectError(error.UnsafeExtensionName, validateExtensionName("."));
+    try std.testing.expectError(error.UnsafeExtensionName, validateExtensionName(".."));
+    try std.testing.expectError(error.UnsafeExtensionName, validateExtensionName("../outside"));
+    try std.testing.expectError(error.UnsafeExtensionName, validateExtensionName("nested\\outside"));
+    try std.testing.expectError(error.UnsafeExtensionName, validateExtensionName("C:outside"));
 }
 
 test "ensureBuildTrusted fails closed for downloaded shell commands" {
