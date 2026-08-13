@@ -10,6 +10,8 @@ const reset = "\x1B[0m";
 
 var staging_counter = std.atomic.Value(u64).init(0);
 
+const max_extension_archive_bytes: usize = 256 * 1024 * 1024;
+
 // ── Debug Config Types ──────────────────────────────────────────────────
 
 pub const DebuggerType = enum { native, dap };
@@ -1898,6 +1900,7 @@ fn writeTestTarball(
 
 test "validateArchiveEntryPath rejects traversal and absolute paths" {
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("../outside"));
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("root/../outside"));
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("root/../../outside"));
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("/tmp/outside"));
     try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("C:\\outside"));
@@ -1972,6 +1975,40 @@ test "ensureBuildTrusted fails closed for downloaded shell commands" {
     try ensureBuildTrusted("", .{});
     try ensureBuildTrusted("zig build -Doptimize=ReleaseSafe", .{ .trust_build = true });
     try std.testing.expectError(error.UntrustedBuildCommand, ensureBuildTrusted("zig build", .{}));
+}
+
+test "prepareInstallResult allocates complete owned result before promotion" {
+    const allocator = std.testing.allocator;
+    const result = try prepareInstallResult(
+        allocator,
+        "cog-safe",
+        "/tmp/extensions/cog-safe",
+        "1.2.3",
+        "v1.2.3",
+    );
+    defer freeInstallResult(allocator, &result);
+
+    try std.testing.expectEqualStrings("cog-safe", result.name);
+    try std.testing.expectEqualStrings("/tmp/extensions/cog-safe", result.path);
+    try std.testing.expectEqualStrings("1.2.3", result.version);
+    try std.testing.expectEqualStrings("v1.2.3", result.tag);
+}
+
+test "prepareInstallResult frees partial ownership on allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 2 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        prepareInstallResult(
+            failing_allocator.allocator(),
+            "cog-safe",
+            "/tmp/extensions/cog-safe",
+            "1.2.3",
+            "v1.2.3",
+        ),
+    );
 }
 
 test "writeInstallMetadata writes pretty JSON atomically" {
