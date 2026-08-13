@@ -3483,21 +3483,101 @@ test "dashboard send writes a complete JSON line" {
     try std.testing.expectEqualStrings("{\"type\":\"run\"}\n", received[0..count]);
 }
 
-test "dashboard replay retains session-scoped breakpoint state" {
+test "dashboard replay retains per-session status and breakpoint capacity" {
     var server = DebugServer.init(std.testing.allocator);
     defer server.deinit();
-    server.rememberDashboardLaunch("session-1", "/tmp/app", "native");
-    server.rememberDashboardBreakpoint("session-1", "set", .{ .id = 7, .verified = true, .file = "/tmp/app.c", .line = 42 });
+    server.rememberDashboardLaunch("session-1", "/tmp/app", "native", "running");
+
+    for (0..32) |index| {
+        server.rememberDashboardBreakpoint("session-1", "set", .{
+            .id = @intCast(index + 1),
+            .verified = false,
+            .file = "/tmp/app.c",
+            .line = @intCast(index + 1),
+        });
+    }
+    server.rememberDashboardBreakpoint("session-1", "set", .{
+        .id = 32,
+        .verified = true,
+        .file = "/tmp/updated.c",
+        .line = 99,
+    });
 
     try std.testing.expectEqual(@as(usize, 1), server.dashboard_session_count);
     try std.testing.expectEqualStrings("/tmp/app", server.dashboard_sessions[0].programSlice());
-    try std.testing.expectEqual(@as(usize, 1), server.dashboard_breakpoint_count);
-    try std.testing.expectEqualStrings("session-1", server.dashboard_breakpoints[0].sessionIdSlice());
+    try std.testing.expectEqualStrings("running", server.dashboard_sessions[0].statusSlice());
+    try std.testing.expectEqual(@as(usize, 32), server.dashboard_sessions[0].breakpoint_count);
+    try std.testing.expect(server.dashboard_sessions[0].breakpoints[31].verified);
+    try std.testing.expectEqualStrings("/tmp/updated.c", server.dashboard_sessions[0].breakpoints[31].fileSlice());
 
-    server.rememberDashboardBreakpoint("session-1", "remove", .{ .id = 7, .verified = false, .file = "", .line = 0 });
+    server.rememberDashboardBreakpoint("session-1", "remove", .{ .id = 32, .verified = false, .file = "", .line = 0 });
     server.forgetDashboardSession("session-1");
-    try std.testing.expectEqual(@as(usize, 0), server.dashboard_breakpoint_count);
     try std.testing.expectEqual(@as(usize, 0), server.dashboard_session_count);
+}
+
+test "dashboard replay cache matches TUI session capacity" {
+    var server = DebugServer.init(std.testing.allocator);
+    defer server.deinit();
+
+    for (0..16) |index| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "session-{d}", .{index + 1});
+        server.rememberDashboardLaunch(id, "/tmp/app", "native", "stopped");
+        server.rememberDashboardBreakpoint(id, "set", .{
+            .id = 1,
+            .verified = true,
+            .file = "/tmp/app.c",
+            .line = 1,
+        });
+    }
+
+    try std.testing.expectEqual(@as(usize, 16), server.dashboard_session_count);
+    for (server.dashboard_sessions[0..server.dashboard_session_count]) |*session| {
+        try std.testing.expectEqual(@as(usize, 1), session.breakpoint_count);
+    }
+}
+
+test "dashboard session end state is retained until delivery" {
+    var server = DebugServer.init(std.testing.allocator);
+    defer server.deinit();
+    server.rememberDashboardLaunch("session-1", "/tmp/app", "native", "stopped");
+    server.dashboard_available = false;
+    server.dashboard_failure_count = 1;
+    server.last_dashboard_attempt_ms = std.time.milliTimestamp();
+
+    try std.testing.expect(!server.emitSessionEndEvent("session-1"));
+    try std.testing.expectEqual(@as(usize, 1), server.dashboard_session_count);
+    try std.testing.expect(server.dashboard_sessions[0].pending_end);
+}
+
+test "dashboard stop event stays within protocol frame limit" {
+    var server = DebugServer.init(std.testing.allocator);
+    defer server.deinit();
+    const adversarial = [_]u8{0x1b} ** 512;
+    const frames = [_]types.StackFrame{.{
+        .id = 1,
+        .name = &adversarial,
+        .source = &adversarial,
+        .line = 1,
+    }} ** 32;
+    const locals = [_]types.Variable{.{
+        .name = &adversarial,
+        .value = &adversarial,
+        .type = &adversarial,
+    }} ** 32;
+    const state = types.StopState{
+        .stop_reason = .breakpoint,
+        .location = .{ .file = &adversarial, .line = 1, .function = &adversarial },
+        .stack_trace = &frames,
+        .locals = &locals,
+    };
+
+    const event = try server.buildStopEvent(std.testing.allocator, "session-1", "continue", state);
+    defer std.testing.allocator.free(event);
+    try std.testing.expect(event.len < 8192);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("stop", parsed.value.object.get("type").?.string);
 }
 
 test "dashboard reconnect backoff grows and stays bounded" {

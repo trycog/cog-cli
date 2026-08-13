@@ -1925,11 +1925,17 @@ test "client framing drops oversized lines and resynchronizes at newline" {
     try std.testing.expectEqual(@as(usize, 0), tui.client_buf_lens[idx]);
 }
 
-test "copyInto strips terminal control characters" {
+test "copyInto preserves semantic source bytes" {
     var dest: [64]u8 = undefined;
     var len: usize = 0;
-    copyInto(&dest, &len, "safe\x1b[2J\r\n\ttext\x07");
-    try std.testing.expectEqualStrings("safetext", dest[0..len]);
+    copyInto(&dest, &len, "\tindented\ttext");
+    try std.testing.expectEqualStrings("\tindented\ttext", dest[0..len]);
+}
+
+test "terminal sanitizer strips escape and control sequences" {
+    var dest: [64]u8 = undefined;
+    const sanitized = sanitizeTerminalText(&dest, "safe\x1b[2J\r\n\ttext\x07");
+    try std.testing.expectEqualStrings("safetext", sanitized);
 }
 
 test "DashboardTui initializes with empty state" {
@@ -1941,18 +1947,54 @@ test "DashboardTui initializes with empty state" {
     try std.testing.expect(tui.listener == null);
 }
 
-test "processEvent launch replay is idempotent" {
+test "processEvent launch replay is idempotent and preserves status" {
     var tui = DashboardTui.init(std.testing.allocator);
     tui.processEvent(
-        \\{"type":"launch","session_id":"session-1","program":"/tmp/first","driver":"native"}
+        \\{"type":"launch","source_id":"source-a","session_id":"session-1","program":"/tmp/first","driver":"native","status":"running"}
     );
     tui.processEvent(
-        \\{"type":"launch","session_id":"session-1","program":"/tmp/replayed","driver":"dap"}
+        \\{"type":"launch","source_id":"source-a","session_id":"session-1","program":"/tmp/replayed","driver":"dap","status":"running"}
     );
 
     try std.testing.expectEqual(@as(usize, 1), tui.session_count);
     try std.testing.expectEqualStrings("/tmp/replayed", tui.sessions[0].programSlice());
     try std.testing.expectEqualStrings("dap", tui.sessions[0].driverTypeSlice());
+    try std.testing.expectEqualStrings("running", tui.sessions[0].statusSlice());
+}
+
+test "processEvent namespaces identical session IDs by source" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    tui.processEvent(
+        \\{"type":"launch","source_id":"source-a","session_id":"session-1","program":"/tmp/a","driver":"native","status":"stopped"}
+    );
+    tui.processEvent(
+        \\{"type":"launch","source_id":"source-b","session_id":"session-1","program":"/tmp/b","driver":"dap","status":"running"}
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), tui.session_count);
+    try std.testing.expectEqualStrings("source-a", tui.sessions[0].sourceIdSlice());
+    try std.testing.expectEqualStrings("source-b", tui.sessions[1].sourceIdSlice());
+    try std.testing.expectEqualStrings("/tmp/a", tui.sessions[0].programSlice());
+    try std.testing.expectEqualStrings("/tmp/b", tui.sessions[1].programSlice());
+}
+
+test "new source generation does not retain stale session state" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    tui.processEvent(
+        \\{"type":"launch","source_id":"generation-old","session_id":"session-1","program":"/tmp/old","driver":"native","status":"stopped"}
+    );
+    tui.processEvent(
+        \\{"type":"breakpoint","source_id":"generation-old","session_id":"session-1","action":"set","bp":{"id":1,"file":"/tmp/old.c","line":4,"verified":true}}
+    );
+    tui.processEvent(
+        \\{"type":"launch","source_id":"generation-new","session_id":"session-1","program":"/tmp/new","driver":"native","status":"stopped"}
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), tui.session_count);
+    try std.testing.expectEqual(@as(usize, 1), tui.sessions[0].bp_count);
+    try std.testing.expectEqual(@as(usize, 0), tui.sessions[1].bp_count);
+    try std.testing.expectEqual(@as(usize, 0), tui.sessions[1].frame_count);
+    try std.testing.expectEqual(@as(usize, 0), tui.sessions[1].local_count);
 }
 
 test "processEvent handles launch event" {
@@ -1980,6 +2022,29 @@ test "processEvent breakpoint replay is idempotent" {
     tui.processEvent(event);
     tui.processEvent(event);
     try std.testing.expectEqual(@as(usize, 1), tui.sessions[0].bp_count);
+}
+
+test "processEvent updates existing breakpoint at full capacity" {
+    var tui = DashboardTui.init(std.testing.allocator);
+    tui.processEvent(
+        \\{"type":"launch","source_id":"source-a","session_id":"session-1","program":"/tmp/test","driver":"native","status":"stopped"}
+    );
+
+    for (0..MAX_BREAKPOINTS) |index| {
+        var event_buf: [256]u8 = undefined;
+        const event = try std.fmt.bufPrint(&event_buf,
+            \\{{"type":"breakpoint","source_id":"source-a","session_id":"session-1","action":"set","bp":{{"id":{d},"file":"/tmp/test.c","line":{d},"verified":false}}}}
+        , .{ index + 1, index + 1 });
+        tui.processEvent(event);
+    }
+    tui.processEvent(
+        \\{"type":"breakpoint","source_id":"source-a","session_id":"session-1","action":"set","bp":{"id":32,"file":"/tmp/updated.c","line":99,"verified":true}}
+    );
+
+    try std.testing.expectEqual(@as(usize, MAX_BREAKPOINTS), tui.sessions[0].bp_count);
+    try std.testing.expect(tui.sessions[0].breakpoints[31].verified);
+    try std.testing.expectEqualStrings("/tmp/updated.c", tui.sessions[0].breakpoints[31].fileSlice());
+    try std.testing.expectEqual(@as(u32, 99), tui.sessions[0].breakpoints[31].line);
 }
 
 test "processEvent handles breakpoint set event" {
@@ -2170,6 +2235,20 @@ test "loadSourceContext reads source lines from file" {
 
     // First line should be line 1 (since we have < 10 lines before target)
     try std.testing.expectEqual(@as(u32, 1), session.source_lines[0].line_num);
+}
+
+test "loadSourceContext preserves tab indentation" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "tabs.c", .data = "int main() {\n\treturn 0;\n}\n" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try tmp_dir.dir.realpath("tabs.c", &path_buf);
+    var session: TuiSession = .{};
+    loadSourceContext(&session, abs_path, 2);
+
+    const current = &session.source_lines[session.source_current_idx];
+    try std.testing.expectEqualStrings("\treturn 0;", current.textSlice());
 }
 
 test "loadSourceContext with line 0 loads nothing" {

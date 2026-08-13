@@ -325,6 +325,28 @@ pub const DaemonServer = struct {
     }
 };
 
+test "reaping a session queues dashboard end until delivery" {
+    var daemon = DaemonServer.init(std.testing.allocator, 1);
+    defer daemon.deinit();
+
+    var mock = @import("driver.zig").MockDriver{};
+    const session_id = try daemon.server.session_manager.createSession(mock.activeDriver(), null, .none);
+    const id_copy = try std.testing.allocator.dupe(u8, session_id);
+    defer std.testing.allocator.free(id_copy);
+    daemon.server.rememberDashboardLaunch(session_id, "/tmp/app", "native", "stopped");
+    const session = daemon.server.session_manager.sessions.get(session_id).?;
+    session.last_activity = std.time.milliTimestamp() - 100;
+    daemon.server.dashboard_available = false;
+    daemon.server.dashboard_failure_count = 1;
+    daemon.server.last_dashboard_attempt_ms = std.time.milliTimestamp();
+
+    daemon.reapOrphanedSessions();
+
+    try std.testing.expect(daemon.server.session_manager.sessions.get(id_copy) == null);
+    try std.testing.expectEqual(@as(usize, 1), daemon.server.dashboard_session_count);
+    try std.testing.expect(daemon.server.dashboard_sessions[0].pending_end);
+}
+
 // ── Signal Handling ─────────────────────────────────────────────────────
 
 test "orphan reaper synchronizes active run teardown" {
