@@ -1188,6 +1188,31 @@ pub const DapProxy = struct {
         return try frames.toOwnedSlice(allocator);
     }
 
+    pub fn translateReadMemory(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+        const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.InvalidResponse;
+        if (parsed.value.object.get("success")) |success| {
+            if (success != .bool or !success.bool) return error.NotSupported;
+        }
+        const body = parsed.value.object.get("body") orelse return error.NotSupported;
+        if (body != .object) return error.NotSupported;
+        const data_val = body.object.get("data") orelse return error.NotSupported;
+        if (data_val != .string) return error.NotSupported;
+
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(data_val.string) catch return error.InvalidResponse;
+        const decoded = try allocator.alloc(u8, decoded_len);
+        defer allocator.free(decoded);
+        decoder.decode(decoded, data_val.string) catch return error.InvalidResponse;
+
+        const hex = try allocator.alloc(u8, decoded.len * 2);
+        errdefer allocator.free(hex);
+        _ = std.fmt.bufPrint(hex, "{x}", .{decoded}) catch return error.InvalidResponse;
+        return hex;
+    }
+
     pub fn translateVariables(allocator: std.mem.Allocator, data: []const u8) ![]Variable {
         const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
         defer parsed.deinit();
@@ -2723,24 +2748,11 @@ pub const DapProxy = struct {
         const resp = try self.sendRequest(allocator, msg);
         defer allocator.free(resp);
 
-        // Parse response: body.data is base64 encoded
-        const parsed = try json.parseFromSlice(json.Value, allocator, resp, .{});
-        defer parsed.deinit();
-
-        if (parsed.value != .object) return error.InvalidResponse;
-
-        // Check for success: false (e.g. vscode-js-debug advertises supportsReadMemoryRequest
-        // for WASM but arbitrary addresses fail).
-        if (parsed.value.object.get("success")) |s| {
-            if (s == .bool and !s.bool) return error.NotSupported;
-        }
-
-        const body = parsed.value.object.get("body") orelse return error.NotSupported;
-        if (body != .object) return error.NotSupported;
-        const data_val = body.object.get("data") orelse return error.NotSupported;
-        if (data_val != .string) return error.NotSupported;
-
-        return try allocator.dupe(u8, data_val.string);
+        // DAP returns base64 bytes; the driver contract exposes lowercase hex
+        // so the MCP memory tool uses the same representation for all backends.
+        const hex = try translateReadMemory(allocator, resp);
+        debug_log.log("dap.proxy: decoded readMemory response address=0x{x} bytes={d}", .{ address, hex.len / 2 });
+        return hex;
     }
 
     fn proxyWriteMemory(ctx: *anyopaque, allocator: std.mem.Allocator, address: u64, data: []const u8) anyerror!void {
@@ -4167,6 +4179,27 @@ test "DapProxy vtable includes new WP11 function pointers" {
     try std.testing.expect(vt.cancelFn != null);
     try std.testing.expect(vt.terminateThreadsFn != null);
     try std.testing.expect(vt.restartFn != null);
+}
+
+test "DapProxy decodes readMemory base64 to documented hex" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"seq":2,"type":"response","request_seq":1,"command":"readMemory","success":true,"body":{"address":"0x1000","data":"AP+AQQ=="}}
+    ;
+
+    const hex = try DapProxy.translateReadMemory(allocator, response);
+    defer allocator.free(hex);
+
+    try std.testing.expectEqualStrings("00ff8041", hex);
+}
+
+test "DapProxy rejects invalid readMemory base64" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\{"seq":2,"type":"response","request_seq":1,"command":"readMemory","success":true,"body":{"address":"0x1000","data":"not-base64!"}}
+    ;
+
+    try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
 }
 
 test "DapProxy init and deinit cycle works cleanly" {
