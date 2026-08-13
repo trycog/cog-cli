@@ -190,7 +190,12 @@ fn expectWireType(field: protobuf.Field, expected: protobuf.WireType) !void {
 }
 
 fn readInt32(dec: *Decoder) !i32 {
-    return std.math.cast(i32, try dec.readVarint()) orelse error.IntegerOverflow;
+    const value = try dec.readVarint();
+    if (value <= std.math.maxInt(i32)) return @intCast(value);
+    if (value >= @as(u64, @bitCast(@as(i64, std.math.minInt(i32))))) {
+        return @truncate(@as(i64, @bitCast(value)));
+    }
+    return error.IntegerOverflow;
 }
 
 pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Index {
@@ -614,12 +619,12 @@ test "decode rejects int32 values outside the supported range" {
     const malformed = [_][]const u8{
         &.{
             0x0A, 0x0B, // Index.metadata
-            0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, // Metadata.version = max u64
+            0x08, 0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, // Metadata.version = 2^31
         },
         &.{
             0x12, 0x0D, // Index.documents
             0x12, 0x0B, // Document.occurrences
-            0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, // Occurrence.symbol_roles = max u64
+            0x18, 0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, // Occurrence.symbol_roles = 2^31
         },
     };
 

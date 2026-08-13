@@ -3,6 +3,10 @@ const scip = @import("scip.zig");
 const protobuf = @import("protobuf.zig");
 const Encoder = protobuf.Encoder;
 
+fn int32Varint(value: i32) u64 {
+    return @bitCast(@as(i64, value));
+}
+
 /// Encode a SCIP Index to protobuf bytes. Caller owns the returned slice.
 pub fn encodeIndex(allocator: std.mem.Allocator, index: scip.Index) ![]const u8 {
     var enc = Encoder.init(allocator);
@@ -38,7 +42,7 @@ pub fn encodeMetadata(allocator: std.mem.Allocator, metadata: scip.Metadata) ![]
     defer enc.deinit();
 
     // field 1: version (int32)
-    try enc.writeVarintField(1, @intCast(metadata.version));
+    try enc.writeVarintField(1, int32Varint(metadata.version));
 
     // field 2: tool_info
     const ti_bytes = try encodeToolInfo(allocator, metadata.tool_info);
@@ -51,7 +55,7 @@ pub fn encodeMetadata(allocator: std.mem.Allocator, metadata: scip.Metadata) ![]
     try enc.writeString(3, metadata.project_root);
 
     // field 4: text_document_encoding (int32)
-    try enc.writeVarintField(4, @intCast(metadata.text_document_encoding));
+    try enc.writeVarintField(4, int32Varint(metadata.text_document_encoding));
 
     return enc.toOwnedSlice();
 }
@@ -115,10 +119,10 @@ pub fn encodeOccurrence(allocator: std.mem.Allocator, occ: scip.Occurrence) ![]c
     try enc.writeString(2, occ.symbol);
 
     // field 3: symbol_roles
-    try enc.writeVarintField(3, @intCast(occ.symbol_roles));
+    try enc.writeVarintField(3, int32Varint(occ.symbol_roles));
 
     // field 5: syntax_kind
-    try enc.writeVarintField(5, @intCast(occ.syntax_kind));
+    try enc.writeVarintField(5, int32Varint(occ.syntax_kind));
 
     // field 7: enclosing_range (packed int32, same encoding as range)
     if (occ.enclosing_range) |er| {
@@ -153,7 +157,7 @@ pub fn encodeSymbolInformation(allocator: std.mem.Allocator, sym: scip.SymbolInf
     }
 
     // field 5: kind
-    try enc.writeVarintField(5, @intCast(sym.kind));
+    try enc.writeVarintField(5, int32Varint(sym.kind));
 
     // field 6: display_name
     try enc.writeString(6, sym.display_name);
@@ -188,6 +192,93 @@ pub fn encodeRelationship(allocator: std.mem.Allocator, rel: scip.Relationship) 
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "encoder preserves signed int32 protobuf values" {
+    const allocator = std.testing.allocator;
+    const occurrence: scip.Occurrence = .{
+        .range = .{ .start_line = -1, .start_char = -2, .end_line = -1, .end_char = -3 },
+        .symbol = "negative",
+        .symbol_roles = -1,
+        .syntax_kind = -2,
+    };
+
+    const encoded = try encodeOccurrence(allocator, occurrence);
+    defer allocator.free(encoded);
+
+    var document_bytes = Encoder.init(allocator);
+    defer document_bytes.deinit();
+    try document_bytes.writeLengthDelimited(2, encoded);
+
+    var index_bytes = Encoder.init(allocator);
+    defer index_bytes.deinit();
+    try index_bytes.writeLengthDelimited(2, document_bytes.data.items);
+
+    var index = try scip.decode(allocator, index_bytes.data.items);
+    defer scip.freeIndex(allocator, &index);
+
+    const decoded = index.documents[0].occurrences[0];
+    try std.testing.expectEqual(@as(i32, -1), decoded.range.start_line);
+    try std.testing.expectEqual(@as(i32, -2), decoded.range.start_char);
+    try std.testing.expectEqual(@as(i32, -3), decoded.range.end_char);
+    try std.testing.expectEqual(@as(i32, -1), decoded.symbol_roles);
+    try std.testing.expectEqual(@as(i32, -2), decoded.syntax_kind);
+}
+
+test "encodeIndex cleans up every partial allocation failure" {
+    var relationships = [_]scip.Relationship{
+        .{
+            .symbol = "target",
+            .is_reference = true,
+            .is_implementation = false,
+            .is_type_definition = false,
+            .is_definition = false,
+        },
+    };
+    var symbols = [_]scip.SymbolInformation{
+        .{
+            .symbol = "symbol",
+            .documentation = &.{ "first", "second" },
+            .relationships = &relationships,
+            .kind = 17,
+            .display_name = "symbol",
+            .enclosing_symbol = "scope",
+        },
+    };
+    var occurrences = [_]scip.Occurrence{
+        .{
+            .range = .{ .start_line = 1, .start_char = 2, .end_line = 1, .end_char = 3 },
+            .symbol = "symbol",
+            .symbol_roles = scip.SymbolRole.Definition,
+            .syntax_kind = 17,
+        },
+    };
+    var documents = [_]scip.Document{
+        .{
+            .language = "zig",
+            .relative_path = "src/main.zig",
+            .occurrences = &occurrences,
+            .symbols = &symbols,
+        },
+    };
+    var external_symbols = [_]scip.SymbolInformation{symbols[0]};
+    const index: scip.Index = .{
+        .metadata = .{
+            .version = 1,
+            .tool_info = .{ .name = "test", .version = "1" },
+            .project_root = "file:///test",
+            .text_document_encoding = 1,
+        },
+        .documents = &documents,
+        .external_symbols = &external_symbols,
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, encodeAndFree, .{index});
+}
+
+fn encodeAndFree(allocator: std.mem.Allocator, index: scip.Index) !void {
+    const encoded = try encodeIndex(allocator, index);
+    defer allocator.free(encoded);
+}
 
 test "round-trip empty Index" {
     const allocator = std.testing.allocator;
