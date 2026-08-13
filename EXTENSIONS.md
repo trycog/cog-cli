@@ -95,7 +95,7 @@ Create `cog-extension.json` in the repository root:
 | Placeholder | Replaced With |
 |-------------|---------------|
 | `{files}` | One argv entry per matched file path |
-| `{output}` | Temp file path for SCIP output (e.g., `/tmp/cog-index-12345.scip`) |
+| `{output}` | Opaque path to a private, project-local temporary file precreated by Cog |
 
 Extensions can optionally report per-file bulk progress on `stderr` using
 newline-delimited JSON events while writing the final SCIP payload to
@@ -115,8 +115,12 @@ bin/<name> <args with placeholders substituted>
 For example, with the manifest above:
 
 ```
-bin/cog-zig --output /tmp/cog-index-12345.scip /Users/me/project/lib/a.ex /Users/me/project/lib/b.ex
+bin/cog-zig --output <private-project-temp>/index-output.scip project/lib/a.ex project/lib/b.ex
 ```
+
+Treat the supplied `{output}` path as opaque. Cog precreates the file with
+restrictive permissions; truncate and write that same file rather than replacing
+it, renaming another file over it, or broadening its permissions.
 
 Cog invokes the extension once per language extension group and expands
 `{files}` inline on argv. The extension can then decide whether to process
@@ -396,7 +400,7 @@ These are built-in SCIP extension definitions. Cog invokes them as external proc
 - [ ] Binary accepts `{files}` and `{output}` arguments
 - [ ] Binary writes valid SCIP protobuf to the output path
 - [ ] Binary exits 0 on success, non-zero on failure
-- [ ] Binary does not write to stdout or stderr (both are ignored by Cog)
+- [ ] Binary does not write to stdout; stderr may contain supported NDJSON progress events or diagnostic lines
 - [ ] Paths in SCIP documents are relative to the project root
 - [ ] Occurrences include `symbol_roles` with the definition bit (`0x1`) set for definitions
 
@@ -455,7 +459,7 @@ func main() {
     }
 
     data, _ := proto.Marshal(index)
-    os.WriteFile(outputPath, data, 0644)
+    os.WriteFile(outputPath, data, 0600)
 }
 ```
 

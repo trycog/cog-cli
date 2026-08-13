@@ -14,6 +14,7 @@ const hooks_mod = @import("hooks.zig");
 const debug_log = @import("debug_log.zig");
 const paths = @import("paths.zig");
 const code_intel = @import("code_intel.zig");
+const debug_mod = @import("debug.zig");
 const fs_util = @import("fs_util.zig");
 const extensions_mod = @import("extensions.zig");
 const memory_mod = @import("memory.zig");
@@ -2164,59 +2165,12 @@ fn ensureCogGitignore(allocator: std.mem.Allocator) !void {
 
 fn signForDebug(allocator: std.mem.Allocator) void {
     printErr("  Signing for debug server... ");
-
-    // Get path to our own executable
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = std.fs.selfExePath(&buf) catch {
-        printErr("skipped (could not find executable path)\n");
+    debug_mod.ensureDebugEntitlements(allocator) catch {
+        printErr("skipped (codesign failed)\n");
         return;
     };
-
-    // Write temporary entitlements plist
-    const tmp_path = "/tmp/cog-debug-entitlements.plist";
-    const plist =
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<plist version="1.0">
-        \\<dict>
-        \\    <key>com.apple.security.cs.debugger</key>
-        \\    <true/>
-        \\</dict>
-        \\</plist>
-        \\
-    ;
-    const tmp_file = std.fs.cwd().createFile(tmp_path, .{}) catch {
-        printErr("skipped (could not write entitlements)\n");
-        return;
-    };
-    tmp_file.writeAll(plist) catch {
-        tmp_file.close();
-        printErr("skipped (could not write entitlements)\n");
-        return;
-    };
-    tmp_file.close();
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
-    // Run codesign
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "codesign", "--entitlements", tmp_path, "-fs", "-", exe_path },
-    }) catch {
-        printErr("skipped (codesign not available)\n");
-        return;
-    };
-    allocator.free(result.stdout);
-    allocator.free(result.stderr);
-
-    switch (result.term) {
-        .Exited => |code| if (code == 0) {
-            tui.checkmark();
-            printErr("\n");
-            return;
-        },
-        else => {},
-    }
-    printErr("skipped (codesign failed)\n");
+    tui.checkmark();
+    printErr("\n");
 }
 
 fn makeDirsAbsolute(path: []const u8) !void {
