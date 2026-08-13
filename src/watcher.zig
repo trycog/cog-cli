@@ -8,6 +8,83 @@ const debug_log = @import("debug_log.zig");
 
 // ── Public API ──────────────────────────────────────────────────────────
 
+pub const QUIET_WINDOW_NS: i128 = 200 * std.time.ns_per_ms;
+pub const MAX_BATCH_EVENTS: usize = 64;
+const MAX_WATCHER_LINE_BYTES: usize = std.fs.max_path_bytes;
+
+pub const DrainEvent = union(enum) {
+    path: []const u8,
+    overflow,
+};
+
+pub const BatchState = struct {
+    pending_count: usize = 0,
+    last_event_ns: i128 = 0,
+
+    pub fn noteEvent(self: *BatchState, now_ns: i128) void {
+        self.pending_count += 1;
+        self.last_event_ns = now_ns;
+    }
+
+    pub fn shouldFlush(self: BatchState, now_ns: i128) bool {
+        if (self.pending_count == 0) return false;
+        return self.pending_count >= MAX_BATCH_EVENTS or now_ns - self.last_event_ns >= QUIET_WINDOW_NS;
+    }
+
+    pub fn reset(self: *BatchState) void {
+        self.* = .{};
+    }
+};
+
+const LineDecoder = struct {
+    buf: [MAX_WATCHER_LINE_BYTES]u8 = undefined,
+    len: usize = 0,
+    discarding: bool = false,
+    overflow_pending: bool = false,
+
+    fn append(self: *LineDecoder, input: []const u8) void {
+        for (input) |byte| {
+            if (self.discarding) {
+                if (byte == '\n') self.discarding = false;
+                continue;
+            }
+            if (self.len == self.buf.len) {
+                self.len = 0;
+                self.discarding = byte != '\n';
+                self.overflow_pending = true;
+                continue;
+            }
+            self.buf[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn next(self: *LineDecoder) ?DrainEvent {
+        if (self.overflow_pending) {
+            self.overflow_pending = false;
+            return .overflow;
+        }
+        const nl = std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') orelse return null;
+        const line = self.buf[0..nl];
+        if (line.len > 0 and line[0] == 0) {
+            const remaining = self.len - (nl + 1);
+            if (remaining > 0) std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[nl + 1 .. self.len]);
+            self.len = remaining;
+            return .overflow;
+        }
+        const remaining = self.len - (nl + 1);
+        if (remaining > 0) std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[nl + 1 .. self.len]);
+        self.len = remaining;
+        if (line.len == 0) return self.next();
+        return .{ .path = line };
+    }
+
+    fn feed(self: *LineDecoder, input: []const u8) ?DrainEvent {
+        self.append(input);
+        return self.next();
+    }
+};
+
 pub const Watcher = struct {
     allocator: std.mem.Allocator,
     pipe_read: posix.fd_t,
@@ -17,8 +94,7 @@ pub const Watcher = struct {
     project_root: []const u8,
     index_patterns: []const []const u8,
     read_buf: [4096]u8,
-    read_len: usize,
-    read_start: usize,
+    decoder: LineDecoder,
     // CFRunLoop cross-thread wakeup (macOS only).
     // Stored as usize for atomic access; 0 means not yet set.
     macos_run_loop: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -70,8 +146,7 @@ pub const Watcher = struct {
             .project_root = owned_root,
             .index_patterns = patterns,
             .read_buf = undefined,
-            .read_len = 0,
-            .read_start = 0,
+            .decoder = .{},
             .macos_run_loop = std.atomic.Value(usize).init(0),
             .macos_stop_fn = std.atomic.Value(usize).init(0),
         };
@@ -116,38 +191,14 @@ pub const Watcher = struct {
         return self.pipe_read;
     }
 
-    /// Drain one newline-delimited path from the pipe buffer.
-    /// Returns a relative path slice valid until the next drainOne() call, or null.
-    pub fn drainOne(self: *Watcher) ?[]const u8 {
+    /// Drain one newline-delimited watcher event.
+    /// Path slices remain valid until the next drainOne() call.
+    pub fn drainOne(self: *Watcher) ?DrainEvent {
+        if (self.decoder.next()) |event| return event;
         while (true) {
-            // Scan for newline in existing buffer
-            if (self.read_len > 0) {
-                const data = self.read_buf[self.read_start .. self.read_start + self.read_len];
-                if (std.mem.indexOfScalar(u8, data, '\n')) |nl| {
-                    const line = data[0..nl];
-                    self.read_start += nl + 1;
-                    self.read_len -= nl + 1;
-                    if (line.len > 0) return line;
-                    continue; // skip empty lines
-                }
-            }
-
-            // Compact buffer if needed
-            if (self.read_start > 0 and self.read_len > 0) {
-                std.mem.copyForwards(u8, &self.read_buf, self.read_buf[self.read_start .. self.read_start + self.read_len]);
-            }
-            self.read_start = 0;
-
-            // Try to read more
-            if (self.read_len >= self.read_buf.len) {
-                // Buffer full with no newline — discard
-                self.read_len = 0;
-                return null;
-            }
-
-            const n = posix.read(self.pipe_read, self.read_buf[self.read_len..]) catch return null;
+            const n = posix.read(self.pipe_read, &self.read_buf) catch return null;
             if (n == 0) return null;
-            self.read_len += n;
+            if (self.decoder.feed(self.read_buf[0..n])) |event| return event;
         }
     }
 };
@@ -201,6 +252,31 @@ fn setNonBlock(fd: posix.fd_t) void {
     _ = posix.fcntl(fd, posix.F.SETFL, flags | nonblock) catch {};
 }
 
+fn emitWatcherRecord(self: *Watcher, record: []const u8) bool {
+    if (record.len + 1 > 4096) {
+        debug_log.log("watcher: record too large bytes={d}; signaling overflow", .{record.len});
+        return emitOverflow(self);
+    }
+    var buf: [4096]u8 = undefined;
+    @memcpy(buf[0..record.len], record);
+    buf[record.len] = '\n';
+    const written = posix.write(self.pipe_write, buf[0 .. record.len + 1]) catch |err| {
+        debug_log.log("watcher: pipe write failed error={s}; signaling overflow", .{@errorName(err)});
+        return emitOverflow(self);
+    };
+    if (written != record.len + 1) {
+        debug_log.log("watcher: short pipe write bytes={d}/{d}; signaling overflow", .{ written, record.len + 1 });
+        return emitOverflow(self);
+    }
+    return true;
+}
+
+fn emitOverflow(self: *Watcher) bool {
+    const marker = "\x00\n";
+    const written = posix.write(self.pipe_write, marker) catch return false;
+    return written == marker.len;
+}
+
 // ── macOS Backend (FSEvents) ────────────────────────────────────────────
 // Frameworks are loaded dynamically at runtime via std.DynLib so that
 // cross-compilation works without macOS SDK stubs.
@@ -244,6 +320,10 @@ const CF = struct {
     const kFSEventStreamEventIdSinceNow: FSEventStreamEventId = 0xFFFFFFFFFFFFFFFF;
 
     // Event flags
+    const kFSEventStreamEventFlagMustScanSubDirs: u32 = 0x00000001;
+    const kFSEventStreamEventFlagUserDropped: u32 = 0x00000002;
+    const kFSEventStreamEventFlagKernelDropped: u32 = 0x00000004;
+    const kFSEventStreamEventFlagRootChanged: u32 = 0x00000020;
     const kFSEventStreamEventFlagItemIsFile: u32 = 0x00010000;
     const kFSEventStreamEventFlagItemCreated: u32 = 0x00000100;
     const kFSEventStreamEventFlagItemModified: u32 = 0x00001000;
@@ -396,7 +476,7 @@ fn watcherThreadMacos(self: *Watcher) void {
         cf_paths,
         CF.kFSEventStreamEventIdSinceNow,
         0.5, // 500ms latency for batching
-        CF.kFSEventStreamCreateFlagFileEvents | CF.kFSEventStreamCreateFlagNoDefer,
+        CF.kFSEventStreamCreateFlagFileEvents,
     ) orelse return;
 
     const run_loop = cf.CFRunLoopGetCurrent();
@@ -439,6 +519,15 @@ fn fseventsCallback(
 
     for (0..num_events) |i| {
         const flags = event_flags[i];
+        const overflow_flags = CF.kFSEventStreamEventFlagMustScanSubDirs |
+            CF.kFSEventStreamEventFlagUserDropped |
+            CF.kFSEventStreamEventFlagKernelDropped |
+            CF.kFSEventStreamEventFlagRootChanged;
+        if (flags & overflow_flags != 0) {
+            debug_log.log("watcher.macos: overflow flags=0x{x}; requesting resync", .{flags});
+            _ = emitOverflow(self);
+            continue;
+        }
 
         // Only care about file events (not directory events)
         if (flags & CF.kFSEventStreamEventFlagItemIsFile == 0) continue;
@@ -455,9 +544,7 @@ fn fseventsCallback(
 
         if (!shouldWatchPath(rel_path, self.index_patterns)) continue;
 
-        // Write "rel_path\n" to pipe (non-blocking, drop on EAGAIN)
-        _ = posix.write(self.pipe_write, rel_path) catch continue;
-        _ = posix.write(self.pipe_write, "\n") catch continue;
+        _ = emitWatcherRecord(self, rel_path);
     }
 }
 
@@ -509,6 +596,11 @@ fn watcherThreadLinux(self: *Watcher) void {
         while (offset < bytes_read) {
             const event: *const linux.inotify_event = @ptrCast(@alignCast(&event_buf[offset]));
             offset += @sizeOf(linux.inotify_event) + event.len;
+            if (event.mask & linux.IN.Q_OVERFLOW != 0) {
+                debug_log.log("watcher.linux: inotify queue overflow; requesting resync", .{});
+                _ = emitOverflow(self);
+                continue;
+            }
 
             const name = event.getName() orelse continue;
             const dir_path = wd_map.get(event.wd) orelse continue;
@@ -521,8 +613,8 @@ fn watcherThreadLinux(self: *Watcher) void {
             else
                 std.fmt.bufPrint(&path_buf, "{s}", .{name}) catch continue;
 
-            // If a new directory is created, add a watch for it
-            if (event.mask & linux.IN.CREATE != 0 and event.mask & linux.IN.ISDIR != 0) {
+            // If a directory is created or moved in, add a watch for it.
+            if (event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0 and event.mask & linux.IN.ISDIR != 0) {
                 if (!isExcludedDir(name) and name[0] != '.') {
                     const abs_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name }) catch continue;
                     addWatchRecursive(self, inotify_fd, watch_mask, abs_path, &wd_map);
@@ -536,9 +628,7 @@ fn watcherThreadLinux(self: *Watcher) void {
 
             if (!shouldWatchPath(rel_path, self.index_patterns)) continue;
 
-            // Write "rel_path\n" to pipe
-            _ = posix.write(self.pipe_write, rel_path) catch continue;
-            _ = posix.write(self.pipe_write, "\n") catch continue;
+            _ = emitWatcherRecord(self, rel_path);
         }
     }
 }
@@ -585,5 +675,36 @@ fn addWatchRecursive(
         const child = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
         defer self.allocator.free(child);
         addWatchRecursive(self, inotify_fd, mask, child, wd_map);
+    }
+}
+
+test "BatchState flushes on size threshold" {
+    var state: BatchState = .{};
+    state.noteEvent(0);
+    state.pending_count = MAX_BATCH_EVENTS;
+    try std.testing.expect(state.shouldFlush(0));
+}
+
+test "BatchState flushes after quiet window" {
+    var state: BatchState = .{};
+    state.noteEvent(10);
+    try std.testing.expect(!state.shouldFlush(10 + QUIET_WINDOW_NS - 1));
+    try std.testing.expect(state.shouldFlush(10 + QUIET_WINDOW_NS));
+}
+
+test "line decoder reports overflow and resumes at newline" {
+    const allocator = std.testing.allocator;
+    var decoder = LineDecoder{};
+    var oversized = [_]u8{'a'} ** (MAX_WATCHER_LINE_BYTES + 1);
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    try input.appendSlice(allocator, &oversized);
+    try input.appendSlice(allocator, "\nresynced.zig\n");
+
+    try std.testing.expectEqual(DrainEvent.overflow, decoder.feed(input.items));
+    const path_event = decoder.next().?;
+    switch (path_event) {
+        .path => |path| try std.testing.expectEqualStrings("resynced.zig", path),
+        .overflow => return error.TestUnexpectedResult,
     }
 }

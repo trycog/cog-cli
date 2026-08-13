@@ -39,6 +39,17 @@ const ToolTier = debug_server_mod.ToolTier;
 
 const MAX_HANDLER_CONCURRENCY: usize = 8;
 const handler_wait_poll_ns: u64 = 10 * std.time.ns_per_ms;
+const watcher_poll_interval_ms: i32 = 50;
+
+const IndexGeneration = struct {
+    inode: std.fs.File.INode,
+    size: u64,
+    mtime: i128,
+
+    fn eql(self: IndexGeneration, other: IndexGeneration) bool {
+        return self.inode == other.inode and self.size == other.size and self.mtime == other.mtime;
+    }
+};
 const handler_shutdown_grace_ns: u64 = 2 * std.time.ns_per_s;
 
 const HandlerThreads = struct {
@@ -217,6 +228,7 @@ const Runtime = struct {
     observe_enabled: bool,
     observe_server: ?ObserveServer,
     code_cache: ?code_intel.CodeIndex = null,
+    code_cache_generation: ?IndexGeneration = null,
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
     session_contexts: std.StringHashMapUnmanaged(session_context_mod.SessionContext) = .empty,
@@ -248,6 +260,7 @@ const Runtime = struct {
             .observe_enabled = observe_enabled,
             .observe_server = if (observe_enabled) try ObserveServer.init(allocator) else null,
             .code_cache = null,
+            .code_cache_generation = null,
             .remote_tools = null,
             .mcp_session_id = null,
             .session_contexts = .empty,
@@ -308,23 +321,61 @@ const Runtime = struct {
         return &self.mem_db.?;
     }
 
+    fn indexGeneration(self: *Runtime) ?IndexGeneration {
+        const cog_dir = paths.findCogDir(self.allocator) catch {
+            debug_log_mod.log("mcp.cache: index generation unavailable; no .cog directory", .{});
+            return null;
+        };
+        defer self.allocator.free(cog_dir);
+        const index_path = std.fmt.allocPrint(self.allocator, "{s}/index.scip", .{cog_dir}) catch return null;
+        defer self.allocator.free(index_path);
+        const file = std.fs.openFileAbsolute(index_path, .{}) catch |err| {
+            debug_log_mod.log("mcp.cache: index generation open failed error={s}", .{@errorName(err)});
+            return null;
+        };
+        defer file.close();
+        const stat = file.stat() catch |err| {
+            debug_log_mod.log("mcp.cache: index generation stat failed error={s}", .{@errorName(err)});
+            return null;
+        };
+        return .{ .inode = stat.inode, .size = stat.size, .mtime = stat.mtime };
+    }
+
     fn ensureCodeCache(self: *Runtime) !*code_intel.CodeIndex {
-        if (self.code_cache == null) {
-            debug_log_mod.log("ensureCodeCache: loading index", .{});
-            self.code_cache = code_intel.loadIndexForRuntime(self.allocator) catch |err| {
-                debug_log_mod.log("ensureCodeCache: load failed: {s}", .{@errorName(err)});
-                return err;
-            };
-            debug_log_mod.log("ensureCodeCache: index loaded successfully", .{});
+        const disk_generation = self.indexGeneration();
+        if (self.code_cache != null) {
+            if (disk_generation != null and self.code_cache_generation != null and self.code_cache_generation.?.eql(disk_generation.?)) {
+                debug_log_mod.log("mcp.cache: generation unchanged inode={d} size={d}", .{ disk_generation.?.inode, disk_generation.?.size });
+                return &self.code_cache.?;
+            }
+            debug_log_mod.log("mcp.cache: generation changed or unavailable; refreshing", .{});
         }
+
+        const fresh = code_intel.loadIndexForRuntime(self.allocator) catch |err| {
+            debug_log_mod.log("mcp.cache: refresh failed error={s}; invalidating stale cache", .{@errorName(err)});
+            self.invalidateCodeCache();
+            return err;
+        };
+        const fresh_generation = self.indexGeneration() orelse {
+            var discarded = fresh;
+            discarded.deinit(self.allocator);
+            self.invalidateCodeCache();
+            return error.IndexUnavailable;
+        };
+        if (self.code_cache) |*old| old.deinit(self.allocator);
+        self.code_cache = fresh;
+        self.code_cache_generation = fresh_generation;
+        debug_log_mod.log("mcp.cache: atomically refreshed inode={d} size={d} mtime={d}", .{ fresh_generation.inode, fresh_generation.size, fresh_generation.mtime });
         return &self.code_cache.?;
     }
 
     fn invalidateCodeCache(self: *Runtime) void {
         if (self.code_cache) |*ci| {
+            debug_log_mod.log("mcp.cache: invalidating loaded index", .{});
             ci.deinit(self.allocator);
             self.code_cache = null;
         }
+        self.code_cache_generation = null;
     }
 
     fn refreshCodeCache(self: *Runtime) !void {
@@ -333,16 +384,7 @@ const Runtime = struct {
     }
 
     fn syncCodeCacheAfterWrite(self: *Runtime) !void {
-        const fresh = code_intel.loadIndexForRuntime(self.allocator) catch {
-            // Avoid stale in-memory state if disk changed but reload failed.
-            self.invalidateCodeCache();
-            return error.Explained;
-        };
-
-        if (self.code_cache) |*old| {
-            old.deinit(self.allocator);
-        }
-        self.code_cache = fresh;
+        _ = try self.ensureCodeCache();
     }
 
     fn currentSessionKey(self: *const Runtime) []const u8 {
@@ -463,6 +505,13 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     var framing_state: MessageFramingState = .{};
 
     var read_buf: [8192]u8 = undefined;
+    var watcher_batch: watcher_mod.BatchState = .{};
+    var watcher_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (watcher_paths.items) |file_path| allocator.free(file_path);
+        watcher_paths.deinit(allocator);
+    }
+    var watcher_overflow = false;
 
     while (!shutdown_requested.load(.acquire)) {
         if (builtin.os.tag != .windows) {
@@ -473,13 +522,24 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
                 fds[1] = .{ .fd = w.getFd(), .events = posix.POLL.IN, .revents = 0 };
                 nfds = 2;
             }
-            const poll_result = posix.poll(fds[0..nfds], 250) catch continue;
-            if (poll_result == 0) continue;
+            const poll_result = posix.poll(fds[0..nfds], watcher_poll_interval_ms) catch continue;
+            const now_ns = std.time.nanoTimestamp();
 
-            // Process watcher events if ready
             if (nfds > 1 and fds[1].revents & posix.POLL.IN != 0) {
-                processWatcherEvents(&runtime);
+                const drained = collectWatcherEvents(&runtime, &watcher_paths, &watcher_overflow);
+                if (drained > 0 or watcher_overflow) {
+                    watcher_batch.pending_count += @max(drained, @as(usize, 1));
+                    watcher_batch.last_event_ns = now_ns;
+                    debug_log_mod.log("watcher batch: pending={d} paths={d} overflow={any}", .{ watcher_batch.pending_count, watcher_paths.items.len, watcher_overflow });
+                }
             }
+            if (watcher_batch.shouldFlush(now_ns)) {
+                debug_log_mod.log("watcher batch: flushing pending={d}", .{watcher_batch.pending_count});
+                processWatcherEvents(&runtime, &watcher_paths, watcher_overflow);
+                watcher_batch.reset();
+                watcher_overflow = false;
+            }
+            if (poll_result == 0) continue;
 
             if (fds[0].revents & posix.POLL.ERR != 0) {
                 debug_log_mod.log("poll: POLLERR on stdin, exiting", .{});
@@ -2053,54 +2113,60 @@ fn callCodeExplore(runtime: *Runtime, arguments: ?json.Value) ![]const u8 {
 
 // ── File Watcher Event Processing ───────────────────────────────────────
 
-fn processWatcherEvents(runtime: *Runtime) void {
+fn collectWatcherEvents(
+    runtime: *Runtime,
+    paths_buf: *std.ArrayListUnmanaged([]const u8),
+    overflow: *bool,
+) usize {
     const allocator = runtime.allocator;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    for (paths_buf.items) |file_path| seen.put(allocator, file_path, {}) catch {};
 
-    // Step 1: Drain all pending paths under the mutex.
-    // The watcher pipe buffer is only safe to read while we hold the lock
-    // (prevents a concurrent tool call from triggering a second drain).
-    var paths_buf: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (paths_buf.items) |p| allocator.free(p);
-        paths_buf.deinit(allocator);
-    }
-
-    {
-        debug_log_mod.log("processWatcherEvents: acquiring runtime mutex (drain)", .{});
-        runtime.mutex.lock();
-        defer {
-            runtime.mutex.unlock();
-            debug_log_mod.log("processWatcherEvents: runtime mutex released (drain)", .{});
-        }
-        debug_log_mod.log("processWatcherEvents: runtime mutex acquired (drain)", .{});
-
-        var w = &runtime.watcher.?;
-        while (w.drainOne()) |rel_path| {
+    var added: usize = 0;
+    debug_log_mod.log("watcher batch: acquiring runtime mutex for drain", .{});
+    runtime.mutex.lock();
+    defer runtime.mutex.unlock();
+    var watcher = &runtime.watcher.?;
+    while (watcher.drainOne()) |event| switch (event) {
+        .overflow => overflow.* = true,
+        .path => |rel_path| {
+            const entry = seen.getOrPut(allocator, rel_path) catch continue;
+            if (entry.found_existing) continue;
             const duped = allocator.dupe(u8, rel_path) catch continue;
             paths_buf.append(allocator, duped) catch {
                 allocator.free(duped);
                 continue;
             };
-        }
-    }
+            added += 1;
+        },
+    };
+    return added;
+}
 
-    if (paths_buf.items.len == 0) return;
-    debug_log_mod.log("processWatcherEvents: reindexing {d} files via re-exec worker", .{paths_buf.items.len});
+fn processWatcherEvents(
+    runtime: *Runtime,
+    paths_buf: *std.ArrayListUnmanaged([]const u8),
+    overflow: bool,
+) void {
+    const allocator = runtime.allocator;
+    if (!overflow and paths_buf.items.len == 0) return;
+    debug_log_mod.log("watcher batch: spawning worker paths={d} overflow={any}", .{ paths_buf.items.len, overflow });
+    const result = if (overflow)
+        spawnResyncWorker(allocator)
+    else
+        spawnReindexWorker(allocator, paths_buf.items);
 
-    // Step 2: Re-exec the current binary as an isolated worker. The worker does
-    // file I/O and exits with code 0 if anything changed, 1 if not.
-    const result = spawnReindexWorker(allocator, paths_buf.items);
+    for (paths_buf.items) |file_path| allocator.free(file_path);
+    paths_buf.clearRetainingCapacity();
 
-    // Step 3: Re-acquire mutex only to swap the in-memory code cache.
     if (result == .changed) {
-        debug_log_mod.log("processWatcherEvents: acquiring runtime mutex (cache swap)", .{});
+        debug_log_mod.log("watcher batch: acquiring runtime mutex for cache refresh", .{});
         runtime.mutex.lock();
-        defer {
-            runtime.mutex.unlock();
-            debug_log_mod.log("processWatcherEvents: runtime mutex released (cache swap)", .{});
-        }
-        debug_log_mod.log("processWatcherEvents: runtime mutex acquired (cache swap)", .{});
-        runtime.syncCodeCacheAfterWrite() catch {};
+        defer runtime.mutex.unlock();
+        runtime.syncCodeCacheAfterWrite() catch |err| {
+            debug_log_mod.log("watcher batch: cache refresh failed error={s}", .{@errorName(err)});
+        };
     }
 }
 
@@ -2144,6 +2210,29 @@ fn reindexInProcessAfterSpawnFailure(allocator: std.mem.Allocator, file_paths: [
         }
     }
     return if (changed) .changed else .unchanged;
+}
+
+fn spawnResyncWorker(allocator: std.mem.Allocator) ReindexWorkerResult {
+    const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
+        debug_log_mod.log("watcher resync worker: self executable lookup failed error={s}", .{@errorName(err)});
+        return .failed;
+    };
+    defer allocator.free(exe_path);
+    const argv = [_][]const u8{ exe_path, code_intel.WATCHER_RESYNC_WORKER_COMMAND };
+    debug_log_mod.log("watcher resync worker: spawning executable={s}", .{exe_path});
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch |err| {
+        debug_log_mod.log("watcher resync worker: spawn failed error={s}", .{@errorName(err)});
+        return .failed;
+    };
+    const term = child.wait() catch |err| {
+        debug_log_mod.log("watcher resync worker: wait failed error={s}", .{@errorName(err)});
+        return .failed;
+    };
+    return reindexWorkerResult(term);
 }
 
 fn spawnReindexWorker(allocator: std.mem.Allocator, file_paths: []const []const u8) ReindexWorkerResult {
@@ -2480,6 +2569,14 @@ test "shutdown remains requested when its response write fails" {
 
     try std.testing.expectError(error.WriteFailure, handleShutdown(std.testing.allocator, &reply));
     try std.testing.expect(shutdown_requested.load(.acquire));
+}
+
+test "IndexGeneration detects identity size and mtime changes" {
+    const base = IndexGeneration{ .inode = 1, .size = 10, .mtime = 100 };
+    try std.testing.expect(base.eql(.{ .inode = 1, .size = 10, .mtime = 100 }));
+    try std.testing.expect(!base.eql(.{ .inode = 2, .size = 10, .mtime = 100 }));
+    try std.testing.expect(!base.eql(.{ .inode = 1, .size = 11, .mtime = 100 }));
+    try std.testing.expect(!base.eql(.{ .inode = 1, .size = 10, .mtime = 101 }));
 }
 
 test "reindexWorkerResult maps documented exit statuses" {
