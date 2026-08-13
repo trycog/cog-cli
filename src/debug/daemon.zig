@@ -91,7 +91,10 @@ pub const DaemonServer = struct {
         self.socket_fd = sock;
 
         // Write PID file
-        self.writePidFile() catch {};
+        self.writePidFile() catch |err| {
+            debug_log.log("DaemonServer.run: failed to write PID file: {s}", .{@errorName(err)});
+            return err;
+        };
 
         // Store socket path for signal handler cleanup
         @memcpy(g_daemon_socket_path[0..sock_path.len], sock_path);
