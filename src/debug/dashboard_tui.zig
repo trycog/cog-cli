@@ -373,8 +373,8 @@ pub const DashboardTui = struct {
             }
             return err;
         };
+        if (@import("builtin").os.tag != .windows) try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o600, 0);
         try posix.listen(sock, 5);
-        if (@import("builtin").os.tag != .windows) try std.posix.fchmod(sock, 0o600);
         self.listener = sock;
 
         // Enter raw terminal mode

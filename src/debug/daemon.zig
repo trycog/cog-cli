@@ -85,8 +85,8 @@ pub const DaemonServer = struct {
 
         debug_log.log("DaemonServer.run: binding socket {s}", .{sock_path});
         try posix.bind(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+        if (@import("builtin").os.tag != .windows) try std.posix.fchmodat(std.posix.AT.FDCWD, sock_path, 0o600, 0);
         try posix.listen(sock, 8);
-        if (@import("builtin").os.tag != .windows) try std.posix.fchmod(sock, 0o600);
 
         self.socket_fd = sock;
 
