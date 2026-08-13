@@ -692,6 +692,18 @@ pub const DapProxy = struct {
         return seq_val.integer;
     }
 
+    fn remainingDeadlineMs(deadline_ms: u64, elapsed_ms: u64) ?i32 {
+        if (elapsed_ms >= deadline_ms) return null;
+        return @intCast(@min(deadline_ms - elapsed_ms, @as(u64, std.math.maxInt(i32))));
+    }
+
+    fn remainingDeadlineNs(deadline_ns: u64, elapsed_ns: u64) ?i32 {
+        if (elapsed_ns >= deadline_ns) return null;
+        const remaining_ns = deadline_ns - elapsed_ns;
+        const remaining_ms = @max(@as(u64, 1), @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+        return @intCast(@min(remaining_ms, @as(u64, std.math.maxInt(i32))));
+    }
+
     /// Read messages from the adapter until we get a matching response (type == "response").
     /// Verifies request_seq matches the expected seq to correlate responses.
     /// Events are processed inline (e.g., update thread_id from stopped events).
@@ -944,12 +956,10 @@ pub const DapProxy = struct {
 
             // Poll only for the remaining absolute deadline so event traffic or
             // partial frames cannot restart the request timeout.
-            const elapsed_ns = timer.read();
-            if (elapsed_ns >= deadline_ns) {
+            const remaining_ms = remainingDeadlineNs(deadline_ns, timer.read()) orelse {
                 dapLog("[DAP readResponse] TIMEOUT after {d}ms", .{self.request_timeout_ms});
                 return error.Timeout;
-            }
-            const remaining_ms: i32 = @intCast(@max(@as(u64, 1), @divTrunc(deadline_ns - elapsed_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            };
             dapLog("[DAP readResponse] Polling (remaining={d}ms, loop {d})...", .{ remaining_ms, loop_count });
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = poll_fd,
@@ -1115,12 +1125,10 @@ pub const DapProxy = struct {
                 allocator.free(decoded.body);
             }
 
-            const elapsed_ns = timer.read();
-            if (elapsed_ns >= deadline_ns) {
+            const remaining_ms = remainingDeadlineNs(deadline_ns, timer.read()) orelse {
                 dapLog("[DAP waitForEvent] TIMEOUT waiting for event: {s}", .{event_name});
                 return error.Timeout;
-            }
-            const remaining_ms: i32 = @intCast(@max(@as(u64, 1), @divTrunc(deadline_ns - elapsed_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            };
             dapLog("[DAP waitForEvent] Polling (loop {d}, remaining={d}ms)...", .{ loop_count, remaining_ms });
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = poll_fd,
@@ -1529,7 +1537,8 @@ pub const DapProxy = struct {
         const server_stdout = server_child.stdout orelse return error.NotInitialized;
         var port_buf: [256]u8 = undefined;
         var port_len: usize = 0;
-        const port_timeout_ms: i32 = @intCast(cfg.port_detection_timeout_ms);
+        const port_timeout_ms: u64 = cfg.port_detection_timeout_ms;
+        var port_timer = std.time.Timer.start() catch return error.ReadFailed;
 
         while (port_len < port_buf.len) {
             var poll_fds = [_]std.posix.pollfd{.{
@@ -1537,7 +1546,9 @@ pub const DapProxy = struct {
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const poll_result = std.posix.poll(&poll_fds, port_timeout_ms) catch return error.ReadFailed;
+            const elapsed_ms = @divTrunc(port_timer.read(), std.time.ns_per_ms);
+            const remaining_ms = remainingDeadlineMs(port_timeout_ms, elapsed_ms) orelse return error.Timeout;
+            const poll_result = std.posix.poll(&poll_fds, remaining_ms) catch return error.ReadFailed;
             if (poll_result == 0) return error.Timeout;
 
             const n = server_stdout.read(port_buf[port_len..]) catch return error.ReadFailed;
@@ -1610,18 +1621,15 @@ pub const DapProxy = struct {
         defer self.connection_mutex.unlock();
         const poll_fd = try self.transportPollFd();
         var read_buf: [8192]u8 = undefined;
-        const timeout_ms: i32 = 15_000;
-        var elapsed: i64 = 0;
-        const start = std.time.milliTimestamp();
+        const timeout_ms: u64 = 15_000;
+        var timer = std.time.Timer.start() catch return error.ReadFailed;
 
         while (self.pending_child_config == null) {
-            elapsed = std.time.milliTimestamp() - start;
-            if (elapsed >= timeout_ms) {
-                dapLog("[DAP waitForChildConfig] Timeout after {d}ms — no startDebugging received", .{elapsed});
+            const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
+            const remaining = remainingDeadlineMs(timeout_ms, elapsed_ms) orelse {
+                dapLog("[DAP waitForChildConfig] Timeout after {d}ms — no startDebugging received", .{elapsed_ms});
                 return; // Not an error — adapter may not use child sessions
-            }
-
-            const remaining: i32 = @intCast(@max(timeout_ms - elapsed, 100));
+            };
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = poll_fd,
                 .events = std.posix.POLL.IN,
@@ -1707,7 +1715,7 @@ pub const DapProxy = struct {
                 allocator.free(decoded.body);
             }
         }
-        dapLog("[DAP waitForChildConfig] Child config received in {d}ms", .{std.time.milliTimestamp() - start});
+        dapLog("[DAP waitForChildConfig] Child config received in {d}ms", .{@divTrunc(timer.read(), std.time.ns_per_ms)});
     }
 
     /// Connect to a vscode-js-debug child session.
@@ -3845,13 +3853,17 @@ pub const DapProxy = struct {
                 const server_stdout = child.stdout orelse return error.NotInitialized;
                 var port_buf: [256]u8 = undefined;
                 var port_len: usize = 0;
+                const port_timeout_ms: u64 = cfg.port_detection_timeout_ms;
+                var port_timer = std.time.Timer.start() catch return error.ReadFailed;
                 while (port_len < port_buf.len) {
                     var poll_fds = [_]std.posix.pollfd{.{
                         .fd = server_stdout.handle,
                         .events = std.posix.POLL.IN,
                         .revents = 0,
                     }};
-                    const pr = std.posix.poll(&poll_fds, @intCast(cfg.port_detection_timeout_ms)) catch return error.ReadFailed;
+                    const elapsed_ms = @divTrunc(port_timer.read(), std.time.ns_per_ms);
+                    const remaining_ms = remainingDeadlineMs(port_timeout_ms, elapsed_ms) orelse return error.Timeout;
+                    const pr = std.posix.poll(&poll_fds, remaining_ms) catch return error.ReadFailed;
                     if (pr == 0) return error.Timeout;
                     const n = server_stdout.read(port_buf[port_len..]) catch return error.ReadFailed;
                     if (n == 0) return error.ConnectionClosed;
@@ -4533,6 +4545,13 @@ test "DapProxy temporary request timeout restores after early exit" {
     }
 
     try std.testing.expectEqual(@as(i32, 30_000), proxy.request_timeout_ms);
+}
+
+test "DapProxy remaining deadline never renews the timeout" {
+    try std.testing.expectEqual(@as(?i32, 100), DapProxy.remainingDeadlineMs(1_000, 900));
+    try std.testing.expectEqual(@as(?i32, 1), DapProxy.remainingDeadlineMs(1_000, 999));
+    try std.testing.expectEqual(@as(?i32, null), DapProxy.remainingDeadlineMs(1_000, 1_000));
+    try std.testing.expectEqual(@as(?i32, null), DapProxy.remainingDeadlineMs(1_000, 1_001));
 }
 
 test "DapProxy init and deinit cycle works cleanly" {
