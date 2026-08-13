@@ -24,6 +24,8 @@ const std = @import("std");
 const help = @import("help_text.zig");
 const tui = @import("tui.zig");
 const debug_log = @import("debug_log.zig");
+const fs_util = @import("fs_util.zig");
+const paths = @import("paths.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -113,31 +115,80 @@ pub fn ensureDebugEntitlements(allocator: std.mem.Allocator) !void {
         \\</plist>
     ;
 
-    var tmp_dir = std.fs.openDirAbsolute("/tmp", .{}) catch {
-        printErr("error: could not open /tmp\n");
+    const runtime_dir_path = paths.getRuntimeDir(allocator) catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to resolve runtime directory: {s}", .{@errorName(err)});
+        printErr("error: could not resolve private runtime directory\n");
         return error.Explained;
     };
-    defer tmp_dir.close();
+    defer allocator.free(runtime_dir_path);
+    var runtime_dir = std.fs.openDirAbsolute(runtime_dir_path, .{}) catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to open {s}: {s}", .{ runtime_dir_path, @errorName(err) });
+        printErr("error: could not open private runtime directory\n");
+        return error.Explained;
+    };
+    defer runtime_dir.close();
 
-    const tmp_name = "cog-debug-entitlements.plist";
-    tmp_dir.writeFile(.{ .sub_path = tmp_name, .data = entitlements_xml }) catch {
-        printErr("error: could not write entitlements to /tmp\n");
+    var temp = fs_util.createSecureTempFile(runtime_dir, allocator, "debug-entitlements") catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to create entitlement file: {s}", .{@errorName(err)});
+        printErr("error: could not create entitlement file\n");
         return error.Explained;
     };
-    defer tmp_dir.deleteFile(tmp_name) catch {};
+    defer allocator.free(temp.name);
+    defer temp.file.close();
+    defer runtime_dir.deleteFile(temp.name) catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to remove {s}: {s}", .{ temp.name, @errorName(err) });
+    };
+
+    debug_log.log("ensureDebugEntitlements: writing {s}", .{temp.name});
+    temp.file.writeAll(entitlements_xml) catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to write {s}: {s}", .{ temp.name, @errorName(err) });
+        printErr("error: could not write entitlement file\n");
+        return error.Explained;
+    };
+    temp.file.sync() catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to sync {s}: {s}", .{ temp.name, @errorName(err) });
+        printErr("error: could not sync entitlement file\n");
+        return error.Explained;
+    };
+    const entitlement_path = std.fs.path.join(allocator, &.{ runtime_dir_path, temp.name }) catch |err| {
+        debug_log.log("ensureDebugEntitlements: failed to resolve entitlement path: {s}", .{@errorName(err)});
+        return error.Explained;
+    };
+    defer allocator.free(entitlement_path);
 
     // Run codesign
+    debug_log.log("ensureDebugEntitlements: spawning codesign for {s}", .{exe_path});
     var child = std.process.Child.init(
-        &.{ "codesign", "--entitlements", "/tmp/" ++ tmp_name, "--force", "-s", "-", exe_path },
+        &.{ "codesign", "--entitlements", entitlement_path, "--force", "-s", "-", exe_path },
         allocator,
     );
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
 
-    _ = child.spawnAndWait() catch {
+    const term = child.spawnAndWait() catch |err| {
+        debug_log.log("ensureDebugEntitlements: codesign spawn failed: {s}", .{@errorName(err)});
         printErr("error: failed to run codesign\n");
         return error.Explained;
     };
+    if (!childExitedSuccessfully(term)) {
+        debug_log.log("ensureDebugEntitlements: codesign failed with {s}", .{@tagName(term)});
+        printErr("error: codesign failed\n");
+        return error.Explained;
+    }
+    debug_log.log("ensureDebugEntitlements: codesign completed successfully", .{});
+}
+
+fn childExitedSuccessfully(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+}
+
+test "childExitedSuccessfully requires zero exit status" {
+    try std.testing.expect(childExitedSuccessfully(.{ .Exited = 0 }));
+    try std.testing.expect(!childExitedSuccessfully(.{ .Exited = 1 }));
+    try std.testing.expect(!childExitedSuccessfully(.{ .Signal = 9 }));
 }
 
 /// Re-exec the current process so macOS loads the newly signed entitlements.
@@ -161,11 +212,13 @@ pub fn reexecWithEntitlements() void {
     }
     if (argc == 0) return;
 
-    std.posix.execvpeZ(
+    debug_log.log("reexecWithEntitlements: replacing process with {s}", .{argv_buf[0].?});
+    const exec_err = std.posix.execvpeZ(
         argv_buf[0].?,
         @ptrCast(&argv_buf),
         @ptrCast(std.c.environ),
-    ) catch {};
+    );
+    debug_log.log("reexecWithEntitlements: exec failed: {s}", .{@errorName(exec_err)});
     // If execvpe fails, fall through — server runs without entitlements
 }
 
