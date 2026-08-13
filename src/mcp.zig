@@ -36,6 +36,151 @@ const RemoteTool = struct {
 
 const ToolTier = debug_server_mod.ToolTier;
 
+const MAX_HANDLER_CONCURRENCY: usize = 8;
+
+const HandlerThreads = struct {
+    const State = enum { empty, running, complete };
+
+    const Slot = struct {
+        state: State = .empty,
+        thread: ?std.Thread = null,
+    };
+
+    slots: [MAX_HANDLER_CONCURRENCY]Slot = [_]Slot{.{}} ** MAX_HANDLER_CONCURRENCY,
+    limit: usize,
+    accepting: bool = true,
+    mutex: std.Thread.Mutex = .{},
+    available: std.Thread.Condition = .{},
+
+    fn init(limit: usize) HandlerThreads {
+        std.debug.assert(limit > 0 and limit <= MAX_HANDLER_CONCURRENCY);
+        return .{ .limit = limit };
+    }
+
+    fn begin(self: *HandlerThreads) ?usize {
+        while (true) {
+            var completed_thread: ?std.Thread = null;
+            var completed_slot: usize = 0;
+
+            self.mutex.lock();
+            if (!self.accepting) {
+                self.mutex.unlock();
+                debug_log_mod.log("mcp.handlers: rejecting request after shutdown", .{});
+                return null;
+            }
+
+            for (self.slots[0..self.limit], 0..) |*slot, i| {
+                if (slot.state == .complete and slot.thread != null) {
+                    completed_thread = slot.thread;
+                    completed_slot = i;
+                    slot.* = .{};
+                    break;
+                }
+            }
+
+            if (completed_thread) |thread| {
+                self.mutex.unlock();
+                debug_log_mod.log("mcp.handlers: joining completed slot={d}", .{completed_slot});
+                thread.join();
+                continue;
+            }
+
+            for (self.slots[0..self.limit], 0..) |*slot, i| {
+                if (slot.state == .empty) {
+                    slot.state = .running;
+                    self.mutex.unlock();
+                    debug_log_mod.log("mcp.handlers: reserved slot={d}", .{i});
+                    return i;
+                }
+            }
+
+            debug_log_mod.log("mcp.handlers: concurrency cap reached limit={d}; waiting", .{self.limit});
+            self.available.wait(&self.mutex);
+            self.mutex.unlock();
+        }
+    }
+
+    fn track(self: *HandlerThreads, slot_index: usize, thread: std.Thread) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const slot = &self.slots[slot_index];
+        std.debug.assert(slot.state != .empty and slot.thread == null);
+        slot.thread = thread;
+        self.available.broadcast();
+        debug_log_mod.log("mcp.handlers: tracking slot={d}", .{slot_index});
+    }
+
+    fn cancel(self: *HandlerThreads, slot_index: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const slot = &self.slots[slot_index];
+        std.debug.assert(slot.state == .running and slot.thread == null);
+        slot.* = .{};
+        self.available.broadcast();
+        debug_log_mod.log("mcp.handlers: released unspawned slot={d}", .{slot_index});
+    }
+
+    fn finish(self: *HandlerThreads, slot_index: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const slot = &self.slots[slot_index];
+        std.debug.assert(slot.state == .running);
+        slot.state = .complete;
+        self.available.broadcast();
+        debug_log_mod.log("mcp.handlers: completed slot={d}", .{slot_index});
+    }
+
+    fn stopAccepting(self: *HandlerThreads) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.accepting) return;
+        self.accepting = false;
+        self.available.broadcast();
+        debug_log_mod.log("mcp.handlers: stopped accepting requests", .{});
+    }
+
+    fn drain(self: *HandlerThreads) void {
+        debug_log_mod.log("mcp.handlers: draining in-flight requests", .{});
+        while (true) {
+            var completed_thread: ?std.Thread = null;
+            var completed_slot: usize = 0;
+            var has_in_flight = false;
+
+            self.mutex.lock();
+            for (self.slots[0..self.limit], 0..) |*slot, i| {
+                if (slot.state == .complete and slot.thread != null) {
+                    completed_thread = slot.thread;
+                    completed_slot = i;
+                    slot.* = .{};
+                    break;
+                }
+                if (slot.state != .empty) has_in_flight = true;
+            }
+
+            if (completed_thread) |thread| {
+                self.mutex.unlock();
+                debug_log_mod.log("mcp.handlers: joining drain slot={d}", .{completed_slot});
+                thread.join();
+                continue;
+            }
+
+            if (!has_in_flight) {
+                self.mutex.unlock();
+                debug_log_mod.log("mcp.handlers: drain complete", .{});
+                return;
+            }
+
+            debug_log_mod.log("mcp.handlers: waiting for in-flight request completion", .{});
+            self.available.wait(&self.mutex);
+            self.mutex.unlock();
+        }
+    }
+};
+
 const Runtime = struct {
     allocator: std.mem.Allocator,
     mem_config: ?Config,
@@ -278,6 +423,9 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         .mutex = &stdout_mutex,
     };
 
+    var handler_threads = HandlerThreads.init(MAX_HANDLER_CONCURRENCY);
+    debug_log_mod.log("mcp.handlers: initialized concurrency limit={d}", .{MAX_HANDLER_CONCURRENCY});
+
     var input_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer input_buf.deinit(allocator);
 
@@ -330,26 +478,42 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
         try input_buf.appendSlice(allocator, read_buf[0..n]);
 
-        while (try nextMessageFromBuffer(allocator, &input_buf)) |msg| {
-            // Spawn a handler thread per message for concurrent processing.
-            // The thread owns `msg` and frees it when done.
-            const thread = std.Thread.spawn(.{}, handleRequest, .{ &runtime, msg, stdout_writer }) catch {
-                // If we can't spawn a thread, process inline as fallback
+        while (!shutdown_requested.load(.acquire)) {
+            const msg = try nextMessageFromBuffer(allocator, &input_buf) orelse break;
+            const slot_index = handler_threads.begin() orelse {
+                debug_log_mod.log("mcp.handlers: dropping buffered request after shutdown", .{});
+                allocator.free(msg);
+                break;
+            };
+            if (shutdown_requested.load(.acquire)) {
+                debug_log_mod.log("mcp.handlers: shutdown observed after slot reservation; rejecting request", .{});
+                handler_threads.cancel(slot_index);
+                allocator.free(msg);
+                break;
+            }
+
+            // The thread owns `msg`; HandlerThreads owns and joins the thread.
+            const thread = std.Thread.spawn(.{}, handleRequest, .{ &runtime, msg, stdout_writer, &handler_threads, slot_index }) catch |err| {
+                handler_threads.cancel(slot_index);
+                debug_log_mod.log("mcp.handlers: spawn failed error={s}; processing inline", .{@errorName(err)});
                 defer allocator.free(msg);
-                processMessage(&runtime, msg, stdout_writer) catch |err| {
-                    logErr("MCP processMessage error: ", err);
-                    if (err == error.WriteFailure) {
+                processMessage(&runtime, msg, stdout_writer) catch |process_err| {
+                    logErr("MCP processMessage error: ", process_err);
+                    if (process_err == error.WriteFailure) {
                         shutdown_requested.store(true, .release);
                         break;
                     }
                 };
                 continue;
             };
-            thread.detach();
+            handler_threads.track(slot_index, thread);
         }
     }
 
-    debug_log_mod.log("mcp.serve: shutting down", .{});
+    debug_log_mod.log("mcp.serve: shutdown requested; stopping handler intake", .{});
+    handler_threads.stopAccepting();
+    handler_threads.drain();
+    debug_log_mod.log("mcp.serve: handlers drained before runtime teardown", .{});
 
     // Clean up debug sessions before exiting — kills adapter process groups
     // to prevent orphaned debugpy/launcher/debuggee processes.
@@ -466,7 +630,8 @@ fn nextMessageFromBuffer(allocator: std.mem.Allocator, input: *std.ArrayListUnma
 }
 
 /// Handler thread entry point. Owns `msg` and frees it when done.
-fn handleRequest(runtime: *Runtime, msg: []const u8, stdout: StdoutWriter) void {
+fn handleRequest(runtime: *Runtime, msg: []const u8, stdout: StdoutWriter, handlers: *HandlerThreads, slot_index: usize) void {
+    defer handlers.finish(slot_index);
     defer runtime.allocator.free(msg);
     processMessage(runtime, msg, stdout) catch |err| {
         logErr("MCP processMessage error: ", err);
@@ -2050,6 +2215,59 @@ fn logErr(prefix: []const u8, err: anyerror) void {
     w.interface.writeAll(@errorName(err)) catch {};
     w.interface.writeByte('\n') catch {};
     w.interface.flush() catch {};
+}
+
+test "HandlerThreads caps active handlers" {
+    var handlers = HandlerThreads.init(2);
+    const first_slot = handlers.begin().?;
+    const second_slot = handlers.begin().?;
+
+    const Completion = struct {
+        fn run(handler_threads: *HandlerThreads, slot_index: usize) void {
+            handler_threads.finish(slot_index);
+        }
+    };
+    handlers.track(first_slot, try std.Thread.spawn(.{}, Completion.run, .{ &handlers, first_slot }));
+
+    const reused_slot = handlers.begin().?;
+    try std.testing.expectEqual(first_slot, reused_slot);
+
+    handlers.cancel(reused_slot);
+    handlers.cancel(second_slot);
+    handlers.stopAccepting();
+    handlers.drain();
+}
+
+test "HandlerThreads stop accepting and drain tracked handlers" {
+    var handlers = HandlerThreads.init(1);
+    const slot_index = handlers.begin().?;
+
+    var allow_finish = std.atomic.Value(bool).init(false);
+    const Handler = struct {
+        fn run(handler_threads: *HandlerThreads, slot: usize, finish: *std.atomic.Value(bool)) void {
+            while (!finish.load(.acquire)) std.Thread.yield() catch {};
+            handler_threads.finish(slot);
+        }
+    };
+    handlers.track(slot_index, try std.Thread.spawn(.{}, Handler.run, .{ &handlers, slot_index, &allow_finish }));
+    handlers.stopAccepting();
+    try std.testing.expect(handlers.begin() == null);
+
+    var drain_complete = std.atomic.Value(bool).init(false);
+    const Drainer = struct {
+        fn run(handler_threads: *HandlerThreads, complete: *std.atomic.Value(bool)) void {
+            handler_threads.drain();
+            complete.store(true, .release);
+        }
+    };
+    const drain_thread = try std.Thread.spawn(.{}, Drainer.run, .{ &handlers, &drain_complete });
+    defer drain_thread.join();
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    try std.testing.expect(!drain_complete.load(.acquire));
+
+    allow_finish.store(true, .release);
+    while (!drain_complete.load(.acquire)) std.Thread.yield() catch {};
 }
 
 test "nextMessageFromBuffer extracts newline-delimited JSON" {
