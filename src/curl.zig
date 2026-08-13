@@ -220,6 +220,7 @@ pub fn getWithOptions(
 pub const DownloadResult = struct {
     status_code: u16,
     bytes_written: usize,
+    sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
 /// Stream a GET response into a mode-0600 sibling staging file, then atomically
@@ -231,6 +232,30 @@ pub fn downloadToFile(
     headers: []const []const u8,
     output_path: []const u8,
     max_bytes: usize,
+) !DownloadResult {
+    return downloadToFileInternal(allocator, url, headers, output_path, max_bytes, null);
+}
+
+/// Stream a GET response as `downloadToFile` does, but promote it only when its
+/// SHA-256 digest matches `expected_sha256`.
+pub fn downloadToFileVerified(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    output_path: []const u8,
+    max_bytes: usize,
+    expected_sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+) !DownloadResult {
+    return downloadToFileInternal(allocator, url, headers, output_path, max_bytes, expected_sha256);
+}
+
+fn downloadToFileInternal(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    output_path: []const u8,
+    max_bytes: usize,
+    expected_sha256: ?[std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) !DownloadResult {
     globalInit();
     try (RequestOptions{ .max_response_bytes = max_bytes }).validate();
@@ -317,12 +342,19 @@ pub fn downloadToFile(
         return err;
     };
 
+    const sha256 = finishFileDigest(&callback_data, expected_sha256) catch |err| {
+        debug_log.log("downloadToFile: SHA-256 verification failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    if (expected_sha256 != null) debug_log.log("downloadToFile: SHA-256 verified", .{});
+
     try stage.promote();
     debug_log.log("downloadToFile: completed status={d} bytes={d}", .{ validated_status, callback_data.bytes_written });
 
     return .{
         .status_code = validated_status,
         .bytes_written = callback_data.bytes_written,
+        .sha256 = sha256,
     };
 }
 
@@ -697,6 +729,7 @@ const FileWriteCallbackData = struct {
     file: *std.fs.File,
     max_bytes: usize,
     bytes_written: usize = 0,
+    hasher: std.crypto.hash.sha2.Sha256 = .init(.{}),
     failure: FileWriteFailure = .none,
     write_error: ?anyerror = null,
 };
@@ -730,8 +763,21 @@ fn fileWriteCallback(
         debug_log.log("curl response file write failure: {s}", .{@errorName(err)});
         return 0;
     };
+    data.hasher.update(ptr[0..total]);
     data.bytes_written += total;
     return total;
+}
+
+fn finishFileDigest(
+    data: *FileWriteCallbackData,
+    expected_sha256: ?[std.crypto.hash.sha2.Sha256.digest_length]u8,
+) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var actual_sha256: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    data.hasher.final(&actual_sha256);
+    if (expected_sha256) |expected| {
+        if (!std.mem.eql(u8, &actual_sha256, &expected)) return error.ArtifactDigestMismatch;
+    }
+    return actual_sha256;
 }
 
 fn writeCallback(

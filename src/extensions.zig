@@ -1091,11 +1091,18 @@ const StableVersion = struct {
     patch: u64,
 };
 
+const ReleaseAssetInfo = struct {
+    name: []const u8,
+    download_url: []const u8,
+    digest: ?[]const u8,
+};
+
 const ReleaseInfo = struct {
     tag_name: []const u8,
     tarball_url: []const u8,
     draft: bool,
     prerelease: bool,
+    assets: []const ReleaseAssetInfo = &.{},
 };
 
 const install_metadata_filename = "cog-extension-install.json";
@@ -1104,6 +1111,7 @@ const InstallMetadata = struct {
     source_url: []u8,
     version: []u8,
     tag: []u8,
+    archive_sha256: ?[]u8,
 };
 
 pub const InstallOptions = struct {
@@ -1113,7 +1121,8 @@ pub const InstallOptions = struct {
 const ResolvedRelease = struct {
     tag_name: []u8,
     version: []u8,
-    tarball_url: []u8,
+    archive_url: []u8,
+    archive_sha256: []u8,
 };
 
 pub const InstallResult = struct {
@@ -1218,6 +1227,36 @@ fn chooseRelease(releases: []const ReleaseInfo, requested_version: ?[]const u8) 
     return best;
 }
 
+fn isTarArchiveAsset(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".tar.gz") or std.mem.endsWith(u8, name, ".tgz");
+}
+
+fn chooseReleaseArtifact(release: *const ReleaseInfo) !ReleaseAssetInfo {
+    var selected: ?ReleaseAssetInfo = null;
+    for (release.assets) |asset| {
+        if (!isTarArchiveAsset(asset.name)) continue;
+        if (asset.digest == null) continue;
+        if (selected != null) return error.AmbiguousReleaseArchive;
+        selected = asset;
+    }
+    if (selected) |asset| return asset;
+
+    for (release.assets) |asset| {
+        if (isTarArchiveAsset(asset.name)) return error.MissingArtifactDigest;
+    }
+    return error.MissingReleaseArchive;
+}
+
+fn parseSha256Digest(text: []const u8) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    const prefix = "sha256:";
+    const hex = if (std.mem.startsWith(u8, text, prefix)) text[prefix.len..] else return error.InvalidArtifactDigest;
+    if (hex.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidArtifactDigest;
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, hex) catch return error.InvalidArtifactDigest;
+    return digest;
+}
+
 fn resolveGithubRelease(allocator: std.mem.Allocator, git_url: []const u8, requested_version: ?[]const u8) !ResolvedRelease {
     const repo = parseGitHubRepo(git_url) orelse {
         printErr("error: extension release installs currently require a GitHub repository URL\n");
@@ -1255,6 +1294,11 @@ fn resolveGithubRelease(allocator: std.mem.Allocator, git_url: []const u8, reque
 
     var releases: std.ArrayListUnmanaged(ReleaseInfo) = .empty;
     defer releases.deinit(allocator);
+    var release_assets: std.ArrayListUnmanaged([]ReleaseAssetInfo) = .empty;
+    defer {
+        for (release_assets.items) |assets| allocator.free(assets);
+        release_assets.deinit(allocator);
+    }
 
     for (parsed.value.array.items) |item| {
         if (item != .object) continue;
@@ -1262,12 +1306,33 @@ fn resolveGithubRelease(allocator: std.mem.Allocator, git_url: []const u8, reque
         const tarball_value = item.object.get("tarball_url") orelse continue;
         const draft_value = item.object.get("draft") orelse continue;
         const prerelease_value = item.object.get("prerelease") orelse continue;
-        if (tag_value != .string or tarball_value != .string or draft_value != .bool or prerelease_value != .bool) continue;
+        const assets_value = item.object.get("assets") orelse continue;
+        if (tag_value != .string or tarball_value != .string or draft_value != .bool or prerelease_value != .bool or assets_value != .array) continue;
+
+        var assets: std.ArrayListUnmanaged(ReleaseAssetInfo) = .empty;
+        errdefer assets.deinit(allocator);
+        for (assets_value.array.items) |asset_value| {
+            if (asset_value != .object) continue;
+            const name_value = asset_value.object.get("name") orelse continue;
+            const url_value = asset_value.object.get("browser_download_url") orelse continue;
+            const digest_value = asset_value.object.get("digest") orelse continue;
+            if (name_value != .string or url_value != .string) continue;
+            if (digest_value != .string and digest_value != .null) continue;
+            try assets.append(allocator, .{
+                .name = name_value.string,
+                .download_url = url_value.string,
+                .digest = if (digest_value == .string) digest_value.string else null,
+            });
+        }
+        const owned_assets = try assets.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_assets);
+        try release_assets.append(allocator, owned_assets);
         try releases.append(allocator, .{
             .tag_name = tag_value.string,
             .tarball_url = tarball_value.string,
             .draft = draft_value.bool,
             .prerelease = prerelease_value.bool,
+            .assets = owned_assets,
         });
     }
 
@@ -1286,23 +1351,52 @@ fn resolveGithubRelease(allocator: std.mem.Allocator, git_url: []const u8, reque
     };
     debug_log.log("resolveGithubRelease: selected tag {s}", .{selected.tag_name});
 
+    const artifact = chooseReleaseArtifact(&selected) catch |err| {
+        debug_log.log("resolveGithubRelease: release artifact digest discovery failed: {s}", .{@errorName(err)});
+        switch (err) {
+            error.MissingReleaseArchive => printErr("error: extension release must include one .tar.gz or .tgz asset\n"),
+            error.MissingArtifactDigest => printErr("error: extension release archive is missing a GitHub SHA-256 digest\n"),
+            error.AmbiguousReleaseArchive => printErr("error: extension release includes multiple digest-bearing tar archives\n"),
+            else => printErr("error: invalid extension release archive metadata\n"),
+        }
+        return error.Explained;
+    };
+    const digest_text = artifact.digest.?;
+    _ = parseSha256Digest(digest_text) catch {
+        debug_log.log("resolveGithubRelease: release artifact digest format rejected", .{});
+        printErr("error: extension release archive has an invalid SHA-256 digest\n");
+        return error.Explained;
+    };
+    debug_log.log("resolveGithubRelease: discovered GitHub SHA-256 digest for archive asset", .{});
+
+    const tag_name = try allocator.dupe(u8, selected.tag_name);
+    errdefer allocator.free(tag_name);
+    const version = try allocator.dupe(u8, normalizeVersionString(selected.tag_name));
+    errdefer allocator.free(version);
+    const archive_url = try allocator.dupe(u8, artifact.download_url);
+    errdefer allocator.free(archive_url);
+    const archive_sha256 = try allocator.dupe(u8, digest_text["sha256:".len..]);
+
     return .{
-        .tag_name = try allocator.dupe(u8, selected.tag_name),
-        .version = try allocator.dupe(u8, normalizeVersionString(selected.tag_name)),
-        .tarball_url = try allocator.dupe(u8, selected.tarball_url),
+        .tag_name = tag_name,
+        .version = version,
+        .archive_url = archive_url,
+        .archive_sha256 = archive_sha256,
     };
 }
 
 fn freeResolvedRelease(allocator: std.mem.Allocator, release: *const ResolvedRelease) void {
     allocator.free(release.tag_name);
     allocator.free(release.version);
-    allocator.free(release.tarball_url);
+    allocator.free(release.archive_url);
+    allocator.free(release.archive_sha256);
 }
 
 fn freeInstallMetadata(allocator: std.mem.Allocator, metadata: *const InstallMetadata) void {
     allocator.free(metadata.source_url);
     allocator.free(metadata.version);
     allocator.free(metadata.tag);
+    if (metadata.archive_sha256) |digest| allocator.free(digest);
 }
 
 pub fn freeInstallResult(allocator: std.mem.Allocator, result: *const InstallResult) void {
@@ -1355,6 +1449,8 @@ fn writeInstallMetadata(allocator: std.mem.Allocator, ext_dir: []const u8, sourc
     try s.write(release.version);
     try s.objectField("tag");
     try s.write(release.tag_name);
+    try s.objectField("archive_sha256");
+    try s.write(release.archive_sha256);
     try s.endObject();
     try aw.writer.writeByte('\n');
 
@@ -1381,13 +1477,35 @@ fn readInstallMetadata(allocator: std.mem.Allocator, ext_dir: []const u8) !Insta
     const source_url_value = parsed.value.object.get("source_url") orelse return error.InvalidInstallMetadata;
     const version_value = parsed.value.object.get("version") orelse return error.InvalidInstallMetadata;
     const tag_value = parsed.value.object.get("tag") orelse return error.InvalidInstallMetadata;
+    const digest_value = parsed.value.object.get("archive_sha256");
     if (source_url_value != .string or version_value != .string or tag_value != .string) return error.InvalidInstallMetadata;
+    if (digest_value) |digest| {
+        if (digest != .string or digest.string.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return error.InvalidInstallMetadata;
+        var decoded: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        _ = std.fmt.hexToBytes(&decoded, digest.string) catch return error.InvalidInstallMetadata;
+    }
+
+    const source_url = try allocator.dupe(u8, source_url_value.string);
+    errdefer allocator.free(source_url);
+    const version = try allocator.dupe(u8, version_value.string);
+    errdefer allocator.free(version);
+    const tag = try allocator.dupe(u8, tag_value.string);
+    errdefer allocator.free(tag);
+    const archive_sha256 = if (digest_value) |digest| try allocator.dupe(u8, digest.string) else null;
+    errdefer if (archive_sha256) |digest| allocator.free(digest);
 
     return .{
-        .source_url = try allocator.dupe(u8, source_url_value.string),
-        .version = try allocator.dupe(u8, version_value.string),
-        .tag = try allocator.dupe(u8, tag_value.string),
+        .source_url = source_url,
+        .version = version,
+        .tag = tag,
+        .archive_sha256 = archive_sha256,
     };
+}
+
+fn extensionNeedsUpdate(metadata: *const InstallMetadata, latest_tag: []const u8, latest_sha256: []const u8) bool {
+    if (!std.mem.eql(u8, latest_tag, metadata.tag)) return true;
+    const installed_sha256 = metadata.archive_sha256 orelse return true;
+    return !std.mem.eql(u8, latest_sha256, installed_sha256);
 }
 
 fn deleteTreeIfExistsAbsolute(path: []const u8) !void {
@@ -1540,14 +1658,20 @@ fn extractTarball(allocator: std.mem.Allocator, tarball_path: []const u8, output
     try validateExtractedTree(allocator, output_dir);
 }
 
-fn downloadReleaseTarball(allocator: std.mem.Allocator, tarball_url: []const u8, output_path: []const u8) !void {
+fn downloadReleaseTarball(allocator: std.mem.Allocator, archive_url: []const u8, expected_sha256_text: []const u8, output_path: []const u8) !void {
+    const prefixed_digest = try std.fmt.allocPrint(allocator, "sha256:{s}", .{expected_sha256_text});
+    defer allocator.free(prefixed_digest);
+    const expected_sha256 = parseSha256Digest(prefixed_digest) catch |err| {
+        debug_log.log("downloadReleaseTarball: expected digest rejected: {s}", .{@errorName(err)});
+        return error.InvalidArtifactDigest;
+    };
     debug_log.log(
-        "downloadReleaseTarball: streaming {s} -> {s} cap={d}",
-        .{ tarball_url, output_path, max_extension_archive_bytes },
+        "downloadReleaseTarball: streaming release archive cap={d}",
+        .{max_extension_archive_bytes},
     );
-    const result = curl.downloadToFile(
+    const result = curl.downloadToFileVerified(
         allocator,
-        tarball_url,
+        archive_url,
         &.{
             "Accept: application/vnd.github+json",
             "User-Agent: cog-cli",
@@ -1555,16 +1679,18 @@ fn downloadReleaseTarball(allocator: std.mem.Allocator, tarball_url: []const u8,
         },
         output_path,
         max_extension_archive_bytes,
+        expected_sha256,
     ) catch |err| {
         debug_log.log(
-            "downloadReleaseTarball: streaming download failed: {s}",
+            "downloadReleaseTarball: streaming verification failed: {s}",
             .{@errorName(err)},
         );
+        if (err == error.ArtifactDigestMismatch) return err;
         return error.DownloadFailed;
     };
     debug_log.log(
-        "downloadReleaseTarball: downloaded status={d} bytes={d} to {s}",
-        .{ result.status_code, result.bytes_written, output_path },
+        "downloadReleaseTarball: verified archive status={d} bytes={d}",
+        .{ result.status_code, result.bytes_written },
     );
 }
 
@@ -1644,8 +1770,12 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
     errdefer deleteTreeIfExistsAbsolute(staged_dir) catch {};
     errdefer std.fs.deleteFileAbsolute(tarball_path) catch {};
 
-    downloadReleaseTarball(allocator, release.tarball_url, tarball_path) catch {
-        printErr("error: failed to download extension release tarball\n");
+    downloadReleaseTarball(allocator, release.archive_url, release.archive_sha256, tarball_path) catch |err| {
+        if (err == error.ArtifactDigestMismatch) {
+            printErr("error: extension release archive SHA-256 verification failed\n");
+        } else {
+            printErr("error: failed to download extension release archive\n");
+        }
         return error.Explained;
     };
     extractTarball(allocator, tarball_path, staged_dir) catch {
@@ -1831,12 +1961,16 @@ pub fn updateExtensions(allocator: std.mem.Allocator, requested_name: ?[]const u
 
         const latest_release = try resolveGithubRelease(allocator, metadata.source_url, null);
         defer freeResolvedRelease(allocator, &latest_release);
-        if (std.mem.eql(u8, latest_release.tag_name, metadata.tag)) {
-            debug_log.log("updateExtensions: {s} already current at {s}", .{ entry.name, metadata.tag });
+        if (!extensionNeedsUpdate(&metadata, latest_release.tag_name, latest_release.archive_sha256)) {
+            debug_log.log("updateExtensions: {s} already current with verified archive integrity", .{entry.name});
             continue;
         }
 
-        debug_log.log("updateExtensions: {s} {s} -> {s}", .{ entry.name, metadata.tag, latest_release.tag_name });
+        if (std.mem.eql(u8, latest_release.tag_name, metadata.tag)) {
+            debug_log.log("updateExtensions: {s} refreshing integrity metadata for current tag", .{entry.name});
+        } else {
+            debug_log.log("updateExtensions: {s} advancing release tag", .{entry.name});
+        }
 
         const install_result = try installExtensionToDir(allocator, metadata.source_url, null, entry.name, options);
         defer freeInstallResult(allocator, &install_result);
