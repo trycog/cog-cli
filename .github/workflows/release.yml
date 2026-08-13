@@ -120,6 +120,15 @@ jobs:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         run: cp "$BUNDLE_PATH" tarballs/cog-build-provenance.json
 
+      - name: Verify build provenance and release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_DIGEST: ${{ github.sha }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/release.yml
+        run: ./scripts/validate-release.sh "$RELEASE_TAG" tarballs release-notes.md tarballs/cog-build-provenance.json
+
       - name: Create draft GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:

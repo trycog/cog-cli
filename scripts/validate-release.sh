@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    printf 'usage: %s vMAJOR.MINOR.PATCH [artifact-directory] [release-notes-output]\n' "$0" >&2
+    printf 'usage: %s vMAJOR.MINOR.PATCH [artifact-directory] [release-notes-output] [provenance-bundle]\n' "$0" >&2
     exit 2
 }
 
@@ -11,12 +11,14 @@ fail() {
     exit 1
 }
 
-[ "$#" -ge 1 ] && [ "$#" -le 3 ] || usage
+[ "$#" -ge 1 ] && [ "$#" -le 4 ] || usage
 
 release_tag=$1
 artifact_dir=${2:-}
 notes_output=${3:-}
+provenance_bundle=${4:-}
 ruby_bin=${RUBY:-ruby}
+gh_bin=${GH:-gh}
 
 case "$release_tag" in
     v[0-9]*.[0-9]*.[0-9]*) ;;
@@ -114,3 +116,58 @@ artifact_version=$("$verify_dir/cog" --version 2>/dev/null) || fail "$host_artif
 [ "$artifact_version" = "$source_version" ] || fail "$host_artifact reports version $artifact_version, expected $source_version"
 
 printf 'Release artifacts validated for source version %s\n' "$source_version"
+
+if [ -z "$provenance_bundle" ]; then
+    exit 0
+fi
+
+checksum_manifest="$artifact_dir/SHA256SUMS"
+[ -f "$checksum_manifest" ] || fail "SHA256SUMS is missing from artifact directory"
+checksum_names=$(
+    "$ruby_bin" -e '
+path = ARGV.fetch(0)
+names = File.readlines(path, chomp: true).filter_map do |line|
+  match = line.match(/\A[0-9a-fA-F]{64}\s+\*?(.+)\z/)
+  abort "invalid checksum line: #{line}" unless match
+  match[1]
+end
+puts names.sort
+' -- "$checksum_manifest"
+) || fail "SHA256SUMS contains invalid entries"
+[ "$checksum_names" = "$expected_names" ] || fail "SHA256SUMS must list exactly the release artifacts"
+
+checksum_mismatch=$(
+    "$ruby_bin" -rdigest -e '
+dir = ARGV.fetch(0)
+path = ARGV.fetch(1)
+File.readlines(path, chomp: true).each do |line|
+  expected, name = line.match(/\A([0-9a-fA-F]{64})\s+\*?(.+)\z/).captures
+  if Digest::SHA256.file(File.join(dir, name)).hexdigest != expected
+    puts name
+    break
+  end
+end
+' -- "$artifact_dir" "$checksum_manifest"
+)
+[ -z "$checksum_mismatch" ] || fail "SHA256SUMS digest mismatch for $checksum_mismatch"
+
+[ -f "$provenance_bundle" ] || fail "provenance bundle does not exist: $provenance_bundle"
+source_digest=${SOURCE_DIGEST:-}
+source_repository=${SOURCE_REPOSITORY:-}
+signer_workflow=${SIGNER_WORKFLOW:-}
+[ -n "$source_digest" ] || fail "SOURCE_DIGEST is required for provenance validation"
+[ -n "$source_repository" ] || fail "SOURCE_REPOSITORY is required for provenance validation"
+[ -n "$signer_workflow" ] || fail "SIGNER_WORKFLOW is required for provenance validation"
+
+provenance_subjects="$expected_names
+SHA256SUMS"
+for subject_name in $provenance_subjects; do
+    "$gh_bin" attestation verify "$artifact_dir/$subject_name" \
+        --bundle "$provenance_bundle" \
+        --repo "$source_repository" \
+        --signer-workflow "$signer_workflow" \
+        --source-ref "refs/tags/$release_tag" \
+        --source-digest "$source_digest" >/dev/null || fail "provenance verification failed for $subject_name"
+done
+
+printf 'Release integrity validated for source version %s\n' "$source_version"

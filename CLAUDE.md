@@ -55,7 +55,7 @@ git tag vX.Y.Z
 git push && git push origin vX.Y.Z
 ```
 
-The GitHub Actions release workflow handles the rest: building binaries, creating the GitHub Release, and updating the Homebrew tap.
+The GitHub Actions release workflow handles the rest: it validates that the tag exactly matches `build.zig.zon`, requires a non-empty matching changelog section, runs unit and indexing gates before building, verifies the release tarballs and `SHA256SUMS`, confirms provenance is bound to the same tag and commit, creates the GitHub Release, and updates the Homebrew tap.
 
 ## CLI Design Language
 

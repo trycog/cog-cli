@@ -19,6 +19,9 @@ jobs:
       - name: Check formatting
         run: zig fmt --check src build.zig build.zig.zon
 
+      - name: Test release validation
+        run: ./test/release/validate-release.sh
+
   test:
     needs: fmt
     strategy:
