@@ -106,6 +106,15 @@ fn printErrFmt(comptime fmt: []const u8, args: anytype) void {
     printErr(msg);
 }
 
+fn runHostConfigStep(context: []const u8, result: anyerror!void, success_called: *bool) !void {
+    result catch |err| {
+        debug_log.log("commands.init: host config merge failed context={s} error={s}", .{ context, @errorName(err) });
+        return err;
+    };
+    debug_log.log("commands.init: host config merge complete context={s}", .{context});
+    success_called.* = true;
+}
+
 pub fn readStdinLine(allocator: std.mem.Allocator) ![]const u8 {
     var buf: [1024]u8 = undefined;
     const n = std.posix.read(std.fs.File.stdin().handle, &buf) catch {
@@ -435,8 +444,9 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
             }
             if (!mcp_already_written) {
-                hooks_mod.configureMcp(allocator, agent) catch {};
-                if (agent.mcp_format != .global_only) {
+                var configured = false;
+                try runHostConfigStep("MCP config", hooks_mod.configureMcp(allocator, agent), &configured);
+                if (configured and agent.mcp_format != .global_only) {
                     printErr("    ");
                     tui.checkmark();
                     printErr(" ");
@@ -450,15 +460,18 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 }
             }
         } else if (agent.mcp_format == .global_only) {
-            hooks_mod.configureMcp(allocator, agent) catch {};
+            try hooks_mod.configureMcp(allocator, agent);
         }
 
         // c. Configure tool permissions if user opted in
         if (allow_tools and agent.supportsToolPermissions()) {
-            hooks_mod.configureToolPermissions(allocator, agent) catch {};
-            printErr("    ");
-            tui.checkmark();
-            printErr(" tool permissions\n");
+            var configured = false;
+            try runHostConfigStep("tool permissions", hooks_mod.configureToolPermissions(allocator, agent), &configured);
+            if (configured) {
+                printErr("    ");
+                tui.checkmark();
+                printErr(" tool permissions\n");
+            }
         }
 
         for (hooks_mod.runtimePolicyAssets(agent)) |asset| {
@@ -478,7 +491,8 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
         }
 
-        hooks_mod.configureRuntimePolicy(allocator, agent) catch {};
+        var runtime_policy_configured = false;
+        try runHostConfigStep("runtime policy config", hooks_mod.configureRuntimePolicy(allocator, agent), &runtime_policy_configured);
 
         // d. Deploy agent file (dedup by path)
         if (agent.agent_file_path) |agent_path| {
@@ -496,7 +510,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     break :blk shouldWriteFile(allocator, agent_path, content, &accept_all);
                 } else true; // codex/roo: upsert, always write
                 if (should_write) {
-                    hooks_mod.configureAgentFile(allocator, agent) catch {};
+                    try hooks_mod.configureAgentFile(allocator, agent);
                     printErr("    ");
                     tui.checkmark();
                     printErr(" ");
@@ -527,7 +541,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
             if (shares_path) {
                 // Codex/Roo: same file, writers append — always write
-                hooks_mod.configureDebugAgentFile(allocator, agent) catch {};
+                try hooks_mod.configureDebugAgentFile(allocator, agent);
             } else {
                 var debug_already_written = false;
                 for (written_agents[0..written_agents_count]) |wa| {
@@ -543,7 +557,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                         break :blk shouldWriteFile(allocator, debug_path, content, &accept_all);
                     } else true;
                     if (should_write) {
-                        hooks_mod.configureDebugAgentFile(allocator, agent) catch {};
+                        try hooks_mod.configureDebugAgentFile(allocator, agent);
                         printErr("    ");
                         tui.checkmark();
                         printErr(" ");
@@ -574,7 +588,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
                 if (shares_path) {
                     // Codex/Roo: same file, writers append — always write
-                    hooks_mod.configureMemAgentFile(allocator, agent) catch {};
+                    try hooks_mod.configureMemAgentFile(allocator, agent);
                 } else {
                     var mem_already_written = false;
                     for (written_agents[0..written_agents_count]) |wa| {
@@ -590,7 +604,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                             break :blk shouldWriteFile(allocator, mem_path, content, &accept_all);
                         } else true;
                         if (should_write) {
-                            hooks_mod.configureMemAgentFile(allocator, agent) catch {};
+                            try hooks_mod.configureMemAgentFile(allocator, agent);
                             printErr("    ");
                             tui.checkmark();
                             printErr(" ");
@@ -621,7 +635,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     false;
 
                 if (shares_path) {
-                    hooks_mod.configureValidateAgentFile(allocator, agent) catch {};
+                    try hooks_mod.configureValidateAgentFile(allocator, agent);
                 } else {
                     var validate_already_written = false;
                     for (written_agents[0..written_agents_count]) |wa| {
@@ -637,7 +651,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                             break :blk shouldWriteFile(allocator, validate_path, content, &accept_all);
                         } else true;
                         if (should_write) {
-                            hooks_mod.configureValidateAgentFile(allocator, agent) catch {};
+                            try hooks_mod.configureValidateAgentFile(allocator, agent);
                             printErr("    ");
                             tui.checkmark();
                             printErr(" ");
@@ -667,7 +681,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 false;
 
             if (shares_path) {
-                hooks_mod.configureObserveAgentFile(allocator, agent) catch {};
+                try hooks_mod.configureObserveAgentFile(allocator, agent);
             } else {
                 var observe_already_written = false;
                 for (written_agents[0..written_agents_count]) |wa| {
@@ -683,7 +697,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                         break :blk shouldWriteFile(allocator, observe_path, content, &accept_all);
                     } else true;
                     if (should_write) {
-                        hooks_mod.configureObserveAgentFile(allocator, agent) catch {};
+                        try hooks_mod.configureObserveAgentFile(allocator, agent);
                         printErr("    ");
                         tui.checkmark();
                         printErr(" ");
@@ -2392,6 +2406,15 @@ test "appendUniquePath keeps first occurrence only" {
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqualStrings("CLAUDE.md", buffer[0]);
     try std.testing.expectEqualStrings(".mcp.json", buffer[1]);
+}
+
+test "init host config steps propagate merge failures before success" {
+    var success_called = false;
+    try std.testing.expectError(
+        error.MalformedHostConfig,
+        runHostConfigStep("MCP config", error.MalformedHostConfig, &success_called),
+    );
+    try std.testing.expect(!success_called);
 }
 
 test "writeClientContextManifest writes selected agents and features" {
