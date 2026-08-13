@@ -1309,6 +1309,29 @@ pub fn freeInstallResult(allocator: std.mem.Allocator, result: *const InstallRes
     allocator.free(result.tag);
 }
 
+fn prepareInstallResult(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    path: []const u8,
+    version: []const u8,
+    tag: []const u8,
+) !InstallResult {
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    const owned_version = try allocator.dupe(u8, version);
+    errdefer allocator.free(owned_version);
+    const owned_tag = try allocator.dupe(u8, tag);
+
+    return .{
+        .name = owned_name,
+        .path = owned_path,
+        .version = owned_version,
+        .tag = owned_tag,
+    };
+}
+
 fn metadataPath(allocator: std.mem.Allocator, ext_dir: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ ext_dir, install_metadata_filename });
 }
@@ -1401,6 +1424,11 @@ fn validateRelativePath(path: []const u8, initial_depth: usize) !void {
 }
 
 fn validateArchiveEntryPath(path: []const u8) !void {
+    if (std.mem.eql(u8, path, "..")) return error.UnsafeArchivePath;
+    var components = std.mem.tokenizeAny(u8, path, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return error.UnsafeArchivePath;
+    }
     try validateRelativePath(path, 0);
 }
 
@@ -1510,19 +1538,31 @@ fn extractTarball(allocator: std.mem.Allocator, tarball_path: []const u8, output
 }
 
 fn downloadReleaseTarball(allocator: std.mem.Allocator, tarball_url: []const u8, output_path: []const u8) !void {
-    debug_log.log("downloadReleaseTarball: downloading {s} -> {s}", .{ tarball_url, output_path });
-    const response = curl.get(allocator, tarball_url, &.{
-        "Accept: application/vnd.github+json",
-        "User-Agent: cog-cli",
-        "X-GitHub-Api-Version: 2022-11-28",
-    }) catch return error.DownloadFailed;
-    defer allocator.free(response.body);
-    if (response.status_code != 200) return error.DownloadFailed;
-
-    const file = try std.fs.createFileAbsolute(output_path, .{});
-    defer file.close();
-    try file.writeAll(response.body);
-    debug_log.log("downloadReleaseTarball: wrote {d} bytes to {s}", .{ response.body.len, output_path });
+    debug_log.log(
+        "downloadReleaseTarball: streaming {s} -> {s} cap={d}",
+        .{ tarball_url, output_path, max_extension_archive_bytes },
+    );
+    const result = curl.downloadToFile(
+        allocator,
+        tarball_url,
+        &.{
+            "Accept: application/vnd.github+json",
+            "User-Agent: cog-cli",
+            "X-GitHub-Api-Version: 2022-11-28",
+        },
+        output_path,
+        max_extension_archive_bytes,
+    ) catch |err| {
+        debug_log.log(
+            "downloadReleaseTarball: streaming download failed: {s}",
+            .{@errorName(err)},
+        );
+        return error.DownloadFailed;
+    };
+    debug_log.log(
+        "downloadReleaseTarball: downloaded status={d} bytes={d} to {s}",
+        .{ result.status_code, result.bytes_written, output_path },
+    );
 }
 
 fn ensureBuildTrusted(build_cmd: []const u8, options: InstallOptions) !void {
@@ -1667,6 +1707,16 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
         return error.Explained;
     };
 
+    debug_log.log("installExtensionToDir: allocating result before promotion", .{});
+    const install_result = try prepareInstallResult(
+        allocator,
+        manifest.name,
+        ext_dir,
+        release.version,
+        release.tag_name,
+    );
+    errdefer freeInstallResult(allocator, &install_result);
+
     var ext_parent_dir = std.fs.openDirAbsolute(ext_base, .{}) catch {
         printErr("error: failed to open extensions directory\n");
         return error.Explained;
@@ -1680,12 +1730,7 @@ pub fn installExtensionToDir(allocator: std.mem.Allocator, git_url: []const u8, 
     };
     debug_log.log("installExtensionToDir: promoted extension {s}", .{resolved_name});
 
-    return .{
-        .name = try allocator.dupe(u8, manifest.name),
-        .path = try allocator.dupe(u8, ext_dir),
-        .version = try allocator.dupe(u8, release.version),
-        .tag = try allocator.dupe(u8, release.tag_name),
-    };
+    return install_result;
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────
@@ -1913,7 +1958,7 @@ test "validateArchiveSymlink rejects links escaping the staged tree" {
     try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("bin/cog-safe", "../../outside"));
     try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("bin/cog-safe", "/tmp/outside"));
     try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("bin/cog-safe", "\\outside"));
-    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("nested/../bin/cog-safe", "../../outside"));
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveSymlink("nested/../bin/cog-safe", "../../outside"));
 }
 
 test "inspectTarballArchive rejects unsafe archive contents" {
