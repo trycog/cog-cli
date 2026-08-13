@@ -296,6 +296,7 @@ const DefInfo = struct {
     path: []const u8,
     line: i32,
     end_line: i32 = 0, // end of definition body (from enclosing_range); 0 = unknown
+    enclosing_range: ?scip.Range = null,
     kind: i32,
     display_name: []const u8,
     documentation: []const []const u8,
@@ -368,95 +369,106 @@ pub const CodeIndex = struct {
         var symbol_to_calls: std.StringHashMapUnmanaged(RelationshipList) = .empty;
         var symbol_to_callers: std.StringHashMapUnmanaged(RelationshipList) = .empty;
 
+        debug_log.log("CodeIndex.build: pass1 documents={d}", .{index.documents.len});
+
+        // Pass 1: register every document and definition before resolving any
+        // relationship. This makes relationship construction independent of
+        // SCIP document order.
         for (index.documents, 0..) |doc, doc_idx| {
             try path_to_doc_idx.put(allocator, doc.relative_path, doc_idx);
 
-            // Process symbol definitions from document's symbols
             for (doc.symbols) |sym| {
-                if (sym.symbol.len > 0) {
-                    // Find the definition occurrence for this symbol
-                    var def_line: i32 = 0;
-                    var def_end_line: i32 = 0;
-                    for (doc.occurrences) |occ| {
-                        if (std.mem.eql(u8, occ.symbol, sym.symbol) and scip.SymbolRole.isDefinition(occ.symbol_roles)) {
-                            def_line = occ.range.start_line;
-                            if (occ.enclosing_range) |er| {
-                                def_end_line = er.end_line;
-                            }
-                            break;
-                        }
-                    }
-                    try symbol_to_defs.put(allocator, sym.symbol, .{
-                        .path = doc.relative_path,
-                        .line = def_line,
-                        .end_line = def_end_line,
-                        .kind = sym.kind,
-                        .display_name = sym.display_name,
-                        .documentation = sym.documentation,
+                if (sym.symbol.len == 0) continue;
+
+                var def_line: i32 = 0;
+                var def_end_line: i32 = 0;
+                var enclosing_range: ?scip.Range = null;
+                for (doc.occurrences) |occ| {
+                    if (!std.mem.eql(u8, occ.symbol, sym.symbol)) continue;
+                    if (!scip.SymbolRole.isDefinition(occ.symbol_roles)) continue;
+                    def_line = occ.range.start_line;
+                    enclosing_range = occ.enclosing_range;
+                    if (occ.enclosing_range) |range| def_end_line = range.end_line;
+                    break;
+                }
+
+                try symbol_to_defs.put(allocator, sym.symbol, .{
+                    .path = doc.relative_path,
+                    .line = def_line,
+                    .end_line = def_end_line,
+                    .enclosing_range = enclosing_range,
+                    .kind = sym.kind,
+                    .display_name = sym.display_name,
+                    .documentation = sym.documentation,
+                });
+            }
+        }
+
+        for (index.external_symbols) |sym| {
+            if (sym.symbol.len > 0 and !symbol_to_defs.contains(sym.symbol)) {
+                try symbol_to_defs.put(allocator, sym.symbol, .{
+                    .path = "",
+                    .line = 0,
+                    .kind = sym.kind,
+                    .display_name = sym.display_name,
+                    .documentation = sym.documentation,
+                });
+            }
+        }
+
+        debug_log.log("CodeIndex.build: pass2 definitions={d}", .{symbol_to_defs.count()});
+
+        // Pass 2: build containment, declared relationships, references,
+        // imports, and call edges against the complete definition table.
+        for (index.documents) |doc| {
+            for (doc.symbols) |sym| {
+                if (sym.symbol.len == 0) continue;
+
+                if (sym.enclosing_symbol.len > 0) {
+                    try symbol_to_parent.put(allocator, sym.symbol, sym.enclosing_symbol);
+                    const children_entry = try parent_to_children.getOrPut(allocator, sym.enclosing_symbol);
+                    if (!children_entry.found_existing) children_entry.value_ptr.* = .empty;
+                    try appendUniqueRelationship(allocator, children_entry.value_ptr, .{
+                        .symbol = sym.symbol,
+                        .kind = "contains",
                     });
+                }
 
-                    if (sym.enclosing_symbol.len > 0) {
-                        try symbol_to_parent.put(allocator, sym.symbol, sym.enclosing_symbol);
-                        const children_entry = try parent_to_children.getOrPut(allocator, sym.enclosing_symbol);
-                        if (!children_entry.found_existing) children_entry.value_ptr.* = .empty;
-                        try appendUniqueRelationship(allocator, children_entry.value_ptr, .{
-                            .symbol = sym.symbol,
-                            .kind = "contains",
-                        });
-                    }
+                if (sym.relationships.len == 0) continue;
+                const outgoing_entry = try symbol_to_relationships.getOrPut(allocator, sym.symbol);
+                if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
 
-                    if (sym.relationships.len > 0) {
-                        const outgoing_entry = try symbol_to_relationships.getOrPut(allocator, sym.symbol);
-                        if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
+                for (sym.relationships) |rel| {
+                    const rel_kind = scip.relationshipKind(rel);
+                    try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
+                        .symbol = rel.symbol,
+                        .kind = rel_kind,
+                    });
+                    try addSpecializedRelationship(
+                        allocator,
+                        doc.relative_path,
+                        sym.symbol,
+                        rel.symbol,
+                        rel_kind,
+                        &symbol_to_defs,
+                        &file_to_imports,
+                        &symbol_to_calls,
+                        &symbol_to_callers,
+                    );
 
-                        for (sym.relationships) |rel| {
-                            const rel_kind = scip.relationshipKind(rel);
-                            try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
-                                .symbol = rel.symbol,
-                                .kind = rel_kind,
-                            });
-
-                            if (std.mem.eql(u8, rel_kind, "calls")) {
-                                const calls_entry = try symbol_to_calls.getOrPut(allocator, sym.symbol);
-                                if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
-                                try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{
-                                    .symbol = rel.symbol,
-                                    .kind = "calls",
-                                });
-
-                                const callers_entry = try symbol_to_callers.getOrPut(allocator, rel.symbol);
-                                if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
-                                try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{
-                                    .symbol = sym.symbol,
-                                    .kind = "callers",
-                                });
-                            } else if (std.mem.eql(u8, rel_kind, "imports")) {
-                                const imports_entry = try file_to_imports.getOrPut(allocator, doc.relative_path);
-                                if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
-                                try appendUniqueImport(allocator, imports_entry.value_ptr, .{
-                                    .label = displayLabelForSymbol(rel.symbol, &symbol_to_defs),
-                                    .symbol = rel.symbol,
-                                });
-                            }
-
-                            const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
-                            if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
-                            try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{
-                                .symbol = sym.symbol,
-                                .kind = rel_kind,
-                            });
-                        }
-                    }
+                    const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
+                    if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
+                    try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{
+                        .symbol = sym.symbol,
+                        .kind = rel_kind,
+                    });
                 }
             }
 
-            // Process all occurrences for references
             for (doc.occurrences) |occ| {
                 if (occ.symbol.len == 0) continue;
                 const entry = try symbol_to_refs.getOrPut(allocator, occ.symbol);
-                if (!entry.found_existing) {
-                    entry.value_ptr.* = .empty;
-                }
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
                 try entry.value_ptr.append(allocator, .{
                     .path = doc.relative_path,
                     .line = occ.range.start_line,
@@ -472,62 +484,33 @@ pub const CodeIndex = struct {
                     });
                 } else if (std.mem.startsWith(u8, occ.symbol, "cog/call/")) {
                     const call_name = occ.symbol["cog/call/".len..];
-                    const caller_symbol = findEnclosingSymbolForOccurrence(doc, occ) orelse continue;
+                    const caller_symbol = findEnclosingSymbolForOccurrence(doc, occ, &symbol_to_defs) orelse continue;
                     const callee_symbol = resolveCallTarget(call_name, doc.relative_path, &symbol_to_defs) orelse continue;
-
-                    const calls_entry = try symbol_to_calls.getOrPut(allocator, caller_symbol);
-                    if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
-                    try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{
-                        .symbol = callee_symbol,
-                        .kind = "calls",
-                    });
-
-                    const callers_entry = try symbol_to_callers.getOrPut(allocator, callee_symbol);
-                    if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
-                    try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{
-                        .symbol = caller_symbol,
-                        .kind = "callers",
-                    });
+                    try addCallEdge(allocator, caller_symbol, callee_symbol, &symbol_to_calls, &symbol_to_callers);
                 }
             }
         }
 
-        // Also process external_symbols
         for (index.external_symbols) |sym| {
-            if (sym.symbol.len > 0 and !symbol_to_defs.contains(sym.symbol)) {
-                try symbol_to_defs.put(allocator, sym.symbol, .{
-                    .path = "",
-                    .line = 0,
-                    .kind = sym.kind,
-                    .display_name = sym.display_name,
-                    .documentation = sym.documentation,
+            if (sym.relationships.len == 0) continue;
+            const outgoing_entry = try symbol_to_relationships.getOrPut(allocator, sym.symbol);
+            if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
+            for (sym.relationships) |rel| {
+                const rel_kind = scip.relationshipKind(rel);
+                try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
+                    .symbol = rel.symbol,
+                    .kind = rel_kind,
                 });
-            }
-
-            if (sym.relationships.len > 0) {
-                const outgoing_entry = try symbol_to_relationships.getOrPut(allocator, sym.symbol);
-                if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
-                for (sym.relationships) |rel| {
-                    const rel_kind = scip.relationshipKind(rel);
-                    try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
-                        .symbol = rel.symbol,
-                        .kind = rel_kind,
-                    });
-
-                    if (std.mem.eql(u8, rel_kind, "calls")) {
-                        const calls_entry = try symbol_to_calls.getOrPut(allocator, sym.symbol);
-                        if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
-                        try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{ .symbol = rel.symbol, .kind = "calls" });
-
-                        const callers_entry = try symbol_to_callers.getOrPut(allocator, rel.symbol);
-                        if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
-                        try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{ .symbol = sym.symbol, .kind = "callers" });
-                    }
-
-                    const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
-                    if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
-                    try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{ .symbol = sym.symbol, .kind = rel_kind });
+                if (std.mem.eql(u8, rel_kind, "calls")) {
+                    try addCallEdge(allocator, sym.symbol, rel.symbol, &symbol_to_calls, &symbol_to_callers);
                 }
+
+                const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
+                if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
+                try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{
+                    .symbol = sym.symbol,
+                    .kind = rel_kind,
+                });
             }
         }
 
@@ -547,7 +530,6 @@ pub const CodeIndex = struct {
             .symbol_to_callers = symbol_to_callers,
         };
     }
-
     pub fn deinit(self: *CodeIndex, allocator: std.mem.Allocator) void {
         self.symbol_to_defs.deinit(allocator);
         var ref_iter = self.symbol_to_refs.iterator();
@@ -615,6 +597,51 @@ pub const CodeIndex = struct {
         try list.append(allocator, item);
     }
 
+    fn addCallEdge(
+        allocator: std.mem.Allocator,
+        caller_symbol: []const u8,
+        callee_symbol: []const u8,
+        symbol_to_calls: *std.StringHashMapUnmanaged(RelationshipList),
+        symbol_to_callers: *std.StringHashMapUnmanaged(RelationshipList),
+    ) !void {
+        const calls_entry = try symbol_to_calls.getOrPut(allocator, caller_symbol);
+        if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
+        try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{
+            .symbol = callee_symbol,
+            .kind = "calls",
+        });
+
+        const callers_entry = try symbol_to_callers.getOrPut(allocator, callee_symbol);
+        if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
+        try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{
+            .symbol = caller_symbol,
+            .kind = "callers",
+        });
+    }
+
+    fn addSpecializedRelationship(
+        allocator: std.mem.Allocator,
+        document_path: []const u8,
+        source_symbol: []const u8,
+        target_symbol: []const u8,
+        kind: []const u8,
+        defs: *const std.StringHashMapUnmanaged(DefInfo),
+        file_to_imports: *std.StringHashMapUnmanaged(FileImportList),
+        symbol_to_calls: *std.StringHashMapUnmanaged(RelationshipList),
+        symbol_to_callers: *std.StringHashMapUnmanaged(RelationshipList),
+    ) !void {
+        if (std.mem.eql(u8, kind, "calls")) {
+            try addCallEdge(allocator, source_symbol, target_symbol, symbol_to_calls, symbol_to_callers);
+        } else if (std.mem.eql(u8, kind, "imports")) {
+            const imports_entry = try file_to_imports.getOrPut(allocator, document_path);
+            if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
+            try appendUniqueImport(allocator, imports_entry.value_ptr, .{
+                .label = displayLabelForSymbol(target_symbol, defs),
+                .symbol = target_symbol,
+            });
+        }
+    }
+
     fn displayLabelForSymbol(symbol: []const u8, defs: *const std.StringHashMapUnmanaged(DefInfo)) []const u8 {
         if (std.mem.startsWith(u8, symbol, "cog/import/")) {
             return symbol["cog/import/".len..];
@@ -628,18 +655,36 @@ pub const CodeIndex = struct {
         return scip.extractSymbolName(symbol);
     }
 
-    fn findEnclosingSymbolForOccurrence(self_doc: scip.Document, occ: scip.Occurrence) ?[]const u8 {
+    fn findEnclosingSymbolForOccurrence(
+        self_doc: scip.Document,
+        occ: scip.Occurrence,
+        defs: *const std.StringHashMapUnmanaged(DefInfo),
+    ) ?[]const u8 {
+        var best_symbol: ?[]const u8 = null;
+        var best_range: ?scip.Range = null;
+
         for (self_doc.symbols) |sym| {
             if (sym.symbol.len == 0) continue;
-            for (self_doc.occurrences) |candidate_occ| {
-                if (!std.mem.eql(u8, candidate_occ.symbol, sym.symbol)) continue;
-                if (!scip.SymbolRole.isDefinition(candidate_occ.symbol_roles)) continue;
-                const range = candidate_occ.enclosing_range orelse continue;
-                if (occ.range.start_line < range.start_line or occ.range.start_line > range.end_line) continue;
-                return sym.symbol;
+            const range = (defs.get(sym.symbol) orelse continue).enclosing_range orelse continue;
+            if (!rangeContainsPoint(range, occ.range.start_line, occ.range.start_char)) continue;
+            if (best_range == null or rangeContainsRange(best_range.?, range)) {
+                best_symbol = sym.symbol;
+                best_range = range;
             }
         }
-        return null;
+        return best_symbol;
+    }
+
+    fn rangeContainsPoint(range: scip.Range, line: i32, char: i32) bool {
+        if (line < range.start_line or line > range.end_line) return false;
+        if (line == range.start_line and char < range.start_char) return false;
+        if (line == range.end_line and char > range.end_char) return false;
+        return true;
+    }
+
+    fn rangeContainsRange(outer: scip.Range, inner: scip.Range) bool {
+        return rangeContainsPoint(outer, inner.start_line, inner.start_char) and
+            rangeContainsPoint(outer, inner.end_line, inner.end_char);
     }
 
     fn resolveCallTarget(call_name: []const u8, caller_path: []const u8, defs: *const std.StringHashMapUnmanaged(DefInfo)) ?[]const u8 {
@@ -5281,6 +5326,107 @@ test "findSymbol with alternation" {
     var no_matches = try ci.findSymbol(allocator, "Banner|Logo|Title", null, null);
     defer no_matches.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), no_matches.items.len);
+}
+
+test "CodeIndex build resolves later cross-document calls and uses smallest enclosing definition" {
+    const allocator = std.testing.allocator;
+
+    var caller_occurrences = try allocator.alloc(scip.Occurrence, 3);
+    caller_occurrences[0] = .{
+        .range = .{ .start_line = 0, .start_char = 0, .end_line = 0, .end_char = 5 },
+        .symbol = "local src/caller.js:0",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 0, .start_char = 0, .end_line = 8, .end_char = 1 },
+    };
+    caller_occurrences[1] = .{
+        .range = .{ .start_line = 2, .start_char = 4, .end_line = 2, .end_char = 9 },
+        .symbol = "local src/caller.js:1",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 2, .start_char = 4, .end_line = 5, .end_char = 5 },
+    };
+    caller_occurrences[2] = .{
+        .range = .{ .start_line = 4, .start_char = 8, .end_line = 4, .end_char = 14 },
+        .symbol = "cog/call/helper",
+        .symbol_roles = scip.SymbolRole.ReadAccess,
+        .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 2, .start_char = 4, .end_line = 5, .end_char = 5 },
+    };
+
+    var caller_symbols = try allocator.alloc(scip.SymbolInformation, 2);
+    caller_symbols[0] = .{
+        .symbol = "local src/caller.js:0",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 17,
+        .display_name = "outer",
+        .enclosing_symbol = "",
+    };
+    caller_symbols[1] = .{
+        .symbol = "local src/caller.js:1",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 17,
+        .display_name = "inner",
+        .enclosing_symbol = "local src/caller.js:0",
+    };
+
+    var callee_occurrences = try allocator.alloc(scip.Occurrence, 1);
+    callee_occurrences[0] = .{
+        .range = .{ .start_line = 0, .start_char = 0, .end_line = 0, .end_char = 6 },
+        .symbol = "local src/helper.js:0",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+        .enclosing_range = .{ .start_line = 0, .start_char = 0, .end_line = 1, .end_char = 1 },
+    };
+
+    var callee_symbols = try allocator.alloc(scip.SymbolInformation, 1);
+    callee_symbols[0] = .{
+        .symbol = "local src/helper.js:0",
+        .documentation = &.{},
+        .relationships = &.{},
+        .kind = 17,
+        .display_name = "helper",
+        .enclosing_symbol = "",
+    };
+
+    var documents = try allocator.alloc(scip.Document, 2);
+    documents[0] = .{
+        .language = "javascript",
+        .relative_path = "src/caller.js",
+        .occurrences = caller_occurrences,
+        .symbols = caller_symbols,
+    };
+    documents[1] = .{
+        .language = "javascript",
+        .relative_path = "src/helper.js",
+        .occurrences = callee_occurrences,
+        .symbols = callee_symbols,
+    };
+
+    const index: scip.Index = .{
+        .metadata = .{
+            .version = 0,
+            .tool_info = .{ .name = "test", .version = "1.0" },
+            .project_root = "file:///test",
+            .text_document_encoding = 0,
+        },
+        .documents = documents,
+        .external_symbols = &.{},
+    };
+
+    var ci = try CodeIndex.build(allocator, index);
+    defer deinitTestIndex(&ci, allocator);
+
+    const calls = ci.getCalls("local src/caller.js:1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
+    try std.testing.expectEqualStrings("local src/helper.js:0", calls.items[0].symbol);
+    try std.testing.expect(ci.getCalls("local src/caller.js:0") == null);
+
+    const callers = ci.getCallers("local src/helper.js:0") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), callers.items.len);
+    try std.testing.expectEqualStrings("local src/caller.js:1", callers.items[0].symbol);
 }
 
 // ── Disambiguation Tests ────────────────────────────────────────────────
