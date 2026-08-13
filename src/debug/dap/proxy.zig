@@ -229,6 +229,10 @@ pub const DapProxy = struct {
     pending_notifications: std.ArrayListUnmanaged(types.DebugNotification) = .empty,
     // Buffered events consumed by readResponse but needed by waitForEvent
     buffered_events: std.ArrayListUnmanaged(BufferedEvent) = .empty,
+    // Only one thread may read/decode a DAP connection at a time. This also
+    // serializes request/response pairs so explicit request_seq correlation is
+    // deterministic even when MCP tools run concurrently.
+    connection_mutex: std.Thread.Mutex = .{},
     // Request timeout in milliseconds (default 30s)
     request_timeout_ms: i32 = 30_000,
     // Saved launch state for emulated restart (adapters without supportsRestartRequest)
@@ -617,24 +621,36 @@ pub const DapProxy = struct {
     }
 
     fn sendRequest(self: *DapProxy, allocator: std.mem.Allocator, msg: []const u8) ![]const u8 {
-        dapLog("[DAP sendRequest] Encoding message ({d} bytes)", .{msg.len});
+        const request_seq = try requestSeq(allocator, msg);
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+
+        dapLog("[DAP sendRequest] Encoding seq={d} message ({d} bytes)", .{ request_seq, msg.len });
         // Encode with Content-Length framing
         const encoded = try transport.encodeMessage(allocator, msg);
         defer allocator.free(encoded);
 
-        dapLog("[DAP sendRequest] Writing to adapter...", .{});
+        dapLog("[DAP sendRequest] Writing seq={d} to adapter...", .{request_seq});
         try self.transportWrite(encoded);
-        dapLog("[DAP sendRequest] Write complete, waiting for response", .{});
+        dapLog("[DAP sendRequest] Write complete, waiting for seq={d} response", .{request_seq});
 
         // Read response (may need to skip events)
-        return self.readResponse(allocator);
+        return self.readResponse(allocator, request_seq);
+    }
+
+    fn requestSeq(allocator: std.mem.Allocator, msg: []const u8) !i64 {
+        const parsed = try json.parseFromSlice(json.Value, allocator, msg, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRequest;
+        const seq_val = parsed.value.object.get("seq") orelse return error.InvalidRequest;
+        if (seq_val != .integer) return error.InvalidRequest;
+        return seq_val.integer;
     }
 
     /// Read messages from the adapter until we get a matching response (type == "response").
     /// Verifies request_seq matches the expected seq to correlate responses.
     /// Events are processed inline (e.g., update thread_id from stopped events).
-    fn readResponse(self: *DapProxy, allocator: std.mem.Allocator) ![]const u8 {
-        const expected_seq = self.seq - 1; // seq used by the most recent sendRequest
+    fn readResponse(self: *DapProxy, allocator: std.mem.Allocator, expected_seq: i64) ![]const u8 {
         dapLog("[DAP readResponse] Waiting for response to seq={d}, buffer={d} bytes", .{ expected_seq, self.read_buffer.items.len });
         const poll_fd = try self.transportPollFd();
 
@@ -931,6 +947,8 @@ pub const DapProxy = struct {
     /// Wait for a specific event type from the adapter.
     /// Returns the raw JSON body of the event.
     fn waitForEvent(self: *DapProxy, allocator: std.mem.Allocator, event_name: []const u8) ![]const u8 {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         dapLog("[DAP waitForEvent] Waiting for event: {s} (buffer={d} bytes, buffered_events={d})", .{ event_name, self.read_buffer.items.len, self.buffered_events.items.len });
 
         // Check buffered events first (events consumed by readResponse during request handling)
@@ -1541,6 +1559,8 @@ pub const DapProxy = struct {
     /// Reads DAP messages in a loop (processing events and reverse requests inline
     /// via readResponse's side-effects) until the config arrives or timeout.
     fn waitForChildConfig(self: *DapProxy, allocator: std.mem.Allocator) !void {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
         const poll_fd = try self.transportPollFd();
         var read_buf: [8192]u8 = undefined;
         const timeout_ms: i32 = 15_000;
@@ -4214,6 +4234,12 @@ test "DapProxy rejects invalid readMemory base64" {
     ;
 
     try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
+}
+
+test "DapProxy extracts explicit request sequence" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(@as(i64, 41), try DapProxy.requestSeq(allocator, "{\"seq\":41,\"type\":\"request\",\"command\":\"threads\"}"));
+    try std.testing.expectError(error.InvalidRequest, DapProxy.requestSeq(allocator, "{\"type\":\"request\"}"));
 }
 
 test "DapProxy temporary request timeout restores after early exit" {
