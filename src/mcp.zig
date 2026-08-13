@@ -1967,15 +1967,14 @@ fn processWatcherEvents(runtime: *Runtime) void {
     }
 
     if (paths_buf.items.len == 0) return;
-    debug_log_mod.log("processWatcherEvents: reindexing {d} files via child process", .{paths_buf.items.len});
+    debug_log_mod.log("processWatcherEvents: reindexing {d} files via re-exec worker", .{paths_buf.items.len});
 
-    // Step 2: Fork a child process to do the reindexing.
-    // If the child crashes (SIGABRT, SIGSEGV, etc.) the MCP server survives.
-    // The child does file I/O and exits with code 0 if anything changed, 1 if not.
-    const changed = forkReindex(allocator, paths_buf.items);
+    // Step 2: Re-exec the current binary as an isolated worker. The worker does
+    // file I/O and exits with code 0 if anything changed, 1 if not.
+    const result = spawnReindexWorker(allocator, paths_buf.items);
 
     // Step 3: Re-acquire mutex only to swap the in-memory code cache.
-    if (changed) {
+    if (result == .changed) {
         debug_log_mod.log("processWatcherEvents: acquiring runtime mutex (cache swap)", .{});
         runtime.mutex.lock();
         defer {
@@ -1987,89 +1986,93 @@ fn processWatcherEvents(runtime: *Runtime) void {
     }
 }
 
-/// Fork a child process to reindex files. Returns true if any file changed.
-/// If the child crashes, the parent survives and returns false.
-fn forkReindex(allocator: std.mem.Allocator, file_paths: []const []const u8) bool {
-    if (builtin.os.tag == .windows) {
-        // No fork on Windows — fall back to in-process reindexing
-        return reindexInProcess(allocator, file_paths);
-    }
+const ReindexWorkerResult = enum {
+    changed,
+    unchanged,
+    failed,
+};
 
-    const pid = posix.fork() catch |err| {
-        debug_log_mod.log("forkReindex: fork failed: {s}, falling back to in-process", .{@errorName(err)});
-        return reindexInProcess(allocator, file_paths);
+fn reindexWorkerResult(term: std.process.Child.Term) ReindexWorkerResult {
+    return switch (term) {
+        .Exited => |exit_code| switch (exit_code) {
+            0 => .changed,
+            1 => .unchanged,
+            else => .failed,
+        },
+        .Signal, .Stopped, .Unknown => .failed,
     };
-
-    if (pid == 0) {
-        // ── Child process ──
-        // Do the heavy work. If we crash, only the child dies.
-        var changed = false;
-        for (file_paths) |path_copy| {
-            const exists = blk: {
-                std.fs.cwd().access(path_copy, .{}) catch break :blk false;
-                break :blk true;
-            };
-            if (exists) {
-                if (code_intel.reindexFile(allocator, path_copy)) {
-                    changed = true;
-                }
-            } else {
-                if (code_intel.removeFileFromIndex(allocator, path_copy)) {
-                    changed = true;
-                }
-            }
-        }
-        // Exit code 0 = changed, 1 = no changes
-        std.c._exit(if (changed) 0 else 1);
-    }
-
-    // ── Parent process ──
-    debug_log_mod.log("forkReindex: child pid={d}, waiting", .{pid});
-    const result = posix.waitpid(pid, 0);
-    const status = result.status;
-
-    if (std.posix.W.IFEXITED(status)) {
-        const exit_code = std.posix.W.EXITSTATUS(status);
-        if (exit_code == 0) {
-            debug_log_mod.log("forkReindex: child exited with 0 (changed)", .{});
-            return true;
-        } else {
-            debug_log_mod.log("forkReindex: child exited with {d} (no change)", .{exit_code});
-            return false;
-        }
-    }
-
-    if (std.posix.W.IFSIGNALED(status)) {
-        const sig = std.posix.W.TERMSIG(status);
-        debug_log_mod.log("forkReindex: child killed by signal {d} — crash isolated", .{sig});
-        return false;
-    }
-
-    debug_log_mod.log("forkReindex: child exited with unexpected status {d}", .{status});
-    return false;
 }
 
-/// In-process reindexing fallback for platforms without fork (Windows).
-fn reindexInProcess(allocator: std.mem.Allocator, file_paths: []const []const u8) bool {
+fn canSafelyReindexInProcess(file_paths: []const []const u8) bool {
+    for (file_paths) |file_path| {
+        std.fs.cwd().access(file_path, .{}) catch continue;
+        return false;
+    }
+    return true;
+}
+
+fn reindexInProcessAfterSpawnFailure(allocator: std.mem.Allocator, file_paths: []const []const u8) ReindexWorkerResult {
+    if (!canSafelyReindexInProcess(file_paths)) {
+        debug_log_mod.log("watcher worker: in-process fallback unsafe; live files require isolated worker", .{});
+        return .failed;
+    }
+
+    debug_log_mod.log("watcher worker: falling back in-process for deleted files", .{});
     var changed = false;
-    for (file_paths) |path_copy| {
-        const exists = blk: {
-            std.fs.cwd().access(path_copy, .{}) catch break :blk false;
-            break :blk true;
-        };
-        if (exists) {
-            if (code_intel.reindexFile(allocator, path_copy)) {
-                debug_log_mod.log("Watcher: reindexed {s}", .{path_copy});
-                changed = true;
-            }
-        } else {
-            if (code_intel.removeFileFromIndex(allocator, path_copy)) {
-                debug_log_mod.log("Watcher: removed {s}", .{path_copy});
-                changed = true;
-            }
+    for (file_paths) |file_path| {
+        if (code_intel.removeFileFromIndex(allocator, file_path)) {
+            debug_log_mod.log("watcher worker fallback: removed {s}", .{file_path});
+            changed = true;
         }
     }
-    return changed;
+    return if (changed) .changed else .unchanged;
+}
+
+fn spawnReindexWorker(allocator: std.mem.Allocator, file_paths: []const []const u8) ReindexWorkerResult {
+    code_intel.validateWatcherReindexArgs(file_paths) catch |err| {
+        debug_log_mod.log("watcher worker: invalid argv: {s}", .{@errorName(err)});
+        return .failed;
+    };
+
+    const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
+        debug_log_mod.log("watcher worker: self executable lookup failed: {s}", .{@errorName(err)});
+        return reindexInProcessAfterSpawnFailure(allocator, file_paths);
+    };
+    defer allocator.free(exe_path);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    argv.ensureTotalCapacity(allocator, file_paths.len + 2) catch |err| {
+        debug_log_mod.log("watcher worker: argv allocation failed: {s}", .{@errorName(err)});
+        return reindexInProcessAfterSpawnFailure(allocator, file_paths);
+    };
+    argv.appendAssumeCapacity(exe_path);
+    argv.appendAssumeCapacity(code_intel.WATCHER_REINDEX_WORKER_COMMAND);
+    for (file_paths) |file_path| argv.appendAssumeCapacity(file_path);
+
+    debug_log_mod.log("watcher worker: spawning executable={s} files={d}", .{ exe_path, file_paths.len });
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch |err| {
+        debug_log_mod.log("watcher worker: spawn failed: {s}", .{@errorName(err)});
+        return reindexInProcessAfterSpawnFailure(allocator, file_paths);
+    };
+    debug_log_mod.log("watcher worker: spawned pid={any}", .{child.id});
+
+    const term = child.wait() catch |err| {
+        debug_log_mod.log("watcher worker: wait failed: {s}", .{@errorName(err)});
+        return .failed;
+    };
+    const result = reindexWorkerResult(term);
+    switch (term) {
+        .Exited => |exit_code| debug_log_mod.log("watcher worker: exited code={d} result={s}", .{ exit_code, @tagName(result) }),
+        .Signal => |signal| debug_log_mod.log("watcher worker: terminated signal={d} result=failed", .{signal}),
+        .Stopped => |signal| debug_log_mod.log("watcher worker: stopped signal={d} result=failed", .{signal}),
+        .Unknown => |status| debug_log_mod.log("watcher worker: unknown status={d} result=failed", .{status}),
+    }
+    return result;
 }
 
 fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
@@ -2286,6 +2289,32 @@ fn logErr(prefix: []const u8, err: anyerror) void {
     w.interface.writeAll(@errorName(err)) catch {};
     w.interface.writeByte('\n') catch {};
     w.interface.flush() catch {};
+}
+
+test "reindexWorkerResult maps documented exit statuses" {
+    try std.testing.expectEqual(ReindexWorkerResult.changed, reindexWorkerResult(.{ .Exited = 0 }));
+    try std.testing.expectEqual(ReindexWorkerResult.unchanged, reindexWorkerResult(.{ .Exited = 1 }));
+    try std.testing.expectEqual(ReindexWorkerResult.failed, reindexWorkerResult(.{ .Exited = 2 }));
+}
+
+test "reindexWorkerResult treats signal and unexpected statuses as failed" {
+    try std.testing.expectEqual(ReindexWorkerResult.failed, reindexWorkerResult(.{ .Signal = 9 }));
+    try std.testing.expectEqual(ReindexWorkerResult.failed, reindexWorkerResult(.{ .Stopped = 19 }));
+    try std.testing.expectEqual(ReindexWorkerResult.failed, reindexWorkerResult(.{ .Unknown = 255 }));
+}
+
+test "canSafelyReindexInProcess only permits missing files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    try tmp.dir.writeFile(.{ .sub_path = "present.zig", .data = "const x = 1;" });
+    try std.testing.expect(!canSafelyReindexInProcess(&.{ "missing.zig", "present.zig" }));
+    try std.testing.expect(canSafelyReindexInProcess(&.{ "missing.zig", "also-missing.zig" }));
 }
 
 test "HandlerThreads caps active handlers" {

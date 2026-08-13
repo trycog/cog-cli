@@ -81,6 +81,15 @@ fn mainInner() !void {
     const subcmd: []const u8 = args[1];
     const cmd_args = args[2..];
 
+    if (std.mem.eql(u8, subcmd, code_intel.WATCHER_REINDEX_WORKER_COMMAND)) {
+        debug_log.log("dispatch hidden watcher worker: files={d}", .{cmd_args.len});
+        const exit_code = code_intel.runWatcherReindexWorker(allocator, cmd_args) catch |err| {
+            debug_log.log("hidden watcher worker: invalid arguments or setup failure: {s}", .{@errorName(err)});
+            return err;
+        };
+        std.process.exit(exit_code);
+    }
+
     // For non-MCP commands, close the log header now. MCP mode defers
     // the separator until handleInitialize appends client info.
     if (!std.mem.eql(u8, subcmd, "mcp") and debug_flag) {

@@ -19,6 +19,10 @@ extern "c" fn flock(fd: c_int, operation: c_int) c_int;
 const LOCK_EX: c_int = 2;
 const LOCK_UN: c_int = 8;
 
+pub const WATCHER_REINDEX_WORKER_COMMAND = "__mcp-watch-reindex";
+pub const MAX_WATCHER_REINDEX_FILES: usize = 256;
+pub const MAX_WATCHER_REINDEX_ARG_BYTES: usize = 64 * 1024;
+
 /// Acquire an exclusive advisory lock on .cog/index.lock.
 /// Blocks until the lock is acquired. Returns the lock fd, or null on failure.
 fn acquireIndexLock(allocator: std.mem.Allocator, cog_dir: []const u8) ?posix.fd_t {
@@ -29,12 +33,8 @@ fn acquireIndexLock(allocator: std.mem.Allocator, cog_dir: []const u8) ?posix.fd
     };
     defer allocator.free(lock_path);
     debug_log.log("acquireIndexLock: path allocated, len={d}", .{lock_path.len});
-    const lock_path_z = posix.toPosixPath(lock_path) catch |err| {
-        debug_log.log("acquireIndexLock: toPosixPath failed: {s}", .{@errorName(err)});
-        return null;
-    };
     debug_log.log("acquireIndexLock: opening file", .{});
-    const fd = posix.open(&lock_path_z, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644) catch |err| {
+    const fd = posix.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o644) catch |err| {
         debug_log.log("acquireIndexLock: open failed: {s}", .{@errorName(err)});
         return null;
     };
@@ -121,6 +121,74 @@ fn printErr(msg: []const u8) void {
 fn printCommandHelp(comptime help_text: []const u8) void {
     tui.header();
     printErr(help_text);
+}
+
+pub fn validateWatcherReindexArgs(file_paths: []const []const u8) !void {
+    if (file_paths.len == 0) return error.MissingFilePaths;
+    if (file_paths.len > MAX_WATCHER_REINDEX_FILES) return error.TooManyFilePaths;
+
+    var total_bytes: usize = 0;
+    for (file_paths) |file_path| {
+        if (file_path.len == 0) return error.EmptyFilePath;
+        if (file_path.len > std.fs.max_path_bytes) return error.FilePathTooLong;
+        if (std.mem.indexOfScalar(u8, file_path, 0) != null) return error.InvalidFilePath;
+
+        total_bytes = std.math.add(usize, total_bytes, file_path.len) catch return error.ArgumentsTooLong;
+        if (total_bytes > MAX_WATCHER_REINDEX_ARG_BYTES) return error.ArgumentsTooLong;
+    }
+}
+
+pub fn runWatcherReindexWorker(allocator: std.mem.Allocator, file_paths: []const []const u8) !u8 {
+    try validateWatcherReindexArgs(file_paths);
+    debug_log.log("watcher worker: starting files={d}", .{file_paths.len});
+
+    var changed = false;
+    for (file_paths) |file_path| {
+        const exists = blk: {
+            std.fs.cwd().access(file_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (exists) {
+            debug_log.log("watcher worker: reindexing {s}", .{file_path});
+            if (reindexFile(allocator, file_path)) changed = true;
+        } else {
+            debug_log.log("watcher worker: removing {s}", .{file_path});
+            if (removeFileFromIndex(allocator, file_path)) changed = true;
+        }
+    }
+
+    const exit_code: u8 = if (changed) 0 else 1;
+    debug_log.log("watcher worker: completed status={d}", .{exit_code});
+    return exit_code;
+}
+
+test "validateWatcherReindexArgs accepts file paths" {
+    try validateWatcherReindexArgs(&.{ "src/main.zig", "path with spaces/file.zig" });
+}
+
+test "validateWatcherReindexArgs rejects missing paths" {
+    try std.testing.expectError(error.MissingFilePaths, validateWatcherReindexArgs(&.{}));
+}
+
+test "validateWatcherReindexArgs rejects too many paths" {
+    const paths_list = [_][]const u8{"src/main.zig"} ** (MAX_WATCHER_REINDEX_FILES + 1);
+    try std.testing.expectError(error.TooManyFilePaths, validateWatcherReindexArgs(&paths_list));
+}
+
+test "validateWatcherReindexArgs rejects invalid path arguments" {
+    try std.testing.expectError(error.EmptyFilePath, validateWatcherReindexArgs(&.{""}));
+
+    const long_path = [_]u8{'a'} ** (std.fs.max_path_bytes + 1);
+    try std.testing.expectError(error.FilePathTooLong, validateWatcherReindexArgs(&.{&long_path}));
+
+    try std.testing.expectError(error.InvalidFilePath, validateWatcherReindexArgs(&.{"src/main\x00.zig"}));
+}
+
+test "validateWatcherReindexArgs rejects excessive argument bytes" {
+    const path = [_]u8{'a'} ** std.fs.max_path_bytes;
+    const path_count = MAX_WATCHER_REINDEX_ARG_BYTES / path.len + 1;
+    const paths_list = [_][]const u8{&path} ** path_count;
+    try std.testing.expectError(error.ArgumentsTooLong, validateWatcherReindexArgs(&paths_list));
 }
 
 pub fn builtinExtensionList() []const u8 {
