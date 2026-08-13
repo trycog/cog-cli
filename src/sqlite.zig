@@ -23,11 +23,18 @@ fn mapError(rc: c_int) Error {
     };
 }
 
+pub const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5_000;
+
 pub const Db = struct {
     handle: *c.sqlite3,
 
     pub fn open(path: [*:0]const u8) Error!Db {
-        debug_log.log("sqlite: opening {s}", .{path});
+        return openWithBusyTimeout(path, DEFAULT_BUSY_TIMEOUT_MS);
+    }
+
+    /// Open a database and bound how long SQLite retries while another writer holds a lock.
+    pub fn openWithBusyTimeout(path: [*:0]const u8, busy_timeout_ms: u32) Error!Db {
+        debug_log.log("sqlite: opening {s} busy_timeout_ms={d}", .{ path, busy_timeout_ms });
         var handle: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(path, &handle);
         if (rc != c.SQLITE_OK) {
@@ -35,7 +42,16 @@ pub const Db = struct {
             if (handle) |h| _ = c.sqlite3_close(h);
             return mapError(rc);
         }
-        return .{ .handle = handle.? };
+
+        const db_handle = handle.?;
+        const timeout_rc = c.sqlite3_busy_timeout(db_handle, @intCast(busy_timeout_ms));
+        if (timeout_rc != c.SQLITE_OK) {
+            debug_log.log("sqlite: busy timeout configuration failed timeout_ms={d} rc={d}", .{ busy_timeout_ms, timeout_rc });
+            _ = c.sqlite3_close(db_handle);
+            return mapError(timeout_rc);
+        }
+        debug_log.log("sqlite: busy timeout configured timeout_ms={d}", .{busy_timeout_ms});
+        return .{ .handle = db_handle };
     }
 
     pub fn close(self: *Db) void {
@@ -49,8 +65,13 @@ pub const Db = struct {
         const rc = c.sqlite3_exec(self.handle, sql, null, null, &err_msg);
         if (rc != c.SQLITE_OK) {
             if (err_msg) |msg| {
-                debug_log.log("sqlite: exec error: {s}", .{msg});
+                debug_log.log("sqlite: exec error rc={d}: {s}", .{ rc, msg });
                 c.sqlite3_free(msg);
+            } else {
+                debug_log.log("sqlite: exec failed rc={d}", .{rc});
+            }
+            if (rc == c.SQLITE_BUSY or rc == c.SQLITE_LOCKED) {
+                debug_log.log("sqlite: busy timeout exhausted rc={d}", .{rc});
             }
             return mapError(rc);
         }
@@ -143,6 +164,33 @@ pub const Stmt = struct {
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "two writers wait for the configured busy timeout" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(db_path);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ db_path, "busy.db" });
+    defer std.testing.allocator.free(path);
+
+    const busy_timeout_ms: u32 = 50;
+    var first = try Db.openWithBusyTimeout(path, busy_timeout_ms);
+    defer first.close();
+    var second = try Db.openWithBusyTimeout(path, busy_timeout_ms);
+    defer second.close();
+
+    try first.exec("CREATE TABLE test (value INTEGER)");
+    try first.exec("BEGIN IMMEDIATE");
+    defer first.exec("ROLLBACK") catch {};
+
+    var timer = try std.time.Timer.start();
+    try std.testing.expectError(error.SqliteBusy, second.exec("INSERT INTO test VALUES (1)"));
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+
+    try std.testing.expect(elapsed_ms >= busy_timeout_ms / 2);
+    try std.testing.expect(elapsed_ms < 1_000);
+}
 
 test "open in-memory db, create table, insert and select" {
     var db = try Db.open(":memory:");
