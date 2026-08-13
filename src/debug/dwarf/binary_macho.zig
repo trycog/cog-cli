@@ -106,6 +106,27 @@ pub const MachoBinary = struct {
         return parseMachO(data);
     }
 
+    /// Return a format-neutral binary view for DWARF section consumers.
+    pub fn view(self: *MachoBinary) binary_common.Binary {
+        return .init(
+            @ptrCast(self),
+            &self.sections,
+            self.text_vmaddr,
+            viewGetSectionData,
+            viewGetSectionDataAlloc,
+        );
+    }
+
+    fn viewGetSectionData(context: *anyopaque, info: SectionInfo) ?[]const u8 {
+        const self: *MachoBinary = @ptrCast(@alignCast(context));
+        return self.getSectionData(info);
+    }
+
+    fn viewGetSectionDataAlloc(context: *anyopaque, allocator: std.mem.Allocator, info: SectionInfo) !?[]const u8 {
+        const self: *MachoBinary = @ptrCast(@alignCast(context));
+        return self.getSectionDataAlloc(allocator, info);
+    }
+
     pub fn deinit(self: *MachoBinary, allocator: std.mem.Allocator) void {
         for (self.decompressed_buffers.items) |buf| {
             allocator.free(buf);

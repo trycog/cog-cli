@@ -133,6 +133,27 @@ pub const ElfBinary = struct {
         return parseElf(data);
     }
 
+    /// Return a format-neutral binary view for DWARF section consumers.
+    pub fn view(self: *ElfBinary) binary_common.Binary {
+        return .init(
+            @ptrCast(self),
+            &self.sections,
+            self.preferred_base,
+            viewGetSectionData,
+            viewGetSectionDataAlloc,
+        );
+    }
+
+    fn viewGetSectionData(context: *anyopaque, info: SectionInfo) ?[]const u8 {
+        const self: *ElfBinary = @ptrCast(@alignCast(context));
+        return self.getSectionData(info);
+    }
+
+    fn viewGetSectionDataAlloc(context: *anyopaque, allocator: std.mem.Allocator, info: SectionInfo) !?[]const u8 {
+        const self: *ElfBinary = @ptrCast(@alignCast(context));
+        return self.getSectionDataAlloc(allocator, info);
+    }
+
     pub fn deinit(self: *ElfBinary, allocator: std.mem.Allocator) void {
         for (self.decompressed_buffers.items) |buf| {
             allocator.free(buf);
