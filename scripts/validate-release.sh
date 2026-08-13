@@ -84,6 +84,17 @@ for artifact_name in $expected_names; do
     tar_entries=$(tar -tzf "$artifact") || fail "could not read release artifact $artifact_name"
     [ "$tar_entries" = cog ] || fail "$artifact_name must contain exactly one top-level cog binary"
 
+    inspect_dir=$(mktemp -d "${TMPDIR:-/tmp}/cog-release-format.XXXXXX")
+    tar -xzf "$artifact" -C "$inspect_dir"
+    actual_format=$(file -b "$inspect_dir/cog")
+    rm -rf "$inspect_dir"
+
+    case "$artifact_name:$actual_format" in
+        cog-darwin-arm64.tar.gz:*Mach-O*arm64*) ;;
+        cog-linux-arm64.tar.gz:*ELF*ARM\ aarch64*) ;;
+        cog-linux-x86_64.tar.gz:*ELF*x86-64*) ;;
+        *) fail "$artifact_name has unexpected binary format: $actual_format" ;;
+    esac
 done
 
 host_os=$(uname -s)
@@ -99,7 +110,7 @@ verify_dir=$(mktemp -d "${TMPDIR:-/tmp}/cog-release-artifact.XXXXXX")
 trap 'rm -rf "$verify_dir"' EXIT HUP INT TERM
 tar -xzf "$artifact_dir/$host_artifact" -C "$verify_dir"
 [ -x "$verify_dir/cog" ] || fail "$host_artifact does not contain an executable cog binary"
-artifact_version=$($verify_dir/cog --version 2>/dev/null) || fail "$host_artifact cog --version failed"
+artifact_version=$("$verify_dir/cog" --version 2>/dev/null) || fail "$host_artifact cog --version failed"
 [ "$artifact_version" = "$source_version" ] || fail "$host_artifact reports version $artifact_version, expected $source_version"
 
 printf 'Release artifacts validated for source version %s\n' "$source_version"

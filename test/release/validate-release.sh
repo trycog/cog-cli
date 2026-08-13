@@ -7,12 +7,96 @@ VALIDATOR="$ROOT/scripts/validate-release.sh"
 pass=0
 fail=0
 
+host_target() {
+    case "$(uname -s)/$(uname -m)" in
+        Darwin/arm64) printf darwin-arm64 ;;
+        Linux/aarch64|Linux/arm64) printf linux-arm64 ;;
+        Linux/x86_64) printf linux-x86_64 ;;
+        *) printf unsupported ;;
+    esac
+}
+
+write_synthetic_binary() {
+    synthetic_path=$1
+    synthetic_target=$2
+    python3 -c 'import pathlib, struct, sys
+path = pathlib.Path(sys.argv[1])
+target = sys.argv[2]
+if target == "darwin-arm64":
+    data = struct.pack("<8I", 0xfeedfacf, 0x0100000c, 0, 2, 0, 0, 0, 0)
+elif target == "linux-arm64":
+    data = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8) + struct.pack("<HHI", 2, 183, 1) + bytes(40)
+elif target == "linux-x86_64":
+    data = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8) + struct.pack("<HHI", 2, 62, 1) + bytes(40)
+else:
+    raise SystemExit(f"unknown target: {target}")
+path.write_bytes(data)
+' "$synthetic_path" "$synthetic_target"
+}
+
+write_native_binary() {
+    native_path=$1
+    native_version=$2
+    source_path="$native_path.c"
+    cat > "$source_path" <<SOURCE
+#include <stdio.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+        puts("$native_version");
+        return 0;
+    }
+    return 1;
+}
+SOURCE
+    cc "$source_path" -o "$native_path"
+}
+
+create_artifacts() {
+    fixture=$1
+    mode=$2
+    native_target=$(host_target)
+    [ "$native_target" != unsupported ] || return 1
+
+    case "$native_target" in
+        darwin-arm64) foreign_target=linux-arm64 ;;
+        linux-arm64|linux-x86_64) foreign_target=darwin-arm64 ;;
+    esac
+
+    for target in darwin-arm64 linux-arm64 linux-x86_64; do
+        payload="$fixture/payload-$target"
+        mkdir -p "$payload"
+        artifact_version=1.2.3
+        if [ "$mode" = wrong-version ] && [ "$target" = "$native_target" ]; then
+            artifact_version=1.2.2
+        fi
+
+        if [ "$target" = "$native_target" ]; then
+            write_native_binary "$payload/cog" "$artifact_version"
+        else
+            binary_target=$target
+            if [ "$mode" = wrong-format ] && [ "$target" = "$foreign_target" ]; then
+                case "$target" in
+                    darwin-arm64) binary_target=linux-x86_64 ;;
+                    linux-arm64) binary_target=linux-x86_64 ;;
+                    linux-x86_64) binary_target=linux-arm64 ;;
+                esac
+            fi
+            write_synthetic_binary "$payload/cog" "$binary_target"
+        fi
+
+        chmod +x "$payload/cog"
+        tar -czf "$fixture/artifacts/cog-$target.tar.gz" -C "$payload" cog
+    done
+}
+
 run_case() {
     name=$1
     expected_status=$2
     expected_message=$3
     fixture_tag=$4
     artifact_mode=${5:-good}
+    space_tmpdir=${6:-false}
 
     fixture=$(mktemp -d "${TMPDIR:-/tmp}/cog-release-validation.XXXXXX")
     mkdir -p "$fixture/artifacts"
@@ -43,46 +127,15 @@ ZON
 CHANGELOG
 
     case "$artifact_mode" in
-        good)
-            for target in darwin-arm64 linux-arm64 linux-x86_64; do
-                payload="$fixture/payload-$target"
-                mkdir -p "$payload"
-                cat > "$payload/cog" <<'BIN'
-#!/bin/sh
-if [ "${1:-}" = "--version" ]; then
-    printf '%s\n' '1.2.3'
-    exit 0
-fi
-exit 1
-BIN
-                chmod +x "$payload/cog"
-                tar -czf "$fixture/artifacts/cog-$target.tar.gz" -C "$payload" cog
-            done
+        good|wrong-version|wrong-format)
+            create_artifacts "$fixture" "$artifact_mode"
             ;;
         missing)
-            artifact="$fixture/artifacts/cog-darwin-arm64.tar.gz"
             payload="$fixture/payload-darwin-arm64"
             mkdir -p "$payload"
-            printf '#!/bin/sh\nprintf "%%s\\n" "1.2.3"\n' > "$payload/cog"
+            write_synthetic_binary "$payload/cog" darwin-arm64
             chmod +x "$payload/cog"
-            tar -czf "$artifact" -C "$payload" cog
-            ;;
-        wrong-version)
-            for target in darwin-arm64 linux-arm64 linux-x86_64; do
-                payload="$fixture/payload-$target"
-                mkdir -p "$payload"
-                version=1.2.3
-                case "$(uname -s)/$(uname -m)" in
-                    Darwin/arm64) host_target=darwin-arm64 ;;
-                    Linux/aarch64|Linux/arm64) host_target=linux-arm64 ;;
-                    Linux/x86_64) host_target=linux-x86_64 ;;
-                    *) host_target=linux-x86_64 ;;
-                esac
-                [ "$target" != "$host_target" ] || version=1.2.2
-                printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$version" > "$payload/cog"
-                chmod +x "$payload/cog"
-                tar -czf "$fixture/artifacts/cog-$target.tar.gz" -C "$payload" cog
-            done
+            tar -czf "$fixture/artifacts/cog-darwin-arm64.tar.gz" -C "$payload" cog
             ;;
         none)
             ;;
@@ -95,6 +148,10 @@ BIN
     set +e
     if [ "$artifact_mode" = none ]; then
         output=$(cd "$fixture" && ./validate-release.sh "$fixture_tag" 2>&1)
+    elif [ "$space_tmpdir" = true ]; then
+        validation_tmpdir="$fixture/tmp with spaces"
+        mkdir -p "$validation_tmpdir"
+        output=$(cd "$fixture" && TMPDIR="$validation_tmpdir" ./validate-release.sh "$fixture_tag" "$fixture/artifacts" "$fixture/release-notes.md" 2>&1)
     else
         output=$(cd "$fixture" && ./validate-release.sh "$fixture_tag" "$fixture/artifacts" "$fixture/release-notes.md" 2>&1)
     fi
@@ -148,8 +205,10 @@ else
 fi
 
 run_case "accepts versioned release artifacts" success "Release artifacts validated for source version 1.2.3" v1.2.3 good
+run_case "handles temporary paths containing spaces" success "Release artifacts validated for source version 1.2.3" v1.2.3 good true
 run_case "rejects missing release artifacts" failure "release artifact set does not match expected targets" v1.2.3 missing
 run_case "rejects artifact source version drift" failure "reports version 1.2.2, expected 1.2.3" v1.2.3 wrong-version
+run_case "rejects wrong non-host artifact format" failure "has unexpected binary format" v1.2.3 wrong-format
 
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
