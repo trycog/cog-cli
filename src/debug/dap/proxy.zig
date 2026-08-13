@@ -913,6 +913,21 @@ pub const DapProxy = struct {
         }
     }
 
+    fn withRequestTimeout(self: *DapProxy, timeout_ms: i32) RequestTimeoutScope {
+        const previous = self.request_timeout_ms;
+        self.request_timeout_ms = timeout_ms;
+        return .{ .proxy = self, .previous = previous };
+    }
+
+    const RequestTimeoutScope = struct {
+        proxy: *DapProxy,
+        previous: i32,
+
+        fn restore(self: *RequestTimeoutScope) void {
+            self.proxy.request_timeout_ms = self.previous;
+        }
+    };
+
     /// Wait for a specific event type from the adapter.
     /// Returns the raw JSON body of the event.
     fn waitForEvent(self: *DapProxy, allocator: std.mem.Allocator, event_name: []const u8) ![]const u8 {
@@ -1857,8 +1872,8 @@ pub const DapProxy = struct {
             // readiness for configuration).  Use a short timeout so non-compliant
             // adapters that never send it don't block indefinitely.
             {
-                const saved_timeout = self.request_timeout_ms;
-                self.request_timeout_ms = 10_000; // 10s for initialized
+                var timeout_scope = self.withRequestTimeout(10_000);
+                defer timeout_scope.restore();
                 dapLog("[DAP proxyRun] Waiting for initialized event (10s timeout)...", .{});
                 if (self.waitForEvent(allocator, "initialized")) |init_event| {
                     allocator.free(init_event);
@@ -1866,7 +1881,6 @@ pub const DapProxy = struct {
                 } else |err| {
                     dapLog("[DAP proxyRun] initialized event not received: {s} (proceeding anyway)", .{@errorName(err)});
                 }
-                self.request_timeout_ms = saved_timeout;
             }
 
             // 3. Re-arm all tracked breakpoints before configurationDone.
@@ -4200,6 +4214,21 @@ test "DapProxy rejects invalid readMemory base64" {
     ;
 
     try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
+}
+
+test "DapProxy temporary request timeout restores after early exit" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+    proxy.request_timeout_ms = 30_000;
+
+    {
+        var scope = proxy.withRequestTimeout(10_000);
+        defer scope.restore();
+        try std.testing.expectEqual(@as(i32, 10_000), proxy.request_timeout_ms);
+    }
+
+    try std.testing.expectEqual(@as(i32, 30_000), proxy.request_timeout_ms);
 }
 
 test "DapProxy init and deinit cycle works cleanly" {
