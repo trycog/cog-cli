@@ -690,6 +690,8 @@ pub const DapProxy = struct {
 
         var read_buf: [8192]u8 = undefined;
         var loop_count: u32 = 0;
+        var timer = std.time.Timer.start() catch return error.ReadFailed;
+        const deadline_ns = @as(u64, @intCast(@max(self.request_timeout_ms, 0))) * std.time.ns_per_ms;
 
         while (true) {
             loop_count += 1;
@@ -929,14 +931,21 @@ pub const DapProxy = struct {
                 allocator.free(decoded.body);
             }
 
-            // Poll with timeout before reading
-            dapLog("[DAP readResponse] Polling (timeout={d}ms, loop {d})...", .{ self.request_timeout_ms, loop_count });
+            // Poll only for the remaining absolute deadline so event traffic or
+            // partial frames cannot restart the request timeout.
+            const elapsed_ns = timer.read();
+            if (elapsed_ns >= deadline_ns) {
+                dapLog("[DAP readResponse] TIMEOUT after {d}ms", .{self.request_timeout_ms});
+                return error.Timeout;
+            }
+            const remaining_ms: i32 = @intCast(@max(@as(u64, 1), @divTrunc(deadline_ns - elapsed_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            dapLog("[DAP readResponse] Polling (remaining={d}ms, loop {d})...", .{ remaining_ms, loop_count });
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = poll_fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const poll_result = std.posix.poll(&poll_fds, self.request_timeout_ms) catch return error.ReadFailed;
+            const poll_result = std.posix.poll(&poll_fds, remaining_ms) catch return error.ReadFailed;
             if (poll_result == 0) {
                 dapLog("[DAP readResponse] TIMEOUT after {d}ms", .{self.request_timeout_ms});
                 return error.Timeout;
@@ -990,6 +999,8 @@ pub const DapProxy = struct {
 
         var read_buf: [8192]u8 = undefined;
         var loop_count: u32 = 0;
+        var timer = std.time.Timer.start() catch return error.ReadFailed;
+        const deadline_ns = @as(u64, @intCast(@max(self.request_timeout_ms, 0))) * std.time.ns_per_ms;
 
         while (true) {
             loop_count += 1;
@@ -1093,13 +1104,19 @@ pub const DapProxy = struct {
                 allocator.free(decoded.body);
             }
 
-            dapLog("[DAP waitForEvent] Polling (loop {d}, timeout={d}ms)...", .{ loop_count, self.request_timeout_ms });
+            const elapsed_ns = timer.read();
+            if (elapsed_ns >= deadline_ns) {
+                dapLog("[DAP waitForEvent] TIMEOUT waiting for event: {s}", .{event_name});
+                return error.Timeout;
+            }
+            const remaining_ms: i32 = @intCast(@max(@as(u64, 1), @divTrunc(deadline_ns - elapsed_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            dapLog("[DAP waitForEvent] Polling (loop {d}, remaining={d}ms)...", .{ loop_count, remaining_ms });
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = poll_fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const poll_result = std.posix.poll(&poll_fds, self.request_timeout_ms) catch return error.ReadFailed;
+            const poll_result = std.posix.poll(&poll_fds, remaining_ms) catch return error.ReadFailed;
             if (poll_result == 0) {
                 dapLog("[DAP waitForEvent] TIMEOUT waiting for event: {s}", .{event_name});
                 return error.Timeout;
