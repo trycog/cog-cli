@@ -1514,7 +1514,11 @@ fn runBootstrap(
                 processed.put(allocator, duped, {}) catch {
                     allocator.free(duped);
                 };
-                saveCheckpoint(allocator, checkpoint_path, &processed, all_subsystems);
+                saveCheckpoint(allocator, checkpoint_path, &processed, all_subsystems) catch |err| {
+                    debug_log.log("mem:bootstrap: failed to save checkpoint: {s}", .{@errorName(err)});
+                    printErr("    " ++ red ++ "failed to save checkpoint" ++ reset ++ "\n");
+                    return err;
+                };
             } else {
                 errors += 1;
                 consecutive_errors += 1;
@@ -1554,6 +1558,8 @@ fn runBootstrap(
         var atomic_cost = std.atomic.Value(usize).init(0);
         var abort_flag = std.atomic.Value(bool).init(false);
         var consec_errors = std.atomic.Value(usize).init(0);
+        var checkpoint_failed = std.atomic.Value(bool).init(false);
+        var checkpoint_mutex: std.Thread.Mutex = .{};
 
         var shared = WorkerShared{
             .file_index = &subsystem_index,
@@ -1575,6 +1581,8 @@ fn runBootstrap(
             .allocator = allocator,
             .checkpoint_path = checkpoint_path,
             .processed = &processed,
+            .checkpoint_mutex = &checkpoint_mutex,
+            .checkpoint_failed = &checkpoint_failed,
             .debug = debug,
             .timeout_ms = timeout_ms,
             .use_tui = use_tui,
@@ -1603,6 +1611,7 @@ fn runBootstrap(
         total_output_tokens = atomic_output_tokens.load(.acquire);
         total_cost_microdollars = atomic_cost.load(.acquire);
         if (abort_flag.load(.acquire)) aborted = true;
+        if (checkpoint_failed.load(.acquire)) return error.CheckpointWriteFailed;
     }
 
     // Stop ticker before phase 1 finish
@@ -1700,6 +1709,8 @@ const WorkerShared = struct {
     allocator: std.mem.Allocator,
     checkpoint_path: []const u8,
     processed: *std.StringHashMapUnmanaged(void),
+    checkpoint_mutex: *std.Thread.Mutex,
+    checkpoint_failed: *std.atomic.Value(bool),
     debug: bool,
     timeout_ms: u64,
     use_tui: bool,
@@ -1739,10 +1750,22 @@ fn workerThread(shared: *WorkerShared) void {
             _ = shared.atomic_output_tokens.fetchAdd(result.output_tokens, .monotonic);
             _ = shared.atomic_cost.fetchAdd(result.cost_microdollars, .monotonic);
             const duped = shared.allocator.dupe(u8, subsystem.id) catch continue;
-            shared.processed.put(shared.allocator, duped, {}) catch {
-                shared.allocator.free(duped);
+            shared.checkpoint_mutex.lock();
+            const checkpoint_result = blk: {
+                shared.processed.put(shared.allocator, duped, {}) catch |err| {
+                    shared.allocator.free(duped);
+                    break :blk err;
+                };
+                saveCheckpoint(shared.allocator, shared.checkpoint_path, shared.processed, shared.all_subsystems) catch |err| break :blk err;
+                break :blk null;
             };
-            saveCheckpoint(shared.allocator, shared.checkpoint_path, shared.processed, shared.all_subsystems);
+            shared.checkpoint_mutex.unlock();
+            if (checkpoint_result) |err| {
+                debug_log.log("workerThread: failed to persist bootstrap checkpoint: {s}", .{@errorName(err)});
+                shared.checkpoint_failed.store(true, .release);
+                shared.abort.store(true, .release);
+                break;
+            }
 
             if (shared.use_tui) {
                 shared.tui_mutex.lock();
@@ -3559,12 +3582,12 @@ fn loadCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8) std
     return map;
 }
 
-fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, processed: *std.StringHashMapUnmanaged(void), all_subsystems: []const Subsystem) void {
+fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, processed: *std.StringHashMapUnmanaged(void), all_subsystems: []const Subsystem) !void {
     // Build JSON manually in v2 format
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
 
-    buf.appendSlice(allocator, "{\n  \"version\": 2,\n  \"processed_subsystems\": [\n") catch return;
+    try buf.appendSlice(allocator, "{\n  \"version\": 2,\n  \"processed_subsystems\": [\n");
 
     // Collect processed subsystem IDs, sorted for determinism
     var ids: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -3572,14 +3595,14 @@ fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, pro
 
     var it = processed.keyIterator();
     while (it.next()) |key| {
-        ids.append(allocator, key.*) catch continue;
+        try ids.append(allocator, key.*);
     }
     sortFiles(ids.items);
 
     for (ids.items, 0..) |id, i| {
-        buf.appendSlice(allocator, "    {\"id\": \"") catch return;
-        appendJsonEscaped(&buf, allocator, id);
-        buf.appendSlice(allocator, "\", \"files\": [") catch return;
+        try buf.appendSlice(allocator, "    {\"id\": \"");
+        try appendJsonEscaped(&buf, allocator, id);
+        try buf.appendSlice(allocator, "\", \"files\": [");
 
         // Find the subsystem with this ID to include its files
         var found_subsystem: ?*const Subsystem = null;
@@ -3592,36 +3615,35 @@ fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, pro
 
         if (found_subsystem) |sub| {
             for (sub.files, 0..) |file_path, fi| {
-                buf.appendSlice(allocator, "\"") catch return;
-                appendJsonEscaped(&buf, allocator, file_path);
-                buf.appendSlice(allocator, "\"") catch return;
+                try buf.appendSlice(allocator, "\"");
+                try appendJsonEscaped(&buf, allocator, file_path);
+                try buf.appendSlice(allocator, "\"");
                 if (fi + 1 < sub.files.len) {
-                    buf.appendSlice(allocator, ", ") catch return;
+                    try buf.appendSlice(allocator, ", ");
                 }
             }
         }
 
-        buf.appendSlice(allocator, "]}") catch return;
+        try buf.appendSlice(allocator, "]}");
         if (i + 1 < ids.items.len) {
-            buf.append(allocator, ',') catch return;
+            try buf.append(allocator, ',');
         }
-        buf.append(allocator, '\n') catch return;
+        try buf.append(allocator, '\n');
     }
 
-    buf.appendSlice(allocator, "  ]\n}\n") catch return;
+    try buf.appendSlice(allocator, "  ]\n}\n");
 
-    const file = std.fs.createFileAbsolute(checkpoint_path, .{}) catch return;
-    defer file.close();
-    file.writeAll(buf.items) catch {};
+    debug_log.log("saveCheckpoint: atomically writing {s} with {d} subsystems", .{ checkpoint_path, ids.items.len });
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, checkpoint_path, buf.items);
 }
 
-fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) void {
+fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| {
         switch (c) {
-            '"' => buf.appendSlice(allocator, "\\\"") catch return,
-            '\\' => buf.appendSlice(allocator, "\\\\") catch return,
-            '\n' => buf.appendSlice(allocator, "\\n") catch return,
-            else => buf.append(allocator, c) catch return,
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            else => try buf.append(allocator, c),
         }
     }
 }
@@ -3815,6 +3837,42 @@ test "buildSubsystemClusters grouping" {
     // With no valid SCIP dir, clusters won't form — this tests the null path
     const result = buildSubsystemClusters(allocator, &.{ "src/a.zig", "src/b.zig", "src/c.zig", "lib/d.zig" }, "/tmp/no-such-dir");
     try std.testing.expectEqual(@as(?[]Subsystem, null), result);
+}
+
+test "saveCheckpoint writes deterministic pretty JSON and preserves mode" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var existing = try tmp.dir.createFile("bootstrap-checkpoint.json", .{ .mode = 0o600 });
+    try existing.writeAll("prior\n");
+    existing.close();
+
+    const path = try tmp.dir.realpathAlloc(allocator, "bootstrap-checkpoint.json");
+    defer allocator.free(path);
+    var processed: std.StringHashMapUnmanaged(void) = .empty;
+    defer processed.deinit(allocator);
+    try processed.put(allocator, "z-subsystem", {});
+    try processed.put(allocator, "a-subsystem", {});
+    const subsystems = [_]Subsystem{
+        .{ .id = "z-subsystem", .label = "z", .files = &.{ "z/two.zig", "z/one.zig" }, .cross_file_context = "" },
+        .{ .id = "a-subsystem", .label = "a", .files = &.{"a/main.zig"}, .cross_file_context = "" },
+    };
+
+    try saveCheckpoint(allocator, path, &processed, &subsystems);
+
+    const content = try tmp.dir.readFileAlloc(allocator, "bootstrap-checkpoint.json", 65536);
+    defer allocator.free(content);
+    const a_pos = std.mem.indexOf(u8, content, "a-subsystem") orelse return error.TestUnexpectedResult;
+    const z_pos = std.mem.indexOf(u8, content, "z-subsystem") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(a_pos < z_pos);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\n  \"processed_subsystems\": [\n") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("processed_subsystems").?.array.items.len);
+    const stat = try tmp.dir.statFile("bootstrap-checkpoint.json");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
 }
 
 test "loadCheckpoint v2 format" {
