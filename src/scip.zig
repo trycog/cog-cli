@@ -185,6 +185,14 @@ pub fn kindName(kind: i32) []const u8 {
 
 // ── Decode functions ────────────────────────────────────────────────────
 
+fn expectWireType(field: protobuf.Field, expected: protobuf.WireType) !void {
+    if (field.wire_type != expected) return error.InvalidWireType;
+}
+
+fn readInt32(dec: *Decoder) !i32 {
+    return std.math.cast(i32, try dec.readVarint()) orelse error.IntegerOverflow;
+}
+
 pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Index {
     var dec = Decoder.init(data);
 
@@ -196,31 +204,45 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Index {
     };
     var documents: std.ArrayListUnmanaged(Document) = .empty;
     defer documents.deinit(allocator);
+    errdefer for (documents.items) |*document| freeDocument(allocator, document);
     var external_symbols: std.ArrayListUnmanaged(SymbolInformation) = .empty;
     defer external_symbols.deinit(allocator);
+    errdefer for (external_symbols.items) |*symbol| freeSymbolInformation(allocator, symbol);
 
     while (dec.hasMore()) {
         const field = try dec.readField();
         switch (field.number) {
             1 => { // metadata
+                try expectWireType(field, .LEN);
                 const sub_data = try dec.readLengthDelimited();
                 metadata = try decodeMetadata(sub_data);
             },
             2 => { // documents
+                try expectWireType(field, .LEN);
                 const sub_data = try dec.readLengthDelimited();
-                try documents.append(allocator, try decodeDocument(allocator, sub_data));
+                var document = try decodeDocument(allocator, sub_data);
+                errdefer freeDocument(allocator, &document);
+                try documents.append(allocator, document);
             },
             3 => { // external_symbols
+                try expectWireType(field, .LEN);
                 const sub_data = try dec.readLengthDelimited();
-                try external_symbols.append(allocator, try decodeSymbolInformation(allocator, sub_data));
+                var symbol = try decodeSymbolInformation(allocator, sub_data);
+                errdefer freeSymbolInformation(allocator, &symbol);
+                try external_symbols.append(allocator, symbol);
             },
             else => try dec.skipField(field.wire_type),
         }
     }
 
+    const owned_documents = try documents.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_documents) |*document| freeDocument(allocator, document);
+        allocator.free(owned_documents);
+    }
     return .{
         .metadata = metadata,
-        .documents = try documents.toOwnedSlice(allocator),
+        .documents = owned_documents,
         .external_symbols = try external_symbols.toOwnedSlice(allocator),
     };
 }
@@ -237,13 +259,23 @@ fn decodeMetadata(data: []const u8) !Metadata {
     while (dec.hasMore()) {
         const field = try dec.readField();
         switch (field.number) {
-            1 => result.version = @intCast(try dec.readVarint()),
+            1 => {
+                try expectWireType(field, .VARINT);
+                result.version = try readInt32(&dec);
+            },
             2 => {
+                try expectWireType(field, .LEN);
                 const sub = try dec.readLengthDelimited();
                 result.tool_info = try decodeToolInfo(sub);
             },
-            3 => result.project_root = try dec.readString(),
-            4 => result.text_document_encoding = @intCast(try dec.readVarint()),
+            3 => {
+                try expectWireType(field, .LEN);
+                result.project_root = try dec.readString();
+            },
+            4 => {
+                try expectWireType(field, .VARINT);
+                result.text_document_encoding = try readInt32(&dec);
+            },
             else => try dec.skipField(field.wire_type),
         }
     }
@@ -257,8 +289,14 @@ fn decodeToolInfo(data: []const u8) !ToolInfo {
     while (dec.hasMore()) {
         const field = try dec.readField();
         switch (field.number) {
-            1 => result.name = try dec.readString(),
-            2 => result.version = try dec.readString(),
+            1 => {
+                try expectWireType(field, .LEN);
+                result.name = try dec.readString();
+            },
+            2 => {
+                try expectWireType(field, .LEN);
+                result.version = try dec.readString();
+            },
             else => try dec.skipField(field.wire_type),
         }
     }
@@ -278,25 +316,37 @@ fn decodeDocument(allocator: std.mem.Allocator, data: []const u8) !Document {
     defer occurrences.deinit(allocator);
     var symbols: std.ArrayListUnmanaged(SymbolInformation) = .empty;
     defer symbols.deinit(allocator);
+    errdefer for (symbols.items) |*symbol| freeSymbolInformation(allocator, symbol);
 
     while (dec.hasMore()) {
         const field = try dec.readField();
         switch (field.number) {
-            1 => result.relative_path = try dec.readString(),
+            1 => {
+                try expectWireType(field, .LEN);
+                result.relative_path = try dec.readString();
+            },
             2 => {
+                try expectWireType(field, .LEN);
                 const sub = try dec.readLengthDelimited();
                 try occurrences.append(allocator, try decodeOccurrence(allocator, sub));
             },
             3 => {
+                try expectWireType(field, .LEN);
                 const sub = try dec.readLengthDelimited();
-                try symbols.append(allocator, try decodeSymbolInformation(allocator, sub));
+                var symbol = try decodeSymbolInformation(allocator, sub);
+                errdefer freeSymbolInformation(allocator, &symbol);
+                try symbols.append(allocator, symbol);
             },
-            4 => result.language = try dec.readString(),
+            4 => {
+                try expectWireType(field, .LEN);
+                result.language = try dec.readString();
+            },
             else => try dec.skipField(field.wire_type),
         }
     }
 
     result.occurrences = try occurrences.toOwnedSlice(allocator);
+    errdefer allocator.free(result.occurrences);
     result.symbols = try symbols.toOwnedSlice(allocator);
     return result;
 }
@@ -314,6 +364,7 @@ fn decodeOccurrence(allocator: std.mem.Allocator, data: []const u8) !Occurrence 
         const field = try dec.readField();
         switch (field.number) {
             1 => { // range - packed int32
+                try expectWireType(field, .LEN);
                 const range_vals = try dec.readPackedInt32(allocator);
                 defer allocator.free(range_vals);
                 if (range_vals.len == 3) {
@@ -332,10 +383,20 @@ fn decodeOccurrence(allocator: std.mem.Allocator, data: []const u8) !Occurrence 
                     };
                 }
             },
-            2 => result.symbol = try dec.readString(),
-            3 => result.symbol_roles = @intCast(try dec.readVarint()),
-            5 => result.syntax_kind = @intCast(try dec.readVarint()),
+            2 => {
+                try expectWireType(field, .LEN);
+                result.symbol = try dec.readString();
+            },
+            3 => {
+                try expectWireType(field, .VARINT);
+                result.symbol_roles = try readInt32(&dec);
+            },
+            5 => {
+                try expectWireType(field, .VARINT);
+                result.syntax_kind = try readInt32(&dec);
+            },
             7 => { // enclosing_range - packed int32 (same encoding as range)
+                try expectWireType(field, .LEN);
                 const range_vals = try dec.readPackedInt32(allocator);
                 defer allocator.free(range_vals);
                 if (range_vals.len == 3) {
@@ -379,20 +440,37 @@ fn decodeSymbolInformation(allocator: std.mem.Allocator, data: []const u8) !Symb
     while (dec.hasMore()) {
         const field = try dec.readField();
         switch (field.number) {
-            1 => result.symbol = try dec.readString(),
-            3 => try docs.append(allocator, try dec.readString()),
+            1 => {
+                try expectWireType(field, .LEN);
+                result.symbol = try dec.readString();
+            },
+            3 => {
+                try expectWireType(field, .LEN);
+                try docs.append(allocator, try dec.readString());
+            },
             4 => {
+                try expectWireType(field, .LEN);
                 const sub = try dec.readLengthDelimited();
                 try rels.append(allocator, try decodeRelationship(sub));
             },
-            5 => result.kind = @intCast(try dec.readVarint()),
-            6 => result.display_name = try dec.readString(),
-            8 => result.enclosing_symbol = try dec.readString(),
+            5 => {
+                try expectWireType(field, .VARINT);
+                result.kind = try readInt32(&dec);
+            },
+            6 => {
+                try expectWireType(field, .LEN);
+                result.display_name = try dec.readString();
+            },
+            8 => {
+                try expectWireType(field, .LEN);
+                result.enclosing_symbol = try dec.readString();
+            },
             else => try dec.skipField(field.wire_type),
         }
     }
 
     result.documentation = try docs.toOwnedSlice(allocator);
+    errdefer allocator.free(result.documentation);
     result.relationships = try rels.toOwnedSlice(allocator);
     return result;
 }
@@ -411,24 +489,44 @@ fn decodeRelationship(data: []const u8) !Relationship {
     while (dec.hasMore()) {
         const field = try dec.readField();
         switch (field.number) {
-            1 => result.symbol = try dec.readString(),
-            2 => result.is_reference = (try dec.readVarint()) != 0,
-            3 => result.is_implementation = (try dec.readVarint()) != 0,
-            4 => result.is_type_definition = (try dec.readVarint()) != 0,
-            5 => result.is_definition = (try dec.readVarint()) != 0,
-            6 => result.kind = try dec.readString(),
+            1 => {
+                try expectWireType(field, .LEN);
+                result.symbol = try dec.readString();
+            },
+            2 => {
+                try expectWireType(field, .VARINT);
+                result.is_reference = (try dec.readVarint()) != 0;
+            },
+            3 => {
+                try expectWireType(field, .VARINT);
+                result.is_implementation = (try dec.readVarint()) != 0;
+            },
+            4 => {
+                try expectWireType(field, .VARINT);
+                result.is_type_definition = (try dec.readVarint()) != 0;
+            },
+            5 => {
+                try expectWireType(field, .VARINT);
+                result.is_definition = (try dec.readVarint()) != 0;
+            },
+            6 => {
+                try expectWireType(field, .LEN);
+                result.kind = try dec.readString();
+            },
             else => try dec.skipField(field.wire_type),
         }
     }
     return result;
 }
 
+fn freeSymbolInformation(allocator: std.mem.Allocator, symbol: *SymbolInformation) void {
+    allocator.free(symbol.documentation);
+    allocator.free(symbol.relationships);
+}
+
 /// Free allocated memory for a single document's internals.
 pub fn freeDocument(allocator: std.mem.Allocator, doc: *Document) void {
-    for (doc.symbols) |*sym| {
-        allocator.free(sym.documentation);
-        allocator.free(sym.relationships);
-    }
+    for (doc.symbols) |*symbol| freeSymbolInformation(allocator, symbol);
     allocator.free(doc.occurrences);
     allocator.free(doc.symbols);
 }
@@ -438,10 +536,7 @@ pub fn freeIndex(allocator: std.mem.Allocator, index: *Index) void {
     for (index.documents) |*doc| {
         freeDocument(allocator, doc);
     }
-    for (index.external_symbols) |*sym| {
-        allocator.free(sym.documentation);
-        allocator.free(sym.relationships);
-    }
+    for (index.external_symbols) |*symbol| freeSymbolInformation(allocator, symbol);
     allocator.free(index.documents);
     allocator.free(index.external_symbols);
 }
@@ -501,6 +596,83 @@ pub fn extractSymbolName(symbol: []const u8) []const u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "decode rejects wrong wire types for known fields" {
+    const malformed = [_][]const u8{
+        &.{ 0x08, 0x00 }, // Index.metadata must be length-delimited.
+        &.{ 0x12, 0x01, 0x08 }, // Document.relative_path must be length-delimited.
+        &.{ 0x12, 0x03, 0x12, 0x01, 0x08 }, // Occurrence.range must be length-delimited.
+        &.{ 0x1A, 0x01, 0x08 }, // SymbolInformation.symbol must be length-delimited.
+    };
+
+    for (malformed) |data| {
+        try std.testing.expectError(error.InvalidWireType, decode(std.testing.allocator, data));
+    }
+}
+
+test "decode rejects int32 values outside the supported range" {
+    const malformed = [_][]const u8{
+        &.{
+            0x0A, 0x0B, // Index.metadata
+            0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, // Metadata.version = max u64
+        },
+        &.{
+            0x12, 0x0D, // Index.documents
+            0x12, 0x0B, // Document.occurrences
+            0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, // Occurrence.symbol_roles = max u64
+        },
+    };
+
+    for (malformed) |data| {
+        try std.testing.expectError(error.IntegerOverflow, decode(std.testing.allocator, data));
+    }
+}
+
+test "decode cleans up every partial allocation failure" {
+    const data = &.{
+        0x12, 0x17, // Index.documents
+        0x0A, 0x01, 'p', // Document.relative_path
+        0x12, 0x05, 0x0A, 0x03, 0x01, 0x02, 0x03, // Document.occurrences
+        0x1A, 0x0B, // Document.symbols
+        0x0A, 0x01, 'S', // SymbolInformation.symbol
+        0x1A, 0x01, 'D', // SymbolInformation.documentation
+        0x22, 0x03, 0x0A, 0x01, 'R', // SymbolInformation.relationships
+        0x1A, 0x0B, // Index.external_symbols
+        0x0A, 0x01, 'E', // SymbolInformation.symbol
+        0x1A, 0x01, 'D', // SymbolInformation.documentation
+        0x22, 0x03, 0x0A, 0x01, 'R', // SymbolInformation.relationships
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decodeAndFree, .{data});
+}
+
+test "decode malformed fuzz smoke has no panic or leak" {
+    const allocator = std.testing.allocator;
+    var state: u64 = 0xD1B54A32D192ED03;
+    var buffer: [128]u8 = undefined;
+
+    for (0..2048) |_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        const len: usize = @intCast(state % (buffer.len + 1));
+        for (buffer[0..len]) |*byte| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            byte.* = @truncate(state);
+        }
+
+        if (decode(allocator, buffer[0..len])) |decoded| {
+            var index = decoded;
+            freeIndex(allocator, &index);
+        } else |_| {}
+    }
+}
+
+fn decodeAndFree(allocator: std.mem.Allocator, data: []const u8) !void {
+    var index = try decode(allocator, data);
+    defer freeIndex(allocator, &index);
+}
 
 test "decode minimal Index" {
     const allocator = std.testing.allocator;
