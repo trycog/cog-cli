@@ -80,7 +80,7 @@ pub fn createSecureTempFile(
     while (true) {
         const sequence = temp_counter.fetchAdd(1, .monotonic);
         const name = try std.fmt.allocPrint(allocator, ".{s}-{d}-{d}.tmp", .{ prefix, std.time.nanoTimestamp(), sequence });
-        const file = dir.createFile(name, .{ .exclusive = true, .mode = 0o600 }) catch |err| switch (err) {
+        const file = dir.createFile(name, .{ .read = true, .exclusive = true, .mode = 0o600 }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(name);
                 continue;

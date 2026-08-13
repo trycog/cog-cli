@@ -10,6 +10,7 @@ const help = @import("help_text.zig");
 const tui = @import("tui.zig");
 const settings_mod = @import("settings.zig");
 const paths = @import("paths.zig");
+const fs_util = @import("fs_util.zig");
 const extensions = @import("extensions.zig");
 const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
 const debug_log = @import("debug_log.zig");
@@ -2002,9 +2003,21 @@ fn invokeIndexerWithSubstitutions(
     file_paths: ?[]const []const u8,
     progress: ?*ExternalIndexerProgress,
 ) !IndexResult {
-    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/cog-index-{d}.scip", .{std.crypto.random.int(u64)});
+    const temp_dir_path = try paths.getProjectTempDir(allocator);
+    defer allocator.free(temp_dir_path);
+    var temp_dir = try std.fs.openDirAbsolute(temp_dir_path, .{ .no_follow = true });
+    defer temp_dir.close();
+
+    const temp = try fs_util.createSecureTempFile(temp_dir, allocator, "index-scip");
+    defer allocator.free(temp.name);
+    var temp_file = temp.file;
+    defer temp_file.close();
+    defer temp_dir.deleteFile(temp.name) catch |err| {
+        debug_log.log("invokeIndexerWithSubstitutions: failed to remove temporary SCIP output {s}: {s}", .{ temp.name, @errorName(err) });
+    };
+    const tmp_path = try std.fs.path.join(allocator, &.{ temp_dir_path, temp.name });
     defer allocator.free(tmp_path);
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    debug_log.log("invokeIndexerWithSubstitutions: reserved private SCIP output {s}", .{tmp_path});
 
     const subs = try allocator.alloc(settings_mod.Substitution, extra_subs.len + 1);
     defer allocator.free(subs);
@@ -2048,19 +2061,27 @@ fn invokeIndexerWithSubstitutions(
     var child = std.process.Child.init(full_args, allocator);
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
-    try child.spawn();
+    child.spawn() catch |err| {
+        debug_log.log("invokeIndexerWithSubstitutions: spawn failed for {s}: {s}", .{ config.command, @errorName(err) });
+        return err;
+    };
 
     if (child.stderr) |stderr_file| {
-        try consumeIndexerProgress(allocator, stderr_file, progress);
+        consumeIndexerProgress(allocator, stderr_file, progress) catch |err| {
+            debug_log.log("invokeIndexerWithSubstitutions: stderr progress read failed: {s}", .{@errorName(err)});
+            return err;
+        };
     }
 
-    const term = try child.wait();
+    const term = child.wait() catch |err| {
+        debug_log.log("invokeIndexerWithSubstitutions: wait failed for {s}: {s}", .{ config.command, @errorName(err) });
+        return err;
+    };
     try ensureIndexerTermSucceeded(term);
 
-    debug_log.log("invokeIndexerWithSubstitutions: reading {s}", .{tmp_path});
-    const tmp_file = try std.fs.openFileAbsolute(tmp_path, .{});
-    defer tmp_file.close();
-    const tmp_data = try tmp_file.readToEndAlloc(allocator, 256 * 1024 * 1024);
+    debug_log.log("invokeIndexerWithSubstitutions: reading reserved output {s}", .{tmp_path});
+    try temp_file.seekTo(0);
+    const tmp_data = try temp_file.readToEndAlloc(allocator, 256 * 1024 * 1024);
 
     const index = scip.decode(allocator, tmp_data) catch |err| {
         allocator.free(tmp_data);
@@ -6168,6 +6189,99 @@ test "auto-retry: glob retry finds partial match" {
 
     // Verify the found symbol is initBrain
     try std.testing.expect(std.mem.eql(u8, glob_match.items[0].def.display_name, "initBrain"));
+}
+
+test "external indexer uses private project output and cleans it up" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.setAsCwd();
+
+    var fixture_documents = [_]scip.Document{.{
+        .language = "zig",
+        .relative_path = "src/main.zig",
+        .occurrences = &.{},
+        .symbols = &.{},
+    }};
+    const fixture_index = scip.Index{
+        .metadata = .{
+            .version = 0,
+            .tool_info = .{ .name = "fixture", .version = "1.0" },
+            .project_root = "",
+            .text_document_encoding = 0,
+        },
+        .documents = &fixture_documents,
+        .external_symbols = &.{},
+    };
+    const encoded = try scip_encode.encodeIndex(allocator, fixture_index);
+    defer allocator.free(encoded);
+    const hex = try std.fmt.allocPrint(allocator, "{x}", .{encoded});
+    defer allocator.free(hex);
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "case \"$1\" in \"$PWD/.cog/tmp/\"*) ;; *) exit 41 ;; esac; [ \"$(stat -f %Lp \"$1\")\" = 600 ] || exit 42; printf '%s' '{s}' | xxd -r -p > \"$1\"",
+        .{hex},
+    );
+    defer allocator.free(script);
+
+    var result = try invokeIndexerWithSubstitutions(
+        allocator,
+        .{ .command = "/bin/sh", .args = &.{ "-c", script, "cog-test-indexer", "{output}" } },
+        &.{},
+        null,
+        null,
+    );
+    defer {
+        scip.freeIndex(allocator, &result.index);
+        if (result.backing_data) |data| allocator.free(data);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.index.documents.len);
+
+    var temp_dir = try std.fs.cwd().openDir(".cog/tmp", .{ .iterate = true });
+    defer temp_dir.close();
+    var entries = temp_dir.iterate();
+    try std.testing.expect((try entries.next()) == null);
+}
+
+test "external indexer cleans private output after failure" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expectError(
+        error.IndexerFailed,
+        invokeIndexerWithSubstitutions(
+            allocator,
+            .{ .command = "/bin/sh", .args = &.{ "-c", "printf invalid > \"$1\"; exit 7", "cog-test-indexer", "{output}" } },
+            &.{},
+            null,
+            null,
+        ),
+    );
+
+    var temp_dir = try std.fs.cwd().openDir(".cog/tmp", .{ .iterate = true });
+    defer temp_dir.close();
+    var entries = temp_dir.iterate();
+    try std.testing.expect((try entries.next()) == null);
 }
 
 test "ensureIndexerTermSucceeded accepts zero exit and rejects signal" {

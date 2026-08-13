@@ -86,6 +86,19 @@ pub fn getGlobalConfigDir(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/.config/cog", .{home});
 }
 
+/// Resolve a private project-local directory for temporary subprocess output.
+/// Keeping it under `.cog` lets sandboxed indexers write inside the project.
+pub fn getProjectTempDir(allocator: std.mem.Allocator) ![]const u8 {
+    const cog_dir = try findCogDir(allocator);
+    defer allocator.free(cog_dir);
+
+    const temp_dir = try std.fs.path.join(allocator, &.{ cog_dir, "tmp" });
+    errdefer allocator.free(temp_dir);
+    try ensurePrivateProjectTempDir(temp_dir);
+    debug_log.log("getProjectTempDir: using {s}", .{temp_dir});
+    return temp_dir;
+}
+
 /// Resolve Cog's private runtime directory. XDG_RUNTIME_DIR is used only when
 /// it already belongs to the current user and is not group/world accessible.
 /// Otherwise Cog falls back to ~/.cache/cog/runtime.
@@ -162,6 +175,31 @@ pub fn validateUnixSocketPath(path: []const u8) !void {
         return error.PathTooLong;
     }
     debug_log.log("validateUnixSocketPath: accepted {d}-byte path", .{path.len});
+}
+
+fn ensurePrivateProjectTempDir(path: []const u8) !void {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidProjectTempPath;
+
+    if (pathExistsNoFollow(path)) {
+        try validateRuntimeDirectoryNode(path);
+    } else {
+        std.fs.cwd().makeDir(path) catch |err| {
+            debug_log.log("ensurePrivateProjectTempDir: failed to create {s}: {s}", .{ path, @errorName(err) });
+            return err;
+        };
+    }
+
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true, .no_follow = true }) catch |err| {
+        debug_log.log("ensurePrivateProjectTempDir: rejected {s}: {s}", .{ path, @errorName(err) });
+        return err;
+    };
+    defer dir.close();
+
+    if (builtin.os.tag != .windows) {
+        const stat = try std.posix.fstat(dir.fd);
+        if (stat.uid != std.posix.geteuid()) return error.RuntimeDirWrongOwner;
+        if (stat.mode & 0o077 != 0) try dir.chmod(0o700);
+    }
 }
 
 fn ensurePrivateRuntimeDir(path: []const u8) !void {
@@ -279,6 +317,56 @@ test "findOrCreateCogDir creates pretty settings without replacing existing cont
     const preserved = try std.fs.cwd().readFileAlloc(allocator, ".cog/settings.json", 1024);
     defer allocator.free(preserved);
     try std.testing.expectEqualStrings("{\n  \"custom\": true\n}\n", preserved);
+}
+
+test "getProjectTempDir creates a private directory under .cog" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.setAsCwd();
+
+    const temp_dir = try getProjectTempDir(allocator);
+    defer allocator.free(temp_dir);
+
+    const cog_dir = try std.fs.cwd().realpathAlloc(allocator, ".cog");
+    defer allocator.free(cog_dir);
+    const expected = try std.fs.path.join(allocator, &.{ cog_dir, "tmp" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, temp_dir);
+
+    var dir = try std.fs.openDirAbsolute(temp_dir, .{ .iterate = true });
+    defer dir.close();
+    const stat = try std.posix.fstat(dir.fd);
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o700), stat.mode & 0o777);
+}
+
+test "getProjectTempDir rejects a symlinked temp directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.makeDir("outside");
+    try tmp.dir.symLink("../outside", ".cog/tmp", .{ .is_directory = true });
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expectError(error.RuntimeDirSymlink, getProjectTempDir(allocator));
 }
 
 test "ensurePrivateRuntimeDir creates mode 0700 directories" {

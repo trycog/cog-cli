@@ -23,6 +23,13 @@ const sqlite = @import("sqlite.zig");
 const Config = config_mod.Config;
 const help = @import("help_text.zig");
 
+const COG_GITIGNORE_CONTENT =
+    \\*.db
+    \\*.scip
+    \\*.log
+    \\
+;
+
 // ANSI styles
 const cyan = "\x1B[36m";
 const bold = "\x1B[1m";
@@ -2151,15 +2158,8 @@ fn ensureCogGitignore(allocator: std.mem.Allocator) !void {
         else => return error.Explained,
     };
 
-    const content =
-        \\*.db
-        \\*.scip
-        \\*.log
-        \\
-    ;
-
     debug_log.log("commands.ensureCogGitignore: writing .cog/.gitignore", .{});
-    try writeCwdFile(".cog/.gitignore", content);
+    try writeCwdFile(".cog/.gitignore", COG_GITIGNORE_CONTENT);
 }
 
 fn signForDebug(allocator: std.mem.Allocator) void {
@@ -2530,6 +2530,10 @@ test "processCogMemTags strips memory gate in tools-only mode" {
     try std.testing.expect(std.mem.indexOf(u8, processed, "cog_mem_learn") == null);
 }
 
+test "Cog gitignore production contract remains stable" {
+    try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", COG_GITIGNORE_CONTENT);
+}
+
 test "ensureCogGitignore writes cog-local ignore patterns" {
     const allocator = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{});
@@ -2547,7 +2551,7 @@ test "ensureCogGitignore writes cog-local ignore patterns" {
     const content = readCwdFile(allocator, ".cog/.gitignore") orelse return error.TestUnexpectedResult;
     defer allocator.free(content);
 
-    try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", content);
+    try std.testing.expectEqualStrings(COG_GITIGNORE_CONTENT, content);
     try std.testing.expect(readCwdFile(allocator, ".gitignore") == null);
 }
 
@@ -2571,7 +2575,7 @@ test "ensureCogGitignore overwrites stale cog-local gitignore content" {
     const content = readCwdFile(allocator, ".cog/.gitignore") orelse return error.TestUnexpectedResult;
     defer allocator.free(content);
 
-    try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", content);
+    try std.testing.expectEqualStrings(COG_GITIGNORE_CONTENT, content);
 }
 
 // ── Doctor Tests ────────────────────────────────────────────────────────

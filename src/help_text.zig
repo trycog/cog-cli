@@ -34,7 +34,12 @@ pub const code_rename =
 // ── Debug ─────────────────────────────────────────────────────────────
 
 pub const debug_serve =
-    bold ++ "  cog debug:serve" ++ reset ++ "\n" ++ "\n" ++ "  Start the debug daemon. Listens on a Unix domain socket and\n" ++ "  dispatches debug tool calls from debug:send.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:serve\n" ++ "\n" ++ cyan ++ bold ++ "  Transport" ++ reset ++ "\n" ++ "    Unix domain socket at /tmp/cog-debug-<uid>.sock.\n" ++ "    Auto-started by debug:send commands when not running.\n" ++ "\n";
+    bold ++ "  cog debug:serve" ++ reset ++ "\n" ++ "\n" ++ "  Start the debug daemon. Listens on a Unix domain socket and\n" ++ "  dispatches debug tool calls from debug:send.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:serve\n" ++ "\n" ++ cyan ++ bold ++ "  Transport" ++ reset ++ "\n" ++ "    Unix domain socket in Cog's private runtime directory.\n" ++ "    Auto-started by debug:send commands when not running.\n" ++ "\n";
+
+test "debug serve help describes private runtime transport" {
+    try @import("std").testing.expect(@import("std").mem.indexOf(u8, debug_serve, "private runtime directory") != null);
+    try @import("std").testing.expect(@import("std").mem.indexOf(u8, debug_serve, "/tmp/cog-debug-") == null);
+}
 
 pub const debug_dashboard =
     bold ++ "  cog debug:dashboard" ++ reset ++ "\n" ++ "\n" ++ "  Live debug session dashboard. Runs in a separate terminal and\n" ++ "  shows real-time state from running debug servers.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog debug:dashboard\n" ++ "\n" ++ cyan ++ bold ++ "  Key Bindings" ++ reset ++ "\n" ++ "    " ++ bold ++ "q" ++ reset ++ " / " ++ bold ++ "Ctrl+C" ++ reset ++ "            " ++ dim ++ "Quit" ++ reset ++ "\n" ++ "    " ++ bold ++ "Up" ++ reset ++ " / " ++ bold ++ "Down" ++ reset ++ "              " ++ dim ++ "Switch focused session" ++ reset ++ "\n" ++ "    " ++ bold ++ "Tab" ++ reset ++ "                   " ++ dim ++ "Cycle focus forward" ++ reset ++ "\n" ++ "\n" ++ dim ++ "  Communicates with the debug daemon via a Unix domain socket.\n" ++ "  Multiple servers can push events to the same dashboard." ++ reset ++ "\n" ++ "\n";
