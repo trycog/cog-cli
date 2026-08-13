@@ -14,6 +14,7 @@ const fs_util = @import("fs_util.zig");
 const extensions = @import("extensions.zig");
 const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
 const debug_log = @import("debug_log.zig");
+const path_matcher = @import("path_matcher.zig");
 
 // Advisory file locking via flock(2). Auto-released on close/process exit.
 extern "c" fn flock(fd: c_int, operation: c_int) c_int;
@@ -1363,23 +1364,18 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
-    // If no CLI patterns, fall back to settings
-    var settings_holder: ?settings_mod.Settings = null;
+    // Load settings for default patterns and approved external roots.
+    const settings_holder = settings_mod.Settings.load(allocator);
     defer if (settings_holder) |s| s.deinit(allocator);
 
     if (patterns.items.len == 0) {
-        if (settings_mod.Settings.load(allocator)) |s| {
+        if (settings_holder) |s| {
             if (s.code) |code| {
                 if (code.index) |index_patterns| {
                     for (index_patterns) |p| {
                         try patterns.append(allocator, p);
                     }
                 }
-            }
-            if (patterns.items.len > 0) {
-                settings_holder = s;
-            } else {
-                s.deinit(allocator);
             }
         }
     }
@@ -1440,13 +1436,25 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         backing_buffers.append(allocator, data) catch {};
     }
 
-    // Expand all patterns to a file list
-    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    const project_root = std.fs.path.dirname(cog_dir) orelse {
+        printErr("error: failed to resolve project root\n");
+        return error.Explained;
+    };
+    const external_roots = if (settings_holder) |s|
+        if (s.code) |code| code.external_roots orelse &.{} else &.{}
+    else
+        &.{};
+
+    // Expand all patterns with the shared path traversal policy.
+    var files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
     defer {
-        for (files.items) |f| allocator.free(f);
+        for (files.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
         files.deinit(allocator);
     }
-    try collectFilesForPatterns(allocator, patterns.items, &files);
+    try collectMatchedFiles(allocator, project_root, patterns.items, external_roots, &files);
 
     if (files.items.len == 0) {
         printErr("error: no files matched\n");
@@ -1518,7 +1526,9 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     };
 
-    for (files.items) |file_path| {
+    for (files.items) |matched_file| {
+        const file_path = matched_file.logical_path;
+        const physical_path = matched_file.physical_path;
         const ext = std.fs.path.extension(file_path);
         if (ext.len == 0) continue;
 
@@ -1549,7 +1559,7 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
                 // Read source file
                 debug_log.log("codeIndex: tree_sitter:file_start path={s} grammar={s}", .{ file_path, ts_config.grammar_name });
-                const source = readFileContents(allocator, file_path) orelse continue;
+                const source = readFileContents(allocator, physical_path) orelse continue;
                 defer allocator.free(source);
                 debug_log.log("codeIndex: tree_sitter:file_read path={s} bytes={d} elapsed_ms={d}", .{ file_path, source.len, std.time.milliTimestamp() - file_start_ms });
                 debug_log.logResourceUsage("codeIndex:tree_sitter:file_read");
@@ -1597,10 +1607,10 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 if (!found and num_unique < 16) {
                     seen_names[num_unique] = resolved.name;
                     unique_exts[num_unique] = resolved;
-                    ext_files[num_unique].append(allocator, file_path) catch {};
+                    ext_files[num_unique].append(allocator, physical_path) catch {};
                     num_unique += 1;
                 } else if (found) {
-                    ext_files[found_idx].append(allocator, file_path) catch {};
+                    ext_files[found_idx].append(allocator, physical_path) catch {};
                 }
             },
         }
@@ -1789,76 +1799,8 @@ fn collectFiles(allocator: std.mem.Allocator, dir_path: []const u8, out: *std.Ar
     }
 }
 
-/// Match a path against a glob pattern.
-/// Supports: `*` (any non-`/` chars), `**` (any path segments), `?` (any single non-`/` char).
-pub fn globMatch(pattern: []const u8, path: []const u8) bool {
-    var pi: usize = 0; // pattern index
-    var si: usize = 0; // path (string) index
-
-    // For `*` backtracking
-    var star_pi: usize = 0;
-    var star_si: usize = 0;
-    var has_star = false;
-
-    while (si < path.len or pi < pattern.len) {
-        if (pi < pattern.len) {
-            // Handle `**`
-            if (pi + 1 < pattern.len and pattern[pi] == '*' and pattern[pi + 1] == '*') {
-                // Skip the `**`
-                pi += 2;
-                // Skip trailing `/` after `**`
-                if (pi < pattern.len and pattern[pi] == '/') pi += 1;
-                // `**` at end matches everything remaining
-                if (pi >= pattern.len) return true;
-                // Try matching the rest of the pattern at every remaining position
-                while (si <= path.len) {
-                    if (globMatch(pattern[pi..], path[si..])) return true;
-                    if (si < path.len) {
-                        si += 1;
-                    } else break;
-                }
-                return false;
-            }
-
-            // Handle `*` (non-`/` chars only)
-            if (pattern[pi] == '*') {
-                star_pi = pi;
-                star_si = si;
-                has_star = true;
-                pi += 1;
-                continue;
-            }
-
-            if (si < path.len) {
-                // Handle `?` (any single non-`/` char)
-                if (pattern[pi] == '?' and path[si] != '/') {
-                    pi += 1;
-                    si += 1;
-                    continue;
-                }
-
-                // Literal match
-                if (pattern[pi] == path[si]) {
-                    pi += 1;
-                    si += 1;
-                    continue;
-                }
-            }
-        }
-
-        // Mismatch — backtrack to last `*` if possible
-        if (has_star and star_si < path.len and path[star_si] != '/') {
-            star_si += 1;
-            si = star_si;
-            pi = star_pi + 1;
-            continue;
-        }
-
-        return false;
-    }
-
-    return true;
-}
+/// Match a path against a glob pattern using the shared scan/watch semantics.
+pub const globMatch = path_matcher.globMatch;
 
 /// Extract the literal directory prefix from a glob pattern (everything before the first wildcard).
 /// Returns "." if the pattern starts with a wildcard.
@@ -2017,47 +1959,20 @@ fn normalizeGlobPattern(pattern: []const u8) []const u8 {
     return if (isNegativeGlobPattern(pattern)) pattern[1..] else pattern;
 }
 
-fn collectFilesForPatterns(
+fn collectMatchedFiles(
     allocator: std.mem.Allocator,
+    project_root: []const u8,
     patterns: []const []const u8,
-    out: *std.ArrayListUnmanaged([]const u8),
+    external_roots: []const []const u8,
+    out: *std.ArrayListUnmanaged(path_matcher.MatchedPath),
 ) !void {
-    var includes: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (includes.items) |f| allocator.free(f);
-        includes.deinit(allocator);
-    }
-
-    var excludes: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (excludes.items) |f| allocator.free(f);
-        excludes.deinit(allocator);
-    }
-
-    for (patterns) |pattern| {
-        const normalized = normalizeGlobPattern(pattern);
-        if (normalized.len == 0) continue;
-        if (isNegativeGlobPattern(pattern)) {
-            collectGlobFiles(allocator, normalized, &excludes) catch continue;
-        } else {
-            collectGlobFiles(allocator, normalized, &includes) catch continue;
-        }
-    }
-
-    var excluded = std.StringHashMapUnmanaged(void){};
-    defer excluded.deinit(allocator);
-    for (excludes.items) |path| {
-        try excluded.put(allocator, path, {});
-    }
-
-    var seen = std.StringHashMapUnmanaged(void){};
-    defer seen.deinit(allocator);
-    for (includes.items) |path| {
-        if (excluded.contains(path)) continue;
-        const gop = try seen.getOrPut(allocator, path);
-        if (gop.found_existing) continue;
-        try out.append(allocator, try allocator.dupe(u8, path));
-    }
+    var matcher = try path_matcher.PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = patterns,
+        .external_roots = external_roots,
+    });
+    defer matcher.deinit();
+    try matcher.collect(out);
 }
 
 /// Recursively walk a directory, building relative paths and matching against a glob pattern.
@@ -4842,12 +4757,23 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
         backing_buffers.append(allocator, data) catch {};
     }
 
-    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    const settings = settings_mod.Settings.load(allocator);
+    defer if (settings) |s| s.deinit(allocator);
+    const project_root = std.fs.path.dirname(cog_dir) orelse return error.NoCogDir;
+    const external_roots = if (settings) |s|
+        if (s.code) |code| code.external_roots orelse &.{} else &.{}
+    else
+        &.{};
+
+    var files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
     defer {
-        for (files.items) |f| allocator.free(f);
+        for (files.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
         files.deinit(allocator);
     }
-    try collectFilesForPatterns(allocator, patterns_buf.items, &files);
+    try collectMatchedFiles(allocator, project_root, patterns_buf.items, external_roots, &files);
 
     if (files.items.len == 0) return error.NoFilesMatched;
     debug_log.log("codeIndexInner: start patterns={d} matched_files={d}", .{ patterns_buf.items.len, files.items.len });
@@ -4896,7 +4822,9 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
         }
     };
 
-    for (files.items) |file_path| {
+    for (files.items) |matched_file| {
+        const file_path = matched_file.logical_path;
+        const physical_path = matched_file.physical_path;
         const ext = std.fs.path.extension(file_path);
         if (ext.len == 0) continue;
 
@@ -4920,7 +4848,7 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
             .tree_sitter => |ts_config| {
                 const file_start_ms = std.time.milliTimestamp();
                 debug_log.log("codeIndexInner: tree_sitter:file_start path={s} grammar={s}", .{ file_path, ts_config.grammar_name });
-                const source = readFileContents(allocator, file_path) orelse continue;
+                const source = readFileContents(allocator, physical_path) orelse continue;
                 defer allocator.free(source);
                 debug_log.log("codeIndexInner: tree_sitter:file_read path={s} bytes={d} elapsed_ms={d}", .{ file_path, source.len, std.time.milliTimestamp() - file_start_ms });
                 if (indexer.indexFile(allocator, source, file_path, ts_config)) |result| {
@@ -4954,10 +4882,10 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
                 if (!found and num_unique < 16) {
                     seen_names[num_unique] = resolved.name;
                     unique_exts[num_unique] = resolved;
-                    ext_files[num_unique].append(allocator, file_path) catch {};
+                    ext_files[num_unique].append(allocator, physical_path) catch {};
                     num_unique += 1;
                 } else if (found) {
-                    ext_files[found_idx].append(allocator, file_path) catch {};
+                    ext_files[found_idx].append(allocator, physical_path) catch {};
                 }
             },
         }
@@ -5215,7 +5143,7 @@ test "negative glob helpers" {
     try std.testing.expectEqualStrings("apps/**/*.js", normalizeGlobPattern("apps/**/*.js"));
 }
 
-test "collectFilesForPatterns applies excludes after includes" {
+test "collectMatchedFiles applies shared excludes and preserves symlink aliases" {
     const allocator = std.testing.allocator;
     var root = std.testing.tmpDir(.{});
     defer root.cleanup();
@@ -5225,6 +5153,7 @@ test "collectFilesForPatterns applies excludes after includes" {
 
     try root.dir.writeFile(.{ .sub_path = "apps/foo/assets/js/app.js", .data = "console.log('src');\n" });
     try root.dir.writeFile(.{ .sub_path = "apps/foo/priv/static/assets/app.js", .data = "console.log('compiled');\n" });
+    try root.dir.symLink("apps/foo/assets", "workspace-assets", .{ .is_directory = true });
 
     const cwd = std.fs.cwd();
     const original = try cwd.realpathAlloc(allocator, ".");
@@ -5234,15 +5163,21 @@ test "collectFilesForPatterns applies excludes after includes" {
     try std.posix.chdir(tmp_root);
     defer std.posix.chdir(original) catch {};
 
-    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
     defer {
-        for (files.items) |f| allocator.free(f);
+        for (files.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
         files.deinit(allocator);
     }
 
-    try collectFilesForPatterns(allocator, &.{ "apps/**/*.js", "!apps/**/priv/static/**" }, &files);
-    try std.testing.expectEqual(@as(usize, 1), files.items.len);
-    try std.testing.expectEqualStrings("apps/foo/assets/js/app.js", files.items[0]);
+    const project_root = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+    try collectMatchedFiles(allocator, project_root, &.{ "**/*.js", "!apps/**/priv/static/**" }, &.{}, &files);
+    try std.testing.expectEqual(@as(usize, 2), files.items.len);
+    try std.testing.expectEqualStrings("apps/foo/assets/js/app.js", files.items[0].logical_path);
+    try std.testing.expectEqualStrings("workspace-assets/js/app.js", files.items[1].logical_path);
 }
 
 test "pathIsTest" {

@@ -6,6 +6,7 @@ pub const protobuf = @import("protobuf.zig");
 pub const scip = @import("scip.zig");
 pub const scip_encode = @import("scip_encode.zig");
 pub const code_intel = @import("code_intel.zig");
+pub const path_matcher = @import("path_matcher.zig");
 pub const settings = @import("settings.zig");
 pub const paths = @import("paths.zig");
 pub const fs_util = @import("fs_util.zig");
@@ -38,6 +39,7 @@ test {
     _ = scip;
     _ = scip_encode;
     _ = code_intel;
+    _ = path_matcher;
     _ = settings;
     _ = paths;
     _ = fs_util;
