@@ -14,6 +14,7 @@ const hooks_mod = @import("hooks.zig");
 const debug_log = @import("debug_log.zig");
 const paths = @import("paths.zig");
 const code_intel = @import("code_intel.zig");
+const fs_util = @import("fs_util.zig");
 const extensions_mod = @import("extensions.zig");
 const memory_mod = @import("memory.zig");
 const bootstrap_mod = @import("bootstrap.zig");
@@ -2090,22 +2091,9 @@ fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
 }
 
 fn writeCwdFile(filename: []const u8, content: []const u8) !void {
-    const file = std.fs.cwd().createFile(filename, .{}) catch {
-        printErr("error: failed to write ");
-        printErr(filename);
-        printErr("\n");
-        return error.Explained;
-    };
-    defer file.close();
-    var write_buf: [4096]u8 = undefined;
-    var fw = file.writer(&write_buf);
-    fw.interface.writeAll(content) catch {
-        printErr("error: failed to write ");
-        printErr(filename);
-        printErr("\n");
-        return error.Explained;
-    };
-    fw.interface.flush() catch {
+    debug_log.log("commands.writeCwdFile: atomically writing {s}", .{filename});
+    fs_util.writeFileAtomic(std.fs.cwd(), std.heap.page_allocator, filename, content) catch |err| {
+        debug_log.log("commands.writeCwdFile: failed to write {s}: {s}", .{ filename, @errorName(err) });
         printErr("error: failed to write ");
         printErr(filename);
         printErr("\n");
@@ -2442,6 +2430,7 @@ test "writeClientContextManifest writes selected agents and features" {
 
     const content = readCwdFile(allocator, ".cog/client-context.json") orelse return error.TestUnexpectedResult;
     defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\n  \"selected_agents\": [\n") != null);
     const parsed = try json.parseFromSlice(json.Value, allocator, content, .{});
     defer parsed.deinit();
 
@@ -2453,6 +2442,28 @@ test "writeClientContextManifest writes selected agents and features" {
     const features = parsed.value.object.get("features").?;
     try std.testing.expect(features.object.get("enhanced_memory_writes").?.bool);
     try std.testing.expect(features.object.get("provenance_envelopes").?.bool);
+}
+
+test "project file writer preserves prior contents and leaves no temp residue on setup failure" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "prior\n" });
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        fs_util.writeFileAtomic(tmp_dir.dir, failing_allocator.allocator(), "AGENTS.md", "replacement\n"),
+    );
+
+    const content = try tmp_dir.dir.readFileAlloc(allocator, "AGENTS.md", 1024);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("prior\n", content);
+
+    var it = tmp_dir.dir.iterate();
+    while (try it.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".AGENTS.md.tmp-"));
+    }
 }
 
 test "prompt markdown includes stronger memory gate guidance" {
