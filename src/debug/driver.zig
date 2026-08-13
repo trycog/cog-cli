@@ -82,8 +82,11 @@ pub const DriverVTable = struct {
     // Write-only pause (fire-and-forget, no readResponse) for use when a
     // background run thread is already reading from the socket.
     sendPauseFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, thread_id: ?u32) anyerror!void = null,
-    // Process identification for async safety (kill from main thread)
+    // Process identification for diagnostics and legacy callers.
     getPidFn: ?*const fn (ctx: *anyopaque) ?std.posix.pid_t = null,
+    // Forcefully interrupt an active run without performing request/response IO.
+    // Must be safe while runFn owns the driver's read side.
+    interruptRunFn: ?*const fn (ctx: *anyopaque) void = null,
 };
 
 /// Runtime-polymorphic debug driver.
@@ -343,6 +346,12 @@ pub const ActiveDriver = struct {
         const f = self.vtable.getPidFn orelse return null;
         return f(self.ptr);
     }
+
+    /// Interrupt a blocking run without issuing synchronous protocol requests.
+    pub fn interruptRun(self: *ActiveDriver) void {
+        const f = self.vtable.interruptRunFn orelse return;
+        f(self.ptr);
+    }
 };
 
 // ── Mock Driver for Testing ─────────────────────────────────────────────
@@ -350,8 +359,50 @@ pub const ActiveDriver = struct {
 pub const MockDriver = struct {
     launched: bool = false,
     stopped: bool = false,
+    terminated: bool = false,
+    detached: bool = false,
+    paused: bool = false,
+    cancelled: bool = false,
+    deinitialized: bool = false,
     run_count: u32 = 0,
     breakpoint_count: u32 = 0,
+    lifecycle_mutex: std.Thread.Mutex = .{},
+    lifecycle_changed: std.Thread.Condition = .{},
+    block_run: bool = false,
+    run_entered: bool = false,
+    run_active: bool = false,
+    run_released: bool = false,
+    pause_releases_run: bool = true,
+    sync_lifecycle_while_run_active: bool = false,
+
+    pub fn setBlockRun(self: *MockDriver, block: bool) void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.block_run = block;
+        if (!block) {
+            self.run_released = true;
+            self.lifecycle_changed.broadcast();
+        }
+    }
+
+    pub fn waitForRunEntered(self: *MockDriver) void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        while (!self.run_entered) self.lifecycle_changed.wait(&self.lifecycle_mutex);
+    }
+
+    pub fn releaseRun(self: *MockDriver) void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.run_released = true;
+        self.lifecycle_changed.broadcast();
+    }
+
+    pub fn setPauseReleasesRun(self: *MockDriver, releases: bool) void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.pause_releases_run = releases;
+    }
 
     pub fn activeDriver(self: *MockDriver) ActiveDriver {
         return .{
@@ -372,6 +423,11 @@ pub const MockDriver = struct {
         .deinitFn = mockDeinit,
         .scopesFn = mockScopes,
         .capabilitiesFn = mockCapabilities,
+        .terminateFn = mockTerminate,
+        .cancelFn = mockCancel,
+        .detachFn = mockDetach,
+        .sendPauseFn = mockSendPause,
+        .interruptRunFn = mockInterruptRun,
     };
 
     fn mockLaunch(ctx: *anyopaque, _: std.mem.Allocator, _: LaunchConfig) anyerror!void {
@@ -381,7 +437,15 @@ pub const MockDriver = struct {
 
     fn mockRun(ctx: *anyopaque, _: std.mem.Allocator, _: RunAction, _: RunOptions) anyerror!StopState {
         const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
         self.run_count += 1;
+        self.run_entered = true;
+        self.run_active = true;
+        self.lifecycle_changed.broadcast();
+        while (self.block_run and !self.run_released) self.lifecycle_changed.wait(&self.lifecycle_mutex);
+        self.run_active = false;
+        self.lifecycle_changed.broadcast();
+        self.lifecycle_mutex.unlock();
         return .{ .stop_reason = .step };
     }
 
@@ -408,10 +472,67 @@ pub const MockDriver = struct {
 
     fn mockStop(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {
         const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        if (self.run_active) self.sync_lifecycle_while_run_active = true;
         self.stopped = true;
+        self.run_released = true;
+        self.lifecycle_changed.broadcast();
     }
 
-    fn mockDeinit(_: *anyopaque) void {}
+    fn mockTerminate(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        if (self.run_active) self.sync_lifecycle_while_run_active = true;
+        self.terminated = true;
+        self.run_released = true;
+        self.lifecycle_changed.broadcast();
+    }
+
+    fn mockDetach(ctx: *anyopaque, _: std.mem.Allocator) anyerror!void {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        if (self.run_active) self.sync_lifecycle_while_run_active = true;
+        self.detached = true;
+        self.run_released = true;
+        self.lifecycle_changed.broadcast();
+    }
+
+    fn mockCancel(ctx: *anyopaque, _: std.mem.Allocator, _: ?u32, _: ?[]const u8) anyerror!void {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.cancelled = true;
+        self.run_released = true;
+        self.lifecycle_changed.broadcast();
+    }
+
+    fn mockSendPause(ctx: *anyopaque, _: std.mem.Allocator, _: ?u32) anyerror!void {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.paused = true;
+        if (self.pause_releases_run) {
+            self.run_released = true;
+            self.lifecycle_changed.broadcast();
+        }
+    }
+
+    fn mockInterruptRun(ctx: *anyopaque) void {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.cancelled = true;
+        self.run_released = true;
+        self.lifecycle_changed.broadcast();
+    }
+
+    fn mockDeinit(ctx: *anyopaque) void {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        self.deinitialized = true;
+    }
 
     fn mockScopes(_: *anyopaque, allocator: std.mem.Allocator, _: u32) anyerror![]const Scope {
         const result = try allocator.alloc(Scope, 1);
@@ -451,11 +572,10 @@ test "ActiveDriver returns NotSupported for null vtable entries" {
     var mock = MockDriver{};
     var driver = mock.activeDriver();
 
-    // All Phase 10 vtable entries default to null, so they should return error.NotSupported
+    // Phase 10 vtable entries without mock lifecycle support return NotSupported.
     try std.testing.expectError(error.NotSupported, driver.setInstructionBreakpoints(std.testing.allocator, &.{}));
     try std.testing.expectError(error.NotSupported, driver.stepInTargets(std.testing.allocator, 0));
     try std.testing.expectError(error.NotSupported, driver.breakpointLocations(std.testing.allocator, "test.zig", 1, null));
-    try std.testing.expectError(error.NotSupported, driver.cancel(std.testing.allocator, null, null));
     try std.testing.expectError(error.NotSupported, driver.terminateThreads(std.testing.allocator, &.{}));
     try std.testing.expectError(error.NotSupported, driver.restart(std.testing.allocator));
 }

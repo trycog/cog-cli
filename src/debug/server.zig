@@ -1218,10 +1218,11 @@ pub const DebugServer = struct {
             const line_val = a.object.get("line") orelse return .{ .err = .{ .code = INVALID_PARAMS, .message = "Missing line for goto" } };
             if (line_val != .integer) return .{ .err = .{ .code = INVALID_PARAMS, .message = "line must be integer" } };
 
-            const state = session.driver.goto(allocator, file_val.string, @intCast(line_val.integer)) catch |err| {
+            var state = session.driver.goto(allocator, file_val.string, @intCast(line_val.integer)) catch |err| {
                 self.dashboard.onError("debug_run", @errorName(err));
                 return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
             };
+            defer state.deinit(allocator);
 
             session.status = .stopped;
             self.dashboard.onRun(session_id_val.string, "goto", state);
@@ -1272,10 +1273,11 @@ pub const DebugServer = struct {
         // Pause is non-blocking — keep synchronous
         if (action == .pause) {
             session.status = .running;
-            const state = session.driver.runEx(allocator, action, run_options) catch |err| {
+            var state = session.driver.runEx(allocator, action, run_options) catch |err| {
                 self.dashboard.onError("debug_run", @errorName(err));
                 return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
             };
+            defer state.deinit(allocator);
 
             session.status = if (state.exit_code != null) .terminated else .stopped;
             self.dashboard.onRun(session_id_val.string, action_val.string, state);
@@ -1296,29 +1298,21 @@ pub const DebugServer = struct {
         else
             30000;
 
-        session.status = .running;
-        self.emitRunEvent(session_id_val.string, action_val.string);
-
-        // Dupe session_id and action_name so they outlive the parsed JSON request.
-        const owned_session_id = self.allocator.dupe(u8, session_id_val.string) catch
-            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to allocate session_id" } };
-        const owned_action_name = self.allocator.dupe(u8, action_val.string) catch {
-            self.allocator.free(owned_session_id);
-            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to allocate action_name" } };
+        const pending_run = session_mod.Session.PendingRun.create(self.allocator, session_id_val.string, action_val.string) catch {
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to allocate run state" } };
         };
 
-        session.pending_run = .{
-            .thread = std.Thread.spawn(.{}, runBackground, .{ session, self.allocator, action, run_options }) catch |err| {
-                session.status = .stopped;
-                self.allocator.free(owned_session_id);
-                self.allocator.free(owned_action_name);
-                session.pending_run = null;
-                self.dashboard.onError("debug_run", @errorName(err));
-                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to spawn run thread" } };
-            },
-            .session_id = owned_session_id,
-            .action_name = owned_action_name,
-            .allocator = self.allocator,
+        session.status = .running;
+        session.pending_run = pending_run;
+        self.emitRunEvent(session_id_val.string, action_val.string);
+
+        debug_log.log("toolRun: spawning background run session_id={s} action={s}", .{ pending_run.session_id, pending_run.action_name });
+        pending_run.thread = std.Thread.spawn(.{}, runBackground, .{ pending_run, session.driver, self.allocator, action, run_options }) catch |err| {
+            session.status = .stopped;
+            session.pending_run = null;
+            pending_run.release();
+            self.dashboard.onError("debug_run", @errorName(err));
+            return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Failed to spawn run thread" } };
         };
 
         // Async path: return immediately with status:running
@@ -1327,92 +1321,107 @@ pub const DebugServer = struct {
             return okText(allocator, "Session `{s}` is running in the background.", .{session_id_val.string});
         }
 
+        pending_run.retain();
+        defer pending_run.release();
+        pending_run.waiter_owns_completion.store(true, .release);
+        defer pending_run.waiter_owns_completion.store(false, .release);
+        const run_driver = session.driver;
         debug_log.log("toolRun: blocking path, timeout_ms={d}", .{timeout_ms});
 
-        // Synchronous blocking path: release mutex, poll until done or timeout,
-        // then re-acquire mutex before returning.
+        // Synchronous blocking path: release mutex while the run owns its
+        // stable PendingRun reference, then re-resolve the session afterward.
         debug_log.log("toolRun: releasing mutex for blocking poll", .{});
         self.mutex.unlock();
-        defer {
-            debug_log.log("toolRun: re-acquiring mutex after poll", .{});
+        var mutex_locked = false;
+        defer if (!mutex_locked) {
+            debug_log.log("toolRun: re-acquiring mutex before return", .{});
             self.mutex.lock();
-            debug_log.log("toolRun: mutex re-acquired after poll", .{});
-        }
+        };
 
         const deadline_ms: i128 = @as(i128, std.time.milliTimestamp()) + timeout_ms;
         const poll_interval_ns: u64 = 10 * std.time.ns_per_ms; // 10ms
 
-        while (true) {
-            if (session.pending_run) |*pr| {
-                const status = pr.result.load(.acquire);
-                if (status == 1) {
-                    // Completed successfully
-                    if (pr.stop_state) |state| {
-                        session.status = if (state.exit_code != null) .terminated else .stopped;
-                        debug_log.log("toolRun: stopped reason={s} exit_code={any}", .{ @tagName(state.stop_reason), state.exit_code });
-                        self.dashboard.onRun(session_id_val.string, action_val.string, state);
-                        self.emitStopEvent(session_id_val.string, action_val.string, state);
-
-                        const stop_result = try formatStopStateText(allocator, &state);
-
-                        pr.thread.join();
-                        pr.deinit();
-                        session.pending_run = null;
-
-                        return .{ .ok = stop_result };
-                    }
-                    // stop_state was null — shouldn't happen, treat as error
-                    debug_log.log("toolRun: completed but no stop state", .{});
-                    pr.thread.join();
-                    pr.deinit();
-                    session.pending_run = null;
-                    session.status = .stopped;
-                    return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Run completed but no stop state" } };
-                } else if (status == 2) {
-                    // Error
-                    const err_msg = pr.error_msg orelse "unknown error";
-                    debug_log.log("toolRun: run error: {s}", .{err_msg});
-                    session.status = .stopped;
-
-                    pr.thread.join();
-                    pr.deinit();
-                    session.pending_run = null;
-
-                    return .{ .err = .{ .code = INTERNAL_ERROR, .message = err_msg } };
-                }
-            } else {
-                // pending_run disappeared — session was cleaned up
-                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Session run state lost" } };
-            }
-
-            // Check timeout
+        while (pending_run.result.load(.acquire) == 0) {
             if (std.time.milliTimestamp() >= deadline_ms) {
-                debug_log.log("toolRun: timeout reached, sending pause", .{});
-                // Timeout: send pause to debuggee and return timeout status
-                session.driver.sendPause(allocator, null) catch {};
-
-                return okText(allocator, "Timed out waiting for session `{s}`; a pause signal was sent.", .{session_id_val.string});
+                debug_log.log("toolRun: timeout reached, requesting pause session_id={s}", .{pending_run.session_id});
+                var driver = run_driver;
+                driver.sendPause(allocator, null) catch |pause_err| {
+                    debug_log.log("toolRun: pause failed session_id={s}: {s}; interrupting active run", .{ pending_run.session_id, @errorName(pause_err) });
+                    driver.interruptRun();
+                };
+                const pause_deadline_ms = std.time.milliTimestamp() + 250;
+                while (pending_run.result.load(.acquire) == 0 and
+                    std.time.milliTimestamp() < pause_deadline_ms)
+                {
+                    std.Thread.sleep(poll_interval_ns);
+                }
+                if (pending_run.result.load(.acquire) == 0) {
+                    debug_log.log("toolRun: pause did not complete session_id={s}; interrupting active run", .{pending_run.session_id});
+                    driver.interruptRun();
+                    const interrupt_deadline_ms = std.time.milliTimestamp() + 250;
+                    while (pending_run.result.load(.acquire) == 0 and
+                        std.time.milliTimestamp() < interrupt_deadline_ms)
+                    {
+                        std.Thread.sleep(poll_interval_ns);
+                    }
+                }
+                if (pending_run.result.load(.acquire) == 0) {
+                    debug_log.log("toolRun: interrupt did not complete session_id={s}; run remains session-owned", .{pending_run.session_id});
+                    return okText(allocator, "Timed out waiting for session `{s}`; the run remains active in the background.", .{pending_run.session_id});
+                }
+                break;
             }
-
             std.Thread.sleep(poll_interval_ns);
         }
+
+        debug_log.log("toolRun: re-acquiring mutex to consume session_id={s}", .{pending_run.session_id});
+        self.mutex.lock();
+        mutex_locked = true;
+        const removed_or_session = self.session_manager.sessions.get(pending_run.session_id);
+        if (removed_or_session) |current_session| {
+            if (current_session.pending_run == pending_run) {
+                current_session.pending_run = null;
+                pending_run.join();
+                defer pending_run.release();
+                return self.finishRun(allocator, current_session, pending_run, true);
+            }
+        }
+        return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session ended while run was active" } };
     }
 
-    /// Background thread function for async execution control.
-    /// Calls driver.runEx() which blocks until the debuggee stops.
-    /// Writes result to session.pending_run using release/acquire ordering.
-    fn runBackground(session: *session_mod.Session, alloc: std.mem.Allocator, action: types.RunAction, opts: types.RunOptions) void {
-        const state = session.driver.runEx(alloc, action, opts) catch |err| {
-            if (session.pending_run) |*pr| {
-                pr.error_msg = @errorName(err);
-                pr.result.store(2, .release);
-            }
+    /// Background thread function for async execution control. The worker only
+    /// touches the stable heap-owned PendingRun record passed at spawn time.
+    fn runBackground(pending_run: *session_mod.Session.PendingRun, driver_value: driver_mod.ActiveDriver, alloc: std.mem.Allocator, action: types.RunAction, opts: types.RunOptions) void {
+        var driver = driver_value;
+        debug_log.log("runBackground: entering driver.runEx session_id={s} action={s}", .{ pending_run.session_id, pending_run.action_name });
+        const state = driver.runEx(alloc, action, opts) catch |err| {
+            pending_run.error_msg = @errorName(err);
+            pending_run.result.store(2, .release);
+            debug_log.log("runBackground: failed session_id={s}: {s}", .{ pending_run.session_id, @errorName(err) });
             return;
         };
-        if (session.pending_run) |*pr| {
-            pr.stop_state = state;
-            pr.result.store(1, .release);
+        pending_run.stop_state = state;
+        pending_run.result.store(1, .release);
+        debug_log.log("runBackground: completed session_id={s} reason={s}", .{ pending_run.session_id, @tagName(state.stop_reason) });
+    }
+
+    fn finishRun(self: *DebugServer, allocator: std.mem.Allocator, session: *session_mod.Session, pending_run: *session_mod.Session.PendingRun, emit_event: bool) !ToolResult {
+        const status = pending_run.result.load(.acquire);
+        if (status == 1) {
+            const state = pending_run.stop_state orelse {
+                session.status = .stopped;
+                return .{ .err = .{ .code = INTERNAL_ERROR, .message = "Run completed but no stop state" } };
+            };
+            session.status = if (state.exit_code != null) .terminated else .stopped;
+            if (emit_event) {
+                self.dashboard.onRun(pending_run.session_id, pending_run.action_name, state);
+                self.emitStopEvent(pending_run.session_id, pending_run.action_name, state);
+            }
+            return .{ .ok = try formatStopStateText(allocator, &state) };
         }
+
+        session.status = .stopped;
+        return .{ .err = .{ .code = INTERNAL_ERROR, .message = pending_run.error_msg orelse "unknown error" } };
     }
 
     /// Composite action: step over repeatedly while evaluating expressions.
@@ -1448,6 +1457,7 @@ pub const DebugServer = struct {
         // Get initial stack depth via stacktrace
         const initial_depth: usize = blk: {
             const frames = session.driver.stackTrace(allocator, 1, 0, 100) catch break :blk 0;
+            defer types.StackFrame.deinitSlice(allocator, frames);
             break :blk frames.len;
         };
 
@@ -1463,6 +1473,8 @@ pub const DebugServer = struct {
         var steps = std.ArrayListUnmanaged(StepRecord).empty;
         defer {
             for (steps.items) |step| {
+                if (step.file.len > 0) allocator.free(step.file);
+                if (step.function.len > 0) allocator.free(step.function);
                 for (step.values) |maybe_val| {
                     if (maybe_val) |v| allocator.free(v);
                 }
@@ -1493,15 +1505,17 @@ pub const DebugServer = struct {
         var exited = false;
 
         while (true) {
-            // Get current location via stacktrace
+            // Get current location via stacktrace. Step records own their copies.
             var step_file: []const u8 = "";
             var step_line: u32 = 0;
             var step_func: []const u8 = "";
             if (session.driver.stackTrace(allocator, 1, 0, 1)) |frames| {
+                defer types.StackFrame.deinitSlice(allocator, frames);
                 if (frames.len > 0) {
-                    step_file = frames[0].source;
+                    step_file = try allocator.dupe(u8, frames[0].source);
+                    errdefer allocator.free(step_file);
                     step_line = frames[0].line;
-                    step_func = frames[0].name;
+                    step_func = try allocator.dupe(u8, frames[0].name);
                 }
             } else |_| {}
 
@@ -1549,10 +1563,11 @@ pub const DebugServer = struct {
             }
 
             // Step over
-            const state = session.driver.runEx(allocator, .step_over, .{}) catch {
+            var state = session.driver.runEx(allocator, .step_over, .{}) catch {
                 final_stop_reason = "error";
                 break;
             };
+            defer state.deinit(allocator);
 
             // Check if program exited
             if (state.exit_code != null or state.stop_reason == .exited) {
@@ -1564,6 +1579,7 @@ pub const DebugServer = struct {
             // Check if we stepped out of the function (stack depth decreased)
             const current_depth: usize = depth_blk: {
                 const frames = session.driver.stackTrace(allocator, 1, 0, 100) catch break :depth_blk initial_depth;
+                defer types.StackFrame.deinitSlice(allocator, frames);
                 break :depth_blk frames.len;
             };
             if (current_depth < initial_depth) {
@@ -1705,49 +1721,57 @@ pub const DebugServer = struct {
         if (session_id_val != .string) return .{ .err = .{ .code = INVALID_PARAMS, .message = "session_id must be string" } };
 
         const session_id = session_id_val.string;
-        debug_log.log("toolStop: session_id={s}", .{session_id});
-
         const terminate_only = if (a.object.get("terminate_only")) |v| (v == .bool and v.bool) else false;
         const detach = if (a.object.get("detach")) |v| (v == .bool and v.bool) else false;
+        const end_mode: EndMode = if (terminate_only) .terminate else if (detach) .detach else .stop;
+        debug_log.log("toolStop: session_id={s} mode={s}", .{ session_id, @tagName(end_mode) });
 
-        if (self.session_manager.getSession(session_id)) |session| {
-            if (session.pending_run != null) {
-                // Background thread is blocking on waitpid/read.
-                // Kill the process directly via SIGKILL — this is safe from any
-                // thread (unlike ptrace) and unblocks the background thread.
-                // Do NOT call driver.stop() which would race on waitpid.
-                if (session.driver.getPid()) |pid| {
-                    posix.kill(pid, posix.SIG.KILL) catch {};
-                }
-                // The background thread will detect the kill and set result to
-                // completed/error. destroySession joins the thread.
-            } else if (terminate_only) {
-                // Terminate the debuggee and clean up session
-                session.driver.terminate(allocator) catch {
-                    // Fall back to full stop if terminate not supported
-                    session.driver.stop(allocator) catch {};
-                };
-                // Fall through to destroy session below
-            } else if (detach) {
-                // Detach without killing the debuggee
-                session.driver.detach(allocator) catch {
-                    // Fall back to full stop if detach not supported
-                    session.driver.stop(allocator) catch {};
-                };
-            } else {
-                session.driver.stop(allocator) catch {};
-            }
+        return self.endSessionLocked(allocator, session_id, end_mode, true);
+    }
+
+    pub const EndMode = enum { stop, terminate, detach };
+
+    /// Remove a session from discoverable state while holding the server mutex,
+    /// then interrupt and join its active run outside the mutex.
+    pub fn endSessionLocked(self: *DebugServer, allocator: std.mem.Allocator, session_id: []const u8, mode: EndMode, emit_event: bool) !ToolResult {
+        const session = self.session_manager.sessions.get(session_id) orelse
+            return ToolResult{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
+        session.status = .ending;
+        const removed = self.session_manager.removeSession(session_id) orelse
+            return .{ .ok_static = "{\"stopped\":true}" };
+
+        debug_log.log("endSessionLocked: removed session_id={s} mode={s} active={}", .{ session_id, @tagName(mode), removed.session.pending_run != null });
+        self.mutex.unlock();
+        defer self.mutex.lock();
+
+        var driver = removed.session.driver;
+        if (removed.session.pending_run) |pending_run| {
+            debug_log.log("endSessionLocked: interrupting active run session_id={s}", .{removed.key});
+            driver.interruptRun();
+            pending_run.join();
         }
 
-        self.dashboard.onStop(session_id);
-        self.emitSessionEndEvent(session_id);
+        switch (mode) {
+            .detach => driver.detach(allocator) catch |err| {
+                debug_log.log("endSessionLocked: detach failed session_id={s}: {s}", .{ removed.key, @errorName(err) });
+                driver.stop(allocator) catch {};
+            },
+            .terminate => driver.terminate(allocator) catch |err| {
+                debug_log.log("endSessionLocked: terminate failed session_id={s}: {s}", .{ removed.key, @errorName(err) });
+                driver.stop(allocator) catch {};
+            },
+            .stop => driver.stop(allocator) catch |err| {
+                debug_log.log("endSessionLocked: stop failed session_id={s}: {s}", .{ removed.key, @errorName(err) });
+                driver.terminate(allocator) catch {};
+            },
+        }
 
-        // Copy key before destroying since destroySession frees the key
-        const id_copy = try allocator.dupe(u8, session_id);
-        defer allocator.free(id_copy);
-        _ = self.session_manager.destroySession(id_copy);
-
-        debug_log.log("toolStop: session {s} terminated", .{id_copy});
+        if (emit_event) {
+            self.dashboard.onStop(removed.key);
+            self.emitSessionEndEvent(removed.key);
+        }
+        self.session_manager.destroyRemovedSession(removed);
+        debug_log.log("endSessionLocked: destroyed session_id={s}", .{session_id});
         return .{ .ok_static = "{\"stopped\":true}" };
     }
 
@@ -1797,6 +1821,7 @@ pub const DebugServer = struct {
             self.dashboard.onError("debug_stacktrace", @errorName(err));
             return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
         };
+        defer types.StackFrame.deinitSlice(allocator, frames);
         self.dashboard.onStackTrace(session_id_val.string, frames.len);
         {
             var abuf: [64]u8 = undefined;
@@ -2536,19 +2561,7 @@ pub const DebugServer = struct {
         const session = self.session_manager.getSession(session_id_val.string) orelse
             return .{ .err = .{ .code = INVALID_PARAMS, .message = "Unknown session" } };
 
-        // Cancel any running background thread first (same pattern as toolStop).
-        // The background thread blocks in waitForEvent reading the TCP socket;
-        // killing the process closes the connection and unblocks it.
-        if (session.pending_run != null) {
-            if (session.driver.getPid()) |pid| {
-                posix.kill(pid, posix.SIG.KILL) catch {};
-            }
-            if (session.pending_run) |*pr| {
-                pr.thread.join();
-                pr.deinit();
-            }
-            session.pending_run = null;
-        }
+        if (requireStopped(session)) |err_result| return err_result;
 
         session.driver.restart(allocator) catch |err| {
             self.dashboard.onError("debug_restart", @errorName(err));
@@ -2700,7 +2713,8 @@ pub const DebugServer = struct {
             const session = entry.value_ptr.*;
 
             // Check for completed async run
-            if (session.pending_run) |*pr| {
+            if (session.pending_run) |pr| {
+                if (pr.waiter_owns_completion.load(.acquire)) continue;
                 const status = pr.result.load(.acquire);
                 if (status == 1) {
                     // Completed successfully — emit stopped event
@@ -2718,9 +2732,9 @@ pub const DebugServer = struct {
                         try state.jsonStringify(&jw);
                         try jw.endObject();
                     }
-                    pr.thread.join();
-                    pr.deinit();
                     session.pending_run = null;
+                    pr.join();
+                    pr.release();
                 } else if (status == 2) {
                     // Error — emit error event
                     const err_msg = pr.error_msg orelse "unknown error";
@@ -2738,9 +2752,9 @@ pub const DebugServer = struct {
                     try jw.endObject();
                     try jw.endObject();
 
-                    pr.thread.join();
-                    pr.deinit();
                     session.pending_run = null;
+                    pr.join();
+                    pr.release();
                 }
                 // status == 0: still running, skip
             }
@@ -3190,7 +3204,7 @@ test "callTool returns error for unknown tool" {
     }
 }
 
-test "callTool dispatches debug_stop" {
+test "debug_stop returns unknown-session error" {
     const allocator = std.testing.allocator;
     var srv = DebugServer.init(allocator);
     defer srv.deinit();
@@ -3203,15 +3217,261 @@ test "callTool dispatches debug_stop" {
 
     const result = try srv.callTool(allocator, "debug_stop", args_parsed.value);
     switch (result) {
-        .ok => |raw| {
-            defer allocator.free(raw);
-            try std.testing.expect(raw.len > 0);
+        .err => |err_result| {
+            try std.testing.expectEqual(INVALID_PARAMS, err_result.code);
+            try std.testing.expectEqualStrings("Unknown session", err_result.message);
         },
-        .ok_static => |raw| {
-            try std.testing.expect(raw.len > 0);
-        },
-        .err => unreachable,
+        .ok, .ok_static => unreachable,
     }
+}
+
+test "debug_stop terminate_only takes precedence over detach" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+    srv.session_manager.getSession(session_id).?.status = .stopped;
+
+    const args_parsed = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","terminate_only":true,"detach":true}
+    , .{});
+    defer args_parsed.deinit();
+    try expectStoppedResult(try srv.callTool(allocator, "debug_stop", args_parsed.value));
+
+    try std.testing.expect(mock.terminated);
+    try std.testing.expect(!mock.detached);
+}
+
+const BlockingRunCall = struct {
+    server: *DebugServer,
+    allocator: std.mem.Allocator,
+    args: json.Value,
+    result: ?ToolResult = null,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *BlockingRunCall) void {
+        self.result = self.server.callTool(self.allocator, "debug_run", self.args) catch unreachable;
+        self.finished.store(true, .release);
+    }
+};
+
+const PollCall = struct {
+    server: *DebugServer,
+    allocator: std.mem.Allocator,
+    args: json.Value,
+    result: ?ToolResult = null,
+
+    fn run(self: *PollCall) void {
+        self.result = self.server.callTool(self.allocator, "debug_poll_events", self.args) catch unreachable;
+    }
+};
+
+fn expectStoppedResult(result: ToolResult) !void {
+    switch (result) {
+        .ok => |raw| std.testing.allocator.free(raw),
+        .ok_static => {},
+        .err => |err_result| {
+            std.debug.print("unexpected tool error: {d} {s}\n", .{ err_result.code, err_result.message });
+            return error.UnexpectedToolError;
+        },
+    }
+}
+
+test "debug_stop during blocking run owns join and frees session once" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    mock.setBlockRun(true);
+    const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+    srv.session_manager.getSession(session_id).?.status = .stopped;
+
+    const run_args_parsed = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","action":"continue","timeout_ms":30000}
+    , .{});
+    defer run_args_parsed.deinit();
+    var run_call = BlockingRunCall{ .server = &srv, .allocator = allocator, .args = run_args_parsed.value };
+    const run_thread = try std.Thread.spawn(.{}, BlockingRunCall.run, .{&run_call});
+    defer run_thread.join();
+
+    mock.waitForRunEntered();
+
+    const stop_args_parsed = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1"}
+    , .{});
+    defer stop_args_parsed.deinit();
+    try expectStoppedResult(try srv.callTool(allocator, "debug_stop", stop_args_parsed.value));
+
+    while (!run_call.finished.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, 0), srv.session_manager.sessionCount());
+    try std.testing.expect(mock.stopped);
+    try std.testing.expect(mock.deinitialized);
+    try std.testing.expect(!mock.terminated);
+    try std.testing.expect(!mock.detached);
+
+    if (run_call.result) |result| switch (result) {
+        .ok => |raw| allocator.free(raw),
+        .ok_static, .err => {},
+    };
+}
+
+test "debug_stop preserves active terminate and detach semantics" {
+    inline for (.{ false, true }) |detach_mode| {
+        const allocator = std.testing.allocator;
+        var srv = DebugServer.init(allocator);
+        defer srv.deinit();
+
+        var mock = driver_mod.MockDriver{};
+        mock.setBlockRun(true);
+        const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+        srv.session_manager.getSession(session_id).?.status = .stopped;
+
+        const run_args_parsed = try json.parseFromSlice(json.Value, allocator,
+            \\{"session_id":"session-1","action":"continue","timeout_ms":0}
+        , .{});
+        defer run_args_parsed.deinit();
+        const run_result = try srv.callTool(allocator, "debug_run", run_args_parsed.value);
+        try expectStoppedResult(run_result);
+        mock.waitForRunEntered();
+
+        const stop_args = if (detach_mode)
+            \\{"session_id":"session-1","detach":true}
+        else
+            \\{"session_id":"session-1","terminate_only":true}
+        ;
+        const stop_args_parsed = try json.parseFromSlice(json.Value, allocator, stop_args, .{});
+        defer stop_args_parsed.deinit();
+        try expectStoppedResult(try srv.callTool(allocator, "debug_stop", stop_args_parsed.value));
+
+        try std.testing.expectEqual(detach_mode, mock.detached);
+        try std.testing.expectEqual(!detach_mode, mock.terminated);
+        try std.testing.expect(!mock.stopped);
+        try std.testing.expect(!mock.sync_lifecycle_while_run_active);
+        try std.testing.expect(mock.deinitialized);
+    }
+}
+
+test "debug_poll_events does not consume synchronous run completion" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    mock.setBlockRun(true);
+    const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+    srv.session_manager.getSession(session_id).?.status = .stopped;
+
+    const run_args = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","action":"continue","timeout_ms":30000}
+    , .{});
+    defer run_args.deinit();
+    var run_call = BlockingRunCall{ .server = &srv, .allocator = allocator, .args = run_args.value };
+    const run_thread = try std.Thread.spawn(.{}, BlockingRunCall.run, .{&run_call});
+    defer run_thread.join();
+    mock.waitForRunEntered();
+
+    const poll_args = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1"}
+    , .{});
+    defer poll_args.deinit();
+    var poll_call = PollCall{ .server = &srv, .allocator = allocator, .args = poll_args.value };
+    const poll_thread = try std.Thread.spawn(.{}, PollCall.run, .{&poll_call});
+
+    mock.releaseRun();
+    poll_thread.join();
+    while (!run_call.finished.load(.acquire)) std.Thread.sleep(std.time.ns_per_ms);
+
+    if (poll_call.result) |result| try expectStoppedResult(result);
+    if (run_call.result) |result| switch (result) {
+        .ok => |raw| allocator.free(raw),
+        .ok_static => {},
+        .err => return error.UnexpectedToolError,
+    };
+    try std.testing.expect(srv.session_manager.getSession(session_id).?.pending_run == null);
+}
+
+test "debug_run lifecycle fixture is stable across repeated active stops" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mocks: [25]driver_mod.MockDriver = [_]driver_mod.MockDriver{.{}} ** 25;
+    for (&mocks, 0..) |*mock, i| {
+        mock.setBlockRun(true);
+        const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+        srv.session_manager.getSession(session_id).?.status = .stopped;
+
+        const run_args_text = try std.fmt.allocPrint(allocator, "{{\"session_id\":\"session-{d}\",\"action\":\"continue\",\"timeout_ms\":0}}", .{i + 1});
+        defer allocator.free(run_args_text);
+        const run_args = try json.parseFromSlice(json.Value, allocator, run_args_text, .{});
+        defer run_args.deinit();
+        try expectStoppedResult(try srv.callTool(allocator, "debug_run", run_args.value));
+        mock.waitForRunEntered();
+
+        const stop_args_text = try std.fmt.allocPrint(allocator, "{{\"session_id\":\"session-{d}\"}}", .{i + 1});
+        defer allocator.free(stop_args_text);
+        const stop_args = try json.parseFromSlice(json.Value, allocator, stop_args_text, .{});
+        defer stop_args.deinit();
+        try expectStoppedResult(try srv.callTool(allocator, "debug_stop", stop_args.value));
+
+        try std.testing.expect(mock.stopped);
+        try std.testing.expect(mock.deinitialized);
+        try std.testing.expectEqual(@as(usize, 0), srv.session_manager.sessionCount());
+    }
+}
+
+test "debug_run timeout pauses then deterministically joins completed run" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    mock.setBlockRun(true);
+    const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+    srv.session_manager.getSession(session_id).?.status = .stopped;
+
+    const run_args_parsed = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","action":"continue","timeout_ms":1}
+    , .{});
+    defer run_args_parsed.deinit();
+    const result = try srv.callTool(allocator, "debug_run", run_args_parsed.value);
+    try expectStoppedResult(result);
+
+    try std.testing.expect(mock.paused or mock.cancelled);
+    const session = srv.session_manager.getSession(session_id).?;
+    try std.testing.expect(session.pending_run == null);
+    try std.testing.expectEqual(session_mod.Session.Status.stopped, session.status);
+}
+
+test "debug_run timeout remains bounded when pause does not complete run" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    mock.setBlockRun(true);
+    mock.setPauseReleasesRun(false);
+    const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+    srv.session_manager.getSession(session_id).?.status = .stopped;
+
+    const run_args_parsed = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","action":"continue","timeout_ms":1}
+    , .{});
+    defer run_args_parsed.deinit();
+    const before = std.time.milliTimestamp();
+    const result = try srv.callTool(allocator, "debug_run", run_args_parsed.value);
+    const elapsed = std.time.milliTimestamp() - before;
+    try expectStoppedResult(result);
+
+    try std.testing.expect(elapsed < 1000);
+    try std.testing.expect(mock.paused);
+    try std.testing.expect(mock.cancelled);
+    const session = srv.session_manager.getSession(session_id).?;
+    try std.testing.expect(session.pending_run == null);
+    try std.testing.expectEqual(session_mod.Session.Status.stopped, session.status);
 }
 
 test "tool schema for debug_launch has program and module fields" {
