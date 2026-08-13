@@ -46,6 +46,14 @@ pub fn supportsEnhancedWrite(capabilities: *const RemoteMemoryCapabilities) bool
     return capabilities.supports_provenance_envelopes and capabilities.preferred_write_tool != null;
 }
 
+pub fn isCapabilityOnlyTool(remote_name: []const u8) bool {
+    return std.mem.eql(u8, remote_name, "cog_assert_record") or
+        std.mem.eql(u8, remote_name, "cog_memory_record") or
+        std.mem.eql(u8, remote_name, "cog_assert_history") or
+        std.mem.eql(u8, remote_name, "cog_rationale_trace") or
+        std.mem.eql(u8, remote_name, "cog_structured_recall");
+}
+
 pub fn registerCapabilityTool(capabilities: *RemoteMemoryCapabilities, allocator: std.mem.Allocator, remote_name: []const u8) !void {
     if (std.mem.eql(u8, remote_name, "cog_assert_record")) {
         capabilities.supports_assertions = true;
@@ -239,6 +247,15 @@ test "supportsEnhancedWrite requires provenance and tool" {
     try std.testing.expect(supportsEnhancedWrite(&capabilities));
 }
 
+test "capability-only tools are recognized for hidden discovery" {
+    try std.testing.expect(isCapabilityOnlyTool("cog_memory_record"));
+    try std.testing.expect(isCapabilityOnlyTool("cog_assert_record"));
+    try std.testing.expect(isCapabilityOnlyTool("cog_assert_history"));
+    try std.testing.expect(isCapabilityOnlyTool("cog_rationale_trace"));
+    try std.testing.expect(isCapabilityOnlyTool("cog_structured_recall"));
+    try std.testing.expect(!isCapabilityOnlyTool("cog_learn"));
+}
+
 test "buildRemoteWriteEnvelope includes provenance and hints" {
     var repo_context = @import("repo_context.zig").RepoContext{
         .cwd = try std.testing.allocator.dupe(u8, "/tmp/project"),
@@ -280,6 +297,7 @@ test "buildRemoteWriteEnvelope includes provenance and hints" {
     defer parsed.deinit();
     const provenance = parsed.value.object.get("provenance") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("opencode", provenance.object.get("host_agent").?.string);
+    try std.testing.expectEqualStrings("sid-1", provenance.object.get("mcp_session_id").?.string);
     try std.testing.expectEqualStrings("code_exploration", provenance.object.get("source_channel").?.string);
 
     const hints = parsed.value.object.get("context_hints") orelse return error.TestUnexpectedResult;

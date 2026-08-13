@@ -1718,7 +1718,7 @@ fn collectRemoteTools(
 
         const cog_prefix = "cog_";
         if (!std.mem.startsWith(u8, remote_name, cog_prefix)) continue;
-        if (isCapabilityOnlyRemoteTool(remote_name)) continue;
+        if (memory_envelope_mod.isCapabilityOnlyTool(remote_name)) continue;
 
         const local_name = try prefixToolName(allocator, remote_name[cog_prefix.len..]);
         errdefer allocator.free(local_name);
@@ -1744,14 +1744,6 @@ fn collectRemoteTools(
             .input_schema = schema_json,
         });
     }
-}
-
-fn isCapabilityOnlyRemoteTool(remote_name: []const u8) bool {
-    return std.mem.eql(u8, remote_name, "cog_assert_record") or
-        std.mem.eql(u8, remote_name, "cog_memory_record") or
-        std.mem.eql(u8, remote_name, "cog_assert_history") or
-        std.mem.eql(u8, remote_name, "cog_rationale_trace") or
-        std.mem.eql(u8, remote_name, "cog_structured_recall");
 }
 
 fn freeRemoteTools(allocator: std.mem.Allocator, tools: *std.ArrayListUnmanaged(RemoteTool)) void {
