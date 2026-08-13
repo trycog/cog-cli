@@ -131,12 +131,9 @@ fn printCommandHelp(comptime help_text: []const u8) void {
 /// When keep_content is true (memory mode): removes tag lines, keeps content between them.
 /// When keep_content is false (tools-only mode): removes tag lines AND all content between them.
 /// Collapses consecutive blank lines left by stripping.
-fn processCogMemTags(allocator: std.mem.Allocator, content: []const u8, keep_content: bool) ![]const u8 {
+fn processTaggedBlock(allocator: std.mem.Allocator, content: []const u8, open_tag: []const u8, close_tag: []const u8, keep_content: bool) ![]const u8 {
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
-
-    const open_tag = "<cog:mem>";
-    const close_tag = "</cog:mem>";
 
     var in_mem_block = false;
     var prev_blank = false;
@@ -169,6 +166,14 @@ fn processCogMemTags(allocator: std.mem.Allocator, content: []const u8, keep_con
     }
 
     return try result.toOwnedSlice(allocator);
+}
+
+fn processCogMemTags(allocator: std.mem.Allocator, content: []const u8, keep_content: bool) ![]const u8 {
+    return processTaggedBlock(allocator, content, "<cog:mem>", "</cog:mem>", keep_content);
+}
+
+fn processCogObserveTags(allocator: std.mem.Allocator, content: []const u8, keep_content: bool) ![]const u8 {
+    return processTaggedBlock(allocator, content, "<cog:observe>", "</cog:observe>", keep_content);
 }
 
 // ── Brain URL Parser ────────────────────────────────────────────────────
@@ -354,8 +359,13 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Tool permissions are installed automatically for agents that support them.
     const allow_tools = true;
 
+    const observe_enabled = settings_mod.isObserveEnabled(allocator);
+    debug_log.log("commands.init: observe_enabled={any}", .{observe_enabled});
+
     // Process embedded PROMPT.md
-    const prompt_content = try processCogMemTags(allocator, build_options.prompt_md, setup_mem);
+    const memory_prompt = try processCogMemTags(allocator, build_options.prompt_md, setup_mem);
+    defer allocator.free(memory_prompt);
+    const prompt_content = try processCogObserveTags(allocator, memory_prompt, observe_enabled);
     defer allocator.free(prompt_content);
 
     // Track overwrite-all consent for existing files
@@ -649,8 +659,8 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
         }
 
-        // h. Deploy observe agent file
-        if (agent.observe_file_path) |observe_path| {
+        // h. Deploy observe agent file only when the feature is enabled.
+        if (agent.observeFilePath(observe_enabled)) |observe_path| {
             const shares_path = if (agent.agent_file_path) |ap|
                 std.mem.eql(u8, ap, observe_path)
             else
@@ -667,7 +677,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     }
                 }
                 if (!observe_already_written) {
-                    const should_write = if (agent.observe_file_header) |header| blk: {
+                    const should_write = if (agent.observeFileHeader(observe_enabled)) |header| blk: {
                         const content = hooks_mod.buildMarkdownAgentContent(allocator, header, build_options.observe_agent_body) catch break :blk true;
                         defer allocator.free(content);
                         break :blk shouldWriteFile(allocator, observe_path, content, &accept_all);
@@ -2493,6 +2503,25 @@ test "processCogMemTags strips memory gate in tools-only mode" {
 
 test "Cog gitignore production contract remains stable" {
     try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", COG_GITIGNORE_CONTENT);
+}
+
+test "processCogObserveTags preserves observe guidance when enabled" {
+    const allocator = std.testing.allocator;
+    const processed = try processCogObserveTags(allocator, build_options.prompt_md, true);
+    defer allocator.free(processed);
+
+    try std.testing.expect(std.mem.indexOf(u8, processed, "## Observability") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "cog-observe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "<cog:observe>") == null);
+}
+
+test "processCogObserveTags strips observe guidance when disabled" {
+    const allocator = std.testing.allocator;
+    const processed = try processCogObserveTags(allocator, build_options.prompt_md, false);
+    defer allocator.free(processed);
+
+    try std.testing.expect(std.mem.indexOf(u8, processed, "## Observability") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "cog-observe") == null);
 }
 
 test "ensureCogGitignore writes cog-local ignore patterns" {

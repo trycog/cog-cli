@@ -239,6 +239,14 @@ pub const Agent = struct {
     observe_file_path: ?[]const u8 = null,
     observe_file_header: ?[]const u8 = null,
 
+    pub fn observeFilePath(self: *const Agent, observe_enabled: bool) ?[]const u8 {
+        return if (observe_enabled) self.observe_file_path else null;
+    }
+
+    pub fn observeFileHeader(self: *const Agent, observe_enabled: bool) ?[]const u8 {
+        return if (observe_enabled) self.observe_file_header else null;
+    }
+
     pub fn capabilities(self: *const Agent) AgentCapabilities {
         if (std.mem.eql(u8, self.id, "claude_code")) {
             return .{
@@ -832,6 +840,14 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .observe_file_path = ".windsurf/skills/cog-observe/SKILL.md",
+        .observe_file_header =
+        \\---
+        \\name: cog-observe
+        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        \\---
+        \\
+        ,
     },
     // ── Cursor ──────────────────────────────────────────────────────
     .{
@@ -860,6 +876,8 @@ pub const agents = [_]Agent{
         .debug_file_header = null,
         .mem_file_path = ".codex/config.toml",
         .mem_file_header = null,
+        .observe_file_path = ".codex/config.toml",
+        .observe_file_header = null,
     },
     // ── Amp ─────────────────────────────────────────────────────────
     .{
@@ -897,6 +915,14 @@ pub const agents = [_]Agent{
         \\---
         \\name: cog-mem-validate
         \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        \\---
+        \\
+        ,
+        .observe_file_path = ".agents/skills/cog-observe/SKILL.md",
+        .observe_file_header =
+        \\---
+        \\name: cog-observe
+        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
         \\---
         \\
         ,
@@ -940,6 +966,14 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .observe_file_path = ".goose/skills/cog-observe/SKILL.md",
+        .observe_file_header =
+        \\---
+        \\name: cog-observe
+        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        \\---
+        \\
+        ,
     },
     // ── Roo Code ────────────────────────────────────────────────────
     .{
@@ -954,6 +988,8 @@ pub const agents = [_]Agent{
         .debug_file_header = null,
         .mem_file_path = ".roomodes",
         .mem_file_header = null,
+        .observe_file_path = ".roomodes",
+        .observe_file_header = null,
     },
     // ── OpenCode ────────────────────────────────────────────────────
     .{
@@ -1038,6 +1074,23 @@ pub const agents = [_]Agent{
         \\---
         \\
         ,
+        .observe_file_path = ".opencode/agents/cog-observe.md",
+        .observe_file_header =
+        \\---
+        \\description: System observability sub-agent for syscall, GPU, network, and cost investigation
+        \\mode: subagent
+        \\permission:
+        \\  read: allow
+        \\  glob: deny
+        \\  grep: deny
+        \\  list: deny
+        \\  cog_*: allow
+        \\tools:
+        \\  write: false
+        \\  edit: false
+        \\---
+        \\
+        ,
     },
     // ── Pi ──────────────────────────────────────────────────────────
     .{
@@ -1075,6 +1128,14 @@ pub const agents = [_]Agent{
         \\---
         \\name: cog-mem-validate
         \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
+        \\---
+        \\
+        ,
+        .observe_file_path = ".pi/skills/cog-observe/SKILL.md",
+        .observe_file_header =
+        \\---
+        \\name: cog-observe
+        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
         \\---
         \\
         ,
@@ -1420,6 +1481,21 @@ test "support matrix helpers stay aligned" {
         "| Goose | `Global config` | Yes |  | Soft skill guidance | Yes | Prompt guidance |",
         goose_row,
     );
+}
+
+test "observe specialist files are hidden while feature is disabled" {
+    for (agents) |agent| {
+        try std.testing.expect(agent.observeFilePath(false) == null);
+        try std.testing.expect(agent.observeFileHeader(false) == null);
+    }
+}
+
+test "observe specialist files preserve all-host parity when enabled" {
+    var supported: usize = 0;
+    for (agents) |agent| {
+        if (agent.observeFilePath(true) != null) supported += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 10), supported);
 }
 
 test "hosts that advertise specialist files have debug_file_path" {

@@ -220,14 +220,18 @@ fn mainInner() !void {
         return;
     }
 
-    // Handle group help: cog observe
-    if (std.mem.eql(u8, subcmd, "observe")) {
-        printObserveHelp();
-        return;
-    }
-
-    // Handle observe:* commands (don't need config — local system observation)
-    if (std.mem.startsWith(u8, subcmd, "observe:")) {
+    // Handle observe commands only after explicit opt-in.
+    if (std.mem.eql(u8, subcmd, "observe") or std.mem.startsWith(u8, subcmd, "observe:")) {
+        const observe_enabled = settings_mod.isObserveEnabled(allocator);
+        debug_log.log("main.dispatch: observe_enabled={any} subcmd={s}", .{ observe_enabled, subcmd });
+        if (!observe_enabled) {
+            printErr("error: " ++ settings_mod.OBSERVE_DISABLED_MESSAGE ++ "\n");
+            return error.Explained;
+        }
+        if (std.mem.eql(u8, subcmd, "observe")) {
+            printObserveHelp();
+            return;
+        }
         try observe_mod.dispatch(allocator, subcmd, cmd_args);
         return;
     }
@@ -253,7 +257,13 @@ fn mainInner() !void {
 }
 
 fn printHelp(allocator: std.mem.Allocator) void {
-    const static_help = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "    " ++ bold ++ "doctor" ++ reset ++ "                " ++ dim ++ "Validate installation and configuration" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe" ++ reset ++ "               " ++ dim ++ "System observability" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext" ++ reset ++ "                   " ++ dim ++ "Extension utilities" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n";
+    const help_prefix = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "    " ++ bold ++ "doctor" ++ reset ++ "                " ++ dim ++ "Validate installation and configuration" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n";
+    const observe_help = "    " ++ bold ++ "observe" ++ reset ++ "               " ++ dim ++ "System observability" ++ reset ++ "\n";
+    const help_suffix = "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext" ++ reset ++ "                   " ++ dim ++ "Extension utilities" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n";
+    const static_help = if (settings_mod.isObserveEnabled(allocator))
+        help_prefix ++ observe_help ++ help_suffix
+    else
+        help_prefix ++ help_suffix;
 
     const footer = dim ++ "  Run 'cog <command> --help' for details on a specific command." ++ reset ++ "\n\n";
 

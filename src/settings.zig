@@ -17,12 +17,18 @@ pub const DebugConfig = struct {
     log_set: bool = false,
 };
 
+pub const OBSERVE_ENABLED_ENV = "COG_OBSERVE_ENABLED";
+pub const OBSERVE_DISABLED_MESSAGE =
+    "Observe is disabled. Set observe.enabled to true in .cog/settings.json or set COG_OBSERVE_ENABLED=1.";
+
 pub const ObserveConfig = struct {
     timeout: ?i64 = null,
     log: bool = false,
     log_set: bool = false,
     enabled: bool = false,
     enabled_set: bool = false,
+    retention_days: i64 = 30,
+    retention_days_set: bool = false,
     default_backend: ?[]const u8 = null,
 };
 
@@ -161,6 +167,22 @@ pub const Settings = struct {
         }
 
         return result;
+    }
+
+    /// Resolve whether the experimental observe subsystem is enabled.
+    /// COG_OBSERVE_ENABLED, when set to an explicit boolean, overrides settings.
+    pub fn isObserveEnabled(self: *const Settings) bool {
+        if (std.posix.getenv(OBSERVE_ENABLED_ENV)) |value| {
+            if (parseBooleanOverride(value)) |enabled| {
+                debug_log.log("Settings.isObserveEnabled: environment override enabled={any}", .{enabled});
+                return enabled;
+            }
+            debug_log.log("Settings.isObserveEnabled: ignoring invalid {s} value", .{OBSERVE_ENABLED_ENV});
+        }
+
+        const enabled = if (self.observe) |config| config.enabled else false;
+        debug_log.log("Settings.isObserveEnabled: settings enabled={any}", .{enabled});
+        return enabled;
     }
 
     pub fn deinit(self: *const Settings, allocator: std.mem.Allocator) void {
@@ -417,6 +439,48 @@ fn mergeDebugConfig(local: ?DebugConfig, global: ?DebugConfig) ?DebugConfig {
     };
 }
 
+fn parseBooleanOverride(value: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(value, "1") or
+        std.ascii.eqlIgnoreCase(value, "true") or
+        std.ascii.eqlIgnoreCase(value, "yes") or
+        std.ascii.eqlIgnoreCase(value, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "0") or
+        std.ascii.eqlIgnoreCase(value, "false") or
+        std.ascii.eqlIgnoreCase(value, "no") or
+        std.ascii.eqlIgnoreCase(value, "off")) return false;
+    return null;
+}
+
+/// Resolve observe enablement without retaining the loaded settings.
+pub fn isObserveEnabled(allocator: std.mem.Allocator) bool {
+    if (std.posix.getenv(OBSERVE_ENABLED_ENV)) |value| {
+        if (parseBooleanOverride(value)) |enabled| {
+            debug_log.log("settings.isObserveEnabled: environment override enabled={any}", .{enabled});
+            return enabled;
+        }
+        debug_log.log("settings.isObserveEnabled: ignoring invalid {s} value", .{OBSERVE_ENABLED_ENV});
+    }
+
+    const loaded = Settings.load(allocator) orelse {
+        debug_log.log("settings.isObserveEnabled: no settings; disabled", .{});
+        return false;
+    };
+    defer loaded.deinit(allocator);
+    return loaded.isObserveEnabled();
+}
+
+/// Resolve observe database retention in days without retaining loaded settings.
+pub fn observeRetentionDays(allocator: std.mem.Allocator) i64 {
+    const loaded = Settings.load(allocator) orelse {
+        debug_log.log("settings.observeRetentionDays: no settings; default=30", .{});
+        return 30;
+    };
+    defer loaded.deinit(allocator);
+    const days = if (loaded.observe) |config| config.retention_days else 30;
+    debug_log.log("settings.observeRetentionDays: days={d}", .{days});
+    return days;
+}
+
 fn parseObserveConfig(allocator: std.mem.Allocator, value: std.json.Value) ?ObserveConfig {
     if (value != .object) return null;
     const obj = value.object;
@@ -435,6 +499,12 @@ fn parseObserveConfig(allocator: std.mem.Allocator, value: std.json.Value) ?Obse
         if (v == .bool) {
             result.enabled = v.bool;
             result.enabled_set = true;
+        }
+    }
+    if (obj.get("retention_days")) |v| {
+        if (v == .integer and v.integer >= 0) {
+            result.retention_days = v.integer;
+            result.retention_days_set = true;
         }
     }
     if (obj.get("default_backend")) |v| {
@@ -458,6 +528,8 @@ fn mergeObserveConfig(allocator: std.mem.Allocator, local: ?ObserveConfig, globa
         .log_set = l.log_set or g.log_set,
         .enabled = if (l.enabled_set) l.enabled else g.enabled,
         .enabled_set = l.enabled_set or g.enabled_set,
+        .retention_days = if (l.retention_days_set) l.retention_days else g.retention_days,
+        .retention_days_set = l.retention_days_set or g.retention_days_set,
         .default_backend = l.default_backend orelse g.default_backend,
     };
 }
@@ -805,6 +877,48 @@ test "parse settings with memory brain flat string (https://)" {
     try std.testing.expect(s.memory != null);
     try std.testing.expect(s.memory.?.brain != null);
     try std.testing.expectEqualStrings("https://trycog.ai/user/brain", s.memory.?.brain.?.url);
+}
+
+test "observe is disabled by default" {
+    const allocator = std.testing.allocator;
+    const s = Settings.parse(allocator, "{}") orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(!s.isObserveEnabled());
+}
+
+test "observe enabled setting can opt in" {
+    const allocator = std.testing.allocator;
+    const s = Settings.parse(allocator,
+        \\{"observe":{"enabled":true}}
+    ) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.isObserveEnabled());
+}
+
+test "observe retention defaults and accepts non-negative override" {
+    const allocator = std.testing.allocator;
+    const defaults = Settings.parse(allocator, "{\"observe\":{}}") orelse return error.ParseFailed;
+    defer defaults.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 30), defaults.observe.?.retention_days);
+
+    const configured = Settings.parse(allocator,
+        \\{"observe":{"retention_days":7}}
+    ) orelse return error.ParseFailed;
+    defer configured.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 7), configured.observe.?.retention_days);
+    try std.testing.expect(configured.observe.?.retention_days_set);
+}
+
+test "observe environment override parser accepts explicit booleans" {
+    try std.testing.expectEqual(@as(?bool, true), parseBooleanOverride("1"));
+    try std.testing.expectEqual(@as(?bool, true), parseBooleanOverride("true"));
+    try std.testing.expectEqual(@as(?bool, true), parseBooleanOverride("YES"));
+    try std.testing.expectEqual(@as(?bool, false), parseBooleanOverride("0"));
+    try std.testing.expectEqual(@as(?bool, false), parseBooleanOverride("false"));
+    try std.testing.expectEqual(@as(?bool, false), parseBooleanOverride("off"));
+    try std.testing.expectEqual(@as(?bool, null), parseBooleanOverride("sometimes"));
 }
 
 test "parse settings with mergeable fields" {

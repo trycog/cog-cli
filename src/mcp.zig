@@ -17,6 +17,7 @@ const memory_mod = @import("memory.zig");
 const repo_context_mod = @import("repo_context.zig");
 const session_context_mod = @import("session_context.zig");
 const memory_envelope_mod = @import("memory_envelope.zig");
+const settings_mod = @import("settings.zig");
 
 const Config = config_mod.Config;
 const DebugServer = debug_server_mod.DebugServer;
@@ -213,7 +214,8 @@ const Runtime = struct {
     brain_type: config_mod.BrainType,
     mem_db: ?memory_mod.MemoryDb = null,
     debug_server: DebugServer,
-    observe_server: ObserveServer,
+    observe_enabled: bool,
+    observe_server: ?ObserveServer,
     code_cache: ?code_intel.CodeIndex = null,
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
@@ -229,9 +231,11 @@ const Runtime = struct {
     /// Protects code_cache, remote_tools, mcp_session_id, and mem_db from concurrent access.
     mutex: std.Thread.Mutex = .{},
 
-    fn init(allocator: std.mem.Allocator, debug_tool_tier: ToolTier) Runtime {
+    fn init(allocator: std.mem.Allocator, debug_tool_tier: ToolTier) !Runtime {
         const brain = config_mod.resolveBrain(allocator);
-        debug_log_mod.log("Runtime.init: brain_type={s}", .{@tagName(brain)});
+        errdefer brain.deinit(allocator);
+        const observe_enabled = settings_mod.isObserveEnabled(allocator);
+        debug_log_mod.log("Runtime.init: brain_type={s} observe_enabled={any}", .{ @tagName(brain), observe_enabled });
         return .{
             .allocator = allocator,
             .mem_config = switch (brain) {
@@ -241,7 +245,8 @@ const Runtime = struct {
             .brain_type = brain,
             .mem_db = null,
             .debug_server = DebugServer.init(allocator),
-            .observe_server = ObserveServer.init(allocator),
+            .observe_enabled = observe_enabled,
+            .observe_server = if (observe_enabled) try ObserveServer.init(allocator) else null,
             .code_cache = null,
             .remote_tools = null,
             .mcp_session_id = null,
@@ -286,7 +291,7 @@ const Runtime = struct {
         if (self.client_agent_version) |v| self.allocator.free(v);
         if (self.client_model) |v| self.allocator.free(v);
         self.debug_server.deinit();
-        self.observe_server.deinit();
+        if (self.observe_server) |*server| server.deinit();
     }
 
     fn hasMemory(self: *const Runtime) bool {
@@ -431,7 +436,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     debug_log_mod.log("mcp.serve: starting version={s} debug_tools={s}", .{ version, @tagName(debug_tool_tier) });
     setupSignalHandler();
 
-    var runtime = Runtime.init(allocator, debug_tool_tier);
+    var runtime = try Runtime.init(allocator, debug_tool_tier);
     // Start the watcher thread AFTER runtime is in its final stack location.
     // The thread captures a pointer to runtime.watcher, so it must not move.
     if (runtime.watcher != null) {
@@ -1172,6 +1177,7 @@ fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !v
             error.MissingFile => "Missing required parameter: file. Provide a file path for this query.",
             error.NotConfigured => "Memory not configured. Proceed without memory for now. The user can run 'cog init' to enable it.",
             error.IndexUnavailable => "Code index unavailable. Run 'cog code:index' in a terminal to build it, or use Read and Glob for file-based exploration.",
+            error.ObserveDisabled => settings_mod.OBSERVE_DISABLED_MESSAGE,
             error.Explained => "Operation failed. Try once more or use an alternative approach.",
             else => "Internal error. Try the operation once more. If it fails again, use an alternative approach.",
         };
@@ -1472,9 +1478,13 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
         }
     }
 
-    // Observe tools — system-level observability (syscalls, GPU, network, cost).
-    for (observe_server_mod.tool_definitions) |tool| {
-        try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+    // Observe tools are experimental and only discoverable after explicit opt-in.
+    if (runtime.observe_enabled) {
+        for (observe_server_mod.tool_definitions) |tool| {
+            try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+        }
+    } else {
+        debug_log_mod.log("writeToolCatalog: observe tools disabled", .{});
     }
 }
 
@@ -1518,6 +1528,10 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
 
     // Observe tools — delegate to ObserveServer (has its own mutex).
     if (std.mem.startsWith(u8, tool_name, "observe_")) {
+        if (!runtime.observe_enabled or runtime.observe_server == null) {
+            debug_log_mod.log("runtimeCallTool: rejecting disabled observe tool {s}", .{tool_name});
+            return error.ObserveDisabled;
+        }
         const result = try callObserveTool(runtime, tool_name, arguments);
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
         return result;
@@ -2150,7 +2164,9 @@ fn callDebugTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Valu
 fn callObserveTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
     debug_log_mod.log("callObserveTool: dispatching {s}", .{tool_name});
     const allocator = runtime.allocator;
-    const result = runtime.observe_server.callTool(allocator, tool_name, arguments) catch return error.Explained;
+    if (!runtime.observe_enabled) return error.ObserveDisabled;
+    const server = if (runtime.observe_server) |*value| value else return error.ObserveDisabled;
+    const result = server.callTool(allocator, tool_name, arguments) catch return error.Explained;
     debug_log_mod.log("callObserveTool: {s} returned", .{tool_name});
     return switch (result) {
         .ok => |payload| payload,
@@ -2784,14 +2800,15 @@ test "nextMessageFromBuffer tags an oversized partial line and discards through 
     }
 }
 
-fn testRuntime(allocator: std.mem.Allocator) Runtime {
+fn testRuntime(allocator: std.mem.Allocator) !Runtime {
     return .{
         .allocator = allocator,
         .mem_config = null,
         .brain_type = .none,
         .mem_db = null,
         .debug_server = DebugServer.init(allocator),
-        .observe_server = ObserveServer.init(allocator),
+        .observe_enabled = true,
+        .observe_server = try ObserveServer.init(allocator),
         .code_cache = null,
         .remote_tools = null,
         .mcp_session_id = null,
@@ -2799,6 +2816,34 @@ fn testRuntime(allocator: std.mem.Allocator) Runtime {
         .debug_tool_tier = .specialist,
         .mutex = .{},
     };
+}
+
+test "tool catalog omits observe tools when observe is disabled" {
+    var runtime = try testRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    runtime.observe_enabled = false;
+
+    const catalog = try buildToolCatalogResourceJson(&runtime);
+    defer std.testing.allocator.free(catalog);
+    try std.testing.expect(std.mem.indexOf(u8, catalog, "observe_status") == null);
+}
+
+test "tool catalog includes observe tools when observe is enabled" {
+    var runtime = try testRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    runtime.observe_enabled = true;
+
+    const catalog = try buildToolCatalogResourceJson(&runtime);
+    defer std.testing.allocator.free(catalog);
+    try std.testing.expect(std.mem.indexOf(u8, catalog, "observe_status") != null);
+}
+
+test "runtimeCallTool rejects observe dispatch when observe is disabled" {
+    var runtime = try testRuntime(std.testing.allocator);
+    defer runtime.deinit();
+    runtime.observe_enabled = false;
+
+    try std.testing.expectError(error.ObserveDisabled, runtimeCallTool(&runtime, "observe_status", null));
 }
 
 test "runtimeCallTool keeps runtime mutex held across remote calls and event recording" {
@@ -2827,7 +2872,7 @@ test "runtimeCallTool rejects code queries when index is unavailable" {
     defer root_dir.close();
     try root_dir.setAsCwd();
 
-    var runtime = testRuntime(allocator);
+    var runtime = try testRuntime(allocator);
     defer runtime.deinit();
 
     const parsed = try json.parseFromSlice(json.Value, allocator, "{\"mode\":\"find\",\"name\":\"main\"}", .{});

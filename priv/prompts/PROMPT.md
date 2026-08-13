@@ -57,6 +57,7 @@ Fast-stack exception: if the language stack recompiles or hot-reloads so quickly
 
 Do NOT fall back to shell debuggers (lldb, gdb, dlv) — the `cog-debug` sub-agent handles all debugging.
 
+<cog:observe>
 ## Observability
 
 **Always delegate system observability to the `cog-observe` sub-agent.** Do NOT call `cog_observe_*` tools directly from the primary agent.
@@ -76,6 +77,7 @@ Prefer the observe sub-agent when:
 Prefer the debugger instead when the issue is clearly application logic — wrong values, control flow, or crash state.
 
 Do NOT fall back to shell profiling tools (strace, perf, dtrace, tcpdump) — the `cog-observe` sub-agent handles all system observability.
+</cog:observe>
 
 <cog:mem>
 ## Memory
