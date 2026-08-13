@@ -27,7 +27,10 @@ pub fn writeFileAtomicMode(
         dir;
     defer if (parent_path != null) parent.close();
 
-    const mode = existingFileMode(parent, basename) catch create_mode;
+    const mode = existingFileMode(parent, basename) catch |err| switch (err) {
+        error.FileNotFound => create_mode,
+        else => return err,
+    };
     const sequence = temp_counter.fetchAdd(1, .monotonic);
     const tmp_name = try std.fmt.allocPrint(allocator, ".{s}.tmp-{d}-{d}", .{ basename, std.time.nanoTimestamp(), sequence });
     defer allocator.free(tmp_name);
@@ -44,21 +47,20 @@ pub fn writeFileAtomicMode(
     try tmp_file.sync();
     try parent.rename(tmp_name, basename);
     renamed = true;
-    syncDirectory(parent);
+    try syncDirectory(parent);
     debug_log.log("fs_util.writeFileAtomic: replaced {s}", .{sub_path});
 }
 
 fn existingFileMode(parent: std.fs.Dir, basename: []const u8) !std.fs.File.Mode {
-    var file = try parent.openFile(basename, .{});
-    defer file.close();
-    const stat = try file.stat();
+    const stat = try parent.statFile(basename);
     return stat.mode;
 }
 
-fn syncDirectory(dir: std.fs.Dir) void {
+fn syncDirectory(dir: std.fs.Dir) !void {
     if (builtin.os.tag == .windows) return;
     std.posix.fsync(dir.fd) catch |err| {
         debug_log.log("fs_util.syncDirectory: failed to sync directory: {s}", .{@errorName(err)});
+        return err;
     };
 }
 
@@ -105,6 +107,23 @@ pub fn replaceDirectoryTransactional(
         return error.InvalidDirectoryName;
     }
 
+    if (builtin.os.tag != .windows) {
+        const staged_stat = std.posix.fstatat(parent.fd, staged_name, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            else => return err,
+        };
+        if (staged_stat.mode & std.posix.S.IFMT != std.posix.S.IFDIR) {
+            debug_log.log("fs_util.replaceDirectoryTransactional: rejected non-directory staged path {s}", .{staged_name});
+            return error.StagedPathNotDirectory;
+        }
+    } else {
+        var staged_dir = parent.openDir(staged_name, .{ .no_follow = true }) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            else => return error.StagedPathNotDirectory,
+        };
+        staged_dir.close();
+    }
+
     const sequence = temp_counter.fetchAdd(1, .monotonic);
     const backup_name = try std.fmt.allocPrint(allocator, ".{s}.backup-{d}-{d}", .{ live_name, std.time.nanoTimestamp(), sequence });
     defer allocator.free(backup_name);
@@ -121,12 +140,14 @@ pub fn replaceDirectoryTransactional(
         debug_log.log("fs_util.replaceDirectoryTransactional: promotion failed for {s}: {s}", .{ live_name, @errorName(err) });
         return err;
     };
-    syncDirectory(parent);
+    try syncDirectory(parent);
 
     if (had_live) {
         parent.deleteTree(backup_name) catch |err| {
             debug_log.log("fs_util.replaceDirectoryTransactional: retained backup {s}: {s}", .{ backup_name, @errorName(err) });
+            return err;
         };
+        try syncDirectory(parent);
     }
     debug_log.log("fs_util.replaceDirectoryTransactional: replaced {s}", .{live_name});
 }
@@ -187,6 +208,21 @@ test "writeFileAtomicMode applies permissions to a new file" {
 
     const stat = try tmp.dir.statFile("secret.json");
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+}
+
+test "writeFileAtomic preserves write-only permissions" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original = try tmp.dir.createFile("secret.json", .{ .mode = 0o200 });
+    original.close();
+    try writeFileAtomic(tmp.dir, allocator, "secret.json", "new\n");
+
+    const stat = try tmp.dir.statFile("secret.json");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o200), stat.mode & 0o777);
 }
 
 test "writeFileAtomic leaves the old file when setup fails" {
@@ -280,6 +316,29 @@ test "replaceDirectoryTransactional leaves live contents when staging is absent"
     try std.testing.expectError(
         error.FileNotFound,
         replaceDirectoryTransactional(tmp.dir, allocator, "live", "missing"),
+    );
+
+    const version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(version);
+    try std.testing.expectEqualStrings("old\n", version);
+}
+
+test "replaceDirectoryTransactional rejects a staged symlink" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("live");
+    try tmp.dir.makeDir("outside");
+    try tmp.dir.writeFile(.{ .sub_path = "live/version", .data = "old\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "outside/version", .data = "outside\n" });
+    try tmp.dir.symLink("outside", "staged", .{ .is_directory = true });
+
+    try std.testing.expectError(
+        error.StagedPathNotDirectory,
+        replaceDirectoryTransactional(tmp.dir, allocator, "live", "staged"),
     );
 
     const version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);

@@ -84,7 +84,7 @@ pub fn getGlobalConfigDir(allocator: std.mem.Allocator) ![]const u8 {
 /// Otherwise Cog falls back to ~/.cache/cog/runtime.
 pub fn getRuntimeDir(allocator: std.mem.Allocator) ![]const u8 {
     if (std.posix.getenv("XDG_RUNTIME_DIR")) |xdg_runtime_dir| {
-        if (try isPrivateOwnedDirectory(xdg_runtime_dir)) {
+        if (std.fs.path.isAbsolute(xdg_runtime_dir) and try isPrivateOwnedDirectory(xdg_runtime_dir)) {
             const path = try std.fs.path.join(allocator, &.{ xdg_runtime_dir, "cog" });
             errdefer allocator.free(path);
             try ensurePrivateRuntimeDir(path);
@@ -95,6 +95,10 @@ pub fn getRuntimeDir(allocator: std.mem.Allocator) ![]const u8 {
     }
 
     const home = std.posix.getenv("HOME") orelse return error.NoHome;
+    if (!std.fs.path.isAbsolute(home)) {
+        debug_log.log("getRuntimeDir: rejecting non-absolute HOME {s}", .{home});
+        return error.InvalidHome;
+    }
     const path = try std.fs.path.join(allocator, &.{ home, ".cache", "cog", "runtime" });
     errdefer allocator.free(path);
     try ensurePrivateRuntimeDir(path);
@@ -116,6 +120,9 @@ pub fn getRuntimePath(allocator: std.mem.Allocator, basename: []const u8) ![]con
 }
 
 fn ensurePrivateRuntimeDir(path: []const u8) !void {
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidRuntimePath;
+    try validateExistingDirectoryChain(path);
+
     if (pathExistsNoFollow(path)) {
         try validateRuntimeDirectoryNode(path);
     } else {
@@ -144,7 +151,29 @@ fn ensurePrivateRuntimeDir(path: []const u8) !void {
     }
 }
 
+fn validateExistingDirectoryChain(path: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+
+    var iterator = try std.fs.path.componentIterator(path);
+    while (iterator.next()) |component| {
+        const stat = std.posix.fstatat(std.posix.AT.FDCWD, component.path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        const kind = stat.mode & std.posix.S.IFMT;
+        if (kind == std.posix.S.IFLNK) {
+            debug_log.log("ensurePrivateRuntimeDir: rejected parent symlink {s}", .{component.path});
+            return error.RuntimeDirSymlink;
+        }
+        if (kind != std.posix.S.IFDIR) {
+            debug_log.log("ensurePrivateRuntimeDir: rejected non-directory parent {s}", .{component.path});
+            return error.RuntimePathNotDirectory;
+        }
+    }
+}
+
 fn isPrivateOwnedDirectory(path: []const u8) !bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
     var dir = std.fs.openDirAbsolute(path, .{ .no_follow = true }) catch return false;
     defer dir.close();
 
@@ -237,7 +266,95 @@ test "ensurePrivateRuntimeDir rejects symlinks" {
     try std.testing.expectError(error.RuntimeDirSymlink, ensurePrivateRuntimeDir(runtime_dir));
 }
 
+test "ensurePrivateRuntimeDir rejects a symlinked parent" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("outside");
+    try tmp.dir.symLink("outside", "cache", .{ .is_directory = true });
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const runtime_dir = try std.fs.path.join(allocator, &.{ root, "cache", "cog", "runtime" });
+    defer allocator.free(runtime_dir);
+
+    try std.testing.expectError(error.RuntimeDirSymlink, ensurePrivateRuntimeDir(runtime_dir));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("outside/cog", .{}));
+}
+
+test "getRuntimeDir ignores an empty XDG runtime path" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original_home = std.posix.getenv("HOME");
+    const original_xdg = std.posix.getenv("XDG_RUNTIME_DIR");
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(home);
+    try setEnv("HOME", home);
+    try setEnv("XDG_RUNTIME_DIR", "");
+    defer {
+        if (original_home) |value| setEnv("HOME", value) catch {} else unsetEnv("HOME");
+        if (original_xdg) |value| setEnv("XDG_RUNTIME_DIR", value) catch {} else unsetEnv("XDG_RUNTIME_DIR");
+    }
+
+    const runtime_dir = try getRuntimeDir(allocator);
+    defer allocator.free(runtime_dir);
+    const expected = try std.fs.path.join(allocator, &.{ home, ".cache", "cog", "runtime" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, runtime_dir);
+}
+
+test "getRuntimeDir ignores a relative XDG runtime path" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original_home = std.posix.getenv("HOME");
+    const original_xdg = std.posix.getenv("XDG_RUNTIME_DIR");
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(home);
+    try setEnv("HOME", home);
+    try setEnv("XDG_RUNTIME_DIR", "relative/runtime");
+    defer {
+        if (original_home) |value| setEnv("HOME", value) catch {} else unsetEnv("HOME");
+        if (original_xdg) |value| setEnv("XDG_RUNTIME_DIR", value) catch {} else unsetEnv("XDG_RUNTIME_DIR");
+    }
+
+    const runtime_dir = try getRuntimeDir(allocator);
+    defer allocator.free(runtime_dir);
+    const expected = try std.fs.path.join(allocator, &.{ home, ".cache", "cog", "runtime" });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, runtime_dir);
+}
+
 test "getRuntimePath accepts only basenames" {
     try std.testing.expectError(error.InvalidRuntimeBasename, getRuntimePath(std.testing.allocator, "../daemon.sock"));
     try std.testing.expectError(error.InvalidRuntimeBasename, getRuntimePath(std.testing.allocator, "nested/daemon.sock"));
+}
+
+fn setEnv(name: []const u8, value: []const u8) !void {
+    const c_fns = struct {
+        extern fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+    };
+    const name_z = try std.testing.allocator.dupeZ(u8, name);
+    defer std.testing.allocator.free(name_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, value);
+    defer std.testing.allocator.free(value_z);
+    if (c_fns.setenv(name_z, value_z, 1) != 0) return error.SetEnvFailed;
+}
+
+fn unsetEnv(name: []const u8) void {
+    const c_fns = struct {
+        extern fn unsetenv([*:0]const u8) c_int;
+    };
+    const name_z = std.testing.allocator.dupeZ(u8, name) catch return;
+    defer std.testing.allocator.free(name_z);
+    _ = c_fns.unsetenv(name_z);
 }
