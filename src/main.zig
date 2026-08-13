@@ -285,7 +285,8 @@ fn printHelp(allocator: std.mem.Allocator) void {
         defer allocator.free(combined);
         printErr(combined);
     } else {
-        printErr(static_help ++ footer);
+        printErr(static_help);
+        printErr(footer);
     }
 }
 
