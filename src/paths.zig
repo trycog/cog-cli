@@ -66,7 +66,7 @@ pub fn findOrCreateCogDir(allocator: std.mem.Allocator) ![]const u8 {
     cog_dir.access("settings.json", .{}) catch |err| switch (err) {
         error.FileNotFound => {
             debug_log.log("findOrCreateCogDir: creating .cog/settings.json", .{});
-            fs_util.writeFileAtomic(cog_dir, allocator, "settings.json", "{}\n") catch |write_err| {
+            fs_util.writeFileAtomicMode(cog_dir, allocator, "settings.json", "{}\n", 0o600) catch |write_err| {
                 debug_log.log("findOrCreateCogDir: failed to create settings.json: {s}", .{@errorName(write_err)});
                 return error.NoCogDir;
             };
@@ -263,6 +263,10 @@ test "findOrCreateCogDir creates pretty settings without replacing existing cont
     const initial = try std.fs.cwd().readFileAlloc(allocator, ".cog/settings.json", 1024);
     defer allocator.free(initial);
     try std.testing.expectEqualStrings("{}\n", initial);
+    if (builtin.os.tag != .windows) {
+        const stat = try std.fs.cwd().statFile(".cog/settings.json");
+        try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+    }
 
     try fs_util.writeFileAtomic(std.fs.cwd(), allocator, ".cog/settings.json", "{\n  \"custom\": true\n}\n");
     const second = try findOrCreateCogDir(allocator);

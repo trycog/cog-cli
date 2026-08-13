@@ -1188,7 +1188,7 @@ fn deployBootstrapTemplates() !void {
     };
     if (needs_bootstrap_upgrade) {
         debug_log.log("commands.deployBootstrapTemplates: writing MEM_BOOTSTRAP.md", .{});
-        try fs_util.writeFileAtomic(cog_dir, std.heap.page_allocator, "MEM_BOOTSTRAP.md", build_options.bootstrap_prompt);
+        try fs_util.writeFileAtomicMode(cog_dir, std.heap.page_allocator, "MEM_BOOTSTRAP.md", build_options.bootstrap_prompt, 0o600);
     }
 
     // Write or upgrade MEM_BOOTSTRAP_ASSOCIATE.md
@@ -1205,7 +1205,7 @@ fn deployBootstrapTemplates() !void {
     };
     if (needs_associate_upgrade) {
         debug_log.log("commands.deployBootstrapTemplates: writing MEM_BOOTSTRAP_ASSOCIATE.md", .{});
-        try fs_util.writeFileAtomic(cog_dir, std.heap.page_allocator, "MEM_BOOTSTRAP_ASSOCIATE.md", build_options.bootstrap_associate_prompt);
+        try fs_util.writeFileAtomicMode(cog_dir, std.heap.page_allocator, "MEM_BOOTSTRAP_ASSOCIATE.md", build_options.bootstrap_associate_prompt, 0o600);
     }
 }
 
@@ -2106,7 +2106,8 @@ fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
 
 fn writeCwdFile(filename: []const u8, content: []const u8) !void {
     debug_log.log("commands.writeCwdFile: atomically writing {s}", .{filename});
-    fs_util.writeFileAtomic(std.fs.cwd(), std.heap.page_allocator, filename, content) catch |err| {
+    const create_mode: std.fs.File.Mode = if (std.mem.startsWith(u8, filename, ".cog/")) 0o600 else std.fs.File.default_mode;
+    fs_util.writeFileAtomicMode(std.fs.cwd(), std.heap.page_allocator, filename, content, create_mode) catch |err| {
         debug_log.log("commands.writeCwdFile: failed to write {s}: {s}", .{ filename, @errorName(err) });
         printErr("error: failed to write ");
         printErr(filename);
@@ -2456,6 +2457,10 @@ test "writeClientContextManifest writes selected agents and features" {
     const features = parsed.value.object.get("features").?;
     try std.testing.expect(features.object.get("enhanced_memory_writes").?.bool);
     try std.testing.expect(features.object.get("provenance_envelopes").?.bool);
+    if (builtin.os.tag != .windows) {
+        const stat = try std.fs.cwd().statFile(".cog/client-context.json");
+        try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+    }
 }
 
 test "project file writer preserves prior contents and leaves no temp residue on setup failure" {
