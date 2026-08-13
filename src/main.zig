@@ -95,6 +95,11 @@ fn mainInner() !void {
         };
         std.process.exit(exit_code);
     }
+    if (std.mem.eql(u8, subcmd, code_intel.WATCHER_RESYNC_WORKER_COMMAND)) {
+        if (cmd_args.len != 0) return error.InvalidArguments;
+        debug_log.log("dispatch hidden watcher resync worker", .{});
+        std.process.exit(code_intel.runWatcherResyncWorker(allocator));
+    }
 
     // For non-MCP commands, close the log header now. MCP mode defers
     // the separator until handleInitialize appends client info.

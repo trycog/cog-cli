@@ -21,6 +21,7 @@ const LOCK_EX: c_int = 2;
 const LOCK_UN: c_int = 8;
 
 pub const WATCHER_REINDEX_WORKER_COMMAND = "__mcp-watch-reindex";
+pub const WATCHER_RESYNC_WORKER_COMMAND = "__mcp-watch-resync";
 pub const MAX_WATCHER_REINDEX_FILES: usize = 256;
 pub const MAX_WATCHER_REINDEX_ARG_BYTES: usize = 64 * 1024;
 
@@ -139,27 +140,37 @@ pub fn validateWatcherReindexArgs(file_paths: []const []const u8) !void {
     }
 }
 
+fn deduplicateFilePaths(allocator: std.mem.Allocator, file_paths: []const []const u8) ![]const []const u8 {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+
+    var unique: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer unique.deinit(allocator);
+    try unique.ensureTotalCapacity(allocator, file_paths.len);
+
+    for (file_paths) |file_path| {
+        const entry = try seen.getOrPut(allocator, file_path);
+        if (entry.found_existing) continue;
+        unique.appendAssumeCapacity(file_path);
+    }
+    return unique.toOwnedSlice(allocator);
+}
+
 pub fn runWatcherReindexWorker(allocator: std.mem.Allocator, file_paths: []const []const u8) !u8 {
     try validateWatcherReindexArgs(file_paths);
-    debug_log.log("watcher worker: starting files={d}", .{file_paths.len});
+    debug_log.log("watcher worker: starting batch files={d}", .{file_paths.len});
 
-    var changed = false;
-    for (file_paths) |file_path| {
-        const exists = blk: {
-            std.fs.cwd().access(file_path, .{}) catch break :blk false;
-            break :blk true;
-        };
-        if (exists) {
-            debug_log.log("watcher worker: reindexing {s}", .{file_path});
-            if (reindexFile(allocator, file_path)) changed = true;
-        } else {
-            debug_log.log("watcher worker: removing {s}", .{file_path});
-            if (removeFileFromIndex(allocator, file_path)) changed = true;
-        }
-    }
-
+    const changed = reindexFiles(allocator, file_paths);
     const exit_code: u8 = if (changed) 0 else 1;
-    debug_log.log("watcher worker: completed status={d}", .{exit_code});
+    debug_log.log("watcher worker: completed batch status={d}", .{exit_code});
+    return exit_code;
+}
+
+pub fn runWatcherResyncWorker(allocator: std.mem.Allocator) u8 {
+    debug_log.log("watcher worker: starting configured resync", .{});
+    const changed = reindexConfiguredFiles(allocator);
+    const exit_code: u8 = if (changed) 0 else 1;
+    debug_log.log("watcher worker: completed configured resync status={d}", .{exit_code});
     return exit_code;
 }
 
@@ -190,6 +201,16 @@ test "validateWatcherReindexArgs rejects excessive argument bytes" {
     const path_count = MAX_WATCHER_REINDEX_ARG_BYTES / path.len + 1;
     const paths_list = [_][]const u8{&path} ** path_count;
     try std.testing.expectError(error.ArgumentsTooLong, validateWatcherReindexArgs(&paths_list));
+}
+
+test "deduplicateFilePaths keeps first occurrence" {
+    const allocator = std.testing.allocator;
+    const unique = try deduplicateFilePaths(allocator, &.{ "src/a.zig", "src/b.zig", "src/a.zig", "src/b.zig" });
+    defer allocator.free(unique);
+
+    try std.testing.expectEqual(@as(usize, 2), unique.len);
+    try std.testing.expectEqualStrings("src/a.zig", unique[0]);
+    try std.testing.expectEqualStrings("src/b.zig", unique[1]);
 }
 
 pub fn builtinExtensionList() []const u8 {
@@ -2416,93 +2437,247 @@ fn removeDocument(allocator: std.mem.Allocator, index: *scip.Index, rel_path: []
     }
 }
 
-/// Remove a file from the SCIP index on disk.
-/// Returns true if the file was found and removed, false otherwise.
-/// Uses flock() advisory locking to serialize concurrent access.
-pub fn removeFileFromIndex(allocator: std.mem.Allocator, file_path: []const u8) bool {
-    debug_log.log("removeFileFromIndex: starting for {s}", .{file_path});
+fn documentIndexByPath(documents: []const scip.Document, rel_path: []const u8) ?usize {
+    for (documents, 0..) |doc, i| {
+        if (std.mem.eql(u8, doc.relative_path, rel_path)) return i;
+    }
+    return null;
+}
+
+fn pathMatchesConfiguredPatterns(file_path: []const u8, patterns: []const []const u8) bool {
+    var included = false;
+    for (patterns) |pattern| {
+        const normalized = normalizeGlobPattern(pattern);
+        if (normalized.len == 0 or !globMatch(normalized, file_path)) continue;
+        if (isNegativeGlobPattern(pattern)) return false;
+        included = true;
+    }
+    return included;
+}
+
+fn applyReindexBatch(
+    allocator: std.mem.Allocator,
+    master_index: *scip.Index,
+    file_paths: []const []const u8,
+) bool {
+    var changed = false;
+    var backing_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (backing_buffers.items) |buf| allocator.free(buf);
+        backing_buffers.deinit(allocator);
+    }
+
+    var string_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (string_buffers.items) |buf| allocator.free(buf);
+        string_buffers.deinit(allocator);
+    }
+
+    var external_symbol_list: std.ArrayListUnmanaged(scip.SymbolInformation) = .empty;
+    defer {
+        for (external_symbol_list.items) |*sym| freeSymbolInformation(allocator, sym);
+        external_symbol_list.deinit(allocator);
+    }
+    external_symbol_list.ensureTotalCapacity(allocator, master_index.external_symbols.len) catch return false;
+    external_symbol_list.appendSliceAssumeCapacity(master_index.external_symbols);
+    if (master_index.external_symbols.len > 0) allocator.free(master_index.external_symbols);
+    master_index.external_symbols = &.{};
+
+    var indexer = tree_sitter_indexer.Indexer.init();
+    defer indexer.deinit();
+
+    var seen_names: [16][]const u8 = undefined;
+    var unique_exts: [16]extensions.Extension = undefined;
+    var ext_files: [16]std.ArrayListUnmanaged([]const u8) = [_]std.ArrayListUnmanaged([]const u8){.empty} ** 16;
+    var num_unique: usize = 0;
+    defer for (0..num_unique) |ext_idx| ext_files[ext_idx].deinit(allocator);
+
+    var ext_cache_keys: [32][]const u8 = undefined;
+    var ext_cache_vals: [32]?extensions.Extension = undefined;
+    var ext_cache_installed: [32]bool = [_]bool{false} ** 32;
+    var ext_cache_len: usize = 0;
+    defer for (0..ext_cache_len) |ci| {
+        if (ext_cache_installed[ci]) {
+            if (ext_cache_vals[ci]) |*value| extensions.freeExtension(allocator, value);
+        }
+    };
+
+    for (file_paths) |file_path| {
+        const exists = blk: {
+            std.fs.cwd().access(file_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (!exists) {
+            const before = master_index.documents.len;
+            removeDocument(allocator, master_index, file_path);
+            if (master_index.documents.len != before) {
+                changed = true;
+                debug_log.log("reindexFiles: queued removal path={s}", .{file_path});
+            }
+            continue;
+        }
+
+        const ext = std.fs.path.extension(file_path);
+        if (ext.len == 0) continue;
+        const resolved = blk: {
+            for (ext_cache_keys[0..ext_cache_len], ext_cache_vals[0..ext_cache_len]) |key, value| {
+                if (std.mem.eql(u8, key, ext)) break :blk value;
+            }
+            const value = extensions.resolveByExtension(allocator, ext);
+            if (ext_cache_len < ext_cache_keys.len) {
+                ext_cache_keys[ext_cache_len] = ext;
+                ext_cache_vals[ext_cache_len] = value;
+                ext_cache_installed[ext_cache_len] = if (value) |resolved_ext| resolved_ext.installed else false;
+                ext_cache_len += 1;
+            }
+            break :blk value;
+        } orelse continue;
+        const idx = resolved.indexer orelse continue;
+
+        switch (idx) {
+            .tree_sitter => |ts_config| {
+                debug_log.log("reindexFiles: reading path={s}", .{file_path});
+                const source = readFileContents(allocator, file_path) orelse continue;
+                defer allocator.free(source);
+                const result = indexer.indexFile(allocator, source, file_path, ts_config) catch {
+                    mergeDocument(allocator, master_index, .{
+                        .language = ts_config.scip_name,
+                        .relative_path = file_path,
+                        .occurrences = &.{},
+                        .symbols = &.{},
+                    });
+                    changed = true;
+                    continue;
+                };
+                string_buffers.append(allocator, result.string_data) catch {
+                    allocator.free(result.string_data);
+                    continue;
+                };
+                mergeDocument(allocator, master_index, result.doc);
+                changed = true;
+            },
+            .scip_binary => {
+                var found_idx: ?usize = null;
+                for (seen_names[0..num_unique], 0..) |name, i| {
+                    if (std.mem.eql(u8, name, resolved.name)) {
+                        found_idx = i;
+                        break;
+                    }
+                }
+                if (found_idx) |i| {
+                    ext_files[i].append(allocator, file_path) catch {};
+                } else if (num_unique < unique_exts.len) {
+                    seen_names[num_unique] = resolved.name;
+                    unique_exts[num_unique] = resolved;
+                    ext_files[num_unique].append(allocator, file_path) catch {};
+                    num_unique += 1;
+                }
+            },
+        }
+    }
+
+    for (0..num_unique) |ext_idx| {
+        const scip_config = switch (unique_exts[ext_idx].indexer orelse continue) {
+            .scip_binary => |config| config,
+            .tree_sitter => continue,
+        };
+        const batch_files = ext_files[ext_idx].items;
+        if (batch_files.len == 0) continue;
+        debug_log.log("reindexFiles: spawning external batch command={s} files={d}", .{ scip_config.command, batch_files.len });
+        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, null) catch |err| {
+            debug_log.log("reindexFiles: external batch failed command={s} error={s}", .{ scip_config.command, @errorName(err) });
+            continue;
+        };
+        backing_buffers.append(allocator, result.backing_data.?) catch {
+            var failed_index = result.index;
+            scip.freeIndex(allocator, &failed_index);
+            allocator.free(result.backing_data.?);
+            continue;
+        };
+        for (result.index.documents) |doc| mergeDocument(allocator, master_index, doc);
+        allocator.free(result.index.documents);
+        for (result.index.external_symbols) |sym| mergeExternalSymbolList(allocator, &external_symbol_list, sym);
+        allocator.free(result.index.external_symbols);
+        changed = true;
+    }
+
+    master_index.external_symbols = external_symbol_list.toOwnedSlice(allocator) catch return false;
+    return changed;
+}
+
+/// Re-index or remove multiple files in a single locked index transaction.
+/// Input paths are deduplicated, the existing index is loaded once, external
+/// indexers receive one batch per extension, and one atomic replacement is made.
+pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8) bool {
+    const unique = deduplicateFilePaths(allocator, file_paths) catch return false;
+    defer allocator.free(unique);
+    if (unique.len == 0) return false;
+    debug_log.log("reindexFiles: batching input={d} unique={d}", .{ file_paths.len, unique.len });
+
     const cog_dir = paths.findCogDir(allocator) catch return false;
     defer allocator.free(cog_dir);
-
     const lock_fd = acquireIndexLock(allocator, cog_dir) orelse return false;
     defer releaseIndexLock(lock_fd);
 
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
     defer allocator.free(index_path);
-
+    debug_log.log("reindexFiles: loading index path={s}", .{index_path});
     const loaded = loadExistingIndex(allocator, index_path);
     var master_index = loaded.index;
     defer scip.freeIndex(allocator, &master_index);
     defer if (loaded.backing_data) |data| allocator.free(data);
 
-    const before = master_index.documents.len;
-    removeDocument(allocator, &master_index, file_path);
-    if (master_index.documents.len == before) return false;
-
+    if (!applyReindexBatch(allocator, &master_index, unique)) return false;
+    debug_log.log("reindexFiles: encoding documents={d}", .{master_index.documents.len});
     return saveIndex(allocator, master_index, index_path);
 }
 
-/// Re-index a single file and update the master index.
-/// Uses flock() advisory locking to serialize concurrent access.
-pub fn reindexFile(allocator: std.mem.Allocator, file_path: []const u8) bool {
-    debug_log.log("reindexFile: starting for {s}", .{file_path});
+/// Reconcile all configured index patterns after watcher event loss.
+pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
+    const settings = settings_mod.Settings.load(allocator) orelse return false;
+    defer settings.deinit(allocator);
+    const patterns = if (settings.code) |code| code.index orelse return false else return false;
+
+    var current_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (current_files.items) |file_path| allocator.free(file_path);
+        current_files.deinit(allocator);
+    }
+    collectFilesForPatterns(allocator, patterns, &current_files) catch return false;
+
     const cog_dir = paths.findCogDir(allocator) catch return false;
     defer allocator.free(cog_dir);
-
     const lock_fd = acquireIndexLock(allocator, cog_dir) orelse return false;
     defer releaseIndexLock(lock_fd);
-
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
     defer allocator.free(index_path);
-
     const loaded = loadExistingIndex(allocator, index_path);
     var master_index = loaded.index;
     defer scip.freeIndex(allocator, &master_index);
     defer if (loaded.backing_data) |data| allocator.free(data);
 
-    const ext_str = std.fs.path.extension(file_path);
-    if (ext_str.len == 0) return false;
-
-    const resolved = extensions.resolveByExtension(allocator, ext_str) orelse return false;
-    defer extensions.freeExtension(allocator, &resolved);
-
-    const idx = resolved.indexer orelse return false;
-    switch (idx) {
-        .tree_sitter => |ts_config| {
-            const source = readFileContents(allocator, file_path) orelse return false;
-            defer allocator.free(source);
-
-            var indexer = tree_sitter_indexer.Indexer.init();
-            defer indexer.deinit();
-
-            const result = indexer.indexFile(allocator, source, file_path, ts_config) catch return false;
-            mergeDocument(allocator, &master_index, result.doc);
-
-            // Encode and write (must happen before freeing string_data,
-            // since symbol names are slices into it)
-            const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
-                allocator.free(result.string_data);
-                return false;
-            };
-            allocator.free(result.string_data);
-            defer allocator.free(encoded);
-
-            return writeEncodedIndexAtomically(allocator, index_path, encoded);
-        },
-        .scip_binary => |scip_config| {
-            const file_result = invokeIndexerForFile(allocator, file_path, scip_config) catch return false;
-            mergeDocument(allocator, &master_index, file_result.doc);
-
-            const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
-                allocator.free(file_result.backing_data);
-                return false;
-            };
-            allocator.free(file_result.backing_data);
-            defer allocator.free(encoded);
-
-            return writeEncodedIndexAtomically(allocator, index_path, encoded);
-        },
+    var batch: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer batch.deinit(allocator);
+    batch.ensureTotalCapacity(allocator, current_files.items.len + master_index.documents.len) catch return false;
+    batch.appendSliceAssumeCapacity(current_files.items);
+    for (master_index.documents) |doc| {
+        if (!pathMatchesConfiguredPatterns(doc.relative_path, patterns)) continue;
+        if (documentIndexByPath(current_files.items, doc.relative_path) != null) continue;
+        batch.appendAssumeCapacity(doc.relative_path);
     }
+    debug_log.log("reindexConfiguredFiles: reconciliation current={d} batch={d}", .{ current_files.items.len, batch.items.len });
+    if (!applyReindexBatch(allocator, &master_index, batch.items)) return false;
+    return saveIndex(allocator, master_index, index_path);
+}
+
+/// Remove a file from the SCIP index on disk.
+pub fn removeFileFromIndex(allocator: std.mem.Allocator, file_path: []const u8) bool {
+    return reindexFiles(allocator, &.{file_path});
+}
+
+/// Re-index a single file and update the master index.
+pub fn reindexFile(allocator: std.mem.Allocator, file_path: []const u8) bool {
+    return reindexFiles(allocator, &.{file_path});
 }
 
 /// Write and save an index to disk.
