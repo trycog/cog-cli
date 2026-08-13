@@ -5,6 +5,7 @@ const Writer = std.io.Writer;
 const agents_mod = @import("agents.zig");
 const build_options = @import("build_options");
 const debug_log = @import("debug_log.zig");
+const fs_util = @import("fs_util.zig");
 
 // ANSI styles
 const cyan = "\x1B[36m";
@@ -31,22 +32,8 @@ fn ensureDir(path: []const u8) !void {
 }
 
 fn writeCwdFile(filename: []const u8, content: []const u8) !void {
-    const file = std.fs.cwd().createFile(filename, .{}) catch {
-        printErr("  error: failed to write ");
-        printErr(filename);
-        printErr("\n");
-        return error.Explained;
-    };
-    defer file.close();
-    var write_buf: [4096]u8 = undefined;
-    var fw = file.writer(&write_buf);
-    fw.interface.writeAll(content) catch {
-        printErr("  error: failed to write ");
-        printErr(filename);
-        printErr("\n");
-        return error.Explained;
-    };
-    fw.interface.flush() catch {
+    debug_log.log("hooks.writeCwdFile: path={s}", .{filename});
+    fs_util.writeFileAtomic(std.fs.cwd(), std.heap.page_allocator, filename, content) catch {
         printErr("  error: failed to write ");
         printErr(filename);
         printErr("\n");
@@ -1944,6 +1931,39 @@ fn withTempCwd(comptime body: fn (std.mem.Allocator) anyerror!void) !void {
 
     tmp_dir.dir.setAsCwd() catch unreachable;
     try body(allocator);
+}
+
+test "writeJsonMcp atomically preserves mode and existing content" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const original_content =
+                \\{"version":1,"mcpServers":{"foo":{"command":"foo"}}}
+            ;
+            const original = try std.fs.cwd().createFile(".mcp.json", .{ .read = true, .mode = 0o600 });
+            defer original.close();
+            try original.writeAll(original_content);
+            try original.seekTo(0);
+
+            try writeJsonMcp(allocator, ".mcp.json", "mcpServers");
+
+            const updated = readCwdFile(allocator, ".mcp.json") orelse return error.TestUnexpectedResult;
+            defer allocator.free(updated);
+            const parsed = try json.parseFromSlice(json.Value, allocator, updated, .{});
+            defer parsed.deinit();
+            const servers = parsed.value.object.get("mcpServers") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(servers.object.get("foo") != null);
+            try std.testing.expect(servers.object.get("cog") != null);
+
+            const stat = try std.fs.cwd().statFile(".mcp.json");
+            try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+
+            const retained_content = try original.readToEndAlloc(allocator, 1048576);
+            defer allocator.free(retained_content);
+            try std.testing.expectEqualStrings(original_content, retained_content);
+        }
+    }.run);
 }
 
 test "writeJsonMcp preserves existing non-cog entries" {
