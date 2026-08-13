@@ -32,13 +32,23 @@ pub const Db = struct {
         return openWithBusyTimeout(path, DEFAULT_BUSY_TIMEOUT_MS);
     }
 
+    /// Open an existing database without allowing creation or writes.
+    pub fn openReadOnly(path: [*:0]const u8) Error!Db {
+        debug_log.log("sqlite: opening read-only {s}", .{path});
+        return openWithFlags(path, c.SQLITE_OPEN_READONLY, DEFAULT_BUSY_TIMEOUT_MS);
+    }
+
     /// Open a database and bound how long SQLite retries while another writer holds a lock.
     pub fn openWithBusyTimeout(path: [*:0]const u8, busy_timeout_ms: u32) Error!Db {
-        debug_log.log("sqlite: opening {s} busy_timeout_ms={d}", .{ path, busy_timeout_ms });
+        return openWithFlags(path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE, busy_timeout_ms);
+    }
+
+    fn openWithFlags(path: [*:0]const u8, flags: c_int, busy_timeout_ms: u32) Error!Db {
+        debug_log.log("sqlite: opening {s} flags=0x{x} busy_timeout_ms={d}", .{ path, flags, busy_timeout_ms });
         var handle: ?*c.sqlite3 = null;
-        const rc = c.sqlite3_open(path, &handle);
+        const rc = c.sqlite3_open_v2(path, &handle, flags, null);
         if (rc != c.SQLITE_OK) {
-            debug_log.log("sqlite: open failed rc={d}", .{rc});
+            debug_log.log("sqlite: open failed flags=0x{x} rc={d}", .{ flags, rc });
             if (handle) |h| _ = c.sqlite3_close(h);
             return mapError(rc);
         }
@@ -164,6 +174,37 @@ pub const Stmt = struct {
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "read-only open rejects a missing database without creating it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ root, "missing.db" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.SqliteError, Db.openReadOnly(path));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("missing.db", .{}));
+}
+
+test "read-only open prevents schema writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.joinZ(std.testing.allocator, &.{ root, "existing.db" });
+    defer std.testing.allocator.free(path);
+
+    var writable = try Db.open(path);
+    try writable.exec("CREATE TABLE test (value INTEGER)");
+    writable.close();
+
+    var read_only = try Db.openReadOnly(path);
+    defer read_only.close();
+    try std.testing.expectError(error.SqliteError, read_only.exec("CREATE TABLE forbidden (value INTEGER)"));
+}
 
 test "two writers wait for the configured busy timeout" {
     var tmp = std.testing.tmpDir(.{});

@@ -18,7 +18,6 @@ const fs_util = @import("fs_util.zig");
 const extensions_mod = @import("extensions.zig");
 const memory_mod = @import("memory.zig");
 const bootstrap_mod = @import("bootstrap.zig");
-const memory_schema = @import("memory_schema.zig");
 const sqlite = @import("sqlite.zig");
 
 const Config = config_mod.Config;
@@ -1806,25 +1805,20 @@ pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 passed += 1;
                 debug_log.log("doctor: local brain at {s}", .{path});
 
-                // Try opening the database
+                // Open the existing database without creating or mutating it.
                 const path_z = std.posix.toPosixPath(path) catch {
                     printErr("    " ++ red ++ cross ++ reset ++ " Database: path too long\n");
                     failures += 1;
                     break :mem_check;
                 };
-                var db = sqlite.Db.open(&path_z) catch {
-                    printErr("    " ++ red ++ cross ++ reset ++ " Database: failed to open\n");
+                debug_log.log("doctor: opening local brain read-only {s}", .{path});
+                var db = sqlite.Db.openReadOnly(&path_z) catch |err| {
+                    debug_log.log("doctor: read-only database open failed: {s}", .{@errorName(err)});
+                    printErr("    " ++ red ++ cross ++ reset ++ " Database: missing or inaccessible\n");
                     failures += 1;
                     break :mem_check;
                 };
                 defer db.close();
-
-                // Ensure schema exists (brain.db may have been created but not yet initialized by the MCP server)
-                memory_schema.ensureSchema(&db) catch {
-                    printErr("    " ++ red ++ cross ++ reset ++ " Database: schema initialization failed\n");
-                    failures += 1;
-                    break :mem_check;
-                };
 
                 // Count engrams and synapses
                 const engram_count = blk_e: {
@@ -2604,6 +2598,21 @@ test "doctor returns failure when no .cog directory" {
             std.fs.cwd().makeDir(".git") catch {};
             const result = doctor(std.testing.allocator, &.{});
             try std.testing.expectError(error.Explained, result);
+        }
+    }.run);
+}
+
+test "doctor does not create a configured missing brain database" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try std.fs.cwd().makeDir(".git");
+            try std.fs.cwd().makeDir(".cog");
+            const settings_file = try std.fs.cwd().createFile(".cog/settings.json", .{});
+            defer settings_file.close();
+            try settings_file.writeAll("{\"memory\":{\"brain\":\"file:.cog/brain.db\"}}\n");
+
+            try std.testing.expectError(error.Explained, doctor(allocator, &.{}));
+            try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(".cog/brain.db", .{}));
         }
     }.run);
 }

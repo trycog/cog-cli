@@ -459,22 +459,20 @@ fn memInfo(allocator: std.mem.Allocator) !void {
             printErr(local.brain_id);
             printErr("\n\n");
 
-            // Open DB and show stats
+            // Open the existing DB read-only and show stats without initializing it.
             const path_z = allocator.dupeZ(u8, local.path) catch {
                 printErr("  (cannot open database)\n");
                 return;
             };
             defer allocator.free(path_z);
 
-            var db = sqlite.Db.open(path_z) catch {
+            debug_log.log("memInfo: opening local brain read-only {s}", .{local.path});
+            var db = sqlite.Db.openReadOnly(path_z) catch |err| {
+                debug_log.log("memInfo: read-only database open failed: {s}", .{@errorName(err)});
                 printErr("  (database not yet created — run a memory tool to initialize)\n");
                 return;
             };
             defer db.close();
-            memory_schema.ensureSchema(&db) catch {
-                printErr("  (schema error)\n");
-                return;
-            };
 
             const engrams = countBrainQuery(&db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ?", local.brain_id);
             const synapses = countBrainQuery(&db, "SELECT COUNT(*) FROM synapses WHERE brain_id = ?", local.brain_id);
@@ -3686,6 +3684,26 @@ fn loadCustomPrompt(allocator: std.mem.Allocator, cog_dir: []const u8, filename:
 }
 
 // Tests
+test "memInfo does not create a configured missing brain database" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir(".cog");
+    const settings_file = try tmp.dir.createFile(".cog/settings.json", .{});
+    defer settings_file.close();
+    try settings_file.writeAll("{\"memory\":{\"brain\":\"file:.cog/brain.db\"}}\n");
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    try memInfo(allocator);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(".cog/brain.db", .{}));
+}
+
 test "saveUploadCheckpoint writes pretty JSON and preserves restrictive mode" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
