@@ -424,6 +424,8 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     };
 
     var handler_threads = HandlerThreads.init(MAX_HANDLER_CONCURRENCY);
+    var handler_threads_drained = false;
+    defer drainHandlerThreads(&handler_threads, &handler_threads_drained);
     debug_log_mod.log("mcp.handlers: initialized concurrency limit={d}", .{MAX_HANDLER_CONCURRENCY});
 
     var input_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -525,10 +527,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
     }
 
-    debug_log_mod.log("mcp.serve: shutdown requested; stopping handler intake", .{});
-    handler_threads.stopAccepting();
-    handler_threads.drain();
-    debug_log_mod.log("mcp.serve: handlers drained before runtime teardown", .{});
+    drainHandlerThreads(&handler_threads, &handler_threads_drained);
 
     // Clean up debug sessions before exiting — kills adapter process groups
     // to prevent orphaned debugpy/launcher/debuggee processes.
@@ -540,6 +539,15 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     // holds no resources that need flushing beyond what the OS reclaims on
     // exit, an immediate _exit is the safest shutdown path.
     std.process.exit(0);
+}
+
+fn drainHandlerThreads(handler_threads: *HandlerThreads, drained: *bool) void {
+    if (drained.*) return;
+    debug_log_mod.log("mcp.serve: shutdown requested; stopping handler intake", .{});
+    handler_threads.stopAccepting();
+    handler_threads.drain();
+    drained.* = true;
+    debug_log_mod.log("mcp.serve: handlers drained before runtime teardown", .{});
 }
 
 fn setupSignalHandler() void {
@@ -752,47 +760,47 @@ fn processMessage(runtime: *Runtime, line: []const u8, stdout: StdoutWriter) !vo
     if (std.mem.eql(u8, method, "initialize")) {
         const params = root.object.get("params");
         handleInitialize(runtime, &reply, params) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "notifications/initialized")) {
         reply.markNotification(); // No response needed
     } else if (std.mem.eql(u8, method, "shutdown")) {
         handleShutdown(allocator, &reply) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "exit")) {
         reply.markNotification(); // No response needed
         shutdown_requested.store(true, .release);
     } else if (std.mem.eql(u8, method, "ping")) {
         handlePing(allocator, &reply) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "tools/list")) {
         handleToolsList(runtime, &reply) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "tools/call")) {
         const params = root.object.get("params");
         handleToolsCall(runtime, &reply, params) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "resources/list")) {
         handleResourcesList(allocator, &reply) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "resources/read")) {
         const params = root.object.get("params");
         handleResourcesRead(runtime, &reply, params) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "prompts/list")) {
         handlePromptsList(allocator, &reply) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "prompts/get")) {
         const params = root.object.get("params");
         handlePromptsGet(allocator, &reply, params) catch |err| {
-            reply.sendInternalError(err);
+            try handleDispatchError(&reply, err);
         };
     } else if (std.mem.eql(u8, method, "notifications/cancelled") or std.mem.eql(u8, method, "notifications/progress")) {
         reply.markNotification(); // No response needed
@@ -886,12 +894,12 @@ const ReplyOnce = struct {
     }
 
     /// Send a -32603 internal error. Used by catch blocks in processMessage.
-    fn sendInternalError(self: *ReplyOnce, err: anyerror) void {
+    fn sendInternalError(self: *ReplyOnce, err: anyerror) !void {
         if (self.responded) return;
         if (self.id == null) return;
         debug_log_mod.log("Handler error: {s}, sending internal error response", .{@errorName(err)});
         self.responded = true;
-        writeError(self.allocator, self.id, -32603, "Internal error", self.stdout) catch {};
+        try writeError(self.allocator, self.id, -32603, "Internal error", self.stdout);
     }
 
     /// Destructor — the safety net. If no response was sent for a request,
@@ -905,7 +913,13 @@ const ReplyOnce = struct {
     }
 };
 
+fn handleDispatchError(reply: *ReplyOnce, err: anyerror) !void {
+    if (err == error.WriteFailure) return err;
+    try reply.sendInternalError(err);
+}
+
 fn handleShutdown(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
+    shutdown_requested.store(true, .release);
     var aw: Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: Stringify = .{ .writer = &aw.writer };
@@ -920,7 +934,6 @@ fn handleShutdown(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
     const result = try aw.toOwnedSlice();
     defer allocator.free(result);
     try reply.sendRaw(result);
-    shutdown_requested.store(true, .release);
 }
 
 fn handlePing(allocator: std.mem.Allocator, reply: *ReplyOnce) !void {
@@ -2289,6 +2302,46 @@ fn logErr(prefix: []const u8, err: anyerror) void {
     w.interface.writeAll(@errorName(err)) catch {};
     w.interface.writeByte('\n') catch {};
     w.interface.flush() catch {};
+}
+
+test "handler drain guard is idempotent across normal and error cleanup" {
+    var handlers = HandlerThreads.init(1);
+    var drained = false;
+
+    drainHandlerThreads(&handlers, &drained);
+    try std.testing.expect(drained);
+
+    drainHandlerThreads(&handlers, &drained);
+    try std.testing.expect(drained);
+}
+
+test "dispatch write failures propagate to request handler" {
+    var mutex: std.Thread.Mutex = .{};
+    var reply = ReplyOnce.init(std.testing.allocator, null, .{
+        .file = std.fs.File.stdout(),
+        .mutex = &mutex,
+    });
+
+    try std.testing.expectError(error.WriteFailure, handleDispatchError(&reply, error.WriteFailure));
+}
+
+test "shutdown remains requested when its response write fails" {
+    shutdown_requested.store(false, .release);
+    defer shutdown_requested.store(false, .release);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var closed_file = try tmp.dir.createFile("closed", .{});
+    closed_file.close();
+
+    var mutex: std.Thread.Mutex = .{};
+    var reply = ReplyOnce.init(std.testing.allocator, null, .{
+        .file = closed_file,
+        .mutex = &mutex,
+    });
+
+    try std.testing.expectError(error.WriteFailure, handleShutdown(std.testing.allocator, &reply));
+    try std.testing.expect(shutdown_requested.load(.acquire));
 }
 
 test "reindexWorkerResult maps documented exit statuses" {
