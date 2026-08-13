@@ -50,14 +50,14 @@ pub const tool_definitions = [_]ToolDef{
         .name = "mem_learn",
         .description = "Store concepts in memory. Always pass an 'items' array, even for a single concept.",
         .input_schema =
-        \\{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"term":{"type":"string","description":"Short name (2-5 words)"},"definition":{"type":"string","description":"Clear definition (1-3 sentences)"},"associations":{"type":"array","items":{"type":"string"},"description":"Existing term names to associate with"},"chain_to":{"type":"string","description":"Term name to create a sequence link to"}},"required":["term","definition"]},"description":"Array of concepts to store"}},"required":["items"]}
+        \\{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"term":{"type":"string","description":"Short name (2-5 words)"},"definition":{"type":"string","description":"Clear definition (1-3 sentences)"},"associations":{"type":"array","items":{"type":"object","properties":{"target":{"type":"string","description":"Existing term name or engram ID"},"predicate":{"type":"string","description":"Relationship from this concept to the target"}},"required":["target","predicate"]},"description":"Relationships to existing or intra-batch concepts"},"chain_to":{"type":"array","items":{"type":"object","properties":{"term":{"type":"string","description":"Next concept term"},"definition":{"type":"string","description":"Next concept definition"},"predicate":{"type":"string","description":"Relationship from the previous concept to this step"}},"required":["term","definition","predicate"]},"description":"Ordered concepts linked from this item through each step"}},"required":["term","definition"]},"description":"Array of concepts to store"}},"required":["items"]}
         ,
     },
     .{
         .name = "mem_recall",
         .description = "Search memory. Always pass a 'queries' array, even for a single search.",
         .input_schema =
-        \\{"type":"object","properties":{"queries":{"type":"array","items":{"type":"string"},"description":"Array of search queries (natural language or keywords)"},"limit":{"type":"number","description":"Max results per query (default 10)"}},"required":["queries"]}
+        \\{"type":"object","properties":{"queries":{"type":"array","items":{"type":"string"},"description":"Array of search queries (natural language or keywords)"},"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Max results per query (default 5, capped at 100)"}},"required":["queries"]}
         ,
     },
     .{
@@ -78,7 +78,7 @@ pub const tool_definitions = [_]ToolDef{
         .name = "mem_associate",
         .description = "Create directional links between concepts. Always pass an 'items' array, even for a single link.",
         .input_schema =
-        \\{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"source":{"type":"string","description":"Source term name or engram ID"},"target":{"type":"string","description":"Target term name or engram ID"},"relation":{"type":"string","description":"Relationship type (default: related_to)"},"weight":{"type":"number","description":"Link strength 0.0-1.0 (default: 1.0)"}},"required":["source","target"]},"description":"Array of associations to create"}},"required":["items"]}
+        \\{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"source":{"type":"string","description":"Source term name or engram ID"},"target":{"type":"string","description":"Target term name or engram ID"},"relation":{"type":"string","description":"Relationship type (default: related_to)"},"weight":{"type":"number","minimum":0.0,"maximum":1.0,"description":"Link strength 0.0-1.0 (default: 1.0)"}},"required":["source","target"]},"description":"Array of associations to create"}},"required":["items"]}
         ,
     },
     .{
@@ -97,7 +97,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "mem_deprecate",
-        .description = "Mark a concept as deprecated. Removes its links and sets it for expiry.",
+        .description = "Mark an active concept as deprecated. Removes its links while retaining historical data.",
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"string","description":"Term to deprecate"}},"required":["term"]}
         ,
@@ -241,7 +241,14 @@ fn getIntArg(args: ?json.Value, key: []const u8, default: i64) i64 {
     const val = a.object.get(key) orelse return default;
     return switch (val) {
         .integer => val.integer,
-        .float => @intFromFloat(val.float),
+        .float => if (!std.math.isFinite(val.float))
+            default
+        else if (val.float >= @as(f64, @floatFromInt(std.math.maxInt(i64))))
+            std.math.maxInt(i64)
+        else if (val.float <= @as(f64, @floatFromInt(std.math.minInt(i64))))
+            std.math.minInt(i64)
+        else
+            @intFromFloat(val.float),
         else => default,
     };
 }
@@ -265,18 +272,19 @@ fn getArrayArg(args: ?json.Value, key: []const u8) ?[]const json.Value {
     return val.array.items;
 }
 
-/// Find engram ID by term name (case-insensitive) or return input if it looks like a UUID.
-fn resolveEngramId(mem_db: *MemoryDb, name_or_id: []const u8) !?[]const u8 {
-    // If it looks like a UUID (36 chars with dashes), return it directly
-    if (name_or_id.len == 36 and name_or_id[8] == '-') {
-        return try mem_db.allocator.dupe(u8, name_or_id);
-    }
+const active_engram_filter =
+    "deprecated_at IS NULL AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))";
 
-    // Otherwise look up by term (case-insensitive)
-    var stmt = try mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ? AND LOWER(term) = LOWER(?) LIMIT 1");
+/// Find an active engram ID by exact ID or term name (case-insensitive).
+fn resolveEngramId(mem_db: *MemoryDb, name_or_id: []const u8) !?[]const u8 {
+    var stmt = try mem_db.db.prepare(
+        "SELECT id FROM engrams WHERE brain_id = ? AND " ++ active_engram_filter ++
+            " AND (id = ? OR LOWER(term) = LOWER(?)) LIMIT 1",
+    );
     defer stmt.finalize();
     try stmt.bindText(1, mem_db.brain_id);
     try stmt.bindText(2, name_or_id);
+    try stmt.bindText(3, name_or_id);
     const result = try stmt.step();
     if (result == .row) {
         const id = stmt.columnText(0) orelse return null;
@@ -316,6 +324,7 @@ const Output = struct {
 const max_definition_chars: usize = 4_000;
 const max_definition_output_chars: usize = 2_000;
 const max_recall_output_chars: usize = 8_000;
+const recall_truncation_notice = "\n\n[... output truncated at 8000 chars. Use mem_get for individual engrams.]";
 
 const ContentViolation = struct {
     kind: enum { injection, sensitive },
@@ -476,8 +485,17 @@ fn sandboxDefinition(out: *Output, definition: []const u8) void {
 fn capOutput(out: *Output) void {
     if (out.buf.items.len > max_recall_output_chars) {
         out.buf.shrinkRetainingCapacity(max_recall_output_chars);
-        out.append("\n\n[... output truncated at 8000 chars. Use mem_get for individual engrams.]");
+        out.append(recall_truncation_notice);
     }
+}
+
+fn appendRecallEngramBounded(out: *Output, term: []const u8, definition: []const u8, memory_term: []const u8, relation: ?[]const u8) bool {
+    const original_len = out.buf.items.len;
+    appendRecallEngram(out, term, definition, memory_term, relation);
+    if (out.buf.items.len <= max_recall_output_chars) return true;
+    out.buf.shrinkRetainingCapacity(original_len);
+    out.append(recall_truncation_notice);
+    return false;
 }
 
 // ── Tool implementations ────────────────────────────────────────────────
@@ -517,7 +535,7 @@ fn toolGet(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         if (id_val != .string) continue;
         const eid = id_val.string;
         if (count > 0) out.append("\n---\n");
-        var stmt = try mem_db.db.prepare("SELECT term, definition, memory_term, weight, created_at, updated_at FROM engrams WHERE id = ? AND brain_id = ?");
+        var stmt = try mem_db.db.prepare("SELECT term, definition, memory_term, weight, created_at, updated_at, deprecated_at, expires_at, recall_count, last_recalled_at FROM engrams WHERE id = ? AND brain_id = ?");
         defer stmt.finalize();
         try stmt.bindText(1, eid);
         try stmt.bindText(2, mem_db.brain_id);
@@ -531,7 +549,14 @@ fn toolGet(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
             const e_weight = stmt.columnReal(3);
             const e_created = stmt.columnText(4) orelse "";
             const e_updated = stmt.columnText(5) orelse "";
-            out.print("**{s}** ({s}, weight: {d:.2})\n{s}\n`id: {s}`\nCreated: {s} | Updated: {s}", .{ e_term, e_mem, e_weight, e_def, eid, e_created, e_updated });
+            const e_deprecated = stmt.columnText(6);
+            const e_expires = stmt.columnText(7);
+            const e_recall_count = stmt.columnInt(8);
+            const e_last_recalled = stmt.columnText(9);
+            out.print("**{s}** ({s}, weight: {d:.2})\n{s}\n`id: {s}`\nCreated: {s} | Updated: {s}\nRecall count: {d}", .{ e_term, e_mem, e_weight, e_def, eid, e_created, e_updated, e_recall_count });
+            if (e_last_recalled) |timestamp| out.print(" | Last recalled: {s}", .{timestamp});
+            if (e_deprecated) |timestamp| out.print("\nDeprecated: {s}", .{timestamp});
+            if (e_expires) |timestamp| out.print("\nExpires: {s}", .{timestamp});
         }
         count += 1;
     }
@@ -639,7 +664,7 @@ fn toolRefactor(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
             return formatViolationError(allocator, v);
     }
 
-    var stmt = try mem_db.db.prepare("UPDATE engrams SET definition = ?, updated_at = datetime('now') WHERE brain_id = ? AND LOWER(term) = LOWER(?)");
+    var stmt = try mem_db.db.prepare("UPDATE engrams SET definition = ?, updated_at = datetime('now') WHERE brain_id = ? AND LOWER(term) = LOWER(?) AND " ++ active_engram_filter);
     defer stmt.finalize();
     try stmt.bindText(1, definition);
     try stmt.bindText(2, mem_db.brain_id);
@@ -656,18 +681,28 @@ fn toolDeprecate(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         return allocator.dupe(u8, "Error: 'term' is required.");
 
     debug_log.log("memory: deprecate term={s}", .{term});
+    try mem_db.db.exec("BEGIN IMMEDIATE");
+    var transaction_open = true;
+    defer if (transaction_open) {
+        debug_log.log("memory: deprecate rolling back term={s}", .{term});
+        mem_db.db.exec("ROLLBACK") catch {};
+    };
 
-    // Find by term
-    var find_stmt = try mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ? AND LOWER(term) = LOWER(?)");
-    defer find_stmt.finalize();
-    try find_stmt.bindText(1, mem_db.brain_id);
-    try find_stmt.bindText(2, term);
-    const result = try find_stmt.step();
-    if (result == .done) return std.fmt.allocPrint(allocator, "Term not found: {s}", .{term});
+    const id = id: {
+        var find_stmt = try mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ? AND LOWER(term) = LOWER(?) AND " ++ active_engram_filter ++ " LIMIT 1");
+        defer find_stmt.finalize();
+        try find_stmt.bindText(1, mem_db.brain_id);
+        try find_stmt.bindText(2, term);
+        if (try find_stmt.step() == .done)
+            return std.fmt.allocPrint(allocator, "Term not found: {s}", .{term});
 
-    const id = find_stmt.columnText(0) orelse return allocator.dupe(u8, "Error reading engram.");
+        const found_id = find_stmt.columnText(0) orelse
+            return allocator.dupe(u8, "Error reading engram.");
+        break :id try allocator.dupe(u8, found_id);
+    };
+    defer allocator.free(id);
 
-    // Delete synapses
+    debug_log.log("memory: deprecate removing links id={s}", .{id});
     {
         var stmt = try mem_db.db.prepare("DELETE FROM synapses WHERE brain_id = ? AND (source_id = ? OR target_id = ?)");
         defer stmt.finalize();
@@ -677,15 +712,19 @@ fn toolDeprecate(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         _ = try stmt.step();
     }
 
-    // Set to short-term with old timestamp to trigger cleanup
+    debug_log.log("memory: deprecate marking id={s}", .{id});
     {
-        var stmt = try mem_db.db.prepare("UPDATE engrams SET memory_term = 'short', created_at = datetime('now', '-25 hours'), updated_at = datetime('now') WHERE id = ?");
+        var stmt = try mem_db.db.prepare("UPDATE engrams SET deprecated_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND brain_id = ? AND " ++ active_engram_filter);
         defer stmt.finalize();
         try stmt.bindText(1, id);
+        try stmt.bindText(2, mem_db.brain_id);
         _ = try stmt.step();
     }
 
-    return std.fmt.allocPrint(allocator, "Deprecated **{s}**. Links removed, set for expiry.", .{term});
+    try mem_db.db.exec("COMMIT");
+    transaction_open = false;
+    debug_log.log("memory: deprecate committed id={s}", .{id});
+    return std.fmt.allocPrint(allocator, "Deprecated **{s}**. Links removed; history retained.", .{term});
 }
 
 fn toolReinforce(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
@@ -737,7 +776,7 @@ fn toolFlush(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     for (ids) |id_val| {
         if (id_val != .string) continue;
         const eid = id_val.string;
-        var stmt = try mem_db.db.prepare("DELETE FROM engrams WHERE id = ? AND brain_id = ? AND memory_term = 'short'");
+        var stmt = try mem_db.db.prepare("DELETE FROM engrams WHERE id = ? AND brain_id = ? AND memory_term = 'short' AND " ++ active_engram_filter);
         defer stmt.finalize();
         try stmt.bindText(1, eid);
         try stmt.bindText(2, mem_db.brain_id);
@@ -763,7 +802,7 @@ fn toolListShortTerm(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     errdefer out.deinit();
     var count: i64 = 0;
 
-    var stmt = try mem_db.db.prepare("SELECT id, term, definition, created_at FROM engrams WHERE brain_id = ? AND memory_term = 'short' ORDER BY created_at DESC LIMIT ?");
+    var stmt = try mem_db.db.prepare("SELECT id, term, definition, created_at FROM engrams WHERE brain_id = ? AND memory_term = 'short' AND " ++ active_engram_filter ++ " ORDER BY created_at DESC LIMIT ?");
     defer stmt.finalize();
     try stmt.bindText(1, mem_db.brain_id);
     try stmt.bindInt(2, limit);
@@ -805,7 +844,10 @@ fn toolConnections(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
             var stmt = try mem_db.db.prepare(
                 \\SELECT s.id, s.relation, s.weight, e.id, e.term
                 \\FROM synapses s JOIN engrams e ON s.target_id = e.id
+                \\JOIN engrams source ON s.source_id = source.id
                 \\WHERE s.brain_id = ? AND s.source_id = ?
+                \\  AND e.deprecated_at IS NULL AND (e.expires_at IS NULL OR datetime(e.expires_at) > datetime('now'))
+                \\  AND source.deprecated_at IS NULL AND (source.expires_at IS NULL OR datetime(source.expires_at) > datetime('now'))
             );
             defer stmt.finalize();
             try stmt.bindText(1, mem_db.brain_id);
@@ -823,7 +865,10 @@ fn toolConnections(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
             var stmt = try mem_db.db.prepare(
                 \\SELECT s.id, s.relation, s.weight, e.id, e.term
                 \\FROM synapses s JOIN engrams e ON s.source_id = e.id
+                \\JOIN engrams target ON s.target_id = target.id
                 \\WHERE s.brain_id = ? AND s.target_id = ?
+                \\  AND e.deprecated_at IS NULL AND (e.expires_at IS NULL OR datetime(e.expires_at) > datetime('now'))
+                \\  AND target.deprecated_at IS NULL AND (target.expires_at IS NULL OR datetime(target.expires_at) > datetime('now'))
             );
             defer stmt.finalize();
             try stmt.bindText(1, mem_db.brain_id);
@@ -874,8 +919,12 @@ fn toolTrace(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         \\    trace.depth + 1
         \\  FROM trace
         \\  JOIN synapses s ON (s.source_id = trace.node OR s.target_id = trace.node)
+        \\  JOIN engrams neighbor ON neighbor.id = CASE WHEN s.source_id = trace.node THEN s.target_id ELSE s.source_id END
         \\  WHERE s.brain_id = ? AND trace.depth < ?
-        \\    AND trace.path NOT LIKE '%' || (SELECT term FROM engrams WHERE id = CASE WHEN s.source_id = trace.node THEN s.target_id ELSE s.source_id END) || '%'
+        \\    AND neighbor.brain_id = ?
+        \\    AND neighbor.deprecated_at IS NULL
+        \\    AND (neighbor.expires_at IS NULL OR datetime(neighbor.expires_at) > datetime('now'))
+        \\    AND trace.path NOT LIKE '%' || neighbor.term || '%'
         \\)
         \\SELECT path || ' -> ' || (SELECT term FROM engrams WHERE id = ?) AS full_path, depth
         \\FROM trace
@@ -902,8 +951,9 @@ fn toolTrace(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     try stmt.bindText(2, source_term);
     try stmt.bindText(3, mem_db.brain_id);
     try stmt.bindInt(4, max_depth);
-    try stmt.bindText(5, to_id);
+    try stmt.bindText(5, mem_db.brain_id);
     try stmt.bindText(6, to_id);
+    try stmt.bindText(7, to_id);
 
     const result = try stmt.step();
     if (result == .done) {
@@ -920,11 +970,17 @@ fn toolStats(mem_db: *MemoryDb) ![]const u8 {
     var out = Output.init(allocator);
     errdefer out.deinit();
 
-    // Total engrams
-    const total = countQuery(mem_db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ?");
-    const short = countQuery(mem_db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND memory_term = 'short'");
-    const long = countQuery(mem_db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND memory_term = 'long'");
-    const synapse_count = countQuery(mem_db, "SELECT COUNT(*) FROM synapses WHERE brain_id = ?");
+    const total = countQuery(mem_db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND " ++ active_engram_filter);
+    const short = countQuery(mem_db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND memory_term = 'short' AND " ++ active_engram_filter);
+    const long = countQuery(mem_db, "SELECT COUNT(*) FROM engrams WHERE brain_id = ? AND memory_term = 'long' AND " ++ active_engram_filter);
+    const synapse_count = countQuery(mem_db,
+        \\SELECT COUNT(*) FROM synapses s
+        \\JOIN engrams source ON source.id = s.source_id
+        \\JOIN engrams target ON target.id = s.target_id
+        \\WHERE s.brain_id = ?
+        \\  AND source.deprecated_at IS NULL AND (source.expires_at IS NULL OR datetime(source.expires_at) > datetime('now'))
+        \\  AND target.deprecated_at IS NULL AND (target.expires_at IS NULL OR datetime(target.expires_at) > datetime('now'))
+    );
 
     out.print("**Memory Stats**\n", .{});
     out.print("- Engrams: {d} ({d} long-term, {d} short-term)\n", .{ total, long, short });
@@ -946,7 +1002,17 @@ fn toolOrphans(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         \\SELECT e.id, e.term
         \\FROM engrams e
         \\WHERE e.brain_id = ?
-        \\  AND NOT EXISTS (SELECT 1 FROM synapses s WHERE s.source_id = e.id OR s.target_id = e.id)
+        \\  AND e.deprecated_at IS NULL
+        \\  AND (e.expires_at IS NULL OR datetime(e.expires_at) > datetime('now'))
+        \\  AND NOT EXISTS (
+        \\    SELECT 1
+        \\    FROM synapses s
+        \\    JOIN engrams counterpart ON counterpart.id = CASE WHEN s.source_id = e.id THEN s.target_id ELSE s.source_id END
+        \\    WHERE (s.source_id = e.id OR s.target_id = e.id)
+        \\      AND counterpart.brain_id = e.brain_id
+        \\      AND counterpart.deprecated_at IS NULL
+        \\      AND (counterpart.expires_at IS NULL OR datetime(counterpart.expires_at) > datetime('now'))
+        \\  )
         \\ORDER BY e.term
         \\LIMIT ?
     );
@@ -977,7 +1043,7 @@ fn toolConnectivity(mem_db: *MemoryDb) ![]const u8 {
     }
 
     {
-        var stmt = try mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ?");
+        var stmt = try mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ? AND " ++ active_engram_filter);
         defer stmt.finalize();
         try stmt.bindText(1, mem_db.brain_id);
         while (try stmt.step() == .row) {
@@ -1026,8 +1092,13 @@ fn toolConnectivity(mem_db: *MemoryDb) ![]const u8 {
 
             // Find neighbors via synapses
             var stmt = try mem_db.db.prepare(
-                \\SELECT CASE WHEN source_id = ? THEN target_id ELSE source_id END
-                \\FROM synapses WHERE brain_id = ? AND (source_id = ? OR target_id = ?)
+                \\SELECT CASE WHEN s.source_id = ? THEN s.target_id ELSE s.source_id END
+                \\FROM synapses s
+                \\JOIN engrams source ON source.id = s.source_id
+                \\JOIN engrams target ON target.id = s.target_id
+                \\WHERE s.brain_id = ? AND (s.source_id = ? OR s.target_id = ?)
+                \\  AND source.deprecated_at IS NULL AND (source.expires_at IS NULL OR datetime(source.expires_at) > datetime('now'))
+                \\  AND target.deprecated_at IS NULL AND (target.expires_at IS NULL OR datetime(target.expires_at) > datetime('now'))
             );
             defer stmt.finalize();
             try stmt.bindText(1, current);
@@ -1064,7 +1135,7 @@ fn toolListTerms(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     errdefer out.deinit();
     var count: i64 = 0;
 
-    var stmt = try mem_db.db.prepare("SELECT id, term, memory_term FROM engrams WHERE brain_id = ? ORDER BY term LIMIT ?");
+    var stmt = try mem_db.db.prepare("SELECT id, term, memory_term FROM engrams WHERE brain_id = ? AND " ++ active_engram_filter ++ " ORDER BY term LIMIT ?");
     defer stmt.finalize();
     try stmt.bindText(1, mem_db.brain_id);
     try stmt.bindInt(2, limit);
@@ -1082,89 +1153,308 @@ fn toolListTerms(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     return out.toOwnedSlice();
 }
 
+const LearnOutcome = union(enum) {
+    pending,
+    learned,
+    duplicate,
+    rejected: []const u8,
+};
+
+const ValidatedLearnItem = struct {
+    term: []const u8,
+    definition: []const u8,
+    associations: []const json.Value,
+    chain_to: []const json.Value,
+    outcome: LearnOutcome,
+};
+
+fn learnValidationError(allocator: Allocator, item_index: usize, field: []const u8, message: []const u8) ![]const u8 {
+    debug_log.log("memory: learn validation rejected item={d} field={s} reason={s}", .{ item_index + 1, field, message });
+    return std.fmt.allocPrint(allocator, "Error: item {d} field '{s}' {s}.", .{ item_index + 1, field, message });
+}
+
+fn requireLearnString(allocator: Allocator, object: json.ObjectMap, item_index: usize, field: []const u8) !union(enum) { value: []const u8, validation_error: []const u8 } {
+    const value = object.get(field) orelse
+        return .{ .validation_error = try learnValidationError(allocator, item_index, field, "is required") };
+    if (value != .string)
+        return .{ .validation_error = try learnValidationError(allocator, item_index, field, "must be a string") };
+    if (value.string.len == 0)
+        return .{ .validation_error = try learnValidationError(allocator, item_index, field, "must not be empty") };
+    return .{ .value = value.string };
+}
+
+fn optionalLearnArray(allocator: Allocator, object: json.ObjectMap, item_index: usize, field: []const u8) !union(enum) { value: []const json.Value, validation_error: []const u8 } {
+    const value = object.get(field) orelse return .{ .value = &.{} };
+    if (value != .array)
+        return .{ .validation_error = try learnValidationError(allocator, item_index, field, "must be an array") };
+    return .{ .value = value.array.items };
+}
+
+fn findEngramIdByTerm(mem_db: *MemoryDb, term: []const u8) !?[]const u8 {
+    var stmt = try mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ? AND LOWER(term) = LOWER(?) AND " ++ active_engram_filter ++ " LIMIT 1");
+    defer stmt.finalize();
+    try stmt.bindText(1, mem_db.brain_id);
+    try stmt.bindText(2, term);
+    if (try stmt.step() == .done) return null;
+    const id = stmt.columnText(0) orelse return null;
+    return try mem_db.allocator.dupe(u8, id);
+}
+
+fn insertEngram(mem_db: *MemoryDb, term: []const u8, definition: []const u8) ![36]u8 {
+    const id_buf = generateUuid();
+    var stmt = try mem_db.db.prepare("INSERT INTO engrams (id, brain_id, term, definition) VALUES (?, ?, ?, ?)");
+    defer stmt.finalize();
+    try stmt.bindText(1, &id_buf);
+    try stmt.bindText(2, mem_db.brain_id);
+    try stmt.bindText(3, term);
+    try stmt.bindText(4, definition);
+    _ = try stmt.step();
+    return id_buf;
+}
+
+fn rollbackLearnValidation(mem_db: *MemoryDb, transaction_open: *bool, item_index: usize, field: []const u8, message: []const u8) ![]const u8 {
+    debug_log.log("memory: batch learn rolling back validation failure item={d} field={s}", .{ item_index + 1, field });
+    try mem_db.db.exec("ROLLBACK");
+    transaction_open.* = false;
+    return learnValidationError(mem_db.allocator, item_index, field, message);
+}
+
 fn toolBulkLearn(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     const allocator = mem_db.allocator;
     const items = getArrayArg(arguments, "items") orelse
         return allocator.dupe(u8, "Error: 'items' is required.");
 
-    debug_log.log("memory: batch learn count={d}", .{items.len});
+    debug_log.log("memory: batch learn validating count={d}", .{items.len});
 
-    try mem_db.db.exec("BEGIN");
-    errdefer mem_db.db.exec("ROLLBACK") catch {};
+    var validated = try std.ArrayListUnmanaged(ValidatedLearnItem).initCapacity(allocator, items.len);
+    defer validated.deinit(allocator);
 
-    var out = Output.init(allocator);
-    errdefer out.deinit();
-    var count: usize = 0;
+    for (items, 0..) |item, item_index| {
+        if (item != .object)
+            return learnValidationError(allocator, item_index, "item", "must be an object");
 
-    for (items) |item| {
-        if (item != .object) continue;
-        const term = blk: {
-            const v = item.object.get("term") orelse continue;
-            if (v != .string) continue;
-            break :blk v.string;
+        const term_result = try requireLearnString(allocator, item.object, item_index, "term");
+        const term = switch (term_result) {
+            .value => |value| value,
+            .validation_error => |message| return message,
         };
-        const definition = blk: {
-            const v = item.object.get("definition") orelse continue;
-            if (v != .string) continue;
-            break :blk v.string;
+        const definition_result = try requireLearnString(allocator, item.object, item_index, "definition");
+        const definition = switch (definition_result) {
+            .value => |value| value,
+            .validation_error => |message| return message,
+        };
+        const associations_result = try optionalLearnArray(allocator, item.object, item_index, "associations");
+        const associations = switch (associations_result) {
+            .value => |value| value,
+            .validation_error => |message| return message,
+        };
+        const chain_result = try optionalLearnArray(allocator, item.object, item_index, "chain_to");
+        const chain_to = switch (chain_result) {
+            .value => |value| value,
+            .validation_error => |message| return message,
         };
 
-        // Content validation
-        const is_unsafe = blk_v: {
-            if (definition.len > max_definition_chars) {
-                if (count > 0) out.append("\n");
-                out.print("- Rejected **{s}** (definition exceeds 4,000 character limit)", .{term});
-                count += 1;
-                break :blk_v true;
+        for (associations, 0..) |association, association_index| {
+            var field_buf: [64]u8 = undefined;
+            const field = try std.fmt.bufPrint(&field_buf, "associations[{d}]", .{association_index + 1});
+            if (association != .object)
+                return learnValidationError(allocator, item_index, field, "must be an object");
+            for ([_][]const u8{ "target", "predicate" }) |key| {
+                const value = association.object.get(key) orelse {
+                    const nested_field = try std.fmt.bufPrint(&field_buf, "associations[{d}].{s}", .{ association_index + 1, key });
+                    return learnValidationError(allocator, item_index, nested_field, "is required");
+                };
+                if (value != .string or value.string.len == 0) {
+                    const nested_field = try std.fmt.bufPrint(&field_buf, "associations[{d}].{s}", .{ association_index + 1, key });
+                    return learnValidationError(allocator, item_index, nested_field, "must be a non-empty string");
+                }
             }
-            const combined = std.fmt.allocPrint(allocator, "{s} {s}", .{ term, definition }) catch break :blk_v false;
+        }
+
+        for (chain_to, 0..) |step, step_index| {
+            var field_buf: [64]u8 = undefined;
+            const field = try std.fmt.bufPrint(&field_buf, "chain_to[{d}]", .{step_index + 1});
+            if (step != .object)
+                return learnValidationError(allocator, item_index, field, "must be an object");
+            for ([_][]const u8{ "term", "definition", "predicate" }) |key| {
+                const value = step.object.get(key) orelse {
+                    const nested_field = try std.fmt.bufPrint(&field_buf, "chain_to[{d}].{s}", .{ step_index + 1, key });
+                    return learnValidationError(allocator, item_index, nested_field, "is required");
+                };
+                if (value != .string or value.string.len == 0) {
+                    const nested_field = try std.fmt.bufPrint(&field_buf, "chain_to[{d}].{s}", .{ step_index + 1, key });
+                    return learnValidationError(allocator, item_index, nested_field, "must be a non-empty string");
+                }
+            }
+            const step_definition = step.object.get("definition").?.string;
+            if (step_definition.len > max_definition_chars) {
+                const nested_field = try std.fmt.bufPrint(&field_buf, "chain_to[{d}].definition", .{step_index + 1});
+                return learnValidationError(allocator, item_index, nested_field, "exceeds the 4,000 character limit");
+            }
+            const combined = try std.fmt.allocPrint(allocator, "{s} {s}", .{ step.object.get("term").?.string, step_definition });
             defer allocator.free(combined);
-            if (validateContentSafety(combined)) |v| {
-                if (count > 0) out.append("\n");
-                out.print("- Rejected **{s}** ({s})", .{ term, v.reason });
-                count += 1;
-                break :blk_v true;
+            if (validateContentSafety(combined)) |violation| {
+                const nested_field = try std.fmt.bufPrint(&field_buf, "chain_to[{d}]", .{step_index + 1});
+                return learnValidationError(allocator, item_index, nested_field, violation.reason);
             }
-            break :blk_v false;
-        };
-        if (is_unsafe) continue;
+        }
 
-        // Check for exact duplicate
-        const exists = blk: {
-            var stmt = mem_db.db.prepare("SELECT id FROM engrams WHERE brain_id = ? AND LOWER(term) = LOWER(?)") catch break :blk false;
-            defer stmt.finalize();
-            stmt.bindText(1, mem_db.brain_id) catch break :blk false;
-            stmt.bindText(2, term) catch break :blk false;
-            const result = stmt.step() catch break :blk false;
-            break :blk result == .row;
+        var outcome: LearnOutcome = .pending;
+        if (definition.len > max_definition_chars) {
+            outcome = .{ .rejected = "definition exceeds 4,000 character limit" };
+        } else {
+            const combined = try std.fmt.allocPrint(allocator, "{s} {s}", .{ term, definition });
+            defer allocator.free(combined);
+            if (validateContentSafety(combined)) |violation|
+                outcome = .{ .rejected = violation.reason };
+        }
+
+        validated.appendAssumeCapacity(.{
+            .term = term,
+            .definition = definition,
+            .associations = associations,
+            .chain_to = chain_to,
+            .outcome = outcome,
+        });
+    }
+
+    debug_log.log("memory: batch learn transaction begin count={d}", .{validated.items.len});
+    try mem_db.db.exec("BEGIN");
+    var transaction_open = true;
+    errdefer |err| if (transaction_open) {
+        debug_log.log("memory: batch learn database error={s}; rolling back", .{@errorName(err)});
+        mem_db.db.exec("ROLLBACK") catch |rollback_err| {
+            debug_log.log("memory: batch learn rollback failed: {s}", .{@errorName(rollback_err)});
         };
-        if (exists) {
-            if (count > 0) out.append("\n");
-            out.print("- Skipped **{s}** (duplicate)", .{term});
-            count += 1;
+    };
+
+    // Insert every accepted top-level concept first so references within this batch resolve.
+    for (validated.items) |*item| {
+        switch (item.outcome) {
+            .rejected => continue,
+            else => {},
+        }
+        if (try findEngramIdByTerm(mem_db, item.term)) |existing_id| {
+            allocator.free(existing_id);
+            item.outcome = .duplicate;
             continue;
         }
+        _ = try insertEngram(mem_db, item.term, item.definition);
+        item.outcome = .learned;
+    }
 
-        const id_buf = generateUuid();
-        {
-            var stmt = try mem_db.db.prepare("INSERT INTO engrams (id, brain_id, term, definition) VALUES (?, ?, ?, ?)");
-            defer stmt.finalize();
-            try stmt.bindText(1, &id_buf);
-            try stmt.bindText(2, mem_db.brain_id);
-            try stmt.bindText(3, term);
-            try stmt.bindText(4, definition);
-            _ = try stmt.step();
+    // Create explicit associations only after all top-level inserts are visible.
+    for (validated.items, 0..) |item, item_index| {
+        switch (item.outcome) {
+            .rejected => continue,
+            else => {},
         }
-        if (count > 0) out.append("\n");
-        out.print("- Learned **{s}**", .{term});
-        count += 1;
+        const source_id = (try findEngramIdByTerm(mem_db, item.term)).?;
+        defer allocator.free(source_id);
+        for (item.associations, 0..) |association, association_index| {
+            const target_name = association.object.get("target").?.string;
+            const target_id = try resolveEngramId(mem_db, target_name) orelse {
+                var field_buf: [64]u8 = undefined;
+                const field = try std.fmt.bufPrint(&field_buf, "associations[{d}].target", .{association_index + 1});
+                return rollbackLearnValidation(mem_db, &transaction_open, item_index, field, "does not resolve to an engram");
+            };
+            defer allocator.free(target_id);
+            const predicate = association.object.get("predicate").?.string;
+            _ = createSynapse(mem_db, source_id, target_id, predicate, 1.0) catch |err| {
+                debug_log.log("memory: batch learn association database error item={d} association={d}: {s}", .{ item_index + 1, association_index + 1, @errorName(err) });
+                return switch (err) {
+                    error.SqliteError => error.SqliteError,
+                    error.SqliteBusy => error.SqliteBusy,
+                    error.SqliteConstraint => error.SqliteConstraint,
+                    error.SqliteMisuse => error.SqliteMisuse,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            };
+        }
+    }
+
+    // Build each chain in order: item -> step 1 -> step 2.
+    for (validated.items, 0..) |item, item_index| {
+        switch (item.outcome) {
+            .rejected => continue,
+            else => {},
+        }
+        var previous_id = (try findEngramIdByTerm(mem_db, item.term)).?;
+        defer allocator.free(previous_id);
+        for (item.chain_to, 0..) |step, step_index| {
+            const step_term = step.object.get("term").?.string;
+            const step_definition = step.object.get("definition").?.string;
+            const step_id = if (try findEngramIdByTerm(mem_db, step_term)) |existing_id|
+                existing_id
+            else blk: {
+                const inserted_id = try insertEngram(mem_db, step_term, step_definition);
+                break :blk try allocator.dupe(u8, &inserted_id);
+            };
+            const predicate = step.object.get("predicate").?.string;
+            _ = createSynapse(mem_db, previous_id, step_id, predicate, 1.0) catch |err| {
+                allocator.free(step_id);
+                debug_log.log("memory: batch learn chain database error item={d} step={d}: {s}", .{ item_index + 1, step_index + 1, @errorName(err) });
+                return switch (err) {
+                    error.SqliteError => error.SqliteError,
+                    error.SqliteBusy => error.SqliteBusy,
+                    error.SqliteConstraint => error.SqliteConstraint,
+                    error.SqliteMisuse => error.SqliteMisuse,
+                    error.OutOfMemory => error.OutOfMemory,
+                };
+            };
+            allocator.free(previous_id);
+            previous_id = step_id;
+        }
     }
 
     try mem_db.db.exec("COMMIT");
-    debug_log.log("memory: batch learn committed {d} items", .{count});
+    transaction_open = false;
+    debug_log.log("memory: batch learn committed {d} items", .{validated.items.len});
 
-    if (count == 0) out.append("No items to learn.");
+    var out = Output.init(allocator);
+    errdefer out.deinit();
+    for (validated.items, 0..) |item, index| {
+        if (index > 0) out.append("\n");
+        switch (item.outcome) {
+            .learned => out.print("- Learned **{s}**", .{item.term}),
+            .duplicate => out.print("- Skipped **{s}** (duplicate)", .{item.term}),
+            .rejected => |reason| out.print("- Rejected **{s}** ({s})", .{ item.term, reason }),
+            .pending => unreachable,
+        }
+    }
+    if (validated.items.len == 0) out.append("No items to learn.");
     return out.toOwnedSlice();
+}
+
+const ValidatedAssociation = struct {
+    source_name: []const u8,
+    target_name: []const u8,
+    source_id: []const u8,
+    target_id: []const u8,
+    relation: []const u8,
+    weight: f64,
+
+    fn deinit(self: ValidatedAssociation, allocator: Allocator) void {
+        allocator.free(self.source_id);
+        allocator.free(self.target_id);
+    }
+};
+
+fn associationValidationError(allocator: Allocator, item_index: usize, field: []const u8, message: []const u8) ![]const u8 {
+    debug_log.log("memory: associate validation rejected item={d} field={s} reason={s}", .{ item_index + 1, field, message });
+    return std.fmt.allocPrint(allocator, "Error: item {d} field '{s}' {s}.", .{ item_index + 1, field, message });
+}
+
+fn parseAssociationName(allocator: Allocator, item: json.Value, item_index: usize, field: []const u8) !union(enum) { value: []const u8, validation_error: []const u8 } {
+    if (item != .object)
+        return .{ .validation_error = try associationValidationError(allocator, item_index, "item", "must be an object") };
+    const value = item.object.get(field) orelse
+        return .{ .validation_error = try associationValidationError(allocator, item_index, field, "is required") };
+    if (value != .string)
+        return .{ .validation_error = try associationValidationError(allocator, item_index, field, "must be a string") };
+    if (value.string.len == 0)
+        return .{ .validation_error = try associationValidationError(allocator, item_index, field, "must not be empty") };
+    return .{ .value = value.string };
 }
 
 fn toolBulkAssociate(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
@@ -1172,55 +1462,181 @@ fn toolBulkAssociate(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     const items = getArrayArg(arguments, "items") orelse
         return allocator.dupe(u8, "Error: 'items' is required.");
 
-    debug_log.log("memory: batch associate count={d}", .{items.len});
+    debug_log.log("memory: batch associate validating count={d}", .{items.len});
 
+    var validated = try std.ArrayListUnmanaged(ValidatedAssociation).initCapacity(allocator, items.len);
+    defer {
+        for (validated.items) |association| association.deinit(allocator);
+        validated.deinit(allocator);
+    }
+
+    for (items, 0..) |item, item_index| {
+        const source_result = try parseAssociationName(allocator, item, item_index, "source");
+        const source_name = switch (source_result) {
+            .value => |value| value,
+            .validation_error => |message| return message,
+        };
+        const target_result = try parseAssociationName(allocator, item, item_index, "target");
+        const target_name = switch (target_result) {
+            .value => |value| value,
+            .validation_error => |message| return message,
+        };
+
+        const relation = if (item.object.get("relation")) |value| blk: {
+            if (value != .string)
+                return associationValidationError(allocator, item_index, "relation", "must be a string");
+            if (value.string.len == 0)
+                return associationValidationError(allocator, item_index, "relation", "must not be empty");
+            break :blk value.string;
+        } else "related_to";
+
+        const weight = if (item.object.get("weight")) |value| switch (value) {
+            .float => value.float,
+            .integer => @as(f64, @floatFromInt(value.integer)),
+            else => return associationValidationError(allocator, item_index, "weight", "must be a number from 0.0 through 1.0"),
+        } else 1.0;
+        if (!std.math.isFinite(weight) or weight < 0.0 or weight > 1.0)
+            return associationValidationError(allocator, item_index, "weight", "must be a finite number from 0.0 through 1.0");
+
+        const source_id = try resolveEngramId(mem_db, source_name) orelse
+            return associationValidationError(allocator, item_index, "source", "does not resolve to an engram");
+        errdefer allocator.free(source_id);
+        const target_id = try resolveEngramId(mem_db, target_name) orelse
+            return associationValidationError(allocator, item_index, "target", "does not resolve to an engram");
+        errdefer allocator.free(target_id);
+
+        validated.appendAssumeCapacity(.{
+            .source_name = source_name,
+            .target_name = target_name,
+            .source_id = source_id,
+            .target_id = target_id,
+            .relation = relation,
+            .weight = weight,
+        });
+    }
+
+    debug_log.log("memory: batch associate transaction begin count={d}", .{validated.items.len});
     try mem_db.db.exec("BEGIN");
-    errdefer mem_db.db.exec("ROLLBACK") catch {};
+    errdefer {
+        debug_log.log("memory: batch associate rolling back after database error", .{});
+        mem_db.db.exec("ROLLBACK") catch |rollback_err| {
+            debug_log.log("memory: batch associate rollback failed: {s}", .{@errorName(rollback_err)});
+        };
+    }
 
     var out = Output.init(allocator);
     errdefer out.deinit();
-    var count: usize = 0;
-
-    for (items) |item| {
-        if (item != .object) continue;
-        const source_name = blk: {
-            const v = item.object.get("source") orelse continue;
-            if (v != .string) continue;
-            break :blk v.string;
+    for (validated.items, 0..) |association, index| {
+        _ = createSynapse(mem_db, association.source_id, association.target_id, association.relation, association.weight) catch |err| {
+            debug_log.log("memory: batch associate database error item={d}: {s}", .{ index + 1, @errorName(err) });
+            return err;
         };
-        const target_name = blk: {
-            const v = item.object.get("target") orelse continue;
-            if (v != .string) continue;
-            break :blk v.string;
-        };
-        const relation = blk: {
-            const v = item.object.get("relation") orelse break :blk "related_to";
-            if (v != .string) break :blk "related_to";
-            break :blk v.string;
-        };
-
-        const source_id = resolveEngramId(mem_db, source_name) catch continue orelse continue;
-        defer allocator.free(source_id);
-        const target_id = resolveEngramId(mem_db, target_name) catch continue orelse continue;
-        defer allocator.free(target_id);
-
-        _ = createSynapse(mem_db, source_id, target_id, relation, 1.0) catch continue;
-        if (count > 0) out.append("\n");
-        out.print("- Linked {s} -> {s}", .{ source_name, target_name });
-        count += 1;
+        if (index > 0) out.append("\n");
+        out.print("- Linked {s} -> {s}", .{ association.source_name, association.target_name });
     }
 
     try mem_db.db.exec("COMMIT");
-    debug_log.log("memory: batch associate committed {d} items", .{count});
+    debug_log.log("memory: batch associate committed {d} items", .{validated.items.len});
 
-    if (count == 0) out.append("No associations created.");
+    if (validated.items.len == 0) out.append("No associations created.");
     return out.toOwnedSlice();
+}
+
+const default_recall_limit: i64 = 5;
+const max_recall_limit: i64 = 100;
+const recall_strength_increment: f64 = 0.03;
+
+fn recallLimit(arguments: ?json.Value) i64 {
+    return std.math.clamp(getIntArg(arguments, "limit", default_recall_limit), 1, max_recall_limit);
+}
+
+fn appendRecallEngram(out: *Output, term: []const u8, definition: []const u8, memory_term: []const u8, relation: ?[]const u8) void {
+    if (relation) |predicate|
+        out.print("**{s}** ({s}, via {s}): ", .{ term, memory_term, predicate })
+    else
+        out.print("**{s}** ({s}): ", .{ term, memory_term });
+    sandboxDefinition(out, definition);
+    out.append("\n");
+}
+
+fn strengthenSynapse(mem_db: *MemoryDb, synapse_id: []const u8) !void {
+    var stmt = try mem_db.db.prepare("UPDATE synapses SET weight = MIN(weight + ?, 1.0) WHERE id = ? AND brain_id = ?");
+    defer stmt.finalize();
+    try stmt.bindReal(1, recall_strength_increment);
+    try stmt.bindText(2, synapse_id);
+    try stmt.bindText(3, mem_db.brain_id);
+    _ = try stmt.step();
+}
+
+const RecallExpansionHit = struct {
+    engram_id: []const u8,
+    synapse_id: []const u8,
+};
+
+fn expandRecallNeighbors(mem_db: *MemoryDb, out: *Output, seen: *std.StringHashMapUnmanaged(void), seed_ids: []const []const u8, result_count: *usize, limit: usize) !void {
+    debug_log.log("memory: recall graph expansion seeds={d} remaining={d}", .{ seed_ids.len, limit - result_count.* });
+    var hits = std.ArrayListUnmanaged(RecallExpansionHit).empty;
+    defer {
+        for (hits.items) |hit| mem_db.allocator.free(hit.synapse_id);
+        hits.deinit(mem_db.allocator);
+    }
+
+    for (seed_ids) |seed_id| {
+        if (result_count.* >= limit) break;
+        {
+            var stmt = try mem_db.db.prepare(
+                \\SELECT s.id, e.id, e.term, e.definition, e.memory_term, s.relation
+                \\FROM synapses s
+                \\JOIN engrams e ON e.id = CASE WHEN s.source_id = ? THEN s.target_id ELSE s.source_id END
+                \\WHERE s.brain_id = ? AND e.brain_id = ? AND (s.source_id = ? OR s.target_id = ?)
+                \\  AND e.deprecated_at IS NULL
+                \\  AND (e.expires_at IS NULL OR datetime(e.expires_at) > datetime('now'))
+                \\ORDER BY s.weight DESC, e.weight DESC, LOWER(e.term), e.id, s.id
+            );
+            defer stmt.finalize();
+            try stmt.bindText(1, seed_id);
+            try stmt.bindText(2, mem_db.brain_id);
+            try stmt.bindText(3, mem_db.brain_id);
+            try stmt.bindText(4, seed_id);
+            try stmt.bindText(5, seed_id);
+
+            while (result_count.* < limit and try stmt.step() == .row) {
+                const synapse_id = stmt.columnText(0) orelse continue;
+                const neighbor_id = stmt.columnText(1) orelse continue;
+                if (seen.contains(neighbor_id)) continue;
+                const term = stmt.columnText(2) orelse continue;
+                const definition = stmt.columnText(3) orelse continue;
+                const memory_term = stmt.columnText(4) orelse "short";
+                const relation = stmt.columnText(5) orelse "related_to";
+                if (!appendRecallEngramBounded(out, term, definition, memory_term, relation)) {
+                    debug_log.log("memory: recall expansion stopped at output cap", .{});
+                    break;
+                }
+
+                const owned_id = try mem_db.allocator.dupe(u8, neighbor_id);
+                errdefer mem_db.allocator.free(owned_id);
+                try seen.put(mem_db.allocator, owned_id, {});
+                const owned_synapse_id = try mem_db.allocator.dupe(u8, synapse_id);
+                errdefer mem_db.allocator.free(owned_synapse_id);
+                try hits.append(mem_db.allocator, .{ .engram_id = owned_id, .synapse_id = owned_synapse_id });
+                result_count.* += 1;
+            }
+        }
+    }
+
+    debug_log.log("memory: recall recording expanded={d}", .{hits.items.len});
+    for (hits.items) |hit| {
+        try recordRecall(mem_db, hit.engram_id);
+        try strengthenWeight(mem_db, hit.engram_id);
+        try strengthenSynapse(mem_db, hit.synapse_id);
+    }
 }
 
 fn toolBulkRecall(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
     const allocator = mem_db.allocator;
     const queries = getArrayArg(arguments, "queries") orelse
         return allocator.dupe(u8, "Error: 'queries' is required.");
+    const limit: usize = @intCast(recallLimit(arguments));
 
     var out = Output.init(allocator);
     errdefer out.deinit();
@@ -1230,40 +1646,69 @@ fn toolBulkRecall(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         if (i > 0) out.append("\n\n---\n\n");
         out.print("## Query: {s}\n\n", .{q.string});
 
-        // Reuse recall logic inline
         const fts_query = buildFtsQuery(allocator, q.string);
-        if (fts_query) |fq| {
-            defer allocator.free(fq);
-            var stmt = mem_db.db.prepare(
-                \\SELECT e.id, e.term, e.definition, e.memory_term
-                \\FROM engrams e
-                \\WHERE e.brain_id = ? AND e.rowid IN (
-                \\  SELECT rowid FROM engrams_fts WHERE engrams_fts MATCH ?
-                \\)
-                \\ORDER BY e.weight DESC
-                \\LIMIT 5
-            ) catch {
-                out.append("Search error.");
-                continue;
-            };
-            defer stmt.finalize();
-            stmt.bindText(1, mem_db.brain_id) catch continue;
-            stmt.bindText(2, fq) catch continue;
-
-            var found = false;
-            while (stmt.step() catch break == .row) {
-                const e_term = stmt.columnText(1) orelse continue;
-                const e_def = stmt.columnText(2) orelse continue;
-                const e_mem = stmt.columnText(3) orelse "short";
-                out.print("**{s}** ({s}): ", .{ e_term, e_mem });
-                sandboxDefinition(&out, e_def);
-                out.append("\n");
-                found = true;
-            }
-            if (!found) out.append("No results.");
-        } else {
+        if (fts_query == null) {
             out.append("No results.");
+            continue;
         }
+        const fq = fts_query.?;
+        defer allocator.free(fq);
+
+        // FTS5 bm25 values are negative with better matches more negative. Multiplying
+        // by a bounded positive memory weight boosts reinforced results without letting
+        // corrupted weights dominate; term and ID keep equal scores deterministic.
+        debug_log.log("memory: recall ranking query={s} limit={d} formula=bm25*clamp(weight,0.1,10.0)", .{ q.string, limit });
+        var stmt = mem_db.db.prepare(
+            \\SELECT e.id, e.term, e.definition, e.memory_term,
+            \\       bm25(engrams_fts, 10.0, 1.0) * MIN(MAX(e.weight, 0.1), 10.0) AS combined_rank
+            \\FROM engrams_fts
+            \\JOIN engrams e ON e.rowid = engrams_fts.rowid
+            \\WHERE e.brain_id = ? AND engrams_fts MATCH ?
+            \\  AND e.deprecated_at IS NULL
+            \\  AND (e.expires_at IS NULL OR datetime(e.expires_at) > datetime('now'))
+            \\ORDER BY combined_rank ASC, LOWER(e.term), e.id
+            \\LIMIT ?
+        ) catch |err| {
+            debug_log.log("memory: recall ranking prepare failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        defer stmt.finalize();
+        try stmt.bindText(1, mem_db.brain_id);
+        try stmt.bindText(2, fq);
+        try stmt.bindInt(3, @intCast(limit));
+
+        var seen = std.StringHashMapUnmanaged(void){};
+        defer {
+            var iterator = seen.keyIterator();
+            while (iterator.next()) |id| allocator.free(id.*);
+            seen.deinit(allocator);
+        }
+        var seed_ids = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, limit);
+        defer seed_ids.deinit(allocator);
+
+        var result_count: usize = 0;
+        while (try stmt.step() == .row) {
+            const engram_id = stmt.columnText(0) orelse continue;
+            const term = stmt.columnText(1) orelse continue;
+            const definition = stmt.columnText(2) orelse continue;
+            const memory_term = stmt.columnText(3) orelse "short";
+            if (!appendRecallEngramBounded(&out, term, definition, memory_term, null)) {
+                debug_log.log("memory: recall seeds stopped at output cap", .{});
+                break;
+            }
+
+            const owned_id = try allocator.dupe(u8, engram_id);
+            errdefer allocator.free(owned_id);
+            try seen.put(allocator, owned_id, {});
+            try seed_ids.append(allocator, owned_id);
+            try recordRecall(mem_db, engram_id);
+            try strengthenWeight(mem_db, engram_id);
+            result_count += 1;
+        }
+
+        if (result_count < limit and !std.mem.endsWith(u8, out.buf.items, recall_truncation_notice))
+            try expandRecallNeighbors(mem_db, &out, &seen, seed_ids.items, &result_count, limit);
+        if (result_count == 0) out.append("No results.");
     }
 
     capOutput(&out);
@@ -1273,6 +1718,13 @@ fn toolBulkRecall(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 fn createSynapse(mem_db: *MemoryDb, source_id: []const u8, target_id: []const u8, relation: []const u8, weight: f64) ![36]u8 {
+    if (resolveEngramId(mem_db, source_id) catch |err| return err) |resolved| {
+        mem_db.allocator.free(resolved);
+    } else return error.SqliteConstraint;
+    if (resolveEngramId(mem_db, target_id) catch |err| return err) |resolved| {
+        mem_db.allocator.free(resolved);
+    } else return error.SqliteConstraint;
+
     debug_log.log("memory: creating synapse {s} -> {s}", .{ source_id, target_id });
     const id_buf = generateUuid();
 
@@ -1320,6 +1772,17 @@ fn appendNeighbors(mem_db: *MemoryDb, out: *Output, engram_id: []const u8) !void
         }
         out.print(" {s}({s})", .{ n_term, n_rel });
     }
+}
+
+fn recordRecall(mem_db: *MemoryDb, engram_id: []const u8) !void {
+    debug_log.log("memory: recording recall id={s}", .{engram_id});
+    var stmt = try mem_db.db.prepare(
+        "UPDATE engrams SET recall_count = recall_count + 1, last_recalled_at = datetime('now') WHERE id = ? AND brain_id = ?",
+    );
+    defer stmt.finalize();
+    try stmt.bindText(1, engram_id);
+    try stmt.bindText(2, mem_db.brain_id);
+    _ = try stmt.step();
 }
 
 fn strengthenWeight(mem_db: *MemoryDb, engram_id: []const u8) !void {
@@ -1696,6 +2159,52 @@ test "associate and connections" {
     try std.testing.expect(std.mem.indexOf(u8, conn_result, "Concept B") != null);
 }
 
+test "associate honors explicit and default weights" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('a1', 'test', 'Source', 'Def')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('b1', 'test', 'Weighted', 'Def')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('c1', 'test', 'Defaulted', 'Def')");
+
+    const args = try parseTestJson(
+        \\{"items":[{"source":"Source","target":"Weighted","weight":0.25},{"source":"Source","target":"Defaulted"}]}
+    );
+    defer args.deinit();
+    const result = try toolAssociate(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    var stmt = try db.prepare("SELECT target_id, weight FROM synapses WHERE brain_id = 'test' ORDER BY target_id");
+    defer stmt.finalize();
+    try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+    try std.testing.expectEqualStrings("b1", stmt.columnText(0).?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), stmt.columnReal(1), 0.0001);
+    try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+    try std.testing.expectEqualStrings("c1", stmt.columnText(0).?);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), stmt.columnReal(1), 0.0001);
+}
+
+test "associate rejects invalid weights before writing" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('a1', 'test', 'Source', 'Def')");
+    try db.exec("INSERT INTO engrams (id, brain_id, term, definition) VALUES ('b1', 'test', 'Target', 'Def')");
+
+    const args = try parseTestJson(
+        \\{"items":[{"source":"Source","target":"Target","weight":1.01}]}
+    );
+    defer args.deinit();
+    const result = try toolAssociate(&mem, args.value);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "item 1 field 'weight'") != null);
+    try std.testing.expectEqual(@as(i64, 0), countQuery(&mem, "SELECT COUNT(*) FROM synapses WHERE brain_id = ?"));
+}
+
 test "reinforce short to long" {
     var db = try Db.open(":memory:");
     defer db.close();
@@ -1798,6 +2307,90 @@ test "learn with items array (batch)" {
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "Bulk A") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Bulk B") != null);
+}
+
+test "bulk learn resolves intra-batch associations and ordered chains" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    const args = try parseTestJson(
+        \\{"items":[{"term":"Batch Source","definition":"Source definition","associations":[{"target":"Batch Target","predicate":"requires"}],"chain_to":[{"term":"Chain One","definition":"First chain step","predicate":"leads_to"},{"term":"Chain Two","definition":"Second chain step","predicate":"enables"}]},{"term":"Batch Target","definition":"Target definition"}]}
+    );
+    defer args.deinit();
+    const result = try toolLearn(&mem, args.value);
+    defer std.testing.allocator.free(result);
+
+    var stmt = try db.prepare(
+        \\SELECT source.term, target.term, s.relation
+        \\FROM synapses s
+        \\JOIN engrams source ON source.id = s.source_id
+        \\JOIN engrams target ON target.id = s.target_id
+        \\WHERE s.brain_id = 'test'
+        \\ORDER BY source.term, target.term
+    );
+    defer stmt.finalize();
+
+    const expected = [_][3][]const u8{
+        .{ "Batch Source", "Batch Target", "requires" },
+        .{ "Batch Source", "Chain One", "leads_to" },
+        .{ "Chain One", "Chain Two", "enables" },
+    };
+    for (expected) |edge| {
+        try std.testing.expectEqual(sqlite.StepResult.row, try stmt.step());
+        try std.testing.expectEqualStrings(edge[0], stmt.columnText(0).?);
+        try std.testing.expectEqualStrings(edge[1], stmt.columnText(1).?);
+        try std.testing.expectEqualStrings(edge[2], stmt.columnText(2).?);
+    }
+    try std.testing.expectEqual(sqlite.StepResult.done, try stmt.step());
+}
+
+test "bulk learn reports structural validation errors without writes" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    const args = try parseTestJson(
+        \\{"items":[{"term":"Valid First","definition":"Would otherwise be inserted"},{"term":"Missing Definition"}]}
+    );
+    defer args.deinit();
+    const result = try toolLearn(&mem, args.value);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "item 2 field 'definition'") != null);
+    try std.testing.expectEqual(@as(i64, 0), countQuery(&mem, "SELECT COUNT(*) FROM engrams WHERE brain_id = ?"));
+}
+
+test "bulk learn rolls back unresolved association targets" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+
+    const args = try parseTestJson(
+        \\{"items":[{"term":"Rollback Source","definition":"Should be rolled back","associations":[{"target":"Missing Target","predicate":"requires"}]}]}
+    );
+    defer args.deinit();
+    const result = try toolLearn(&mem, args.value);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "item 1 field 'associations[1].target'") != null);
+    try std.testing.expectEqual(@as(i64, 0), countQuery(&mem, "SELECT COUNT(*) FROM engrams WHERE brain_id = ?"));
+}
+
+test "bulk learn propagates database failures and rolls back" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    try memory_schema.ensureSchema(&db);
+    var mem = MemoryDb{ .db = db, .brain_id = "test", .allocator = std.testing.allocator };
+    try db.exec("CREATE TRIGGER reject_test_synapse BEFORE INSERT ON synapses BEGIN SELECT RAISE(ABORT, 'rejected'); END");
+
+    const args = try parseTestJson(
+        \\{"items":[{"term":"Failure Source","definition":"Should be rolled back","associations":[{"target":"Failure Target","predicate":"requires"}]},{"term":"Failure Target","definition":"Should also be rolled back"}]}
+    );
+    defer args.deinit();
+    try std.testing.expectError(error.SqliteConstraint, toolLearn(&mem, args.value));
+    try std.testing.expectEqual(@as(i64, 0), countQuery(&mem, "SELECT COUNT(*) FROM engrams WHERE brain_id = ?"));
 }
 
 test "trace path" {
