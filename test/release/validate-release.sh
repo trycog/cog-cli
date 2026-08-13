@@ -254,7 +254,7 @@ end
     case "$integrity_mode" in
         good) ;;
         bad-checksum)
-            ruby -pi -e 'sub(/\A./, "0") if $. == 1' "$fixture/artifacts/SHA256SUMS"
+            ruby -pi -e 'sub(/\A./) { |char| char == "0" ? "1" : "0" } if $. == 1' "$fixture/artifacts/SHA256SUMS"
             ;;
         missing-checksum-entry)
             ruby -e 'lines = File.readlines(ARGV.fetch(0)); File.write(ARGV.fetch(0), lines.drop(1).join)' "$fixture/artifacts/SHA256SUMS"
