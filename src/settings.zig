@@ -14,11 +14,15 @@ pub const BrainConfig = struct {
 pub const DebugConfig = struct {
     timeout: ?i64 = null,
     log: bool = false,
+    log_set: bool = false,
 };
 
 pub const ObserveConfig = struct {
     timeout: ?i64 = null,
     log: bool = false,
+    log_set: bool = false,
+    enabled: bool = false,
+    enabled_set: bool = false,
     default_backend: ?[]const u8 = null,
 };
 
@@ -34,6 +38,7 @@ pub const MemoryConfig = struct {
 
 pub const CodeConfig = struct {
     index: ?[]const []const u8 = null,
+    external_roots: ?[]const []const u8 = null,
     indexer: ?ToolConfig = null,
     editor: ?ToolConfig = null,
     creator: ?ToolConfig = null,
@@ -57,18 +62,17 @@ pub const Settings = struct {
             if (local != null) "found" else "none",
         });
 
-        if (global == null and local == null) return null;
+        if (global == null and local == null) {
+            debug_log.log("Settings.load: no settings found", .{});
+            return null;
+        }
 
-        // Merge: local overrides global field-by-field
-        var result: Settings = .{};
-        const g = global orelse Settings{};
-        const l = local orelse Settings{};
-
-        result.memory = mergeMemoryConfig(allocator, l.memory, g.memory);
-        result.code = mergeCodeConfig(allocator, l.code, g.code);
-        result.debug = mergeDebugConfig(l.debug, g.debug);
-        result.observe = mergeObserveConfig(allocator, l.observe, g.observe);
-
+        const result = mergeSettings(
+            allocator,
+            global orelse Settings{},
+            local orelse Settings{},
+        );
+        debug_log.log("Settings.load: merged global and local settings", .{});
         return result;
     }
 
@@ -95,15 +99,25 @@ pub const Settings = struct {
     }
 
     fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?Settings {
-        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        debug_log.log("Settings.loadFromPath: opening {s}", .{path});
+        const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+            debug_log.log("Settings.loadFromPath: open {s} failed: {s}", .{ path, @errorName(err) });
+            return null;
+        };
         defer file.close();
 
-        const data = file.readToEndAlloc(allocator, 64 * 1024) catch return null;
+        const data = file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
+            debug_log.log("Settings.loadFromPath: read {s} failed: {s}", .{ path, @errorName(err) });
+            return null;
+        };
         defer allocator.free(data);
 
         const result = parse(allocator, data);
         if (result == null and data.len > 0) {
+            debug_log.log("Settings.loadFromPath: invalid settings in {s}", .{path});
             warnInvalidSettings(path);
+        } else {
+            debug_log.log("Settings.loadFromPath: parsed {s}", .{path});
         }
         return result;
     }
@@ -128,10 +142,16 @@ pub const Settings = struct {
         var result: Settings = .{};
 
         if (obj.get("memory")) |v| {
-            result.memory = parseMemoryConfig(allocator, v) catch return null;
+            result.memory = parseMemoryConfig(allocator, v) catch {
+                result.deinit(allocator);
+                return null;
+            };
         }
         if (obj.get("code")) |v| {
-            result.code = parseCodeConfig(allocator, v) catch return null;
+            result.code = parseCodeConfig(allocator, v) catch {
+                result.deinit(allocator);
+                return null;
+            };
         }
         if (obj.get("debug")) |v| {
             result.debug = parseDebugConfig(v);
@@ -155,6 +175,8 @@ fn parseMemoryConfig(allocator: std.mem.Allocator, value: std.json.Value) !Memor
     const obj = value.object;
 
     var result: MemoryConfig = .{};
+    errdefer freeMemoryConfig(allocator, &result);
+
     if (obj.get("brain")) |v| {
         result.brain = try parseBrainConfig(allocator, v);
     }
@@ -187,7 +209,10 @@ fn parseCodeConfig(allocator: std.mem.Allocator, value: std.json.Value) !CodeCon
     errdefer freeCodeConfig(allocator, &result);
 
     if (obj.get("index")) |v| {
-        result.index = try parseIndexPatterns(allocator, v);
+        result.index = try parseStringList(allocator, v);
+    }
+    if (obj.get("external_roots")) |v| {
+        result.external_roots = try parseStringList(allocator, v);
     }
     if (obj.get("indexer")) |v| {
         result.indexer = try parseToolConfig(allocator, v);
@@ -270,7 +295,8 @@ fn freeMemoryConfig(allocator: std.mem.Allocator, config: *const MemoryConfig) v
 }
 
 fn freeCodeConfig(allocator: std.mem.Allocator, config: *const CodeConfig) void {
-    if (config.index) |idx| freeIndexPatterns(allocator, idx);
+    if (config.index) |idx| freeStringList(allocator, idx);
+    if (config.external_roots) |roots| freeStringList(allocator, roots);
     if (config.indexer) |cfg| freeToolConfig(allocator, &cfg);
     if (config.editor) |cfg| freeToolConfig(allocator, &cfg);
     if (config.creator) |cfg| freeToolConfig(allocator, &cfg);
@@ -280,7 +306,7 @@ fn freeCodeConfig(allocator: std.mem.Allocator, config: *const CodeConfig) void 
 
 fn parseDebugConfig(value: std.json.Value) ?DebugConfig {
     // "debug": true  →  enable debug logging
-    if (value == .bool) return .{ .log = value.bool };
+    if (value == .bool) return .{ .log = value.bool, .log_set = true };
 
     if (value != .object) return null;
     const obj = value.object;
@@ -289,7 +315,23 @@ fn parseDebugConfig(value: std.json.Value) ?DebugConfig {
     if (obj.get("timeout")) |v| {
         if (v == .integer) result.timeout = v.integer;
     }
+    if (obj.get("log")) |v| {
+        if (v == .bool) {
+            result.log = v.bool;
+            result.log_set = true;
+        }
+    }
     return result;
+}
+
+fn mergeSettings(allocator: std.mem.Allocator, global: Settings, local: Settings) Settings {
+    debug_log.log("Settings.merge: applying local overrides", .{});
+    return .{
+        .memory = mergeMemoryConfig(allocator, local.memory, global.memory),
+        .code = mergeCodeConfig(allocator, local.code, global.code),
+        .debug = mergeDebugConfig(local.debug, global.debug),
+        .observe = mergeObserveConfig(allocator, local.observe, global.observe),
+    };
 }
 
 fn mergeMemoryConfig(allocator: std.mem.Allocator, local: ?MemoryConfig, global: ?MemoryConfig) ?MemoryConfig {
@@ -301,6 +343,23 @@ fn mergeMemoryConfig(allocator: std.mem.Allocator, local: ?MemoryConfig, global:
     if (l.brain != null) {
         if (g.brain) |gb| freeBrainConfig(allocator, &gb);
     }
+
+    // memory.model and memory.bootstrap.model configure the same setting in
+    // legacy and current forms. A model specified locally overrides either
+    // representation globally.
+    const local_has_model = l.model != null or (l.bootstrap != null and l.bootstrap.?.model != null);
+    if (local_has_model) {
+        result.model = l.model;
+        result.bootstrap = l.bootstrap;
+        if (g.model) |gm| allocator.free(gm);
+        if (g.bootstrap) |gbs| {
+            if (gbs.model) |gm| allocator.free(gm);
+        }
+    } else {
+        result.model = g.model;
+        result.bootstrap = g.bootstrap;
+    }
+
     return result;
 }
 
@@ -312,7 +371,12 @@ fn mergeCodeConfig(allocator: std.mem.Allocator, local: ?CodeConfig, global: ?Co
 
     result.index = l.index orelse g.index;
     if (l.index != null) {
-        if (g.index) |gi| freeIndexPatterns(allocator, gi);
+        if (g.index) |gi| freeStringList(allocator, gi);
+    }
+
+    result.external_roots = l.external_roots orelse g.external_roots;
+    if (l.external_roots != null) {
+        if (g.external_roots) |roots| freeStringList(allocator, roots);
     }
 
     result.indexer = l.indexer orelse g.indexer;
@@ -348,7 +412,8 @@ fn mergeDebugConfig(local: ?DebugConfig, global: ?DebugConfig) ?DebugConfig {
     const g = global orelse return local;
     return .{
         .timeout = l.timeout orelse g.timeout,
-        .log = l.log or g.log,
+        .log = if (l.log_set) l.log else g.log,
+        .log_set = l.log_set or g.log_set,
     };
 }
 
@@ -361,7 +426,16 @@ fn parseObserveConfig(allocator: std.mem.Allocator, value: std.json.Value) ?Obse
         if (v == .integer) result.timeout = v.integer;
     }
     if (obj.get("log")) |v| {
-        if (v == .bool) result.log = v.bool;
+        if (v == .bool) {
+            result.log = v.bool;
+            result.log_set = true;
+        }
+    }
+    if (obj.get("enabled")) |v| {
+        if (v == .bool) {
+            result.enabled = v.bool;
+            result.enabled_set = true;
+        }
     }
     if (obj.get("default_backend")) |v| {
         if (v == .string) result.default_backend = allocator.dupe(u8, v.string) catch null;
@@ -380,7 +454,10 @@ fn mergeObserveConfig(allocator: std.mem.Allocator, local: ?ObserveConfig, globa
 
     return .{
         .timeout = l.timeout orelse g.timeout,
-        .log = l.log or g.log,
+        .log = if (l.log_set) l.log else g.log,
+        .log_set = l.log_set or g.log_set,
+        .enabled = if (l.enabled_set) l.enabled else g.enabled,
+        .enabled_set = l.enabled_set or g.enabled_set,
         .default_backend = l.default_backend orelse g.default_backend,
     };
 }
@@ -399,7 +476,7 @@ fn freeToolConfig(allocator: std.mem.Allocator, config: *const ToolConfig) void 
     allocator.free(config.command);
 }
 
-fn parseIndexPatterns(allocator: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
+fn parseStringList(allocator: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
     if (value != .array) return error.InvalidSettings;
 
     const items = value.array.items;
@@ -419,7 +496,7 @@ fn parseIndexPatterns(allocator: std.mem.Allocator, value: std.json.Value) ![]co
     return patterns;
 }
 
-fn freeIndexPatterns(allocator: std.mem.Allocator, patterns: []const []const u8) void {
+fn freeStringList(allocator: std.mem.Allocator, patterns: []const []const u8) void {
     for (patterns) |p| allocator.free(p);
     allocator.free(patterns);
 }
@@ -728,4 +805,116 @@ test "parse settings with memory brain flat string (https://)" {
     try std.testing.expect(s.memory != null);
     try std.testing.expect(s.memory.?.brain != null);
     try std.testing.expectEqualStrings("https://trycog.ai/user/brain", s.memory.?.brain.?.url);
+}
+
+test "parse settings with mergeable fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "memory": {"bootstrap": {"model": "bootstrap-model"}},
+        \\  "code": {"external_roots": ["../shared", "/opt/generated"]},
+        \\  "debug": {"timeout": 1000, "log": true},
+        \\  "observe": {"enabled": false}
+        \\}
+    ;
+    const s = Settings.parse(allocator, json) orelse return error.ParseFailed;
+    defer s.deinit(allocator);
+
+    try std.testing.expectEqualStrings("bootstrap-model", s.memory.?.bootstrap.?.model.?);
+    try std.testing.expectEqual(@as(usize, 2), s.code.?.external_roots.?.len);
+    try std.testing.expectEqualStrings("../shared", s.code.?.external_roots.?[0]);
+    try std.testing.expectEqualStrings("/opt/generated", s.code.?.external_roots.?[1]);
+    try std.testing.expect(s.debug.?.log);
+    try std.testing.expect(!s.observe.?.enabled);
+}
+
+test "merge settings inherits global fields and applies local overrides" {
+    const allocator = std.testing.allocator;
+    const global_json =
+        \\{
+        \\  "memory": {"brain": "file:global.db", "bootstrap": {"model": "global-model"}},
+        \\  "code": {"index": ["src/**/*.zig"], "external_roots": ["../global"]},
+        \\  "debug": {"timeout": 1000, "log": true},
+        \\  "observe": {"timeout": 2000, "log": true, "enabled": true, "default_backend": "global"}
+        \\}
+    ;
+    const local_json =
+        \\{
+        \\  "memory": {"brain": "file:local.db"},
+        \\  "code": {"external_roots": ["../local"]},
+        \\  "debug": {"log": false},
+        \\  "observe": {"log": false, "enabled": false, "default_backend": "local"}
+        \\}
+    ;
+
+    const global = Settings.parse(allocator, global_json) orelse return error.ParseFailed;
+    const local = Settings.parse(allocator, local_json) orelse return error.ParseFailed;
+    const merged = mergeSettings(allocator, global, local);
+    defer merged.deinit(allocator);
+
+    try std.testing.expectEqualStrings("file:local.db", merged.memory.?.brain.?.url);
+    try std.testing.expectEqualStrings("global-model", merged.memory.?.bootstrap.?.model.?);
+    try std.testing.expectEqualStrings("src/**/*.zig", merged.code.?.index.?[0]);
+    try std.testing.expectEqualStrings("../local", merged.code.?.external_roots.?[0]);
+    try std.testing.expectEqual(@as(i64, 1000), merged.debug.?.timeout.?);
+    try std.testing.expect(!merged.debug.?.log);
+    try std.testing.expectEqual(@as(i64, 2000), merged.observe.?.timeout.?);
+    try std.testing.expect(!merged.observe.?.log);
+    try std.testing.expect(!merged.observe.?.enabled);
+    try std.testing.expectEqualStrings("local", merged.observe.?.default_backend.?);
+}
+
+test "merge settings local legacy memory model overrides global bootstrap model" {
+    const allocator = std.testing.allocator;
+    const global = Settings.parse(allocator,
+        \\{"memory":{"bootstrap":{"model":"global-bootstrap"}}}
+    ) orelse return error.ParseFailed;
+    const local = Settings.parse(allocator,
+        \\{"memory":{"model":"local-legacy"}}
+    ) orelse return error.ParseFailed;
+
+    const merged = mergeSettings(allocator, global, local);
+    defer merged.deinit(allocator);
+
+    try std.testing.expect(merged.memory.?.bootstrap == null);
+    try std.testing.expectEqualStrings("local-legacy", merged.memory.?.model.?);
+}
+
+test "merge settings local bootstrap model overrides global legacy model" {
+    const allocator = std.testing.allocator;
+    const global = Settings.parse(allocator,
+        \\{"memory":{"model":"global-legacy"}}
+    ) orelse return error.ParseFailed;
+    const local = Settings.parse(allocator,
+        \\{"memory":{"bootstrap":{"model":"local-bootstrap"}}}
+    ) orelse return error.ParseFailed;
+
+    const merged = mergeSettings(allocator, global, local);
+    defer merged.deinit(allocator);
+
+    try std.testing.expect(merged.memory.?.model == null);
+    try std.testing.expectEqualStrings("local-bootstrap", merged.memory.?.bootstrap.?.model.?);
+}
+
+test "merge settings empty local external roots overrides global roots" {
+    const allocator = std.testing.allocator;
+    const global = Settings.parse(allocator,
+        \\{"code":{"external_roots":["../global"]}}
+    ) orelse return error.ParseFailed;
+    const local = Settings.parse(allocator,
+        \\{"code":{"external_roots":[]}}
+    ) orelse return error.ParseFailed;
+
+    const merged = mergeSettings(allocator, global, local);
+    defer merged.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), merged.code.?.external_roots.?.len);
+}
+
+test "parse settings cleans memory allocations after later parse failure" {
+    const allocator = std.testing.allocator;
+    const result = Settings.parse(allocator,
+        \\{"memory":{"brain":"file:brain.db"},"code":{"index":[42]}}
+    );
+    try std.testing.expect(result == null);
 }
