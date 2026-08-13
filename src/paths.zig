@@ -143,6 +143,11 @@ pub fn getDashboardSocketPath(allocator: std.mem.Allocator) ![]const u8 {
     return getRuntimePath(allocator, "dashboard.sock");
 }
 
+/// Resolve the CLI diagnostic log path. Caller owns the returned path.
+pub fn getDiagnosticLogPath(allocator: std.mem.Allocator) ![]const u8 {
+    return getRuntimePath(allocator, "cog.log");
+}
+
 /// Resolve the DAP diagnostic log path. Caller owns the returned path.
 pub fn getDapLogPath(allocator: std.mem.Allocator) ![]const u8 {
     return getRuntimePath(allocator, "dap.log");
@@ -435,16 +440,20 @@ test "named runtime paths are allocator-owned private paths" {
     defer allocator.free(daemon_pid);
     const dashboard_socket = try getDashboardSocketPath(allocator);
     defer allocator.free(dashboard_socket);
+    const diagnostic_log = try getDiagnosticLogPath(allocator);
+    defer allocator.free(diagnostic_log);
     const dap_log = try getDapLogPath(allocator);
     defer allocator.free(dap_log);
 
     try std.testing.expectEqualStrings("daemon.sock", std.fs.path.basename(daemon_socket));
     try std.testing.expectEqualStrings("daemon.pid", std.fs.path.basename(daemon_pid));
     try std.testing.expectEqualStrings("dashboard.sock", std.fs.path.basename(dashboard_socket));
+    try std.testing.expectEqualStrings("cog.log", std.fs.path.basename(diagnostic_log));
     try std.testing.expectEqualStrings("dap.log", std.fs.path.basename(dap_log));
     try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(daemon_socket).?);
     try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(daemon_pid).?);
     try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(dashboard_socket).?);
+    try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(diagnostic_log).?);
     try std.testing.expectEqualStrings(runtime_dir, std.fs.path.dirname(dap_log).?);
 }
 

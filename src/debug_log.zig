@@ -19,39 +19,24 @@ pub const ResourceUsage = struct {
     invol_cs: i64,
 };
 
-/// Initialize debug logging by opening .cog/cog.log in the given cog directory.
+/// Initialize debug logging by opening an existing .cog/cog.log.
 /// Truncates the log on each invocation and writes a diagnostic header.
 pub fn init(cog_dir: []const u8, version: []const u8, args: []const [:0]const u8) void {
-    // Open with truncate so each command gets a fresh log
     var dir = std.fs.openDirAbsolute(cog_dir, .{}) catch return;
     defer dir.close();
-    log_file = dir.createFile("cog.log", .{ .truncate = true }) catch return;
+    log_file = dir.openFile("cog.log", .{ .mode = .read_write }) catch return;
+    log_file.?.setEndPos(0) catch {
+        log_file.?.close();
+        log_file = null;
+        return;
+    };
+    log_file.?.seekTo(0) catch {
+        log_file.?.close();
+        log_file = null;
+        return;
+    };
 
-    // Install signal handlers to capture crashes
-    installSignalHandlers();
-
-    // Write diagnostic header
-    log("=== cog debug log ===", .{});
-    log("version: {s}", .{version});
-    log("os: {s}", .{@tagName(builtin.os.tag)});
-    log("arch: {s}", .{@tagName(builtin.cpu.arch)});
-    log("zig: {d}.{d}.{d}", .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch });
-
-    // Log the command line
-    var cmd_buf: [8192]u8 = undefined;
-    var pos: usize = 0;
-    for (args) |arg| {
-        if (pos > 0) {
-            if (pos < cmd_buf.len) {
-                cmd_buf[pos] = ' ';
-                pos += 1;
-            }
-        }
-        const end = @min(pos + arg.len, cmd_buf.len);
-        @memcpy(cmd_buf[pos..end], arg[0 .. end - pos]);
-        pos = end;
-    }
-    log("command: {s}", .{cmd_buf[0..pos]});
+    writeHeader(version, args);
 }
 
 /// Append client (agent) info to the log header. Called once the MCP
@@ -68,13 +53,52 @@ pub fn logHeaderSeparator() void {
     log("---", .{});
 }
 
-/// Initialize debug logging from an existing project .cog directory. Read-only
-/// commands must not create project settings as a side effect of diagnostics.
+/// Initialize debug logging without creating project state. An existing project
+/// log is preferred; otherwise diagnostics go to Cog's private runtime directory.
 pub fn initFromCwd(allocator: std.mem.Allocator, version: []const u8, args: []const [:0]const u8) void {
     const paths = @import("paths.zig");
-    const cog_dir = paths.findCogDir(allocator) catch return;
-    defer allocator.free(cog_dir);
-    init(cog_dir, version, args);
+    if (paths.findCogDir(allocator)) |cog_dir| {
+        defer allocator.free(cog_dir);
+        init(cog_dir, version, args);
+        if (enabled()) return;
+    } else |_| {}
+
+    const diagnostic_path = paths.getDiagnosticLogPath(allocator) catch return;
+    defer allocator.free(diagnostic_path);
+    initAtPath(diagnostic_path, version, args);
+}
+
+fn initAtPath(path: []const u8, version: []const u8, args: []const [:0]const u8) void {
+    log_file = std.fs.createFileAbsolute(path, .{ .truncate = true, .mode = 0o600 }) catch return;
+    if (builtin.os.tag != .windows) log_file.?.chmod(0o600) catch {
+        log_file.?.close();
+        log_file = null;
+        return;
+    };
+    writeHeader(version, args);
+}
+
+fn writeHeader(version: []const u8, args: []const [:0]const u8) void {
+    installSignalHandlers();
+
+    log("=== cog debug log ===", .{});
+    log("version: {s}", .{version});
+    log("os: {s}", .{@tagName(builtin.os.tag)});
+    log("arch: {s}", .{@tagName(builtin.cpu.arch)});
+    log("zig: {d}.{d}.{d}", .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch });
+
+    var cmd_buf: [8192]u8 = undefined;
+    var pos: usize = 0;
+    for (args) |arg| {
+        if (pos > 0 and pos < cmd_buf.len) {
+            cmd_buf[pos] = ' ';
+            pos += 1;
+        }
+        const end = @min(pos + arg.len, cmd_buf.len);
+        @memcpy(cmd_buf[pos..end], arg[0 .. end - pos]);
+        pos = end;
+    }
+    log("command: {s}", .{cmd_buf[0..pos]});
 }
 
 /// Close the debug log file.
@@ -187,10 +211,23 @@ test "debug_log disabled by default" {
     log("this should not crash", .{});
 }
 
-test "initFromCwd does not create project state" {
+test "initFromCwd without project state uses private diagnostic log" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    const original_home = std.posix.getenv("HOME");
+    const original_xdg = std.posix.getenv("XDG_RUNTIME_DIR");
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(home);
+    try setEnv("HOME", home);
+    unsetEnv("XDG_RUNTIME_DIR");
+    defer {
+        if (original_home) |value| setEnv("HOME", value) catch {} else unsetEnv("HOME");
+        if (original_xdg) |value| setEnv("XDG_RUNTIME_DIR", value) catch {} else unsetEnv("XDG_RUNTIME_DIR");
+    }
 
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer original_cwd.close();
@@ -199,6 +236,56 @@ test "initFromCwd does not create project state" {
 
     initFromCwd(allocator, "test", &.{});
     defer deinit();
+    try std.testing.expect(enabled());
+    deinit();
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(".cog", .{}));
+    try tmp.dir.access(".cache/cog/runtime/cog.log", .{});
+    const stat = try tmp.dir.statFile(".cache/cog/runtime/cog.log");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+}
+
+test "initFromCwd uses an existing project log without creating settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir(".cog");
+    const existing_log = try tmp.dir.createFile(".cog/cog.log", .{});
+    existing_log.close();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    initFromCwd(allocator, "test", &.{});
+    defer deinit();
+    try std.testing.expect(enabled());
+    deinit();
+
+    try tmp.dir.access(".cog/cog.log", .{});
+    const content = try tmp.dir.readFileAlloc(allocator, ".cog/cog.log", 4096);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "=== cog debug log ===") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(".cog/settings.json", .{}));
+}
+
+fn setEnv(name: []const u8, value: []const u8) !void {
+    const c_fns = struct {
+        extern fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+    };
+    const name_z = try std.testing.allocator.dupeZ(u8, name);
+    defer std.testing.allocator.free(name_z);
+    const value_z = try std.testing.allocator.dupeZ(u8, value);
+    defer std.testing.allocator.free(value_z);
+    if (c_fns.setenv(name_z, value_z, 1) != 0) return error.SetEnvFailed;
+}
+
+fn unsetEnv(name: []const u8) void {
+    const c_fns = struct {
+        extern fn unsetenv([*:0]const u8) c_int;
+    };
+    const name_z = std.testing.allocator.dupeZ(u8, name) catch return;
+    defer std.testing.allocator.free(name_z);
+    _ = c_fns.unsetenv(name_z);
 }
