@@ -428,6 +428,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
 
     var input_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer input_buf.deinit(allocator);
+    var framing_state: MessageFramingState = .{};
 
     var read_buf: [8192]u8 = undefined;
 
@@ -476,37 +477,51 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
             shutdown_requested.store(true, .release);
             break;
         }
-        try input_buf.appendSlice(allocator, read_buf[0..n]);
+        try appendFramingInput(allocator, &input_buf, &framing_state, read_buf[0..n]);
 
         while (!shutdown_requested.load(.acquire)) {
-            const msg = try nextMessageFromBuffer(allocator, &input_buf) orelse break;
-            const slot_index = handler_threads.begin() orelse {
-                debug_log_mod.log("mcp.handlers: dropping buffered request after shutdown", .{});
-                allocator.free(msg);
-                break;
-            };
-            if (shutdown_requested.load(.acquire)) {
-                debug_log_mod.log("mcp.handlers: shutdown observed after slot reservation; rejecting request", .{});
-                handler_threads.cancel(slot_index);
-                allocator.free(msg);
-                break;
-            }
-
-            // The thread owns `msg`; HandlerThreads owns and joins the thread.
-            const thread = std.Thread.spawn(.{}, handleRequest, .{ &runtime, msg, stdout_writer, &handler_threads, slot_index }) catch |err| {
-                handler_threads.cancel(slot_index);
-                debug_log_mod.log("mcp.handlers: spawn failed error={s}; processing inline", .{@errorName(err)});
-                defer allocator.free(msg);
-                processMessage(&runtime, msg, stdout_writer) catch |process_err| {
-                    logErr("MCP processMessage error: ", process_err);
-                    if (process_err == error.WriteFailure) {
-                        shutdown_requested.store(true, .release);
+            const framed = try nextMessageFromBuffer(allocator, &input_buf, &framing_state) orelse break;
+            switch (framed) {
+                .oversized_complete, .oversized_partial => {
+                    debug_log_mod.log("mcp.framing: rejecting oversized message with null id", .{});
+                    writeError(allocator, null, -32600, "Invalid Request", stdout_writer) catch |err| {
+                        logErr("MCP oversized response error: ", err);
+                        if (err == error.WriteFailure) {
+                            shutdown_requested.store(true, .release);
+                            break;
+                        }
+                    };
+                },
+                .message => |msg| {
+                    const slot_index = handler_threads.begin() orelse {
+                        debug_log_mod.log("mcp.handlers: dropping buffered request after shutdown", .{});
+                        allocator.free(msg);
+                        break;
+                    };
+                    if (shutdown_requested.load(.acquire)) {
+                        debug_log_mod.log("mcp.handlers: shutdown observed after slot reservation; rejecting request", .{});
+                        handler_threads.cancel(slot_index);
+                        allocator.free(msg);
                         break;
                     }
-                };
-                continue;
-            };
-            handler_threads.track(slot_index, thread);
+
+                    // The thread owns `msg`; HandlerThreads owns and joins the thread.
+                    const thread = std.Thread.spawn(.{}, handleRequest, .{ &runtime, msg, stdout_writer, &handler_threads, slot_index }) catch |err| {
+                        handler_threads.cancel(slot_index);
+                        debug_log_mod.log("mcp.handlers: spawn failed error={s}; processing inline", .{@errorName(err)});
+                        defer allocator.free(msg);
+                        processMessage(&runtime, msg, stdout_writer) catch |process_err| {
+                            logErr("MCP processMessage error: ", process_err);
+                            if (process_err == error.WriteFailure) {
+                                shutdown_requested.store(true, .release);
+                                break;
+                            }
+                        };
+                        continue;
+                    };
+                    handler_threads.track(slot_index, thread);
+                },
+            }
         }
     }
 
@@ -565,7 +580,44 @@ fn drainConsumed(allocator: std.mem.Allocator, input: *std.ArrayListUnmanaged(u8
     _ = allocator;
 }
 
-fn nextMessageFromBuffer(allocator: std.mem.Allocator, input: *std.ArrayListUnmanaged(u8)) !?[]u8 {
+const max_mcp_message_bytes: usize = 4 * 1024 * 1024;
+
+const BufferedMessage = union(enum) {
+    message: []u8,
+    oversized_complete,
+    oversized_partial,
+};
+
+const MessageFramingState = struct {
+    discarding_oversized: bool = false,
+};
+
+fn appendFramingInput(
+    allocator: std.mem.Allocator,
+    input: *std.ArrayListUnmanaged(u8),
+    state: *MessageFramingState,
+    bytes: []const u8,
+) !void {
+    var remaining = bytes;
+    if (state.discarding_oversized) {
+        if (std.mem.indexOfScalar(u8, remaining, '\n')) |pos| {
+            debug_log_mod.log("mcp.framing: discarded oversized tail bytes={d}, resynchronized", .{pos + 1});
+            state.discarding_oversized = false;
+            remaining = remaining[pos + 1 ..];
+        } else {
+            debug_log_mod.log("mcp.framing: discarding oversized tail bytes={d}", .{remaining.len});
+            return;
+        }
+    }
+
+    if (remaining.len > 0) try input.appendSlice(allocator, remaining);
+}
+
+fn nextMessageFromBuffer(
+    allocator: std.mem.Allocator,
+    input: *std.ArrayListUnmanaged(u8),
+    state: *MessageFramingState,
+) !?BufferedMessage {
     // MCP stdio transport: messages are newline-delimited JSON.
     // Each message is a single JSON object on one line, terminated by \n.
     const bytes = input.items;
@@ -584,20 +636,27 @@ fn nextMessageFromBuffer(allocator: std.mem.Allocator, input: *std.ArrayListUnma
     // Find the newline that terminates this JSON message.
     const newline_pos = std.mem.indexOfScalar(u8, input.items, '\n');
     if (newline_pos) |pos| {
+        if (pos > max_mcp_message_bytes) {
+            debug_log_mod.log("mcp.framing: oversized complete message bytes={d}, limit={d}", .{ pos, max_mcp_message_bytes });
+            try drainConsumed(allocator, input, pos + 1);
+            return .oversized_complete;
+        }
         const msg = try allocator.dupe(u8, input.items[0..pos]);
         try drainConsumed(allocator, input, pos + 1);
-        return msg;
+        return .{ .message = msg };
     }
 
     // No newline yet — check if the buffer contains a complete JSON object.
     // Some clients send JSON without a trailing newline (e.g. as last message
-    // before closing stdin). Try to parse what we have.
+    // before closing stdin). Try to parse what we have. Bound the scan to one
+    // byte past the limit so an incomplete oversized frame is rejected promptly.
     if (input.items.len > 0 and input.items[0] == '{') {
         // Validate it's complete JSON by counting braces.
         var depth: usize = 0;
         var in_string = false;
         var escape = false;
-        for (input.items, 0..) |c, i| {
+        const scan_len = @min(input.items.len, max_mcp_message_bytes + 1);
+        for (input.items[0..scan_len], 0..) |c, i| {
             if (escape) {
                 escape = false;
                 continue;
@@ -616,13 +675,25 @@ fn nextMessageFromBuffer(allocator: std.mem.Allocator, input: *std.ArrayListUnma
                     depth -= 1;
                     if (depth == 0) {
                         const end = i + 1;
+                        if (end > max_mcp_message_bytes) {
+                            debug_log_mod.log("mcp.framing: oversized complete brace-framed message bytes={d}, limit={d}", .{ end, max_mcp_message_bytes });
+                            try drainConsumed(allocator, input, end);
+                            return .oversized_complete;
+                        }
                         const msg = try allocator.dupe(u8, input.items[0..end]);
                         try drainConsumed(allocator, input, end);
-                        return msg;
+                        return .{ .message = msg };
                     }
                 }
             }
         }
+    }
+
+    if (input.items.len > max_mcp_message_bytes) {
+        debug_log_mod.log("mcp.framing: oversized partial message buffered={d}, limit={d}; discarding until newline", .{ input.items.len, max_mcp_message_bytes });
+        input.clearRetainingCapacity();
+        state.discarding_oversized = true;
+        return .oversized_partial;
     }
 
     // Incomplete message — wait for more data.
@@ -2274,13 +2345,19 @@ test "nextMessageFromBuffer extracts newline-delimited JSON" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
 
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
     try buf.appendSlice(allocator, body ++ "\n");
 
-    const msg = (try nextMessageFromBuffer(allocator, &buf)).?;
-    defer allocator.free(msg);
-    try std.testing.expectEqualStrings(body, msg);
+    const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed) {
+        .message => |msg| {
+            defer allocator.free(msg);
+            try std.testing.expectEqualStrings(body, msg);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
@@ -2288,18 +2365,29 @@ test "nextMessageFromBuffer handles multiple messages" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
 
     const msg1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
     const msg2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}";
     try buf.appendSlice(allocator, msg1 ++ "\n" ++ msg2 ++ "\n");
 
-    const result1 = (try nextMessageFromBuffer(allocator, &buf)).?;
-    defer allocator.free(result1);
-    try std.testing.expectEqualStrings(msg1, result1);
+    const framed1 = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed1) {
+        .message => |result1| {
+            defer allocator.free(result1);
+            try std.testing.expectEqualStrings(msg1, result1);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
-    const result2 = (try nextMessageFromBuffer(allocator, &buf)).?;
-    defer allocator.free(result2);
-    try std.testing.expectEqualStrings(msg2, result2);
+    const framed2 = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed2) {
+        .message => |result2| {
+            defer allocator.free(result2);
+            try std.testing.expectEqualStrings(msg2, result2);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
@@ -2308,40 +2396,138 @@ test "nextMessageFromBuffer skips leading whitespace" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
 
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
     try buf.appendSlice(allocator, "\n\n  " ++ body ++ "\n");
 
-    const msg = (try nextMessageFromBuffer(allocator, &buf)).?;
-    defer allocator.free(msg);
-    try std.testing.expectEqualStrings(body, msg);
+    const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed) {
+        .message => |msg| {
+            defer allocator.free(msg);
+            try std.testing.expectEqualStrings(body, msg);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "nextMessageFromBuffer waits for newline" {
+test "nextMessageFromBuffer preserves brace fallback" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
 
     // Incomplete JSON line (no trailing newline) but a complete JSON object
     // should still be extractable via brace counting.
     const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
     try buf.appendSlice(allocator, body);
 
-    const msg = (try nextMessageFromBuffer(allocator, &buf)).?;
-    defer allocator.free(msg);
-    try std.testing.expectEqualStrings(body, msg);
+    const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed) {
+        .message => |msg| {
+            defer allocator.free(msg);
+            try std.testing.expectEqualStrings(body, msg);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "nextMessageFromBuffer returns null for incomplete JSON" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
 
     const partial = "{\"jsonrpc\":\"2.0\",\"id\":1";
     try buf.appendSlice(allocator, partial);
-    const msg = try nextMessageFromBuffer(allocator, &buf);
+    const msg = try nextMessageFromBuffer(allocator, &buf, &state);
     try std.testing.expect(msg == null);
     try std.testing.expect(buf.items.len == partial.len);
+}
+
+test "nextMessageFromBuffer accepts a message at the size limit" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
+
+    try buf.appendNTimes(allocator, 'x', max_mcp_message_bytes);
+    try buf.append(allocator, '\n');
+
+    const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed) {
+        .message => |msg| {
+            defer allocator.free(msg);
+            try std.testing.expectEqual(max_mcp_message_bytes, msg.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextMessageFromBuffer tags an oversized complete line and resyncs" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
+
+    try buf.appendNTimes(allocator, 'x', max_mcp_message_bytes + 1);
+    try buf.appendSlice(allocator, "\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+
+    const oversized = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    try std.testing.expect(oversized == .oversized_complete);
+
+    const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed) {
+        .message => |msg| {
+            defer allocator.free(msg);
+            try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}", msg);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "nextMessageFromBuffer tags an oversized brace-complete message" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
+
+    try buf.append(allocator, '{');
+    try buf.appendNTimes(allocator, ' ', max_mcp_message_bytes - 1);
+    try buf.append(allocator, '}');
+
+    const oversized = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    try std.testing.expect(oversized == .oversized_complete);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "nextMessageFromBuffer tags an oversized partial line and discards through newline" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var state: MessageFramingState = .{};
+
+    try buf.appendNTimes(allocator, 'x', max_mcp_message_bytes + 1);
+    const oversized = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    try std.testing.expect(oversized == .oversized_partial);
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    try std.testing.expect(state.discarding_oversized);
+
+    try appendFramingInput(allocator, &buf, &state, "discarded tail");
+    try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+    try std.testing.expect(state.discarding_oversized);
+
+    try appendFramingInput(allocator, &buf, &state, "\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n");
+    try std.testing.expect(!state.discarding_oversized);
+
+    const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
+    switch (framed) {
+        .message => |msg| {
+            defer allocator.free(msg);
+            try std.testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}", msg);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn testRuntime(allocator: std.mem.Allocator) Runtime {
