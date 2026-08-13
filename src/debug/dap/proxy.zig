@@ -346,6 +346,7 @@ pub const DapProxy = struct {
     const BpRegistryEntry = struct {
         file: []const u8,
         line: u32,
+        verified: bool = false,
     };
 
     const FunctionBreakpointEntry = struct {
@@ -2110,18 +2111,17 @@ pub const DapProxy = struct {
         return state;
     }
 
-    fn handleBreakpointEvent(_: *DapProxy, bp_obj: std.json.ObjectMap) void {
-        // Update internal breakpoint state based on verification events
+    fn handleBreakpointEvent(self: *DapProxy, bp_obj: std.json.ObjectMap) void {
         const bp_id = if (bp_obj.get("id")) |id| (if (id == .integer) @as(u32, @intCast(id.integer)) else return) else return;
         const verified = if (bp_obj.get("verified")) |v| (v == .bool and v.bool) else false;
         const actual_line = if (bp_obj.get("line")) |l| (if (l == .integer) @as(u32, @intCast(l.integer)) else null) else null;
-        _ = bp_id;
-        _ = verified;
-        _ = actual_line;
-        // Store verification state for future queries
-        // The breakpoint event data is captured but since breakpoint storage
-        // is per-file in file_breakpoints, we'd need to iterate to find it.
-        // For now, the event is consumed and logged.
+        if (self.bp_registry.getPtr(bp_id)) |entry| {
+            entry.verified = verified;
+            if (actual_line) |line| entry.line = line;
+            debug_log.log("dap.proxy: breakpoint event id={d} verified={} line={?}", .{ bp_id, verified, actual_line });
+        } else {
+            debug_log.log("dap.proxy: ignored breakpoint event for unknown id={d}", .{bp_id});
+        }
     }
 
     fn handleMemoryEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
@@ -2424,7 +2424,7 @@ pub const DapProxy = struct {
         });
 
         // Register for removal lookup (use the key that's in the hash map)
-        try self.bp_registry.put(self.allocator, bp_id, .{ .file = gop.key_ptr.*, .line = line });
+        try self.bp_registry.put(self.allocator, bp_id, .{ .file = gop.key_ptr.*, .line = line, .verified = false });
 
         // If adapter is connected and NOT in the deferred config phase, send
         // the DAP setBreakpoints request immediately.  During the deferred
@@ -2462,11 +2462,42 @@ pub const DapProxy = struct {
         defer allocator.free(msg);
         dapLog("[DAP sendFileBreakpoints] Sending setBreakpoints for file={s} with {d} breakpoints", .{ file, bp_list.len });
         const resp = try self.sendRequest(allocator, msg);
+        defer allocator.free(resp);
         {
             const log_len = @min(resp.len, 512);
             dapLog("[DAP sendFileBreakpoints] Response[0..{d}]: {s}", .{ log_len, resp[0..log_len] });
         }
-        allocator.free(resp);
+        self.updateBreakpointRegistryFromResponse(allocator, bp_list, resp);
+    }
+
+    fn updateBreakpointRegistryFromResponse(self: *DapProxy, allocator: std.mem.Allocator, bp_list: []const BreakpointEntry, resp: []const u8) void {
+        const parsed = json.parseFromSlice(json.Value, allocator, resp, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const body = parsed.value.object.get("body") orelse return;
+        if (body != .object) return;
+        const breakpoints = body.object.get("breakpoints") orelse return;
+        if (breakpoints != .array) return;
+
+        for (breakpoints.array.items, 0..) |item, index| {
+            if (index >= bp_list.len or item != .object) break;
+            const local_id = bp_list[index].bp_id;
+            if (self.bp_registry.getPtr(local_id)) |entry| {
+                entry.verified = if (item.object.get("verified")) |value| value == .bool and value.bool else false;
+                if (item.object.get("line")) |value| {
+                    if (value == .integer and value.integer >= 0) entry.line = @intCast(value.integer);
+                }
+                if (item.object.get("id")) |value| {
+                    if (value == .integer and value.integer >= 0) {
+                        const adapter_id: u32 = @intCast(value.integer);
+                        if (adapter_id != local_id) {
+                            const local_entry = entry.*;
+                            self.bp_registry.put(self.allocator, adapter_id, local_entry) catch {};
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn proxyRemoveBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, id: u32) anyerror!void {
@@ -2514,11 +2545,12 @@ pub const DapProxy = struct {
         while (it.next()) |entry| {
             const file = entry.key_ptr.*;
             for (entry.value_ptr.items) |bp| {
+                const registry_entry = self.bp_registry.get(bp.bp_id);
                 try result.append(allocator, .{
                     .id = bp.bp_id,
-                    .verified = true,
+                    .verified = if (registry_entry) |registered| registered.verified else false,
                     .file = file,
-                    .line = bp.line,
+                    .line = if (registry_entry) |registered| registered.line else bp.line,
                     .condition = bp.condition,
                     .hit_condition = bp.hit_condition,
                 });
@@ -4305,6 +4337,28 @@ test "DapProxy rejects invalid readMemory base64" {
     ;
 
     try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
+}
+
+test "DapProxy breakpoint events update registry verification" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    const file = try allocator.dupe(u8, "/tmp/test.zig");
+    var breakpoints: std.ArrayListUnmanaged(DapProxy.BreakpointEntry) = .empty;
+    try breakpoints.append(allocator, .{ .line = 10, .condition = null, .hit_condition = null, .bp_id = 7 });
+    try proxy.file_breakpoints.put(allocator, file, breakpoints);
+    try proxy.bp_registry.put(allocator, 7, .{ .file = file, .line = 10, .verified = false });
+
+    const event = try json.parseFromSlice(json.Value, allocator, "{\"id\":7,\"verified\":true,\"line\":12}", .{});
+    defer event.deinit();
+    proxy.handleBreakpointEvent(event.value.object);
+
+    const listed = try DapProxy.proxyListBreakpoints(@ptrCast(&proxy), allocator);
+    defer allocator.free(listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expect(listed[0].verified);
+    try std.testing.expectEqual(@as(u32, 12), listed[0].line);
 }
 
 test "DetachedProcess closes adapter pipes idempotently" {
