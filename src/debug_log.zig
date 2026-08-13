@@ -68,16 +68,11 @@ pub fn logHeaderSeparator() void {
     log("---", .{});
 }
 
-/// Initialize debug logging by finding .cog directory from cwd.
+/// Initialize debug logging from an existing project .cog directory. Read-only
+/// commands must not create project settings as a side effect of diagnostics.
 pub fn initFromCwd(allocator: std.mem.Allocator, version: []const u8, args: []const [:0]const u8) void {
     const paths = @import("paths.zig");
-    const cog_dir = paths.findCogDir(allocator) catch {
-        // No .cog dir found — try to create one in cwd
-        const fallback = paths.findOrCreateCogDir(allocator) catch return;
-        defer allocator.free(fallback);
-        init(fallback, version, args);
-        return;
-    };
+    const cog_dir = paths.findCogDir(allocator) catch return;
     defer allocator.free(cog_dir);
     init(cog_dir, version, args);
 }
@@ -190,4 +185,20 @@ test "debug_log disabled by default" {
     try std.testing.expect(!enabled());
     // Calling log when disabled should be a safe no-op
     log("this should not crash", .{});
+}
+
+test "initFromCwd does not create project state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    try tmp.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    initFromCwd(allocator, "test", &.{});
+    defer deinit();
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(".cog", .{}));
 }
