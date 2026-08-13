@@ -904,6 +904,38 @@ test "fileWriteCallback streams chunks up to the size cap" {
     try std.testing.expectEqualStrings("abcdef", &contents);
 }
 
+test "fileWriteCallback computes and verifies SHA-256 across streamed chunks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("archive.tmp", .{ .mode = 0o600 });
+    defer file.close();
+    var data = FileWriteCallbackData{
+        .file = &file,
+        .max_bytes = 6,
+    };
+
+    try std.testing.expectEqual(@as(usize, 3), fileWriteCallback("abc".ptr, 1, 3, @ptrCast(&data)));
+    try std.testing.expectEqual(@as(usize, 3), fileWriteCallback("def".ptr, 1, 3, @ptrCast(&data)));
+
+    const expected = [_]u8{
+        0xbe, 0xf5, 0x7e, 0xc7, 0xf5, 0x3a, 0x6d, 0x40,
+        0xbe, 0xb6, 0x40, 0xa7, 0x80, 0xa6, 0x39, 0xc8,
+        0x3b, 0xc2, 0x9a, 0xc8, 0xa9, 0x81, 0x6f, 0x1f,
+        0xc6, 0xc5, 0xc6, 0xdc, 0xd9, 0x3c, 0x47, 0x21,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, &(try finishFileDigest(&data, expected)));
+
+    var mismatch = expected;
+    mismatch[0] ^= 0xff;
+    var second_data = FileWriteCallbackData{
+        .file = &file,
+        .max_bytes = 6,
+    };
+    _ = fileWriteCallback("abcdef".ptr, 1, 6, @ptrCast(&second_data));
+    try std.testing.expectError(error.ArtifactDigestMismatch, finishFileDigest(&second_data, mismatch));
+}
+
 test "fileWriteCallback rejects a chunk that exceeds the size cap" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
