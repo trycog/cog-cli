@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_log = @import("debug_log.zig");
 
 var temp_counter = std.atomic.Value(u64).init(0);
@@ -43,6 +44,7 @@ pub fn writeFileAtomicMode(
     try tmp_file.sync();
     try parent.rename(tmp_name, basename);
     renamed = true;
+    syncDirectory(parent);
     debug_log.log("fs_util.writeFileAtomic: replaced {s}", .{sub_path});
 }
 
@@ -51,6 +53,13 @@ fn existingFileMode(parent: std.fs.Dir, basename: []const u8) !std.fs.File.Mode 
     defer file.close();
     const stat = try file.stat();
     return stat.mode;
+}
+
+fn syncDirectory(dir: std.fs.Dir) void {
+    if (builtin.os.tag == .windows) return;
+    std.posix.fsync(dir.fd) catch |err| {
+        debug_log.log("fs_util.syncDirectory: failed to sync directory: {s}", .{@errorName(err)});
+    };
 }
 
 /// Create a uniquely named, mode-restricted file in `dir`. The caller owns the
@@ -112,6 +121,7 @@ pub fn replaceDirectoryTransactional(
         debug_log.log("fs_util.replaceDirectoryTransactional: promotion failed for {s}: {s}", .{ live_name, @errorName(err) });
         return err;
     };
+    syncDirectory(parent);
 
     if (had_live) {
         parent.deleteTree(backup_name) catch |err| {
