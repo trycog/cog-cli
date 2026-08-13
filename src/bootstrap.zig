@@ -1082,9 +1082,16 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
     };
 
     const existing = blk: {
-        const f = std.fs.cwd().openFile(".cog/settings.json", .{}) catch break :blk null;
+        debug_log.log("writeSettingsBrainUrl: reading .cog/settings.json", .{});
+        const f = std.fs.cwd().openFile(".cog/settings.json", .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk null,
+            else => {
+                debug_log.log("writeSettingsBrainUrl: failed to open settings: {s}", .{@errorName(err)});
+                return err;
+            },
+        };
         defer f.close();
-        break :blk f.readToEndAlloc(allocator, 1048576) catch null;
+        break :blk try f.readToEndAlloc(allocator, 1048576);
     };
     defer if (existing) |e| allocator.free(e);
 

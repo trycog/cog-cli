@@ -991,7 +991,7 @@ fn runProjectScan(
 
 fn writeSettingsCodeIndex(allocator: std.mem.Allocator, patterns: []const []const u8) !void {
     // Read existing settings
-    const existing = readCwdFile(allocator, ".cog/settings.json");
+    const existing = try readCwdFileOptional(allocator, ".cog/settings.json");
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -1497,7 +1497,7 @@ fn writeSettingsMerge(allocator: std.mem.Allocator, brain_url: []const u8) !void
         },
     };
 
-    const existing = readCwdFile(allocator, ".cog/settings.json");
+    const existing = try readCwdFileOptional(allocator, ".cog/settings.json");
     defer if (existing) |e| allocator.free(e);
 
     var aw: Writer.Allocating = .init(allocator);
@@ -2084,10 +2084,24 @@ pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
 // ── System Prompt Setup ─────────────────────────────────────────────────
 
-fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
-    const f = std.fs.cwd().openFile(filename, .{}) catch return null;
+fn readCwdFileOptional(allocator: std.mem.Allocator, filename: []const u8) !?[]const u8 {
+    debug_log.log("commands.readCwdFileOptional: reading {s}", .{filename});
+    const f = std.fs.cwd().openFile(filename, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => {
+            debug_log.log("commands.readCwdFileOptional: failed to open {s}: {s}", .{ filename, @errorName(err) });
+            return err;
+        },
+    };
     defer f.close();
-    return f.readToEndAlloc(allocator, 1048576) catch return null;
+    return f.readToEndAlloc(allocator, 1048576) catch |err| {
+        debug_log.log("commands.readCwdFileOptional: failed to read {s}: {s}", .{ filename, @errorName(err) });
+        return err;
+    };
+}
+
+fn readCwdFile(allocator: std.mem.Allocator, filename: []const u8) ?[]const u8 {
+    return readCwdFileOptional(allocator, filename) catch null;
 }
 
 fn writeCwdFile(filename: []const u8, content: []const u8) !void {
@@ -2106,7 +2120,7 @@ fn updateFileWithPrompt(allocator: std.mem.Allocator, filename: []const u8, prom
     const close_tag = "</cog>";
     const trimmed_prompt = std.mem.trimRight(u8, prompt_content, &std.ascii.whitespace);
 
-    const existing = readCwdFile(allocator, filename);
+    const existing = try readCwdFileOptional(allocator, filename);
     defer if (existing) |e| allocator.free(e);
 
     const new_content = blk: {
