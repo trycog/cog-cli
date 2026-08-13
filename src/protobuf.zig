@@ -48,6 +48,7 @@ pub const Decoder = struct {
             if (self.pos >= self.data.len) return error.UnexpectedEndOfData;
             const byte = self.data[self.pos];
             self.pos += 1;
+            if (shift == 63 and byte > 1) return error.VarintTooLong;
             result |= @as(u64, byte & 0x7F) << shift;
             if (byte & 0x80 == 0) return result;
             shift = std.math.add(u6, shift, 7) catch return error.VarintTooLong;
@@ -212,6 +213,11 @@ test "readVarint empty data" {
     var d = Decoder.init(&.{});
     const result = d.readVarint();
     try std.testing.expectError(error.UnexpectedEndOfData, result);
+}
+
+test "readVarint rejects overflow in tenth byte" {
+    var d = Decoder.init(&.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02 });
+    try std.testing.expectError(error.VarintTooLong, d.readVarint());
 }
 
 test "readField basic" {
