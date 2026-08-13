@@ -1033,7 +1033,7 @@ fn saveUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8, cp: *con
     defer allocator.free(with_newline);
 
     debug_log.log("saveUploadCheckpoint: atomically writing {s}", .{path});
-    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, path, with_newline);
+    try fs_util.writeFileAtomicMode(std.fs.cwd(), allocator, path, with_newline, 0o600);
 }
 
 fn deleteUploadCheckpoint(path: []const u8) void {
@@ -3641,7 +3641,7 @@ fn saveCheckpoint(allocator: std.mem.Allocator, checkpoint_path: []const u8, pro
     try buf.appendSlice(allocator, "  ]\n}\n");
 
     debug_log.log("saveCheckpoint: atomically writing {s} with {d} subsystems", .{ checkpoint_path, ids.items.len });
-    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, checkpoint_path, buf.items);
+    try fs_util.writeFileAtomicMode(std.fs.cwd(), allocator, checkpoint_path, buf.items, 0o600);
 }
 
 fn appendJsonEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -3679,9 +3679,6 @@ test "saveUploadCheckpoint writes pretty JSON and preserves restrictive mode" {
     defer tmp.cleanup();
 
     try tmp.dir.makeDir(".cog");
-    var existing = try tmp.dir.createFile(".cog/upgrade-checkpoint.json", .{ .mode = 0o600 });
-    try existing.writeAll("prior\n");
-    existing.close();
 
     var original_cwd = try std.fs.cwd().openDir(".", .{});
     defer {
@@ -3852,11 +3849,10 @@ test "saveCheckpoint writes deterministic pretty JSON and preserves mode" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var existing = try tmp.dir.createFile("bootstrap-checkpoint.json", .{ .mode = 0o600 });
-    try existing.writeAll("prior\n");
-    existing.close();
 
-    const path = try tmp.dir.realpathAlloc(allocator, "bootstrap-checkpoint.json");
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const path = try std.fs.path.join(allocator, &.{ root, "bootstrap-checkpoint.json" });
     defer allocator.free(path);
     var processed: std.StringHashMapUnmanaged(void) = .empty;
     defer processed.deinit(allocator);
