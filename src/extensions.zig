@@ -1838,6 +1838,10 @@ const TestTarEntry = union(enum) {
         path: []const u8,
         target: []const u8,
     },
+    hardlink: struct {
+        path: []const u8,
+        target: []const u8,
+    },
 };
 
 fn writeTestTarball(
@@ -1853,6 +1857,15 @@ fn writeTestTarball(
         switch (entry) {
             .file => |file| try tar_writer.writeFileBytes(file.path, file.contents, .{}),
             .symlink => |link| try tar_writer.writeLink(link.path, link.target, .{}),
+            .hardlink => |link| {
+                var header = std.tar.Writer.Header.init(.regular);
+                if (link.path.len > header.name.len) return error.NameTooLong;
+                @memcpy(header.name[0..link.path.len], link.path);
+                try header.setLinkname(link.target);
+                const typeflag_byte: *u8 = @ptrCast(&header.typeflag);
+                typeflag_byte.* = '1';
+                try header.write(tar_writer.underlying_writer);
+            },
         }
     }
     try tar_writer.finishPedantically();
@@ -1922,6 +1935,12 @@ test "inspectTarballArchive rejects unsafe archive contents" {
     });
     defer allocator.free(symlink_path);
     try std.testing.expectError(error.UnsafeArchiveLink, inspectTarballArchive(symlink_path));
+
+    const hardlink_path = try writeTestTarball(allocator, tmp.dir, "hardlink.tar.gz", &.{
+        .{ .hardlink = .{ .path = "root/bin/cog-safe", .target = "root/outside" } },
+    });
+    defer allocator.free(hardlink_path);
+    try std.testing.expectError(error.TarUnsupportedHeader, inspectTarballArchive(hardlink_path));
 }
 
 test "inspectTarballArchive accepts contained archive contents" {
