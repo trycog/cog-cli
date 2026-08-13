@@ -19,6 +19,7 @@ pub const dwarf_location = @import("debug/dwarf/location.zig");
 pub const dashboard_tui = @import("debug/dashboard_tui.zig");
 pub const cli = @import("debug/cli.zig");
 pub const daemon = @import("debug/daemon.zig");
+pub const ipc_identity = @import("debug/ipc_identity.zig");
 
 const std = @import("std");
 const help = @import("help_text.zig");
@@ -308,6 +309,7 @@ test {
     _ = dashboard_tui;
     _ = cli;
     _ = daemon;
+    _ = ipc_identity;
 }
 
 test "cog debug routes to debug dispatch" {

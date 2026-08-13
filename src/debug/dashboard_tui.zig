@@ -1,4 +1,6 @@
 const std = @import("std");
+const ipc_identity = @import("ipc_identity.zig");
+const debug_log = @import("../debug_log.zig");
 const posix = std.posix;
 const debug_log = @import("../debug_log.zig");
 const paths = @import("../paths.zig");
@@ -500,7 +502,12 @@ pub const DashboardTui = struct {
         if (self.client_count >= MAX_SESSIONS) return;
 
         const listener = self.listener orelse return;
-        const client_fd = posix.accept(listener, null, null, 0) catch return;
+        const client_fd = posix.accept(listener, null, null, posix.SOCK.CLOEXEC) catch return;
+        ipc_identity.validatePeerUid(client_fd) catch |err| {
+            debug_log.log("DashboardTui.acceptClient: rejected peer: {s}", .{@errorName(err)});
+            posix.close(client_fd);
+            return;
+        };
 
         self.clients[self.client_count] = client_fd;
         self.client_buf_lens[self.client_count] = 0;

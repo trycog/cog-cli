@@ -6,6 +6,7 @@ const posix = std.posix;
 const debug_log = @import("../debug_log.zig");
 const paths = @import("../paths.zig");
 const server_mod = @import("server.zig");
+const ipc_identity = @import("ipc_identity.zig");
 const DebugServer = server_mod.DebugServer;
 const ToolResult = server_mod.ToolResult;
 
@@ -90,7 +91,8 @@ pub const DaemonServer = struct {
 
         self.socket_fd = sock;
 
-        // Write PID file
+        // PID publication is required because clients refuse to signal an
+        // unverified or stale process identity.
         self.writePidFile() catch |err| {
             debug_log.log("DaemonServer.run: failed to write PID file: {s}", .{@errorName(err)});
             return err;
@@ -129,9 +131,14 @@ pub const DaemonServer = struct {
 
             if (fds[0].revents & posix.POLL.IN == 0) continue;
 
-            // Accept a connection
-            const client_fd = posix.accept(sock, null, null, 0) catch continue;
+            // Accept a connection and authenticate it before reading requests.
+            const client_fd = posix.accept(sock, null, null, posix.SOCK.CLOEXEC) catch continue;
             defer posix.close(client_fd);
+
+            ipc_identity.validatePeerUid(client_fd) catch |err| {
+                debug_log.log("DaemonServer.run: rejected socket peer: {s}", .{@errorName(err)});
+                continue;
+            };
 
             self.last_activity = std.time.milliTimestamp();
             self.handleConnection(client_fd);
@@ -313,19 +320,12 @@ pub const DaemonServer = struct {
         const pid_path = try paths.getDaemonPidPath(self.allocator);
         defer self.allocator.free(pid_path);
 
-        debug_log.log("DaemonServer.writePidFile: creating {s}", .{pid_path});
-        var f = try std.fs.createFileAbsolute(pid_path, .{ .mode = 0o600 });
-        defer f.close();
-        if (@import("builtin").os.tag != .windows) try f.chmod(0o600);
-
-        var buf: [32]u8 = undefined;
         const c_fns = struct {
-            extern fn getpid() i32;
+            extern fn getpid() posix.pid_t;
         };
-        const s = std.fmt.bufPrint(&buf, "{d}", .{c_fns.getpid()}) catch return;
-        try f.writeAll(s);
-        try f.sync();
-        debug_log.log("DaemonServer.writePidFile: wrote PID to {s}", .{pid_path});
+
+        debug_log.log("DaemonServer.writePidFile: securely creating {s}", .{pid_path});
+        try ipc_identity.writePidFile(pid_path, c_fns.getpid());
     }
 };
 

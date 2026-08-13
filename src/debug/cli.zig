@@ -3,6 +3,7 @@ const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
 const posix = std.posix;
+const ipc_identity = @import("ipc_identity.zig");
 const debug_log = @import("../debug_log.zig");
 const paths = @import("../paths.zig");
 
@@ -1058,9 +1059,12 @@ fn connectToDaemon(allocator: std.mem.Allocator) !posix.socket_t {
 }
 
 fn tryConnect(sock_path: []const u8) ?posix.socket_t {
-    paths.validateUnixSocketPath(sock_path) catch return null;
+    paths.validateUnixSocketPath(sock_path) catch |err| {
+        debug_log.log("debug.cli.tryConnect: rejected path {s}: {s}", .{ sock_path, @errorName(err) });
+        return null;
+    };
     debug_log.log("debug.cli.tryConnect: connecting to {s}", .{sock_path});
-    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+    const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| {
         debug_log.log("debug.cli.tryConnect: socket creation failed: {s}", .{@errorName(err)});
         return null;
     };
@@ -1074,8 +1078,13 @@ fn tryConnect(sock_path: []const u8) ?posix.socket_t {
         posix.close(sock);
         return null;
     };
+    ipc_identity.validatePeerUid(sock) catch |err| {
+        debug_log.log("debug.cli.tryConnect: rejected daemon peer: {s}", .{@errorName(err)});
+        posix.close(sock);
+        return null;
+    };
 
-    debug_log.log("debug.cli.tryConnect: connected to {s}", .{sock_path});
+    debug_log.log("debug.cli.tryConnect: connected to authenticated peer at {s}", .{sock_path});
     return sock;
 }
 
@@ -1170,39 +1179,25 @@ pub fn killCommand(allocator: std.mem.Allocator) !void {
     };
     defer allocator.free(pid_path);
 
-    // Read PID from file
-    debug_log.log("debug.cli.killCommand: opening {s}", .{pid_path});
-    var f = std.fs.openFileAbsolute(pid_path, .{}) catch {
-        printErr("error: no daemon running (no pid file)\n");
-        return error.Explained;
-    };
-    defer f.close();
-
-    var buf: [32]u8 = undefined;
-    const n = f.readAll(&buf) catch {
-        printErr("error: could not read pid file\n");
+    const pid = ipc_identity.readPidFile(pid_path) catch |err| {
+        debug_log.log("debug.cli.killCommand: rejected PID file {s}: {s}", .{ pid_path, @errorName(err) });
+        if (err == error.FileNotFound) {
+            printErr("error: no daemon running (no pid file)\n");
+        } else {
+            printErr("error: invalid or unsafe daemon pid file\n");
+        }
         return error.Explained;
     };
 
-    const pid_str = std.mem.trim(u8, buf[0..n], &[_]u8{ ' ', '\n', '\r', '\t' });
-    const pid = std.fmt.parseInt(i32, pid_str, 10) catch {
-        printErr("error: invalid pid in pid file\n");
+    ipc_identity.signalValidatedProcess(pid, posix.SIG.TERM) catch |err| {
+        debug_log.log("debug kill: refused to signal pid={d}: {s}", .{ pid, @errorName(err) });
+        printErr("error: pid file does not identify a live Cog daemon owned by this user\n");
         return error.Explained;
     };
-
-    // Send SIGTERM
-    const c_fns = struct {
-        extern fn kill(pid: i32, sig: i32) i32;
-    };
-    const result = c_fns.kill(pid, 15); // SIGTERM = 15
-    if (result != 0) {
-        printErr("error: failed to send SIGTERM to daemon\n");
-        return error.Explained;
-    }
 
     writeStdout("{\"killed\":true}\n");
 
-    // Clean up pid file
+    // Clean up only the no-follow validated PID path after successful signal.
     debug_log.log("debug.cli.killCommand: removing {s}", .{pid_path});
     std.fs.deleteFileAbsolute(pid_path) catch |err| switch (err) {
         error.FileNotFound => {},

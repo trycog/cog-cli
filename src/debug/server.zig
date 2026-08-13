@@ -10,6 +10,7 @@ const dashboard_mod = @import("dashboard.zig");
 const extensions = @import("../extensions.zig");
 const debug_log = @import("../debug_log.zig");
 const paths = @import("../paths.zig");
+const ipc_identity = @import("ipc_identity.zig");
 
 // Debug logging to file
 var server_log_file: ?std.fs.File = null;
@@ -2867,7 +2868,7 @@ pub const DebugServer = struct {
             return;
         };
 
-        const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch |err| {
+        const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch |err| {
             debug_log.log("DebugServer.connectDashboardSocket: socket creation failed: {s}", .{@errorName(err)});
             return;
         };
@@ -2880,6 +2881,11 @@ pub const DebugServer = struct {
         debug_log.log("DebugServer.connectDashboardSocket: connecting to {s}", .{path});
         posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch |err| {
             debug_log.log("DebugServer.connectDashboardSocket: connection failed: {s}", .{@errorName(err)});
+            posix.close(sock);
+            return;
+        };
+        ipc_identity.validatePeerUid(sock) catch |err| {
+            debug_log.log("DebugServer.connectDashboardSocket: rejected peer: {s}", .{@errorName(err)});
             posix.close(sock);
             return;
         };
