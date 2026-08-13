@@ -274,10 +274,13 @@ pub const DapProxy = struct {
     buffered_events: std.ArrayListUnmanaged(BufferedEvent) = .empty,
     dropped_buffered_events: usize = 0,
     dropped_output_entries: usize = 0,
-    // Only one thread may read/decode a DAP connection at a time. This also
-    // serializes request/response pairs so explicit request_seq correlation is
-    // deterministic even when MCP tools run concurrently.
+    // Only one thread may read/decode or write a framed DAP message at a time.
+    // Request/response transactions hold this mutex across both operations so
+    // explicit request_seq correlation stays deterministic under concurrency.
     connection_mutex: std.Thread.Mutex = .{},
+    // Sequence numbers can be reserved while another request is in flight, so
+    // protect allocation independently from the connection transaction.
+    seq_mutex: std.Thread.Mutex = .{},
     // Request timeout in milliseconds (default 30s)
     request_timeout_ms: i32 = 30_000,
     // Saved launch state for emulated restart (adapters without supportsRestartRequest)
@@ -516,6 +519,8 @@ pub const DapProxy = struct {
     };
 
     fn nextSeq(self: *DapProxy) i64 {
+        self.seq_mutex.lock();
+        defer self.seq_mutex.unlock();
         const s = self.seq;
         self.seq += 1;
         return s;
@@ -649,6 +654,9 @@ pub const DapProxy = struct {
 
     /// Send a DAP message without waiting for a response.
     fn sendRaw(self: *DapProxy, allocator: std.mem.Allocator, msg: []const u8) !void {
+        self.connection_mutex.lock();
+        defer self.connection_mutex.unlock();
+
         const encoded = try transport.encodeMessage(allocator, msg);
         defer allocator.free(encoded);
 
@@ -2240,7 +2248,9 @@ pub const DapProxy = struct {
         return aw.toOwnedSlice();
     }
 
-    /// Send a response for a reverse request from the adapter.
+    /// Send a response for a reverse request from the adapter. Callers already
+    /// hold connection_mutex while decoding the reverse request, so write the
+    /// reply directly without trying to recursively acquire the mutex.
     fn sendReverseResponse(self: *DapProxy, allocator: std.mem.Allocator, request_seq: i64, command: []const u8, success: bool, message: ?[]const u8) void {
         const msg = buildReverseResponse(allocator, self.nextSeq(), request_seq, command, success, message) catch return;
         defer allocator.free(msg);
@@ -4482,6 +4492,32 @@ test "DapProxy extracts explicit request sequence" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqual(@as(i64, 41), try DapProxy.requestSeq(allocator, "{\"seq\":41,\"type\":\"request\",\"command\":\"threads\"}"));
     try std.testing.expectError(error.InvalidRequest, DapProxy.requestSeq(allocator, "{\"type\":\"request\"}"));
+}
+
+fn reserveRequestSequences(proxy: *DapProxy, ids: []i64, cursor: *std.atomic.Value(usize), count: usize) void {
+    for (0..count) |_| {
+        const index = cursor.fetchAdd(1, .monotonic);
+        ids[index] = proxy.nextSeq();
+    }
+}
+
+test "DapProxy allocates unique request sequences concurrently" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    var ids: [256]i64 = undefined;
+    var cursor: std.atomic.Value(usize) = .init(0);
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, reserveRequestSequences, .{ &proxy, &ids, &cursor, 32 });
+    }
+    for (&threads) |thread| thread.join();
+
+    std.mem.sort(i64, &ids, {}, std.sort.asc(i64));
+    for (ids, 0..) |id, index| {
+        try std.testing.expectEqual(@as(i64, @intCast(index + 1)), id);
+    }
 }
 
 test "DapProxy temporary request timeout restores after early exit" {
