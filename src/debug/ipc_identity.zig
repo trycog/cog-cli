@@ -3,35 +3,28 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const debug_log = @import("../debug_log.zig");
 
-pub const ProcessIdentity = struct {
-    pid: posix.pid_t,
-    uid: posix.uid_t,
-    executable: ExecutableIdentity,
-
-    pub const ExecutableIdentity = struct {
-        device: u64,
-        inode: u64,
-    };
-};
-
+/// Security-relevant process properties collected before a daemon signal.
 pub const ProcessSnapshot = struct {
     alive: bool,
     uid: posix.uid_t,
     executable_matches: bool,
 };
 
+/// Reasons a PID cannot be trusted as the current user's Cog daemon.
 pub const ProcessValidationError = error{
     ProcessNotAlive,
     ProcessWrongUser,
     ProcessWrongExecutable,
 };
 
+/// Apply the platform-independent daemon process identity policy.
 pub fn validateProcessSnapshot(snapshot: ProcessSnapshot, expected_uid: posix.uid_t) ProcessValidationError!void {
     if (!snapshot.alive) return error.ProcessNotAlive;
     if (snapshot.uid != expected_uid) return error.ProcessWrongUser;
     if (!snapshot.executable_matches) return error.ProcessWrongExecutable;
 }
 
+/// Require a connected Unix socket peer to have the current effective UID.
 pub fn validatePeerUid(fd: posix.socket_t) !void {
     const peer_uid = try peerUid(fd);
     const expected_uid = posix.geteuid();
@@ -81,6 +74,7 @@ fn macosPeerUid(fd: posix.socket_t) !posix.uid_t {
     return uid;
 }
 
+/// Create or replace a PID file as a no-follow, owner-only regular file.
 pub fn writePidFile(path: []const u8, pid: posix.pid_t) !void {
     debug_log.log("debug IPC: opening pid file without symlink following {s}", .{path});
     const fd = try posix.open(path, .{
@@ -100,6 +94,7 @@ pub fn writePidFile(path: []const u8, pid: posix.pid_t) !void {
     debug_log.log("debug IPC: wrote pid={d} mode=0600 to {s}", .{ pid, path });
 }
 
+/// Read a PID only from a no-follow, current-user, mode-0600 regular file.
 pub fn readPidFile(path: []const u8) !posix.pid_t {
     debug_log.log("debug IPC: reading pid file without symlink following {s}", .{path});
     const fd = try posix.open(path, .{
@@ -123,6 +118,7 @@ pub fn readPidFile(path: []const u8) !posix.pid_t {
     return pid;
 }
 
+/// Prove a live PID belongs to the current UID and executes this Cog image.
 pub fn validateProcessIdentity(pid: posix.pid_t) !void {
     const expected_uid = posix.geteuid();
     const snapshot = try processSnapshot(pid);
@@ -133,12 +129,13 @@ pub fn validateProcessIdentity(pid: posix.pid_t) !void {
     debug_log.log("debug IPC: validated pid={d} uid={d} executable=cog", .{ pid, snapshot.uid });
 }
 
+/// Signal a validated daemon through a PID-reuse-resistant platform handle.
 pub fn signalValidatedProcess(pid: posix.pid_t, signal: u8) !void {
-    if (builtin.os.tag == .linux) return signalValidatedLinuxProcess(pid, signal);
-
-    try validateProcessIdentity(pid);
-    debug_log.log("debug IPC: signaling validated pid={d} signal={d}", .{ pid, signal });
-    try posix.kill(pid, signal);
+    return switch (builtin.os.tag) {
+        .linux => signalValidatedLinuxProcess(pid, signal),
+        .macos => signalValidatedMacosProcess(pid, signal),
+        else => error.UnsupportedPlatform,
+    };
 }
 
 fn signalValidatedLinuxProcess(pid: posix.pid_t, signal: u8) !void {
@@ -167,6 +164,79 @@ fn signalValidatedLinuxProcess(pid: posix.pid_t, signal: u8) !void {
     }
 }
 
+fn signalValidatedMacosProcess(pid: posix.pid_t, signal: u8) !void {
+    const darwin = std.c;
+    const AuditToken = extern struct {
+        value: [8]u32,
+    };
+    const TASK_AUDIT_TOKEN: darwin.natural_t = 15;
+    const c_fns = struct {
+        extern fn task_name_for_pid(
+            target_tport: darwin.mach_port_name_t,
+            pid: c_int,
+            task_name: *darwin.mach_port_name_t,
+        ) darwin.kern_return_t;
+        extern fn proc_pidpath_audittoken(token: *AuditToken, buffer: *anyopaque, buffer_size: u32) c_int;
+        extern fn proc_signal_with_audittoken(token: *AuditToken, signal: c_int) c_int;
+    };
+    const AuditTokenToEuidFn = *const fn (AuditToken) callconv(.c) posix.uid_t;
+    const AuditTokenToPidFn = *const fn (AuditToken) callconv(.c) posix.pid_t;
+
+    var bsm = std.DynLib.open("/usr/lib/libbsm.dylib") catch {
+        debug_log.log("debug IPC: libbsm unavailable for audit-token validation", .{});
+        return error.ProcessIdentityUnavailable;
+    };
+    defer bsm.close();
+    const audit_token_to_euid = bsm.lookup(AuditTokenToEuidFn, "audit_token_to_euid") orelse
+        return error.ProcessIdentityUnavailable;
+    const audit_token_to_pid = bsm.lookup(AuditTokenToPidFn, "audit_token_to_pid") orelse
+        return error.ProcessIdentityUnavailable;
+
+    var task_name: darwin.mach_port_name_t = 0;
+    if (c_fns.task_name_for_pid(darwin.mach_task_self(), pid, &task_name) != 0) {
+        debug_log.log("debug IPC: task identity unavailable for pid={d}", .{pid});
+        return error.ProcessNotAlive;
+    }
+    defer _ = darwin.mach_port_deallocate(darwin.mach_task_self(), task_name);
+
+    var token: AuditToken = undefined;
+    var token_count: darwin.mach_msg_type_number_t = @sizeOf(AuditToken) / @sizeOf(darwin.natural_t);
+    if (darwin.task_info(task_name, TASK_AUDIT_TOKEN, @ptrCast(&token), &token_count) != 0 or
+        token_count != @sizeOf(AuditToken) / @sizeOf(darwin.natural_t))
+    {
+        debug_log.log("debug IPC: audit token unavailable for pid={d}", .{pid});
+        return error.ProcessNotAlive;
+    }
+
+    const token_pid = audit_token_to_pid(token);
+    const token_uid = audit_token_to_euid(token);
+    if (token_pid != pid) return error.ProcessNotAlive;
+    if (token_uid != posix.geteuid()) return error.ProcessWrongUser;
+
+    var process_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const process_path_len = c_fns.proc_pidpath_audittoken(&token, &process_path_buf, process_path_buf.len);
+    if (process_path_len <= 0) return error.ProcessWrongExecutable;
+
+    var process_file = std.fs.openFileAbsolute(process_path_buf[0..@intCast(process_path_len)], .{}) catch {
+        return error.ProcessWrongExecutable;
+    };
+    defer process_file.close();
+    const self_file = try std.fs.openSelfExe(.{});
+    defer self_file.close();
+    if (!sameExecutable(try posix.fstat(process_file.handle), try posix.fstat(self_file.handle))) {
+        return error.ProcessWrongExecutable;
+    }
+
+    debug_log.log("debug IPC: signaling audit-token pid={d} uid={d} signal={d}", .{ pid, token_uid, signal });
+    const signal_result = c_fns.proc_signal_with_audittoken(&token, signal);
+    switch (posix.errno(signal_result)) {
+        .SUCCESS => {},
+        .SRCH => return error.ProcessNotAlive,
+        .PERM, .ACCES => return error.ProcessWrongUser,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
 fn processSnapshot(pid: posix.pid_t) !ProcessSnapshot {
     return switch (builtin.os.tag) {
         .linux => linuxProcessSnapshot(pid),
@@ -177,8 +247,19 @@ fn processSnapshot(pid: posix.pid_t) !ProcessSnapshot {
 
 fn linuxProcessSnapshot(pid: posix.pid_t) !ProcessSnapshot {
     var proc_path_buf: [64]u8 = undefined;
-    const proc_path = try std.fmt.bufPrint(&proc_path_buf, "/proc/{d}/exe", .{pid});
-    const proc_fd = posix.open(proc_path, .{
+    const proc_path = try std.fmt.bufPrint(&proc_path_buf, "/proc/{d}", .{pid});
+    const proc_dir_fd = posix.open(proc_path, .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0) catch |err| return switch (err) {
+        error.FileNotFound, error.ProcessNotFound => .{ .alive = false, .uid = 0, .executable_matches = false },
+        else => err,
+    };
+    defer posix.close(proc_dir_fd);
+
+    const proc_fd = posix.openat(proc_dir_fd, "exe", .{
         .ACCMODE = .RDONLY,
         .CLOEXEC = true,
     }, 0) catch |err| return switch (err) {
@@ -190,11 +271,12 @@ fn linuxProcessSnapshot(pid: posix.pid_t) !ProcessSnapshot {
     const self_file = try std.fs.openSelfExe(.{});
     defer self_file.close();
 
+    const proc_dir_stat = try posix.fstat(proc_dir_fd);
     const proc_stat = try posix.fstat(proc_fd);
     const self_stat = try posix.fstat(self_file.handle);
     return .{
         .alive = true,
-        .uid = proc_stat.uid,
+        .uid = proc_dir_stat.uid,
         .executable_matches = sameExecutable(proc_stat, self_stat),
     };
 }
