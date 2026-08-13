@@ -2100,22 +2100,13 @@ pub const DwarfEngine = struct {
         else
             regs.pc +% @as(u64, @intCast(-self.aslr_slide));
 
-        {
-            const f = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
-            if (f) |file| {
-                defer file.close();
-                file.seekFromEnd(0) catch {};
-                var buf: [512]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "buildLocals: regs.pc=0x{x}, aslr_slide={d}, dwarf_pc=0x{x}, has_loc={}, has_loclists={}\n", .{
-                    regs.pc,
-                    self.aslr_slide,
-                    dwarf_pc,
-                    dd.loc_data != null,
-                    dd.loclists_data != null,
-                }) catch "buildLocals: fmt error\n";
-                file.writeAll(msg) catch {};
-            }
-        }
+        debug_log.log("dwarf.engine: buildLocals pc=0x{x} slide={d} dwarf_pc=0x{x} has_loc={} has_loclists={}", .{
+            regs.pc,
+            self.aslr_slide,
+            dwarf_pc,
+            dd.loc_data != null,
+            dd.loclists_data != null,
+        });
 
         var scoped = parser.parseScopedVariables(
             dd.info_data,
@@ -2191,63 +2182,31 @@ pub const DwarfEngine = struct {
         var locals = std.ArrayListUnmanaged(types.Variable).empty;
         errdefer locals.deinit(self.allocator);
 
-        {
-            const f2 = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
-            if (f2) |file2| {
-                defer file2.close();
-                file2.seekFromEnd(0) catch {};
-                var buf2: [512]u8 = undefined;
-                const msg2 = std.fmt.bufPrint(&buf2, "buildLocals: frame_base={?}, cfa={?}, sp=0x{x}, fp=0x{x}, num_vars={}\n", .{
-                    frame_base,
-                    self.computeCfa(regs),
-                    regs.sp,
-                    regs.fp,
-                    scoped.variables.len,
-                }) catch "buildLocals frame_base: fmt error\n";
-                file2.writeAll(msg2) catch {};
-            }
-        }
+        debug_log.log("dwarf.engine: buildLocals frame_base={?} cfa={?} sp=0x{x} fp=0x{x} variables={d}", .{
+            frame_base,
+            self.computeCfa(regs),
+            regs.sp,
+            regs.fp,
+            scoped.variables.len,
+        });
 
         for (scoped.variables) |v| {
             if (v.location_expr.len == 0) continue;
 
             const loc = location.evalLocationWithMemory(v.location_expr, reg_provider, frame_base, mem_reader);
 
-            {
-                const f3 = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
-                if (f3) |file3| {
-                    defer file3.close();
-                    file3.seekFromEnd(0) catch {};
-                    var buf3: [512]u8 = undefined;
-                    var p3: usize = 0;
-                    p3 += (std.fmt.bufPrint(buf3[p3..], "  var {s}: loc_type={s}", .{
-                        v.name,
-                        switch (loc) {
-                            .address => "address",
-                            .register => "register",
-                            .value => "value",
-                            .empty => "empty",
-                            .implicit_pointer => "implicit_pointer",
-                            .composite => "composite",
-                        },
-                    }) catch "").len;
-                    p3 += (switch (loc) {
-                        .address => |a| std.fmt.bufPrint(buf3[p3..], " addr=0x{x}", .{a}),
-                        .register => |r| std.fmt.bufPrint(buf3[p3..], " reg={}", .{r}),
-                        .value => |val| std.fmt.bufPrint(buf3[p3..], " val=0x{x}", .{val}),
-                        else => std.fmt.bufPrint(buf3[p3..], "", .{}),
-                    } catch "").len;
-                    p3 += (std.fmt.bufPrint(buf3[p3..], " expr_bytes=", .{}) catch "").len;
-                    for (v.location_expr) |b| {
-                        p3 += (std.fmt.bufPrint(buf3[p3..], "{x:0>2}", .{b}) catch "").len;
-                    }
-                    if (p3 < buf3.len) {
-                        buf3[p3] = '\n';
-                        p3 += 1;
-                    }
-                    file3.writeAll(buf3[0..p3]) catch {};
-                }
-            }
+            debug_log.log("dwarf.engine: local name={s} expr_len={d} result={s}", .{
+                v.name,
+                v.location_expr.len,
+                switch (loc) {
+                    .address => "address",
+                    .register => "register",
+                    .value => "value",
+                    .empty => "empty",
+                    .implicit_pointer => "implicit_pointer",
+                    .composite => "composite",
+                },
+            });
 
             var fmt_buf: [64]u8 = undefined;
             const value_str = switch (loc) {

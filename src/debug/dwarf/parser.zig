@@ -3697,14 +3697,7 @@ pub fn parseScopedVariables(
                     false;
 
                 if (die_low_pc > 0 and die_low_pc <= target_pc + 0x100 and target_pc < die_low_pc + 0x1000) {
-                    const df = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
-                    if (df) |dfile| {
-                        defer dfile.close();
-                        dfile.seekFromEnd(0) catch {};
-                        var dbuf: [512]u8 = undefined;
-                        const dmsg = std.fmt.bufPrint(&dbuf, "parseScopedVars: subprog low=0x{x} high=0x{x} target_pc=0x{x} match={}\n", .{ die_low_pc, die_high_pc, target_pc, pc_in_func }) catch "parseScopedVars: fmt error\n";
-                        dfile.writeAll(dmsg) catch {};
-                    }
+                    debug_log.log("dwarf.parser: scoped subprogram low=0x{x} high=0x{x} target=0x{x} match={}", .{ die_low_pc, die_high_pc, target_pc, pc_in_func });
                 }
 
                 if (pc_in_func) {
@@ -3765,16 +3758,12 @@ pub fn parseScopedVariables(
                     else
                         try allocator.alloc(u8, 0);
 
-                    {
-                        const df2 = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
-                        if (df2) |dfile2| {
-                            defer dfile2.close();
-                            dfile2.seekFromEnd(0) catch {};
-                            var dbuf2: [512]u8 = undefined;
-                            const dmsg2 = std.fmt.bufPrint(&dbuf2, "parseScopedVars: var name={s} loc_expr_len={} die_location_len={} cu_low_pc=0x{x}\n", .{ name, loc_expr.len, if (die_location) |l| l.len else @as(usize, 0), cu_low_pc }) catch "parseScopedVars var: fmt error\n";
-                            dfile2.writeAll(dmsg2) catch {};
-                        }
-                    }
+                    debug_log.log("dwarf.parser: scoped variable name={s} expr_len={d} raw_location_len={d} cu_low_pc=0x{x}", .{
+                        name,
+                        loc_expr.len,
+                        if (die_location) |loc| loc.len else @as(usize, 0),
+                        cu_low_pc,
+                    });
 
                     try variables.append(allocator, .{
                         .name = name,

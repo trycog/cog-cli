@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const parser = @import("parser.zig");
+const debug_log = @import("../../debug_log.zig");
 
 // ── DWARF Location Expression Evaluation ───────────────────────────────
 
@@ -1489,45 +1490,19 @@ pub fn inspectLocals(
 
         const loc = evalLocationWithMemory(v.location_expr, regs, frame_base, mem_reader);
 
-        {
-            const df = std.fs.cwd().createFile("/tmp/cog-dwarf-debug.log", .{ .truncate = false }) catch null;
-            if (df) |dfile| {
-                defer dfile.close();
-                dfile.seekFromEnd(0) catch {};
-                var lbuf: [1024]u8 = undefined;
-                var pos: usize = 0;
-                const loc_type: []const u8 = switch (loc) {
-                    .address => "address",
-                    .register => "register",
-                    .value => "value",
-                    .empty => "empty",
-                    .implicit_pointer => "implicit_pointer",
-                    .composite => "composite",
-                };
-                pos += (std.fmt.bufPrint(lbuf[pos..], "inspectVars: name={s} loc_expr_len={} loc_type={s}", .{
-                    v.name, v.location_expr.len, loc_type,
-                }) catch "").len;
-                pos += (switch (loc) {
-                    .address => |a| std.fmt.bufPrint(lbuf[pos..], " addr=0x{x}", .{a}) catch "",
-                    .register => |r| std.fmt.bufPrint(lbuf[pos..], " reg={}", .{r}) catch "",
-                    .value => |val| std.fmt.bufPrint(lbuf[pos..], " val={}", .{val}) catch "",
-                    else => @as([]const u8, ""),
-                }).len;
-                if (frame_base) |fb| {
-                    pos += (std.fmt.bufPrint(lbuf[pos..], " frame_base=0x{x} loc_bytes=", .{fb}) catch "").len;
-                } else {
-                    pos += (std.fmt.bufPrint(lbuf[pos..], " frame_base=null loc_bytes=", .{}) catch "").len;
-                }
-                for (v.location_expr) |b| {
-                    pos += (std.fmt.bufPrint(lbuf[pos..], "{x:0>2}", .{b}) catch "").len;
-                }
-                if (pos < lbuf.len) {
-                    lbuf[pos] = '\n';
-                    pos += 1;
-                }
-                dfile.writeAll(lbuf[0..pos]) catch {};
-            }
-        }
+        debug_log.log("dwarf.location: inspect local name={s} expr_len={d} result={s} frame_base={?}", .{
+            v.name,
+            v.location_expr.len,
+            switch (loc) {
+                .address => "address",
+                .register => "register",
+                .value => "value",
+                .empty => "empty",
+                .implicit_pointer => "implicit_pointer",
+                .composite => "composite",
+            },
+            frame_base,
+        });
 
         var value_str: []const u8 = "";
         switch (loc) {
