@@ -245,8 +245,10 @@ pub const DapProxy = struct {
     // Breakpoint tracking: per-file breakpoint lines (DAP requires re-sending all BPs for a file)
     file_breakpoints: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(BreakpointEntry)) = .empty,
     next_bp_id: u32 = 1,
-    // Map from our bp_id to file path + line for removal
+    // Map from our local breakpoint ID to its canonical state, plus adapter
+    // breakpoint IDs back to the local IDs used by Cog's public API.
     bp_registry: std.AutoHashMapUnmanaged(u32, BpRegistryEntry) = .empty,
+    adapter_bp_ids: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     // Function breakpoint tracking (for listing and restart re-arming)
     function_breakpoints: std.ArrayListUnmanaged(FunctionBreakpointEntry) = .empty,
     // Active exception filter IDs (for restart re-arming)
@@ -376,6 +378,7 @@ pub const DapProxy = struct {
         }
         self.file_breakpoints.deinit(self.allocator);
         self.bp_registry.deinit(self.allocator);
+        self.adapter_bp_ids.deinit(self.allocator);
         // Clean up function breakpoints
         for (self.function_breakpoints.items) |entry| {
             self.allocator.free(entry.name);
@@ -2129,15 +2132,16 @@ pub const DapProxy = struct {
     }
 
     fn handleBreakpointEvent(self: *DapProxy, bp_obj: std.json.ObjectMap) void {
-        const bp_id = if (bp_obj.get("id")) |id| (if (id == .integer) @as(u32, @intCast(id.integer)) else return) else return;
+        const adapter_id = if (bp_obj.get("id")) |id| (if (id == .integer and id.integer >= 0) @as(u32, @intCast(id.integer)) else return) else return;
+        const local_id = self.adapter_bp_ids.get(adapter_id) orelse adapter_id;
         const verified = if (bp_obj.get("verified")) |v| (v == .bool and v.bool) else false;
-        const actual_line = if (bp_obj.get("line")) |l| (if (l == .integer) @as(u32, @intCast(l.integer)) else null) else null;
-        if (self.bp_registry.getPtr(bp_id)) |entry| {
+        const actual_line = if (bp_obj.get("line")) |l| (if (l == .integer and l.integer >= 0) @as(u32, @intCast(l.integer)) else null) else null;
+        if (self.bp_registry.getPtr(local_id)) |entry| {
             entry.verified = verified;
             if (actual_line) |line| entry.line = line;
-            debug_log.log("dap.proxy: breakpoint event id={d} verified={} line={?}", .{ bp_id, verified, actual_line });
+            debug_log.log("dap.proxy: breakpoint event adapter_id={d} local_id={d} verified={} line={?}", .{ adapter_id, local_id, verified, actual_line });
         } else {
-            debug_log.log("dap.proxy: ignored breakpoint event for unknown id={d}", .{bp_id});
+            debug_log.log("dap.proxy: ignored breakpoint event for unknown adapter_id={d}", .{adapter_id});
         }
     }
 
@@ -2507,10 +2511,9 @@ pub const DapProxy = struct {
                 if (item.object.get("id")) |value| {
                     if (value == .integer and value.integer >= 0) {
                         const adapter_id: u32 = @intCast(value.integer);
-                        if (adapter_id != local_id) {
-                            const local_entry = entry.*;
-                            self.bp_registry.put(self.allocator, adapter_id, local_entry) catch {};
-                        }
+                        self.adapter_bp_ids.put(self.allocator, adapter_id, local_id) catch |err| {
+                            debug_log.log("dap.proxy: failed to map breakpoint adapter_id={d} local_id={d} error={s}", .{ adapter_id, local_id, @errorName(err) });
+                        };
                     }
                 }
             }
@@ -2550,6 +2553,15 @@ pub const DapProxy = struct {
             }
         }
 
+        var adapter_id_to_remove: ?u32 = null;
+        var adapter_it = self.adapter_bp_ids.iterator();
+        while (adapter_it.next()) |mapping| {
+            if (mapping.value_ptr.* == id) {
+                adapter_id_to_remove = mapping.key_ptr.*;
+                break;
+            }
+        }
+        if (adapter_id_to_remove) |adapter_id| _ = self.adapter_bp_ids.remove(adapter_id);
         _ = self.bp_registry.remove(id);
     }
 
@@ -4367,7 +4379,12 @@ test "DapProxy breakpoint events update registry verification" {
     try proxy.file_breakpoints.put(allocator, file, breakpoints);
     try proxy.bp_registry.put(allocator, 7, .{ .file = file, .line = 10, .verified = false });
 
-    const event = try json.parseFromSlice(json.Value, allocator, "{\"id\":7,\"verified\":true,\"line\":12}", .{});
+    const response =
+        \\{"type":"response","body":{"breakpoints":[{"id":99,"verified":false,"line":10}]}}
+    ;
+    proxy.updateBreakpointRegistryFromResponse(allocator, breakpoints.items, response);
+
+    const event = try json.parseFromSlice(json.Value, allocator, "{\"id\":99,\"verified\":true,\"line\":12}", .{});
     defer event.deinit();
     proxy.handleBreakpointEvent(event.value.object);
 
