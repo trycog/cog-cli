@@ -4,41 +4,11 @@ const zon = @import("build.zig.zon");
 const version = zon.version;
 const BENCH_INDEXING_CWD = ".zig-cache/indexing-benchmark";
 
-const tree_sitter_version = "v0.25.4";
-
-const GrammarRefKind = enum {
-    tag,
-    branch,
-};
-
-const GrammarSource = struct {
-    name: []const u8,
-    repo: []const u8,
-    ref_name: []const u8,
-    src_prefix: []const u8,
-    has_scanner: bool,
-    ref_kind: GrammarRefKind = .tag,
-};
-
-const grammars = [_]GrammarSource{
-    .{ .name = "c", .repo = "tree-sitter/tree-sitter-c", .ref_name = "v0.24.1", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "cpp", .repo = "tree-sitter/tree-sitter-cpp", .ref_name = "v0.23.4", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "go", .repo = "tree-sitter/tree-sitter-go", .ref_name = "v0.25.0", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "json", .repo = "tree-sitter/tree-sitter-json", .ref_name = "v0.24.8", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "java", .repo = "tree-sitter/tree-sitter-java", .ref_name = "v0.23.5", .src_prefix = "src", .has_scanner = false },
-    .{ .name = "javascript", .repo = "tree-sitter/tree-sitter-javascript", .ref_name = "v0.25.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "markdown", .repo = "tree-sitter-grammars/tree-sitter-markdown", .ref_name = "v0.5.1", .src_prefix = "tree-sitter-markdown/src", .has_scanner = true },
-    .{ .name = "mdx", .repo = "srazzak/tree-sitter-mdx", .ref_name = "main", .src_prefix = "src", .has_scanner = true, .ref_kind = .branch },
-    .{ .name = "python", .repo = "tree-sitter/tree-sitter-python", .ref_name = "v0.25.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "rst", .repo = "stsewd/tree-sitter-rst", .ref_name = "v0.2.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "rust", .repo = "tree-sitter/tree-sitter-rust", .ref_name = "v0.24.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "toml", .repo = "tree-sitter-grammars/tree-sitter-toml", .ref_name = "v0.7.0", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "typescript", .repo = "tree-sitter/tree-sitter-typescript", .ref_name = "v0.23.2", .src_prefix = "typescript/src", .has_scanner = true },
-    .{ .name = "tsx", .repo = "tree-sitter/tree-sitter-typescript", .ref_name = "v0.23.2", .src_prefix = "tsx/src", .has_scanner = true },
-    .{ .name = "yaml", .repo = "tree-sitter-grammars/tree-sitter-yaml", .ref_name = "v0.7.2", .src_prefix = "src", .has_scanner = true },
-    .{ .name = "asciidoc", .repo = "cathaysia/tree-sitter-asciidoc", .ref_name = "v0.6.0", .src_prefix = "tree-sitter-asciidoc/src", .has_scanner = true },
-    .{ .name = "bash", .repo = "tree-sitter/tree-sitter-bash", .ref_name = "v0.25.1", .src_prefix = "src", .has_scanner = true },
-};
+const grammar_sources = @import("src/grammar_sources.zig");
+const GrammarSource = grammar_sources.GrammarSource;
+const tree_sitter_source = grammar_sources.tree_sitter_source;
+const grammars = grammar_sources.grammars;
+const compiled_grammars = grammar_sources.compiled_grammars;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -136,9 +106,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const grammar_source_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/grammar_sources.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_grammar_source_tests = b.addRunArtifact(grammar_source_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_grammar_source_tests.step);
 
     // Benchmark
     const bench_exe = b.addExecutable(.{
@@ -220,7 +199,15 @@ pub fn build(b: *std.Build) void {
     exe_tests.step.dependOn(&check_grammars.step);
 
     // Setup step (download grammars)
-    addSetupStep(b);
+    const verify_source = b.addExecutable(.{
+        .name = "verify-source",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/verify_source.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    addSetupStep(b, verify_source);
 
     // Release step
     const release_step = b.step("release", "Build release tarballs");
@@ -237,23 +224,9 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     // Include paths
     mod.addIncludePath(ts_include);
     mod.addIncludePath(ts_src);
-    mod.addIncludePath(b.path("grammars/go"));
-    mod.addIncludePath(b.path("grammars/json"));
-    mod.addIncludePath(b.path("grammars/java"));
-    mod.addIncludePath(b.path("grammars/c"));
-    mod.addIncludePath(b.path("grammars/typescript"));
-    mod.addIncludePath(b.path("grammars/tsx"));
-    mod.addIncludePath(b.path("grammars/javascript"));
-    mod.addIncludePath(b.path("grammars/markdown"));
-    mod.addIncludePath(b.path("grammars/mdx"));
-    mod.addIncludePath(b.path("grammars/python"));
-    mod.addIncludePath(b.path("grammars/rst"));
-    mod.addIncludePath(b.path("grammars/rust"));
-    mod.addIncludePath(b.path("grammars/toml"));
-    mod.addIncludePath(b.path("grammars/cpp"));
-    mod.addIncludePath(b.path("grammars/yaml"));
-    mod.addIncludePath(b.path("grammars/asciidoc"));
-    mod.addIncludePath(b.path("grammars/bash"));
+    for (compiled_grammars) |grammar| {
+        mod.addIncludePath(b.path(b.fmt("grammars/{s}", .{grammar.name})));
+    }
 
     // Disable Zig's UBSan for third-party C code: in ReleaseSafe Zig passes
     // -fsanitize=undefined -fsanitize-trap=undefined to Clang, which causes
@@ -267,39 +240,12 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
         .flags = c_flags,
     });
 
-    // Grammar parsers (parser-only: Go, Java, C)
-    mod.addCSourceFile(.{ .file = b.path("grammars/go/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/json/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/java/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/c/parser.c"), .flags = c_flags });
-
-    // Grammar parsers + scanners: TypeScript, TSX, JavaScript, Markdown, MDX, Python, RST, Rust, TOML, YAML, AsciiDoc, C++
-    mod.addCSourceFile(.{ .file = b.path("grammars/typescript/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/typescript/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/tsx/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/tsx/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/javascript/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/javascript/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/markdown/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/markdown/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/mdx/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/mdx/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/python/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/python/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/rst/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/rst/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/rust/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/rust/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/toml/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/toml/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/yaml/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/yaml/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/asciidoc/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/asciidoc/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/cpp/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/cpp/scanner.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/bash/parser.c"), .flags = c_flags });
-    mod.addCSourceFile(.{ .file = b.path("grammars/bash/scanner.c"), .flags = c_flags });
+    for (compiled_grammars) |grammar| {
+        mod.addCSourceFile(.{ .file = b.path(b.fmt("grammars/{s}/parser.c", .{grammar.name})), .flags = c_flags });
+        if (grammar.has_scanner) {
+            mod.addCSourceFile(.{ .file = b.path(b.fmt("grammars/{s}/scanner.c", .{grammar.name})), .flags = c_flags });
+        }
+    }
 }
 
 /// Add libcurl (with mbedTLS and zlib) to a module via the zig-curl package.
@@ -412,138 +358,141 @@ fn addRelease(
     release_step.dependOn(&install_tar.step);
 }
 
-fn addSetupStep(b: *std.Build) void {
-    const setup_step = b.step("setup", "Download tree-sitter grammars");
-    setup_step.dependOn(addDownloadCore(b));
+fn addSetupStep(b: *std.Build, verify_source: *std.Build.Step.Compile) void {
+    var script = std.ArrayList(u8).initCapacity(b.allocator, 32 * 1024) catch @panic("OOM");
+    var writer = script.writer(b.allocator);
+    writer.writeAll(
+        \\set -eu
+        \\WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/cog-grammars.XXXXXX")
+        \\STAGING="$WORKDIR/grammars"
+        \\BACKUP="$WORKDIR/previous-grammars"
+        \\mkdir -p "$STAGING"
+        \\cleanup() {
+        \\  status=$?
+        \\  trap - EXIT INT TERM
+        \\  if [ "$status" -ne 0 ] && [ -d "$BACKUP" ] && [ ! -d grammars ]; then mv "$BACKUP" grammars; fi
+        \\  rm -rf "$WORKDIR"
+        \\  exit "$status"
+        \\}
+        \\trap cleanup EXIT
+        \\trap 'trap - INT; exit 130' INT
+        \\trap 'trap - TERM; exit 143' TERM
+        \\fetch_source() {
+        \\  repo="$1"
+        \\  commit="$2"
+        \\  sha256="$3"
+        \\  archive="$4"
+        \\  curl --fail --location --silent --show-error --output "$archive" "https://codeload.github.com/$repo/tar.gz/$commit"
+        \\  "$VERIFY_SOURCE" "$archive" "$sha256"
+        \\}
+        \\VERIFY_SOURCE="$1"
+        \\ARCHIVE="$WORKDIR/tree-sitter.tar.gz"
+    ) catch @panic("OOM");
+    writer.writeByte('\n') catch @panic("OOM");
+    appendCoreSetup(&writer);
 
-    // Track whether we've already added the typescript repo download
-    var ts_step: ?*std.Build.Step = null;
-
-    for (grammars) |g| {
-        if (std.mem.eql(u8, g.name, "typescript") or std.mem.eql(u8, g.name, "tsx")) {
-            if (ts_step == null) {
-                ts_step = addDownloadTypescript(b);
+    var saw_typescript = false;
+    for (grammars) |grammar| {
+        if (std.mem.eql(u8, grammar.name, "typescript") or std.mem.eql(u8, grammar.name, "tsx")) {
+            if (!saw_typescript) {
+                appendTypescriptSetup(&writer, grammar);
+                saw_typescript = true;
             }
-            setup_step.dependOn(ts_step.?);
         } else {
-            setup_step.dependOn(addDownloadGrammar(b, g));
+            appendGrammarSetup(&writer, grammar);
         }
     }
+
+    writer.writeAll(
+        \\if [ -d grammars ]; then mv grammars "$BACKUP"; fi
+        \\mv "$STAGING" grammars
+        \\rm -rf "$BACKUP"
+        \\echo "Installed verified tree-sitter grammar sources"
+    ) catch @panic("OOM");
+
+    const cmd = b.addSystemCommand(&.{ "sh", "-c", script.items, "sh" });
+    cmd.addFileArg(verify_source.getEmittedBin());
+    const setup_step = b.step("setup", "Download and verify tree-sitter grammars");
+    setup_step.dependOn(&cmd.step);
 }
 
-fn addDownloadCore(b: *std.Build) *std.Build.Step {
-    const script = b.fmt(
-        \\set -e
-        \\mkdir -p grammars/tree-sitter/src grammars/tree-sitter/include
-        \\TMPDIR=$(mktemp -d)
-        \\curl -sL "https://github.com/tree-sitter/tree-sitter/archive/refs/tags/{s}.tar.gz" | tar xz -C "$TMPDIR"
-        \\EXTRACTED="$TMPDIR/tree-sitter-{s}"
-        \\cp -R "$EXTRACTED/lib/src/"* grammars/tree-sitter/src/
-        \\cp -R "$EXTRACTED/lib/include/"* grammars/tree-sitter/include/
-        \\rm -rf "$TMPDIR"
-        \\echo "Downloaded tree-sitter {s}"
-    , .{
-        tree_sitter_version,
-        tree_sitter_version[1..], // strip leading 'v' for directory name
-        tree_sitter_version,
-    });
-    const cmd = b.addSystemCommand(&.{ "sh", "-c", script });
-    return &cmd.step;
+fn appendCoreSetup(writer: anytype) void {
+    const source = tree_sitter_source;
+    writer.print(
+        \\fetch_source "{s}" "{s}" "{s}" "$ARCHIVE"
+        \\tar xzf "$ARCHIVE" -C "$WORKDIR"
+        \\EXTRACTED="$WORKDIR/tree-sitter-{s}"
+        \\mkdir -p "$STAGING/tree-sitter/src" "$STAGING/tree-sitter/include"
+        \\cp -R "$EXTRACTED/lib/src/"* "$STAGING/tree-sitter/src/"
+        \\cp -R "$EXTRACTED/lib/include/"* "$STAGING/tree-sitter/include/"
+        \\echo "Downloaded tree-sitter at {s}"
+    , .{ source.repo, source.commit, source.archive_sha256, source.commit, source.commit }) catch @panic("OOM");
+    writer.writeByte('\n') catch @panic("OOM");
 }
 
-fn addDownloadGrammar(b: *std.Build, g: GrammarSource) *std.Build.Step {
-    const ref_path = switch (g.ref_kind) {
-        .tag => "tags",
-        .branch => "heads",
-    };
-    const extracted_name = switch (g.ref_kind) {
-        .tag => if (std.mem.startsWith(u8, g.ref_name, "v")) g.ref_name[1..] else g.ref_name,
-        .branch => g.ref_name,
-    };
-    const scanner_cp = if (g.has_scanner)
-        b.fmt("cp \"$EXTRACTED/{s}/scanner.c\" \"grammars/{s}/scanner.c\"\n", .{ g.src_prefix, g.name })
-    else
-        "";
-    const extra_cp = if (std.mem.eql(u8, g.name, "yaml"))
-        b.fmt(
-            "mkdir -p \"grammars/{s}\"\n" ++
-                "cp \"$EXTRACTED/{s}/schema.core.c\" \"grammars/{s}/schema.core.c\"\n" ++
-                "cp \"$EXTRACTED/{s}/schema.json.c\" \"grammars/{s}/schema.json.c\"\n" ++
-                "cp \"$EXTRACTED/{s}/schema.legacy.c\" \"grammars/{s}/schema.legacy.c\"\n",
-            .{ g.name, g.src_prefix, g.name, g.src_prefix, g.name, g.src_prefix, g.name },
-        )
-    else if (std.mem.eql(u8, g.name, "rst"))
-        b.fmt(
-            "mkdir -p \"grammars/{s}/tree_sitter_rst\"\n" ++
-                "cp -R \"$EXTRACTED/{s}/tree_sitter_rst/\"* \"grammars/{s}/tree_sitter_rst/\"\n",
-            .{ g.name, g.src_prefix, g.name },
-        )
-    else if (std.mem.eql(u8, g.name, "asciidoc"))
-        b.fmt(
-            "mkdir -p \"grammars/{s}/include\"\n" ++
-                "cp -R \"$EXTRACTED/{s}/include/\"* \"grammars/{s}/include/\"\n",
-            .{ g.name, g.src_prefix, g.name },
-        )
-    else
-        "";
+fn appendGrammarSetup(writer: anytype, grammar: GrammarSource) void {
+    const repo_name = std.fs.path.basename(grammar.repo);
+    writer.print(
+        \\ARCHIVE="$WORKDIR/{s}.tar.gz"
+        \\fetch_source "{s}" "{s}" "{s}" "$ARCHIVE"
+        \\tar xzf "$ARCHIVE" -C "$WORKDIR"
+        \\EXTRACTED="$WORKDIR/{s}-{s}"
+        \\mkdir -p "$STAGING/{s}/tree_sitter"
+        \\cp "$EXTRACTED/{s}/parser.c" "$STAGING/{s}/parser.c"
+    , .{ grammar.name, grammar.repo, grammar.commit, grammar.archive_sha256, repo_name, grammar.commit, grammar.name, grammar.src_prefix, grammar.name }) catch @panic("OOM");
+    writer.writeByte('\n') catch @panic("OOM");
 
-    const script = b.fmt(
-        \\set -e
-        \\mkdir -p "grammars/{s}/tree_sitter"
-        \\TMPDIR=$(mktemp -d)
-        \\curl -sL "https://github.com/{s}/archive/refs/{s}/{s}.tar.gz" | tar xz -C "$TMPDIR"
-        \\REPO_NAME=$(echo "{s}" | sed 's|.*/||')
-        \\EXTRACTED="$TMPDIR/$REPO_NAME-{s}"
-        \\cp "$EXTRACTED/{s}/parser.c" "grammars/{s}/parser.c"
-        \\{s}{s}cp "$EXTRACTED/{s}/tree_sitter/"*.h "grammars/{s}/tree_sitter/"
-        \\if [ -f "$EXTRACTED/tags.scm" ]; then cp "$EXTRACTED/tags.scm" "grammars/{s}/tags.scm"; fi
-        \\if [ -f "$EXTRACTED/{s}/tags.scm" ]; then cp "$EXTRACTED/{s}/tags.scm" "grammars/{s}/tags.scm"; fi
-        \\rm -rf "$TMPDIR"
-        \\echo "Downloaded {s} grammar ({s})"
-    , .{
-        g.name, // mkdir target
-        g.repo, // curl URL repo
-        ref_path, // archive ref path
-        g.ref_name, // archive ref name
-        g.repo, // repo name extraction
-        extracted_name, // extracted directory suffix
-        g.src_prefix, // parser.c source
-        g.name, // parser.c dest
-        scanner_cp, // optional scanner copy
-        extra_cp, // optional extra files
-        g.src_prefix, // tree_sitter headers source
-        g.name, // tree_sitter headers dest
-        g.name, // tags.scm root check dest
-        g.src_prefix, // tags.scm prefix -f check
-        g.src_prefix, // tags.scm prefix cp source
-        g.name, // tags.scm prefix check dest
-        g.name, // echo name
-        g.ref_name, // echo ref
-    });
-    const cmd = b.addSystemCommand(&.{ "sh", "-c", script });
-    return &cmd.step;
+    if (grammar.has_scanner) {
+        writer.print("cp \"$EXTRACTED/{s}/scanner.c\" \"$STAGING/{s}/scanner.c\"\n", .{ grammar.src_prefix, grammar.name }) catch @panic("OOM");
+    }
+    writer.print(
+        \\cp "$EXTRACTED/{s}/tree_sitter/"*.h "$STAGING/{s}/tree_sitter/"
+        \\if [ -f "$EXTRACTED/tags.scm" ]; then cp "$EXTRACTED/tags.scm" "$STAGING/{s}/tags.scm"; fi
+        \\if [ -f "$EXTRACTED/{s}/tags.scm" ]; then cp "$EXTRACTED/{s}/tags.scm" "$STAGING/{s}/tags.scm"; fi
+    , .{ grammar.src_prefix, grammar.name, grammar.name, grammar.src_prefix, grammar.src_prefix, grammar.name }) catch @panic("OOM");
+    writer.writeByte('\n') catch @panic("OOM");
+
+    if (std.mem.eql(u8, grammar.name, "yaml")) {
+        writer.print(
+            \\cp "$EXTRACTED/{s}/schema.core.c" "$STAGING/{s}/schema.core.c"
+            \\cp "$EXTRACTED/{s}/schema.json.c" "$STAGING/{s}/schema.json.c"
+            \\cp "$EXTRACTED/{s}/schema.legacy.c" "$STAGING/{s}/schema.legacy.c"
+        , .{ grammar.src_prefix, grammar.name, grammar.src_prefix, grammar.name, grammar.src_prefix, grammar.name }) catch @panic("OOM");
+        writer.writeByte('\n') catch @panic("OOM");
+    } else if (std.mem.eql(u8, grammar.name, "rst")) {
+        writer.print(
+            \\mkdir -p "$STAGING/{s}/tree_sitter_rst"
+            \\cp -R "$EXTRACTED/{s}/tree_sitter_rst/"* "$STAGING/{s}/tree_sitter_rst/"
+        , .{ grammar.name, grammar.src_prefix, grammar.name }) catch @panic("OOM");
+        writer.writeByte('\n') catch @panic("OOM");
+    } else if (std.mem.eql(u8, grammar.name, "asciidoc")) {
+        writer.print(
+            \\mkdir -p "$STAGING/{s}/include"
+            \\cp -R "$EXTRACTED/{s}/include/"* "$STAGING/{s}/include/"
+        , .{ grammar.name, grammar.src_prefix, grammar.name }) catch @panic("OOM");
+        writer.writeByte('\n') catch @panic("OOM");
+    }
+    writer.print("echo \"Downloaded {s} grammar at {s}\"\n", .{ grammar.name, grammar.commit }) catch @panic("OOM");
+    writer.writeByte('\n') catch @panic("OOM");
 }
 
-fn addDownloadTypescript(b: *std.Build) *std.Build.Step {
-    const tag = "v0.23.2";
-    const script = b.fmt(
-        \\set -e
-        \\mkdir -p grammars/typescript/tree_sitter grammars/tsx/tree_sitter grammars/common
-        \\TMPDIR=$(mktemp -d)
-        \\curl -sL "https://github.com/tree-sitter/tree-sitter-typescript/archive/refs/tags/{s}.tar.gz" | tar xz -C "$TMPDIR"
-        \\EXTRACTED="$TMPDIR/tree-sitter-typescript-{s}"
-        \\cp "$EXTRACTED/typescript/src/parser.c" grammars/typescript/parser.c
-        \\cp "$EXTRACTED/typescript/src/scanner.c" grammars/typescript/scanner.c
-        \\cp "$EXTRACTED/typescript/src/tree_sitter/"*.h grammars/typescript/tree_sitter/
-        \\if [ -f "$EXTRACTED/typescript/tags.scm" ]; then cp "$EXTRACTED/typescript/tags.scm" grammars/typescript/tags.scm; fi
-        \\cp "$EXTRACTED/tsx/src/parser.c" grammars/tsx/parser.c
-        \\cp "$EXTRACTED/tsx/src/scanner.c" grammars/tsx/scanner.c
-        \\cp "$EXTRACTED/tsx/src/tree_sitter/"*.h grammars/tsx/tree_sitter/
-        \\if [ -f "$EXTRACTED/tsx/tags.scm" ]; then cp "$EXTRACTED/tsx/tags.scm" grammars/tsx/tags.scm; fi
-        \\cp "$EXTRACTED/common/scanner.h" grammars/common/scanner.h
-        \\rm -rf "$TMPDIR"
-        \\echo "Downloaded typescript/tsx grammars ({s})"
-    , .{ tag, tag[1..], tag });
-    const cmd = b.addSystemCommand(&.{ "sh", "-c", script });
-    return &cmd.step;
+fn appendTypescriptSetup(writer: anytype, source: GrammarSource) void {
+    writer.print(
+        \\ARCHIVE="$WORKDIR/typescript.tar.gz"
+        \\fetch_source "{s}" "{s}" "{s}" "$ARCHIVE"
+        \\tar xzf "$ARCHIVE" -C "$WORKDIR"
+        \\EXTRACTED="$WORKDIR/tree-sitter-typescript-{s}"
+        \\mkdir -p "$STAGING/typescript/tree_sitter" "$STAGING/tsx/tree_sitter" "$STAGING/common"
+        \\cp "$EXTRACTED/typescript/src/parser.c" "$STAGING/typescript/parser.c"
+        \\cp "$EXTRACTED/typescript/src/scanner.c" "$STAGING/typescript/scanner.c"
+        \\cp "$EXTRACTED/typescript/src/tree_sitter/"*.h "$STAGING/typescript/tree_sitter/"
+        \\if [ -f "$EXTRACTED/typescript/tags.scm" ]; then cp "$EXTRACTED/typescript/tags.scm" "$STAGING/typescript/tags.scm"; fi
+        \\cp "$EXTRACTED/tsx/src/parser.c" "$STAGING/tsx/parser.c"
+        \\cp "$EXTRACTED/tsx/src/scanner.c" "$STAGING/tsx/scanner.c"
+        \\cp "$EXTRACTED/tsx/src/tree_sitter/"*.h "$STAGING/tsx/tree_sitter/"
+        \\if [ -f "$EXTRACTED/tsx/tags.scm" ]; then cp "$EXTRACTED/tsx/tags.scm" "$STAGING/tsx/tags.scm"; fi
+        \\cp "$EXTRACTED/common/scanner.h" "$STAGING/common/scanner.h"
+        \\echo "Downloaded typescript/tsx grammars at {s}"
+    , .{ source.repo, source.commit, source.archive_sha256, source.commit, source.commit }) catch @panic("OOM");
+    writer.writeByte('\n') catch @panic("OOM");
 }
