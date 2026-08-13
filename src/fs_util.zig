@@ -82,6 +82,50 @@ pub fn createSecureTempFile(
     }
 }
 
+/// Replace `live_name` with an already staged sibling directory. The previous
+/// live directory is retained until promotion succeeds and restored if it does
+/// not. The staged directory is left in place on failure for diagnostics or a
+/// later retry.
+pub fn replaceDirectoryTransactional(
+    parent: std.fs.Dir,
+    allocator: std.mem.Allocator,
+    live_name: []const u8,
+    staged_name: []const u8,
+) !void {
+    if (!isBasename(live_name) or !isBasename(staged_name) or std.mem.eql(u8, live_name, staged_name)) {
+        return error.InvalidDirectoryName;
+    }
+
+    const sequence = temp_counter.fetchAdd(1, .monotonic);
+    const backup_name = try std.fmt.allocPrint(allocator, ".{s}.backup-{d}-{d}", .{ live_name, std.time.nanoTimestamp(), sequence });
+    defer allocator.free(backup_name);
+
+    var had_live = true;
+    parent.rename(live_name, backup_name) catch |err| switch (err) {
+        error.FileNotFound => had_live = false,
+        else => return err,
+    };
+    errdefer if (had_live) parent.rename(backup_name, live_name) catch {};
+
+    debug_log.log("fs_util.replaceDirectoryTransactional: promoting {s} to {s}", .{ staged_name, live_name });
+    parent.rename(staged_name, live_name) catch |err| {
+        debug_log.log("fs_util.replaceDirectoryTransactional: promotion failed for {s}: {s}", .{ live_name, @errorName(err) });
+        return err;
+    };
+
+    if (had_live) {
+        parent.deleteTree(backup_name) catch |err| {
+            debug_log.log("fs_util.replaceDirectoryTransactional: retained backup {s}: {s}", .{ backup_name, @errorName(err) });
+        };
+    }
+    debug_log.log("fs_util.replaceDirectoryTransactional: replaced {s}", .{live_name});
+}
+
+fn isBasename(name: []const u8) bool {
+    return name.len > 0 and std.fs.path.basename(name).len == name.len and
+        !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, "..");
+}
+
 test "writeFileAtomic creates a file" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -188,4 +232,62 @@ test "createSecureTempFile rejects path prefixes" {
 
     try std.testing.expectError(error.InvalidTempPrefix, createSecureTempFile(tmp.dir, std.testing.allocator, "nested/file"));
     try std.testing.expectError(error.InvalidTempPrefix, createSecureTempFile(tmp.dir, std.testing.allocator, ""));
+}
+
+test "replaceDirectoryTransactional promotes staged contents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("live");
+    try tmp.dir.makeDir("staged");
+    try tmp.dir.writeFile(.{ .sub_path = "live/version", .data = "old\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "staged/version", .data = "new\n" });
+
+    try replaceDirectoryTransactional(tmp.dir, allocator, "live", "staged");
+
+    const version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(version);
+    try std.testing.expectEqualStrings("new\n", version);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("staged", .{}));
+
+    var dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer dir.close();
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".live.backup-"));
+    }
+}
+
+test "replaceDirectoryTransactional leaves live contents when staging is absent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("live");
+    try tmp.dir.writeFile(.{ .sub_path = "live/version", .data = "old\n" });
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        replaceDirectoryTransactional(tmp.dir, allocator, "live", "missing"),
+    );
+
+    const version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(version);
+    try std.testing.expectEqualStrings("old\n", version);
+}
+
+test "replaceDirectoryTransactional installs when live is absent" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("staged");
+    try tmp.dir.writeFile(.{ .sub_path = "staged/version", .data = "new\n" });
+
+    try replaceDirectoryTransactional(tmp.dir, allocator, "live", "staged");
+
+    const version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(version);
+    try std.testing.expectEqualStrings("new\n", version);
 }
