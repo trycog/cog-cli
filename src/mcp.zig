@@ -2409,7 +2409,7 @@ test "unknown method write failures propagate to request handler" {
     closed_file.close();
 
     var mutex: std.Thread.Mutex = .{};
-    var runtime = testRuntime(std.testing.allocator);
+    var runtime = try testRuntime(std.testing.allocator);
     defer runtime.deinit();
 
     try std.testing.expectError(error.WriteFailure, processMessage(
