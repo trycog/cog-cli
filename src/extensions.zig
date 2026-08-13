@@ -2,6 +2,7 @@ const std = @import("std");
 const curl = @import("curl.zig");
 const paths = @import("paths.zig");
 const debug_log = @import("debug_log.zig");
+const fs_util = @import("fs_util.zig");
 
 // ANSI styles
 const dim = "\x1B[2m";
@@ -1098,6 +1099,10 @@ const InstallMetadata = struct {
     tag: []u8,
 };
 
+pub const InstallOptions = struct {
+    trust_build: bool = false,
+};
+
 const ResolvedRelease = struct {
     tag_name: []u8,
     version: []u8,
@@ -1678,6 +1683,60 @@ pub fn updateExtensions(allocator: std.mem.Allocator, requested_name: ?[]const u
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "validateArchiveEntryPath rejects traversal and absolute paths" {
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("../outside"));
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("root/../../outside"));
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("/tmp/outside"));
+    try std.testing.expectError(error.UnsafeArchivePath, validateArchiveEntryPath("C:\\outside"));
+    try validateArchiveEntryPath("root/bin/cog-safe");
+}
+
+test "validateArchiveSymlink rejects links escaping the staged tree" {
+    try validateArchiveSymlink("root/bin/cog-safe", "../lib/cog-safe");
+    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("root/bin/cog-safe", "../../../outside"));
+    try std.testing.expectError(error.UnsafeArchiveLink, validateArchiveSymlink("root/bin/cog-safe", "/tmp/outside"));
+}
+
+test "ensureBuildTrusted fails closed for downloaded shell commands" {
+    try ensureBuildTrusted("", .{});
+    try ensureBuildTrusted("zig build -Doptimize=ReleaseSafe", .{ .trust_build = true });
+    try std.testing.expectError(error.UntrustedBuildCommand, ensureBuildTrusted("zig build", .{}));
+}
+
+test "writeInstallMetadata writes pretty JSON atomically" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ext_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(ext_dir);
+    const release: ResolvedRelease = .{
+        .tag_name = @constCast("v1.2.3"),
+        .version = @constCast("1.2.3"),
+        .tarball_url = @constCast("https://example.com/archive.tar.gz"),
+    };
+
+    try writeInstallMetadata(allocator, ext_dir, "https://github.com/example/cog-safe", release);
+
+    const contents = try tmp.dir.readFileAlloc(allocator, install_metadata_filename, 4096);
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings(
+        \\{
+        \\  "source_url": "https://github.com/example/cog-safe",
+        \\  "version": "1.2.3",
+        \\  "tag": "v1.2.3"
+        \\}
+        \\
+    , contents);
+
+    var dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    defer dir.close();
+    var iterator = dir.iterate();
+    while (try iterator.next()) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".cog-extension-install.json.tmp-"));
+    }
+}
 
 test "resolveByExtension finds built-in for .go" {
     const allocator = std.testing.allocator;
