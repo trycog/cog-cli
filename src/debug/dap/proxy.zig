@@ -74,6 +74,10 @@ const DriverVTable = driver_mod.DriverVTable;
 
 // ── DAP Proxy ───────────────────────────────────────────────────────────
 
+const MAX_PENDING_NOTIFICATIONS: usize = 256;
+const MAX_BUFFERED_EVENTS: usize = 256;
+const MAX_OUTPUT_ENTRIES: usize = 512;
+
 const BufferedEvent = struct {
     event_name: []const u8,
     body: []const u8,
@@ -227,8 +231,11 @@ pub const DapProxy = struct {
     invalidated_areas: std.ArrayListUnmanaged(InvalidatedEvent) = .empty,
     // Pending notifications for MCP server to emit
     pending_notifications: std.ArrayListUnmanaged(types.DebugNotification) = .empty,
+    dropped_notifications: usize = 0,
     // Buffered events consumed by readResponse but needed by waitForEvent
     buffered_events: std.ArrayListUnmanaged(BufferedEvent) = .empty,
+    dropped_buffered_events: usize = 0,
+    dropped_output_entries: usize = 0,
     // Only one thread may read/decode a DAP connection at a time. This also
     // serializes request/response pairs so explicit request_seq correlation is
     // deterministic even when MCP tools run concurrently.
@@ -716,10 +723,7 @@ pub const DapProxy = struct {
                                     // Queue notification for poll_events
                                     self.queueNotification("debug/stopped", decoded.body);
                                     // Also buffer for waitForEvent so it isn't lost
-                                    self.buffered_events.append(self.allocator, .{
-                                        .event_name = self.allocator.dupe(u8, "stopped") catch "",
-                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
-                                    }) catch {};
+                                    self.bufferEvent("stopped", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "output")) {
                                     // Capture debuggee output (skip telemetry — adapter-internal metrics)
                                     if (parsed.value.object.get("body")) |body| {
@@ -736,10 +740,7 @@ pub const DapProxy = struct {
                                                 if (text.len > 0) {
                                                     const log_len = @min(text.len, 256);
                                                     dapLog("[DAP readResponse] output({s}): {s}", .{ category, text[0..log_len] });
-                                                    self.output_buffer.append(self.allocator, .{
-                                                        .category = self.allocator.dupe(u8, category) catch "",
-                                                        .text = self.allocator.dupe(u8, text) catch "",
-                                                    }) catch {};
+                                                    self.bufferOutput(category, text);
                                                 }
                                                 self.queueNotification("debug/output", decoded.body);
                                             }
@@ -820,18 +821,12 @@ pub const DapProxy = struct {
                                 } else if (std.mem.eql(u8, evt.string, "exited")) {
                                     // Exited event — process exited with exit code (per DAP spec)
                                     self.queueNotification("debug/exited", decoded.body);
-                                    self.buffered_events.append(self.allocator, .{
-                                        .event_name = self.allocator.dupe(u8, "exited") catch "",
-                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
-                                    }) catch {};
+                                    self.bufferEvent("exited", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "terminated")) {
                                     // Terminated event — debug session end
                                     self.initialized = false;
                                     self.queueNotification("debug/terminated", decoded.body);
-                                    self.buffered_events.append(self.allocator, .{
-                                        .event_name = self.allocator.dupe(u8, "terminated") catch "",
-                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
-                                    }) catch {};
+                                    self.bufferEvent("terminated", decoded.body);
                                 } else if (std.mem.eql(u8, evt.string, "invalidated")) {
                                     // Invalidated event — parse areas and stack frame ID
                                     if (parsed.value.object.get("body")) |body| {
@@ -843,10 +838,7 @@ pub const DapProxy = struct {
                                 } else {
                                     // Unrecognized event — buffer it for waitForEvent
                                     dapLog("[DAP readResponse] Buffering unrecognized event: {s}", .{evt.string});
-                                    self.buffered_events.append(self.allocator, .{
-                                        .event_name = self.allocator.dupe(u8, evt.string) catch "",
-                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
-                                    }) catch {};
+                                    self.bufferEvent(evt.string, decoded.body);
                                 }
                             }
                         }
@@ -1010,10 +1002,7 @@ pub const DapProxy = struct {
                                 // be silently discarded.
                                 if (evt == .string) {
                                     dapLog("[DAP waitForEvent] Buffering non-target event: {s}", .{evt.string});
-                                    self.buffered_events.append(self.allocator, .{
-                                        .event_name = self.allocator.dupe(u8, evt.string) catch "",
-                                        .body = self.allocator.dupe(u8, decoded.body) catch "",
-                                    }) catch {};
+                                    self.bufferEvent(evt.string, decoded.body);
                                     // If the program exited/terminated while we're waiting
                                     // for "stopped" or "initialized", bail out early — the
                                     // expected event will never arrive.
@@ -1040,10 +1029,7 @@ pub const DapProxy = struct {
                                                     if (text.len > 0) {
                                                         const log_len = @min(text.len, 256);
                                                         dapLog("[DAP waitForEvent] output({s}): {s}", .{ category, text[0..log_len] });
-                                                        self.output_buffer.append(self.allocator, .{
-                                                            .category = self.allocator.dupe(u8, category) catch "",
-                                                            .text = self.allocator.dupe(u8, text) catch "",
-                                                        }) catch {};
+                                                        self.bufferOutput(category, text);
                                                     }
                                                     self.queueNotification("debug/output", decoded.body);
                                                 }
@@ -1656,10 +1642,7 @@ pub const DapProxy = struct {
                         // Buffer events for later consumption
                         if (parsed.value.object.get("event")) |evt| {
                             if (evt == .string) {
-                                self.buffered_events.append(self.allocator, .{
-                                    .event_name = self.allocator.dupe(u8, evt.string) catch "",
-                                    .body = self.allocator.dupe(u8, decoded.body) catch "",
-                                }) catch {};
+                                self.bufferEvent(evt.string, decoded.body);
                             }
                         }
                     }
@@ -2226,10 +2209,51 @@ pub const DapProxy = struct {
     }
 
     fn queueNotification(self: *DapProxy, method: []const u8, params_json: []const u8) void {
+        if (self.pending_notifications.items.len >= MAX_PENDING_NOTIFICATIONS) {
+            self.dropped_notifications += 1;
+            debug_log.log("dap.proxy: dropped notification method={s} total_dropped={d}", .{ method, self.dropped_notifications });
+            return;
+        }
+        const method_owned = self.allocator.dupe(u8, method) catch return;
+        errdefer self.allocator.free(method_owned);
+        const params_owned = self.allocator.dupe(u8, params_json) catch return;
+        errdefer self.allocator.free(params_owned);
         self.pending_notifications.append(self.allocator, .{
-            .method = self.allocator.dupe(u8, method) catch return,
-            .params_json = self.allocator.dupe(u8, params_json) catch return,
-        }) catch {};
+            .method = method_owned,
+            .params_json = params_owned,
+        }) catch return;
+    }
+
+    fn bufferEvent(self: *DapProxy, event_name: []const u8, body: []const u8) void {
+        if (self.buffered_events.items.len >= MAX_BUFFERED_EVENTS) {
+            self.dropped_buffered_events += 1;
+            debug_log.log("dap.proxy: dropped buffered event name={s} total_dropped={d}", .{ event_name, self.dropped_buffered_events });
+            return;
+        }
+        const event_owned = self.allocator.dupe(u8, event_name) catch return;
+        errdefer self.allocator.free(event_owned);
+        const body_owned = self.allocator.dupe(u8, body) catch return;
+        errdefer self.allocator.free(body_owned);
+        self.buffered_events.append(self.allocator, .{
+            .event_name = event_owned,
+            .body = body_owned,
+        }) catch return;
+    }
+
+    fn bufferOutput(self: *DapProxy, category: []const u8, text: []const u8) void {
+        if (self.output_buffer.items.len >= MAX_OUTPUT_ENTRIES) {
+            self.dropped_output_entries += 1;
+            debug_log.log("dap.proxy: dropped output category={s} total_dropped={d}", .{ category, self.dropped_output_entries });
+            return;
+        }
+        const category_owned = self.allocator.dupe(u8, category) catch return;
+        errdefer self.allocator.free(category_owned);
+        const text_owned = self.allocator.dupe(u8, text) catch return;
+        errdefer self.allocator.free(text_owned);
+        self.output_buffer.append(self.allocator, .{
+            .category = category_owned,
+            .text = text_owned,
+        }) catch return;
     }
 
     /// Drain and return all pending notifications, transferring ownership to caller.
@@ -4253,6 +4277,23 @@ test "DapProxy rejects invalid readMemory base64" {
     ;
 
     try std.testing.expectError(error.InvalidResponse, DapProxy.translateReadMemory(allocator, response));
+}
+
+test "DapProxy bounds notification event and output queues" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    for (0..MAX_PENDING_NOTIFICATIONS + 3) |_| proxy.queueNotification("debug/output", "{}");
+    for (0..MAX_BUFFERED_EVENTS + 2) |_| proxy.bufferEvent("stopped", "{}");
+    for (0..MAX_OUTPUT_ENTRIES + 1) |_| proxy.bufferOutput("stdout", "x");
+
+    try std.testing.expectEqual(MAX_PENDING_NOTIFICATIONS, proxy.pending_notifications.items.len);
+    try std.testing.expectEqual(@as(usize, 3), proxy.dropped_notifications);
+    try std.testing.expectEqual(MAX_BUFFERED_EVENTS, proxy.buffered_events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), proxy.dropped_buffered_events);
+    try std.testing.expectEqual(MAX_OUTPUT_ENTRIES, proxy.output_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 1), proxy.dropped_output_entries);
 }
 
 test "DapProxy builds failure response for unsupported reverse request" {
