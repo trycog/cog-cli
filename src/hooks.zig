@@ -1933,6 +1933,149 @@ fn withTempCwd(comptime body: fn (std.mem.Allocator) anyerror!void) !void {
     try body(allocator);
 }
 
+fn writeHostConfigFixture(path: []const u8, content: []const u8, mode: std.fs.File.Mode) !void {
+    if (std.fs.path.dirname(path)) |parent| try std.fs.cwd().makePath(parent);
+    const file = try std.fs.cwd().createFile(path, .{ .mode = mode });
+    defer file.close();
+    try file.writeAll(content);
+}
+
+fn expectHostConfigUnchanged(allocator: std.mem.Allocator, path: []const u8, expected: []const u8, mode: std.fs.File.Mode) !void {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, expected.len + 1);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings(expected, content);
+    if (@import("builtin").os.tag != .windows) {
+        const stat = try std.fs.cwd().statFile(path);
+        try std.testing.expectEqual(mode, stat.mode & 0o777);
+    }
+}
+
+fn resetMalformedHostConfig(path: []const u8, content: []const u8) !void {
+    std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try writeHostConfigFixture(path, content, 0o600);
+}
+
+test "configureMcp rejects malformed existing configs for every repo-local host" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const repo_local_agent_indices = [_]usize{ 0, 1, 2, 4, 5, 6, 8, 9, 10 };
+            for (repo_local_agent_indices) |index| {
+                const agent = agents_mod.agents[index];
+                const path = agent.mcp_path orelse return error.TestUnexpectedResult;
+                const malformed = if (agent.mcp_format == .toml) "[broken" else "{broken";
+                try writeHostConfigFixture(path, malformed, 0o600);
+
+                try std.testing.expectError(error.MalformedHostConfig, configureMcp(allocator, agent));
+                try expectHostConfigUnchanged(allocator, path, malformed, 0o600);
+            }
+        }
+    }.run);
+}
+
+test "host permission and runtime mergers reject malformed existing JSON" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const malformed = "{broken";
+            const permission_agent_indices = [_]usize{ 0, 1, 6, 9 };
+            for (permission_agent_indices) |index| {
+                const agent = agents_mod.agents[index];
+                const path = if (std.mem.eql(u8, agent.id, "claude_code")) ".claude/settings.json" else agent.mcp_path.?;
+                try resetMalformedHostConfig(path, malformed);
+
+                try std.testing.expectError(error.MalformedHostConfig, configureToolPermissions(allocator, agent));
+                try expectHostConfigUnchanged(allocator, path, malformed, 0o600);
+            }
+
+            const runtime_agent_indices = [_]usize{ 0, 1 };
+            for (runtime_agent_indices) |index| {
+                const agent = agents_mod.agents[index];
+                const path = if (std.mem.eql(u8, agent.id, "claude_code")) ".claude/settings.json" else agent.mcp_path.?;
+                try resetMalformedHostConfig(path, malformed);
+
+                try std.testing.expectError(error.MalformedHostConfig, configureRuntimePolicy(allocator, agent));
+                try expectHostConfigUnchanged(allocator, path, malformed, 0o600);
+            }
+        }
+    }.run);
+}
+
+test "shared host config specialist mergers reject malformed existing configs" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const codex = agents_mod.agents[5];
+            const roo = agents_mod.agents[8];
+            const configure_functions = .{
+                configureAgentFile,
+                configureDebugAgentFile,
+                configureMemAgentFile,
+                configureValidateAgentFile,
+                configureObserveAgentFile,
+            };
+
+            inline for (configure_functions) |configure_fn| {
+                try resetMalformedHostConfig(codex.agent_file_path.?, "[broken");
+                try std.testing.expectError(error.MalformedHostConfig, configure_fn(allocator, codex));
+                try expectHostConfigUnchanged(allocator, codex.agent_file_path.?, "[broken", 0o600);
+
+                try resetMalformedHostConfig(roo.agent_file_path.?, "{broken");
+                try std.testing.expectError(error.MalformedHostConfig, configure_fn(allocator, roo));
+                try expectHostConfigUnchanged(allocator, roo.agent_file_path.?, "{broken", 0o600);
+            }
+        }
+    }.run);
+}
+
+test "host config readers distinguish missing unreadable and oversized files" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeJsonMcp(allocator, "missing.json", "mcpServers");
+            try std.testing.expect(fileExistsInCwd("missing.json"));
+
+            const unreadable_content = "{\"keep\":true}";
+            const unreadable = try std.fs.cwd().createFile("unreadable.json", .{ .read = true, .mode = 0o600 });
+            defer unreadable.close();
+            try unreadable.writeAll(unreadable_content);
+            try unreadable.chmod(0);
+            defer unreadable.chmod(0o600) catch {};
+
+            try std.testing.expectError(error.HostConfigUnreadable, writeJsonMcp(allocator, "unreadable.json", "mcpServers"));
+            try unreadable.seekTo(0);
+            const retained_unreadable = try unreadable.readToEndAlloc(allocator, unreadable_content.len + 1);
+            defer allocator.free(retained_unreadable);
+            try std.testing.expectEqualStrings(unreadable_content, retained_unreadable);
+
+            const oversized = try allocator.alloc(u8, 1048577);
+            defer allocator.free(oversized);
+            @memset(oversized, ' ');
+            oversized[0] = '{';
+            oversized[oversized.len - 1] = '}';
+            try writeHostConfigFixture("oversized.json", oversized, 0o640);
+
+            try std.testing.expectError(error.HostConfigTooLarge, writeJsonMcp(allocator, "oversized.json", "mcpServers"));
+            try expectHostConfigUnchanged(allocator, "oversized.json", oversized, 0o640);
+        }
+    }.run);
+}
+
+test "host JSON config mergers reject non-object roots" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const invalid_config = "[]";
+            try writeHostConfigFixture("config.json", invalid_config, 0o600);
+
+            try std.testing.expectError(error.InvalidHostConfig, writeJsonMcp(allocator, "config.json", "mcpServers"));
+            try expectHostConfigUnchanged(allocator, "config.json", invalid_config, 0o600);
+        }
+    }.run);
+}
+
 test "writeJsonMcp atomically preserves mode and existing content" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
 
