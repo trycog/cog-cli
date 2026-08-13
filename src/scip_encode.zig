@@ -224,6 +224,61 @@ test "encoder preserves signed int32 protobuf values" {
     try std.testing.expectEqual(@as(i32, -2), decoded.syntax_kind);
 }
 
+test "encodeIndex canonicalizes repeated fields for deterministic bytes" {
+    const allocator = std.testing.allocator;
+
+    var relationships_a = [_]scip.Relationship{
+        .{ .symbol = "pkg/Zed#", .is_reference = true, .is_implementation = false, .is_type_definition = false, .is_definition = false, .kind = "calls" },
+        .{ .symbol = "pkg/Alpha#", .is_reference = true, .is_implementation = false, .is_type_definition = false, .is_definition = false, .kind = "imports" },
+    };
+    var relationships_b = [_]scip.Relationship{ relationships_a[1], relationships_a[0] };
+    var docs_a = [_][]const u8{ "second", "first" };
+    var docs_b = [_][]const u8{ "first", "second" };
+
+    var symbols_a = [_]scip.SymbolInformation{
+        .{ .symbol = "local src/z.zig:2", .documentation = &docs_a, .relationships = &relationships_a, .kind = 17, .display_name = "zed", .enclosing_symbol = "" },
+        .{ .symbol = "local src/z.zig:1", .documentation = &.{}, .relationships = &.{}, .kind = 49, .display_name = "Alpha", .enclosing_symbol = "" },
+    };
+    var symbols_b = [_]scip.SymbolInformation{
+        symbols_a[1],
+        .{ .symbol = "local src/z.zig:2", .documentation = &docs_b, .relationships = &relationships_b, .kind = 17, .display_name = "zed", .enclosing_symbol = "" },
+    };
+
+    var occurrences_a = [_]scip.Occurrence{
+        .{ .range = .{ .start_line = 8, .start_char = 2, .end_line = 8, .end_char = 5 }, .symbol = symbols_a[0].symbol, .symbol_roles = 0, .syntax_kind = 17 },
+        .{ .range = .{ .start_line = 1, .start_char = 0, .end_line = 1, .end_char = 5 }, .symbol = symbols_a[1].symbol, .symbol_roles = scip.SymbolRole.Definition, .syntax_kind = 49 },
+    };
+    var occurrences_b = [_]scip.Occurrence{ occurrences_a[1], occurrences_a[0] };
+
+    var documents_a = [_]scip.Document{
+        .{ .language = "zig", .relative_path = "src/z.zig", .occurrences = &occurrences_a, .symbols = &symbols_a },
+        .{ .language = "zig", .relative_path = "src/a.zig", .occurrences = &.{}, .symbols = &.{} },
+    };
+    var documents_b = [_]scip.Document{
+        documents_a[1],
+        .{ .language = "zig", .relative_path = "src/z.zig", .occurrences = &occurrences_b, .symbols = &symbols_b },
+    };
+
+    var external_a = [_]scip.SymbolInformation{
+        .{ .symbol = "external/Zed#", .documentation = &.{}, .relationships = &.{}, .kind = 49, .display_name = "Zed", .enclosing_symbol = "" },
+        .{ .symbol = "external/Alpha#", .documentation = &.{}, .relationships = &.{}, .kind = 49, .display_name = "Alpha", .enclosing_symbol = "" },
+    };
+    var external_b = [_]scip.SymbolInformation{ external_a[1], external_a[0] };
+
+    const metadata: scip.Metadata = .{
+        .version = 1,
+        .tool_info = .{ .name = "cog", .version = "1" },
+        .project_root = "",
+        .text_document_encoding = 1,
+    };
+    const first = try encodeIndex(allocator, .{ .metadata = metadata, .documents = &documents_a, .external_symbols = &external_a });
+    defer allocator.free(first);
+    const second = try encodeIndex(allocator, .{ .metadata = metadata, .documents = &documents_b, .external_symbols = &external_b });
+    defer allocator.free(second);
+
+    try std.testing.expectEqualSlices(u8, first, second);
+}
+
 test "encodeIndex cleans up every partial allocation failure" {
     var relationships = [_]scip.Relationship{
         .{
