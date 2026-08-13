@@ -1484,16 +1484,7 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
                 try discoverRemoteTools(runtime);
             }
 
-            // Release mutex for the remote HTTP call so concurrent tool
-            // calls (code_query, code_explore, other mem_* calls) are not
-            // blocked by network latency.  Re-acquire afterwards for the
-            // deferred unlock and recordToolEvent.
-            runtime.mutex.unlock();
-            const result = callRemoteHostedTool(runtime, session_ctx, tool_name, arguments) catch |err| {
-                runtime.mutex.lock();
-                return err;
-            };
-            runtime.mutex.lock();
+            const result = try callRemoteHostedTool(runtime, session_ctx, tool_name, arguments);
             try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
             return result;
         }
@@ -2627,6 +2618,20 @@ fn testRuntime(allocator: std.mem.Allocator) Runtime {
         .debug_tool_tier = .specialist,
         .mutex = .{},
     };
+}
+
+test "runtimeCallTool keeps runtime mutex held across remote calls and event recording" {
+    const source = @embedFile("mcp.zig");
+    const remote_branch_start = std.mem.indexOf(u8, source, "        } else {\n            // Ensure remote tools are discovered while holding the mutex") orelse return error.TestUnexpectedResult;
+    const remote_branch_end = std.mem.indexOfPos(u8, source, remote_branch_start, "            return result;\n        }\n") orelse return error.TestUnexpectedResult;
+    const remote_branch = source[remote_branch_start..remote_branch_end];
+
+    try std.testing.expect(std.mem.indexOf(u8, remote_branch, "runtime.mutex.unlock()") == null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_branch, "runtime.mutex.lock()") == null);
+
+    const remote_call = std.mem.indexOf(u8, remote_branch, "callRemoteHostedTool(runtime, session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
+    const record_event = std.mem.indexOf(u8, remote_branch, "session_context_mod.recordToolEvent(session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(remote_call < record_event);
 }
 
 test "runtimeCallTool rejects code queries when index is unavailable" {
