@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_log = @import("debug_log.zig");
+const fs_util = @import("fs_util.zig");
 
 /// Find .cog directory by walking up from cwd.
 /// Stops at project boundaries (.git) to avoid escaping the current project.
@@ -58,17 +59,23 @@ pub fn findOrCreateCogDir(allocator: std.mem.Allocator) ![]const u8 {
         else => return error.NoCogDir,
     };
 
-    // Create empty settings.json if it doesn't exist
+    // Create pretty settings.json if it doesn't exist. Existing settings are
+    // never replaced by this bootstrap path.
     var cog_dir = std.fs.cwd().openDir(".cog", .{}) catch return error.NoCogDir;
     defer cog_dir.close();
-    if (cog_dir.openFile("settings.json", .{})) |f| {
-        f.close();
-    } else |_| {
-        // Doesn't exist — create it
-        const f = cog_dir.createFile("settings.json", .{}) catch return error.NoCogDir;
-        defer f.close();
-        f.writeAll("{}\n") catch {};
-    }
+    cog_dir.access("settings.json", .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            debug_log.log("findOrCreateCogDir: creating .cog/settings.json", .{});
+            fs_util.writeFileAtomic(cog_dir, allocator, "settings.json", "{}\n") catch |write_err| {
+                debug_log.log("findOrCreateCogDir: failed to create settings.json: {s}", .{@errorName(write_err)});
+                return error.NoCogDir;
+            };
+        },
+        else => {
+            debug_log.log("findOrCreateCogDir: failed to inspect settings.json: {s}", .{@errorName(err)});
+            return error.NoCogDir;
+        },
+    };
 
     return std.fs.cwd().realpathAlloc(allocator, ".cog");
 }
@@ -237,6 +244,32 @@ fn validateRuntimeDirectoryNode(path: []const u8) !void {
         debug_log.log("ensurePrivateRuntimeDir: rejected non-directory {s}", .{path});
         return error.RuntimePathNotDirectory;
     }
+}
+
+test "findOrCreateCogDir creates pretty settings without replacing existing content" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    const first = try findOrCreateCogDir(allocator);
+    allocator.free(first);
+    const initial = try std.fs.cwd().readFileAlloc(allocator, ".cog/settings.json", 1024);
+    defer allocator.free(initial);
+    try std.testing.expectEqualStrings("{}\n", initial);
+
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, ".cog/settings.json", "{\n  \"custom\": true\n}\n");
+    const second = try findOrCreateCogDir(allocator);
+    allocator.free(second);
+    const preserved = try std.fs.cwd().readFileAlloc(allocator, ".cog/settings.json", 1024);
+    defer allocator.free(preserved);
+    try std.testing.expectEqualStrings("{\n  \"custom\": true\n}\n", preserved);
 }
 
 test "ensurePrivateRuntimeDir creates mode 0700 directories" {

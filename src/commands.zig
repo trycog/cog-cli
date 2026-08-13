@@ -302,7 +302,7 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             },
             .input => unreachable,
         }
-        deployBootstrapTemplates();
+        try deployBootstrapTemplates();
     }
 
     // Offer project scan when settings.json didn't exist before init
@@ -1164,8 +1164,12 @@ fn initBrain(allocator: std.mem.Allocator, host: []const u8, existing_parts: ?Br
     }
 }
 
-fn deployBootstrapTemplates() void {
-    const cog_dir = std.fs.cwd().openDir(".cog", .{}) catch return;
+fn deployBootstrapTemplates() !void {
+    debug_log.log("commands.deployBootstrapTemplates: opening .cog", .{});
+    const cog_dir = std.fs.cwd().openDir(".cog", .{}) catch |err| {
+        debug_log.log("commands.deployBootstrapTemplates: failed to open .cog: {s}", .{@errorName(err)});
+        return err;
+    };
 
     // Write or upgrade MEM_BOOTSTRAP.md
     // If the existing file has the old per-file placeholder, replace it with the new subsystem prompt
@@ -1183,10 +1187,8 @@ fn deployBootstrapTemplates() void {
         break :blk false;
     };
     if (needs_bootstrap_upgrade) {
-        if (cog_dir.createFile("MEM_BOOTSTRAP.md", .{})) |file| {
-            defer file.close();
-            file.writeAll(build_options.bootstrap_prompt) catch {};
-        } else |_| {}
+        debug_log.log("commands.deployBootstrapTemplates: writing MEM_BOOTSTRAP.md", .{});
+        try fs_util.writeFileAtomic(cog_dir, std.heap.page_allocator, "MEM_BOOTSTRAP.md", build_options.bootstrap_prompt);
     }
 
     // Write or upgrade MEM_BOOTSTRAP_ASSOCIATE.md
@@ -1202,10 +1204,8 @@ fn deployBootstrapTemplates() void {
         break :blk false;
     };
     if (needs_associate_upgrade) {
-        if (cog_dir.createFile("MEM_BOOTSTRAP_ASSOCIATE.md", .{})) |file| {
-            defer file.close();
-            file.writeAll(build_options.bootstrap_associate_prompt) catch {};
-        } else |_| {}
+        debug_log.log("commands.deployBootstrapTemplates: writing MEM_BOOTSTRAP_ASSOCIATE.md", .{});
+        try fs_util.writeFileAtomic(cog_dir, std.heap.page_allocator, "MEM_BOOTSTRAP_ASSOCIATE.md", build_options.bootstrap_associate_prompt);
     }
 }
 
@@ -2464,6 +2464,31 @@ test "project file writer preserves prior contents and leaves no temp residue on
     while (try it.next()) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".AGENTS.md.tmp-"));
     }
+}
+
+test "deployBootstrapTemplates upgrades legacy prompts and preserves managed replacements" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp_dir.dir.setAsCwd();
+    try std.fs.cwd().makeDir(".cog");
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, ".cog/MEM_BOOTSTRAP.md", "legacy {file_path}\n");
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, ".cog/MEM_BOOTSTRAP_ASSOCIATE.md", "legacy per-file concepts\n");
+
+    try deployBootstrapTemplates();
+
+    const bootstrap_content = try std.fs.cwd().readFileAlloc(allocator, ".cog/MEM_BOOTSTRAP.md", 1024 * 1024);
+    defer allocator.free(bootstrap_content);
+    try std.testing.expectEqualStrings(build_options.bootstrap_prompt, bootstrap_content);
+    const associate_content = try std.fs.cwd().readFileAlloc(allocator, ".cog/MEM_BOOTSTRAP_ASSOCIATE.md", 1024 * 1024);
+    defer allocator.free(associate_content);
+    try std.testing.expectEqualStrings(build_options.bootstrap_associate_prompt, associate_content);
 }
 
 test "prompt markdown includes stronger memory gate guidance" {
