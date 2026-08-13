@@ -6,10 +6,26 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./scripts/validate-release.sh "$RELEASE_TAG"
+
+      - name: Test release validator
+        run: ./test/release/validate-release.sh
+
   ci:
+    needs: validate
     strategy:
       matrix:
         include:
@@ -18,9 +34,11 @@ jobs:
           - os: macos-latest        # aarch64 macOS
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
 
@@ -30,13 +48,18 @@ jobs:
       - name: Run tests
         run: zig build test
 
+      - name: Run indexing integration tests
+        run: zig build test-indexing-integration
+
   build:
     needs: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
 
@@ -46,45 +69,83 @@ jobs:
       - name: Build release tarballs
         run: zig build release
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload release tarballs
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-tarballs
           path: zig-out/release/cog-*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - name: Download release tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-tarballs
           path: tarballs
 
-      - name: Extract changelog
-        id: changelog
+      - name: Validate release artifacts and extract changelog
         env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          SEMVER="${VERSION#v}"
-          # Extract the section between this version's header and the next version header
-          BODY=$(sed -n "/^## \[${SEMVER}\]/,/^## \[/{/^## \[${SEMVER}\]/d;/^## \[/d;p;}" CHANGELOG.md)
-          # Write to file to preserve newlines
-          echo "$BODY" > /tmp/release-notes.md
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./scripts/validate-release.sh "$RELEASE_TAG" tarballs release-notes.md
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Generate SHA-256 checksums
+        working-directory: tarballs
+        run: sha256sum cog-*.tar.gz > SHA256SUMS
+
+      - name: Generate build provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            tarballs/cog-darwin-arm64.tar.gz
+            tarballs/cog-linux-arm64.tar.gz
+            tarballs/cog-linux-x86_64.tar.gz
+            tarballs/SHA256SUMS
+
+      - name: Stage provenance bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" tarballs/cog-build-provenance.json
+
+      - name: Create draft GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: ${{ github.ref_name }}
-          body_path: /tmp/release-notes.md
-          files: tarballs/cog-*.tar.gz
+          body_path: release-notes.md
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            tarballs/cog-darwin-arm64.tar.gz
+            tarballs/cog-linux-arm64.tar.gz
+            tarballs/cog-linux-x86_64.tar.gz
+            tarballs/SHA256SUMS
+            tarballs/cog-build-provenance.json
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
 
   update-tap:
-    needs: release
+    needs: [build, release]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download release tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-tarballs
           path: tarballs
@@ -97,11 +158,12 @@ jobs:
           echo "linux_x86_64=$(sha256sum tarballs/cog-linux-x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Check out Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: trycog/homebrew-tap
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
           path: homebrew-tap
+          persist-credentials: true
 
       - name: Update formula
         env:
@@ -110,7 +172,6 @@ jobs:
           SHA_LINUX_ARM64: ${{ steps.hashes.outputs.linux_arm64 }}
           SHA_LINUX_X86_64: ${{ steps.hashes.outputs.linux_x86_64 }}
         run: |
-          # Strip leading 'v' for the version field
           SEMVER="${VERSION#v}"
 
           cat > homebrew-tap/Formula/cog.rb << FORMULA
@@ -166,7 +227,9 @@ jobs:
     env:
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Extract changelog and notify Discord
         if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
@@ -176,10 +239,8 @@ jobs:
           SEMVER="${VERSION#v}"
           RELEASE_URL="https://github.com/trycog/cog-cli/releases/tag/${VERSION}"
 
-          # Extract changelog section for this version
           CHANGELOG=$(sed -n "/^## \[${SEMVER}\]/,/^## \[/{/^## \[${SEMVER}\]/d;/^## \[/d;p;}" CHANGELOG.md)
 
-          # Build the embed description with changelog + update instructions
           DESCRIPTION=$(cat <<'INNEREOF'
           CHANGELOG_PLACEHOLDER
 
@@ -195,7 +256,6 @@ jobs:
           )
           DESCRIPTION="${DESCRIPTION/CHANGELOG_PLACEHOLDER/$CHANGELOG}"
 
-          # Build JSON payload with jq for proper escaping
           PAYLOAD=$(jq -n \
             --arg title "Cog ${VERSION} Released" \
             --arg url "$RELEASE_URL" \
