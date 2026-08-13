@@ -163,8 +163,57 @@ pub fn callEnhancedRemoteWrite(
     const envelope = try buildRemoteWriteEnvelope(allocator, operation, semantic_payload, session, write_context);
     defer allocator.free(envelope);
 
-    debug_log.log("memory_envelope.callEnhancedRemoteWrite: tool={s} operation={s}", .{ remote_tool, operation });
+    debug_log.log("memory_envelope.callEnhancedRemoteWrite: sending enhanced write tool={s} operation={s} session_bound={any}", .{ remote_tool, operation, session_id != null });
     return client.mcpCallTool(allocator, endpoint, api_key, session_id, remote_tool, envelope);
+}
+
+pub fn isExplicitUnsupportedEnhancedResponse(allocator: std.mem.Allocator, body: []const u8) bool {
+    const parsed = json.parseFromSlice(json.Value, allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    if (parsed.value.object.get("error")) |err_value| {
+        if (err_value != .object) return false;
+        const code = err_value.object.get("code");
+        if (code != null and code.? == .integer and code.?.integer == -32601) return true;
+        const message = err_value.object.get("message") orelse return false;
+        return message == .string and isUnsupportedEnhancedMessage(message.string);
+    }
+
+    const result = parsed.value.object.get("result") orelse return false;
+    if (result != .object) return false;
+    const is_error = result.object.get("isError") orelse return false;
+    if (is_error != .bool or !is_error.bool) return false;
+    const content = result.object.get("content") orelse return false;
+    if (content != .array) return false;
+    for (content.array.items) |item| {
+        if (item != .object) continue;
+        const text = item.object.get("text") orelse continue;
+        if (text == .string and isUnsupportedEnhancedMessage(text.string)) return true;
+    }
+    return false;
+}
+
+fn isUnsupportedEnhancedMessage(message: []const u8) bool {
+    const markers = [_][]const u8{
+        "unknown tool",
+        "unsupported tool",
+        "tool not found",
+        "method not found",
+        "schema validation",
+        "invalid schema",
+        "input schema",
+        "unexpected field",
+        "unrecognized field",
+        "additional properties",
+        "semantic_payload",
+        "provenance",
+        "context_hints",
+    };
+    for (markers) |marker| {
+        if (std.ascii.indexOfIgnoreCase(message, marker) != null) return true;
+    }
+    return false;
 }
 
 fn setPreferredWriteTool(capabilities: *RemoteMemoryCapabilities, allocator: std.mem.Allocator, remote_name: []const u8) !void {
@@ -236,4 +285,26 @@ test "buildRemoteWriteEnvelope includes provenance and hints" {
     const hints = parsed.value.object.get("context_hints") orelse return error.TestUnexpectedResult;
     try std.testing.expect(hints.object.get("recent_symbols").?.array.items.len >= 1);
     try std.testing.expectEqualStrings("rationale", hints.object.get("write_reason_hint").?.string);
+}
+
+test "explicit enhanced tool and schema rejection is retryable" {
+    try std.testing.expect(isExplicitUnsupportedEnhancedResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"Unknown tool: cog_memory_record\"}}",
+    ));
+    try std.testing.expect(isExplicitUnsupportedEnhancedResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"isError\":true,\"content\":[{\"type\":\"text\",\"text\":\"Input schema validation failed for semantic_payload\"}]}}",
+    ));
+}
+
+test "ambiguous enhanced failures are not retryable" {
+    try std.testing.expect(!isExplicitUnsupportedEnhancedResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"upstream unavailable\"}}",
+    ));
+    try std.testing.expect(!isExplicitUnsupportedEnhancedResponse(
+        std.testing.allocator,
+        "not json",
+    ));
 }
