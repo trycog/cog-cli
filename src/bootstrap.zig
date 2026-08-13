@@ -10,6 +10,7 @@ const client = @import("client.zig");
 const settings_mod = @import("settings.zig");
 const code_intel = @import("code_intel.zig");
 const debug_log = @import("debug_log.zig");
+const fs_util = @import("fs_util.zig");
 const memory_mod = @import("memory.zig");
 const memory_schema = @import("memory_schema.zig");
 const sqlite = @import("sqlite.zig");
@@ -723,7 +724,7 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             .synapses_uploaded = 0,
             .total_synapses = total_synapses,
         };
-        saveUploadCheckpoint(allocator, checkpoint_path, &checkpoint.?);
+        try saveUploadCheckpoint(allocator, checkpoint_path, &checkpoint.?);
     }
 
     const cp = &checkpoint.?;
@@ -801,7 +802,7 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
             uploaded += 1;
             cp.engrams_uploaded = uploaded;
-            saveUploadCheckpoint(allocator, checkpoint_path, cp);
+            try saveUploadCheckpoint(allocator, checkpoint_path, cp);
             tui.uploadProgressUpdate(uploaded, total_engrams, cp.synapses_uploaded, total_synapses);
         }
     }
@@ -880,7 +881,7 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
             uploaded += 1;
             cp.synapses_uploaded = uploaded;
-            saveUploadCheckpoint(allocator, checkpoint_path, cp);
+            try saveUploadCheckpoint(allocator, checkpoint_path, cp);
             tui.uploadProgressUpdate(cp.engrams_uploaded, total_engrams, uploaded, total_synapses);
         }
     }
@@ -1001,41 +1002,38 @@ fn freeUploadCheckpoint(allocator: std.mem.Allocator, cp: *UploadCheckpoint) voi
     allocator.free(cp.host);
 }
 
-fn saveUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8, cp: *const UploadCheckpoint) void {
+fn saveUploadCheckpoint(allocator: std.mem.Allocator, path: []const u8, cp: *const UploadCheckpoint) !void {
     debug_log.log("saveUploadCheckpoint: eu={d} su={d}", .{ cp.engrams_uploaded, cp.synapses_uploaded });
     var aw: std.io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var s: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
-    s.beginObject() catch return;
-    s.objectField("version") catch return;
-    s.write(@as(i64, 1)) catch return;
-    s.objectField("target_url") catch return;
-    s.write(cp.target_url) catch return;
-    s.objectField("username") catch return;
-    s.write(cp.username) catch return;
-    s.objectField("brain_name") catch return;
-    s.write(cp.brain_name) catch return;
-    s.objectField("host") catch return;
-    s.write(cp.host) catch return;
-    s.objectField("engrams_uploaded") catch return;
-    s.write(@as(i64, @intCast(cp.engrams_uploaded))) catch return;
-    s.objectField("total_engrams") catch return;
-    s.write(@as(i64, @intCast(cp.total_engrams))) catch return;
-    s.objectField("synapses_uploaded") catch return;
-    s.write(@as(i64, @intCast(cp.synapses_uploaded))) catch return;
-    s.objectField("total_synapses") catch return;
-    s.write(@as(i64, @intCast(cp.total_synapses))) catch return;
-    s.endObject() catch return;
-    const content = aw.toOwnedSlice() catch return;
+    try s.beginObject();
+    try s.objectField("version");
+    try s.write(@as(i64, 1));
+    try s.objectField("target_url");
+    try s.write(cp.target_url);
+    try s.objectField("username");
+    try s.write(cp.username);
+    try s.objectField("brain_name");
+    try s.write(cp.brain_name);
+    try s.objectField("host");
+    try s.write(cp.host);
+    try s.objectField("engrams_uploaded");
+    try s.write(@as(i64, @intCast(cp.engrams_uploaded)));
+    try s.objectField("total_engrams");
+    try s.write(@as(i64, @intCast(cp.total_engrams)));
+    try s.objectField("synapses_uploaded");
+    try s.write(@as(i64, @intCast(cp.synapses_uploaded)));
+    try s.objectField("total_synapses");
+    try s.write(@as(i64, @intCast(cp.total_synapses)));
+    try s.endObject();
+    const content = try aw.toOwnedSlice();
     defer allocator.free(content);
+    const with_newline = try std.fmt.allocPrint(allocator, "{s}\n", .{content});
+    defer allocator.free(with_newline);
 
-    const file = std.fs.cwd().createFile(path, .{}) catch return;
-    defer file.close();
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(&buf);
-    fw.interface.writeAll(content) catch return;
-    fw.interface.writeAll("\n") catch return;
-    fw.interface.flush() catch return;
+    debug_log.log("saveUploadCheckpoint: atomically writing {s}", .{path});
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, path, with_newline);
 }
 
 fn deleteUploadCheckpoint(path: []const u8) void {
@@ -1147,18 +1145,9 @@ fn writeSettingsBrainUrl(allocator: std.mem.Allocator, brain_url: []const u8) !v
     };
     defer allocator.free(with_newline);
 
-    const file = std.fs.cwd().createFile(".cog/settings.json", .{}) catch {
-        printErr("  error: failed to write .cog/settings.json\n");
-        return error.Explained;
-    };
-    defer file.close();
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(&buf);
-    fw.interface.writeAll(with_newline) catch {
-        printErr("  error: failed to write .cog/settings.json\n");
-        return error.Explained;
-    };
-    fw.interface.flush() catch {
+    debug_log.log("writeSettingsBrainUrl: atomically writing .cog/settings.json", .{});
+    fs_util.writeFileAtomic(std.fs.cwd(), allocator, ".cog/settings.json", with_newline) catch |err| {
+        debug_log.log("writeSettingsBrainUrl: failed to write settings: {s}", .{@errorName(err)});
         printErr("  error: failed to write .cog/settings.json\n");
         return error.Explained;
     };
@@ -3653,6 +3642,48 @@ fn loadCustomPrompt(allocator: std.mem.Allocator, cog_dir: []const u8, filename:
 }
 
 // Tests
+test "saveUploadCheckpoint writes pretty JSON and preserves restrictive mode" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir(".cog");
+    var existing = try tmp.dir.createFile(".cog/upgrade-checkpoint.json", .{ .mode = 0o600 });
+    try existing.writeAll("prior\n");
+    existing.close();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    const cp = UploadCheckpoint{
+        .version = 1,
+        .target_url = "https://trycog.ai/user/brain",
+        .username = "user",
+        .brain_name = "brain",
+        .host = "trycog.ai",
+        .engrams_uploaded = 2,
+        .total_engrams = 4,
+        .synapses_uploaded = 1,
+        .total_synapses = 3,
+    };
+    try saveUploadCheckpoint(allocator, ".cog/upgrade-checkpoint.json", &cp);
+
+    const content = try std.fs.cwd().readFileAlloc(allocator, ".cog/upgrade-checkpoint.json", 65536);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\n  \"target_url\": ") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("engrams_uploaded").?.integer);
+    const stat = try std.fs.cwd().statFile(".cog/upgrade-checkpoint.json");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+}
+
 test "replacePlaceholder basic" {
     const allocator = std.testing.allocator;
     const result = try replacePlaceholder(allocator, "process {file_path} now", "{file_path}", "src/main.zig");
