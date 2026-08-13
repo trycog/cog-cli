@@ -73,6 +73,26 @@ fn indexHasSymbol(index: *const scip.Index, rel_path: []const u8, symbol_name: [
     return false;
 }
 
+fn indexHasSymbolKind(index: *const scip.Index, rel_path: []const u8, symbol_name: []const u8, kind: i32) bool {
+    for (index.documents) |doc| {
+        if (!std.mem.eql(u8, doc.relative_path, rel_path)) continue;
+        for (doc.symbols) |sym| {
+            if (std.mem.eql(u8, sym.display_name, symbol_name) and sym.kind == kind) return true;
+        }
+    }
+    return false;
+}
+
+fn indexHasOccurrence(index: *const scip.Index, rel_path: []const u8, symbol: []const u8) bool {
+    for (index.documents) |doc| {
+        if (!std.mem.eql(u8, doc.relative_path, rel_path)) continue;
+        for (doc.occurrences) |occ| {
+            if (std.mem.eql(u8, occ.symbol, symbol)) return true;
+        }
+    }
+    return false;
+}
+
 fn indexHasDocument(index: *const scip.Index, rel_path: []const u8) bool {
     for (index.documents) |doc| {
         if (std.mem.eql(u8, doc.relative_path, rel_path)) return true;
@@ -91,8 +111,12 @@ pub fn main() !void {
     try recreateTestRoot();
 
     try writeFile("apps/cedalio_dozer/assets/js/app.js",
-        \\export function appEntry() {
+        \\export function helper() {
         \\  return 42;
+        \\}
+        \\
+        \\export function appEntry() {
+        \\  service.helper();
         \\}
         \\
         \\export class AppShell {}
@@ -117,19 +141,26 @@ pub fn main() !void {
         \\}
     );
     try writeFile("src/lib.rs",
-        \\fn rust_helper() {}
+        \\fn new() {}
+        \\fn rust_helper() { new(); }
     );
     try writeFile("src/Main.java",
+        \\import java.util.List;
         \\class Main {
+        \\    private int count;
+        \\    Main() { javaHelper(); }
         \\    void javaHelper() {}
+        \\    void run() { this.javaHelper(); }
         \\}
     );
     try writeFile("src/native.c",
         \\void c_helper(void) {}
+        \\void c_run(void) { c_helper(); }
     );
     try writeFile("src/native.cpp",
-        \\class Widget {};
+        \\class Widget { public: void work() {} };
         \\void cppHelper() {}
+        \\void cppRun(Widget &widget) { cppHelper(); widget.work(); }
     );
     try writeFile("notes/doc.md",
         \\# Hello
@@ -174,6 +205,34 @@ pub fn main() !void {
     }
     if (!indexHasDocument(&index, "src/view.tsx")) {
         fail("decoded index missing TSX document `src/view.tsx`\n", .{});
+    }
+    if (!indexHasOccurrence(&index, "apps/cedalio_dozer/assets/js/app.js", "cog/call/helper")) {
+        fail("decoded index missing JavaScript member call `helper`\n", .{});
+    }
+    if (!indexHasSymbolKind(&index, "src/Main.java", "Main", 9)) {
+        fail("decoded index missing Java constructor `Main`\n", .{});
+    }
+    if (!indexHasSymbolKind(&index, "src/Main.java", "count", 15)) {
+        fail("decoded index missing Java field `count`\n", .{});
+    }
+    if (!indexHasOccurrence(&index, "src/Main.java", "cog/import/java.util.List")) {
+        fail("decoded index missing Java import `java.util.List`\n", .{});
+    }
+    if (!indexHasOccurrence(&index, "src/Main.java", "cog/call/javaHelper")) {
+        fail("decoded index missing Java call `javaHelper`\n", .{});
+    }
+    if (!indexHasOccurrence(&index, "src/native.c", "cog/call/c_helper")) {
+        fail("decoded index missing C call `c_helper`\n", .{});
+    }
+    if (!indexHasOccurrence(&index, "src/native.cpp", "cog/call/cppHelper") or
+        !indexHasOccurrence(&index, "src/native.cpp", "cog/call/work"))
+    {
+        fail("decoded index missing C++ free or member call\n", .{});
+    }
+    if (!indexHasSymbol(&index, "src/lib.rs", "new") or
+        !indexHasOccurrence(&index, "src/lib.rs", "cog/call/new"))
+    {
+        fail("decoded index missing valid Rust `new` symbol or call\n", .{});
     }
 
     std.debug.print("indexing integration test passed\n", .{});
