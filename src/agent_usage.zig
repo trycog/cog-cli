@@ -82,24 +82,20 @@ pub fn incrementCounts(allocator: std.mem.Allocator, ids: []const []const u8) !v
         }
     }.lessThan);
 
-    var aw: std.io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    var s: std.json.Stringify = .{ .writer = &aw.writer };
-    try s.beginObject();
-    for (keys.items) |key| {
-        try s.objectField(key);
-        try s.write(counts.get(key).?);
+    var persisted: std.io.Writer.Allocating = .init(allocator);
+    defer persisted.deinit();
+    try persisted.writer.writeAll("{\n");
+    for (keys.items, 0..) |key, index| {
+        try persisted.writer.writeAll("  ");
+        try std.json.Stringify.encodeJsonString(key, .{}, &persisted.writer);
+        try persisted.writer.print(": {d}{s}\n", .{
+            counts.get(key).?,
+            if (index + 1 < keys.items.len) "," else "",
+        });
     }
-    try s.endObject();
-    const body = try aw.toOwnedSlice();
-    defer allocator.free(body);
+    try persisted.writer.writeAll("}\n");
 
-    var persisted = std.ArrayListUnmanaged(u8).empty;
-    defer persisted.deinit(allocator);
-    try persisted.appendSlice(allocator, body);
-    try persisted.append(allocator, '\n');
-
-    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, count_path, persisted.items);
+    try fs_util.writeFileAtomic(std.fs.cwd(), allocator, count_path, persisted.written());
 }
 
 pub fn countFor(counts: *const Counts, id: []const u8) u64 {
@@ -121,7 +117,13 @@ test "incrementCounts persists sorted JSON atomically" {
 
     const body = try tmp.dir.readFileAlloc(allocator, ".config/cog/agent-selection-counts.json", 4096);
     defer allocator.free(body);
-    try std.testing.expectEqualStrings("{\"alpha\":2,\"zeta\":1}\n", body);
+    try std.testing.expectEqualStrings(
+        \\{
+        \\  "alpha": 2,
+        \\  "zeta": 1
+        \\}
+        \\
+    , body);
 }
 
 fn setEnv(name: []const u8, value: []const u8) !void {
