@@ -44,11 +44,18 @@ const DirectoryIdentity = struct {
     inode: u64,
 };
 
+const Alias = struct {
+    canonical_path: []const u8,
+    logical_prefix: []const u8,
+};
+
 pub const PathMatcher = struct {
     allocator: std.mem.Allocator,
     project_root: []const u8,
     patterns: []const []const u8,
     roots: []Root,
+    aliases: std.ArrayListUnmanaged(Alias),
+    aliases_discovered: bool,
     max_depth: usize,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !PathMatcher {
@@ -119,6 +126,8 @@ pub const PathMatcher = struct {
             .project_root = project_root,
             .patterns = patterns,
             .roots = try roots.toOwnedSlice(allocator),
+            .aliases = .empty,
+            .aliases_discovered = false,
             .max_depth = options.max_depth,
         };
     }
@@ -131,6 +140,11 @@ pub const PathMatcher = struct {
             self.allocator.free(root.logical_prefix);
         }
         self.allocator.free(self.roots);
+        for (self.aliases.items) |alias| {
+            self.allocator.free(alias.canonical_path);
+            self.allocator.free(alias.logical_prefix);
+        }
+        self.aliases.deinit(self.allocator);
         self.allocator.free(self.project_root);
     }
 
@@ -152,10 +166,11 @@ pub const PathMatcher = struct {
     }
 
     pub fn collect(self: *PathMatcher, out: *std.ArrayListUnmanaged(MatchedPath)) !void {
+        try self.ensureAliasesDiscovered();
         for (self.roots) |root| {
             var active = std.AutoHashMap(DirectoryIdentity, void).init(self.allocator);
             defer active.deinit();
-            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, out);
+            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, out, false);
         }
         std.mem.sort(MatchedPath, out.items, {}, struct {
             fn lessThan(_: void, a: MatchedPath, b: MatchedPath) bool {
@@ -167,7 +182,8 @@ pub const PathMatcher = struct {
         }.lessThan);
     }
 
-    pub fn watchRoots(self: *const PathMatcher, out: *std.ArrayListUnmanaged(WatchRoot)) !void {
+    pub fn watchRoots(self: *PathMatcher, out: *std.ArrayListUnmanaged(WatchRoot)) !void {
+        try self.ensureAliasesDiscovered();
         for (self.roots) |root| {
             try out.append(self.allocator, .{
                 .physical_path = try self.allocator.dupe(u8, root.canonical_path),
@@ -177,16 +193,17 @@ pub const PathMatcher = struct {
     }
 
     pub fn mapPhysicalToLogical(
-        self: *const PathMatcher,
+        self: *PathMatcher,
         physical_path: []const u8,
         out: *std.ArrayListUnmanaged([]const u8),
     ) !void {
+        try self.ensureAliasesDiscovered();
         const canonical = std.fs.realpathAlloc(self.allocator, physical_path) catch try self.allocator.dupe(u8, physical_path);
         defer self.allocator.free(canonical);
-        for (self.roots) |root| {
-            const suffix = relativeContained(canonical, root.canonical_path) orelse continue;
-            const logical = try joinLogical(self.allocator, root.logical_prefix, suffix);
-            if (logical.len > 0 and self.matches(logical)) {
+        for (self.aliases.items) |alias| {
+            const suffix = relativeContained(canonical, alias.canonical_path) orelse continue;
+            const logical = try joinLogical(self.allocator, alias.logical_prefix, suffix);
+            if (logical.len > 0 and self.matches(logical) and !containsString(out.items, logical)) {
                 try out.append(self.allocator, logical);
             } else {
                 self.allocator.free(logical);
@@ -215,6 +232,7 @@ pub const PathMatcher = struct {
         depth: usize,
         active: *std.AutoHashMap(DirectoryIdentity, void),
         out: *std.ArrayListUnmanaged(MatchedPath),
+        discover_aliases: bool,
     ) !void {
         if (depth > self.max_depth) {
             debug_log.log("PathMatcher.walk: depth cap path={s} depth={d}", .{ physical_dir, depth });
@@ -257,8 +275,13 @@ pub const PathMatcher = struct {
 
             const stat = std.fs.cwd().statFile(canonical_child) catch continue;
             switch (stat.kind) {
-                .directory => try self.walkDirectory(canonical_child, logical_child, depth + 1, active, out),
-                .file => if (self.matches(logical_child)) {
+                .directory => {
+                    if (discover_aliases and !std.mem.eql(u8, physical_child, canonical_child)) {
+                        try self.addAlias(canonical_child, logical_child);
+                    }
+                    try self.walkDirectory(canonical_child, logical_child, depth + 1, active, out, discover_aliases);
+                },
+                .file => if (!discover_aliases and self.matches(logical_child)) {
                     try out.append(self.allocator, .{
                         .logical_path = try self.allocator.dupe(u8, logical_child),
                         .physical_path = try self.allocator.dupe(u8, canonical_child),
@@ -267,6 +290,34 @@ pub const PathMatcher = struct {
                 else => {},
             }
         }
+    }
+
+    fn ensureAliasesDiscovered(self: *PathMatcher) !void {
+        if (self.aliases_discovered) return;
+
+        for (self.roots) |root| {
+            try self.addAlias(root.canonical_path, root.logical_prefix);
+        }
+
+        var active = std.AutoHashMap(DirectoryIdentity, void).init(self.allocator);
+        defer active.deinit();
+        var ignored: std.ArrayListUnmanaged(MatchedPath) = .empty;
+        defer ignored.deinit(self.allocator);
+        try self.walkDirectory(self.project_root, "", 0, &active, &ignored, true);
+        self.aliases_discovered = true;
+        debug_log.log("PathMatcher.aliases: discovered {d} logical roots", .{self.aliases.items.len});
+    }
+
+    fn addAlias(self: *PathMatcher, canonical_path: []const u8, logical_prefix: []const u8) !void {
+        for (self.aliases.items) |alias| {
+            if (std.mem.eql(u8, alias.canonical_path, canonical_path) and
+                std.mem.eql(u8, alias.logical_prefix, logical_prefix)) return;
+        }
+        try self.aliases.append(self.allocator, .{
+            .canonical_path = try self.allocator.dupe(u8, canonical_path),
+            .logical_prefix = try self.allocator.dupe(u8, logical_prefix),
+        });
+        debug_log.log("PathMatcher.aliases: logical={s} physical={s}", .{ logical_prefix, canonical_path });
     }
 
     fn isAllowedCanonical(self: *const PathMatcher, canonical_path: []const u8) bool {
@@ -330,6 +381,13 @@ pub fn isContainedPath(path: []const u8, root: []const u8) bool {
     if (root.len == 0) return false;
     if (root[root.len - 1] == std.fs.path.sep) return true;
     return path.len > root.len and path[root.len] == std.fs.path.sep;
+}
+
+fn containsString(items: []const []const u8, needle: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
 }
 
 fn relativeContained(path: []const u8, root: []const u8) ?[]const u8 {
@@ -557,6 +615,67 @@ test "PathMatcher external roots opt in symlink targets and direct aliases" {
     try std.testing.expect(std.mem.endsWith(u8, paths.items[1].logical_path, "/lib/shared.zig"));
     try std.testing.expect(paths.items[1].logical_path[0] != '/');
     try std.testing.expect(std.mem.indexOf(u8, paths.items[1].logical_path, "..") == null);
+}
+
+test "PathMatcher maps watched physical paths to every approved logical alias" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var external = std.testing.tmpDir(.{});
+    defer external.cleanup();
+
+    try writeTestFile(project.dir, "packages/app/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(external.dir, "lib/shared.zig", "pub const shared = true;\n");
+
+    const external_root = try external.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(external_root);
+    try project.dir.symLink("packages/app", "app-link", .{ .is_directory = true });
+    try project.dir.symLink(external_root, "workspace-shared", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+        .external_roots = &.{external_root},
+    });
+    defer matcher.deinit();
+
+    const app_physical = try project.dir.realpathAlloc(allocator, "packages/app/main.zig");
+    defer allocator.free(app_physical);
+    var app_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (app_paths.items) |path| allocator.free(path);
+        app_paths.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(app_physical, &app_paths);
+    std.mem.sort([]const u8, app_paths.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    try std.testing.expectEqual(@as(usize, 2), app_paths.items.len);
+    try std.testing.expectEqualStrings("app-link/main.zig", app_paths.items[0]);
+    try std.testing.expectEqualStrings("packages/app/main.zig", app_paths.items[1]);
+
+    const shared_physical = try external.dir.realpathAlloc(allocator, "lib/shared.zig");
+    defer allocator.free(shared_physical);
+    var shared_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (shared_paths.items) |path| allocator.free(path);
+        shared_paths.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(shared_physical, &shared_paths);
+    try std.testing.expectEqual(@as(usize, 2), shared_paths.items.len);
+    var saw_workspace_alias = false;
+    var saw_external_alias = false;
+    for (shared_paths.items) |path| {
+        if (std.mem.eql(u8, path, "workspace-shared/lib/shared.zig")) saw_workspace_alias = true;
+        if (std.mem.startsWith(u8, path, "@external/") and std.mem.endsWith(u8, path, "/lib/shared.zig")) saw_external_alias = true;
+    }
+    try std.testing.expect(saw_workspace_alias);
+    try std.testing.expect(saw_external_alias);
 }
 
 test "PathMatcher rejects canonical boundary prefix tricks" {
