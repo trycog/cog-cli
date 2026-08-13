@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const process_types = @import("process_types.zig");
+const debug_log = @import("../../debug_log.zig");
 
 // ── Linux ptrace-based Process Control ──────────────────────────────────
 
@@ -17,10 +18,15 @@ const PTRACE_GETREGS: u32 = 12;
 const PTRACE_SETREGS: u32 = 13;
 const PTRACE_ATTACH: u32 = 16;
 const PTRACE_DETACH: u32 = 17;
+const PTRACE_GETREGSET: u32 = 0x4204;
+const PTRACE_SETREGSET: u32 = 0x4205;
+const NT_PRSTATUS: usize = 1;
+const MAX_PROC_MAPS_SIZE: usize = 1024 * 1024;
+const DELETED_SUFFIX = " (deleted)";
 
 // Linux x86_64 user_regs_struct layout — used with PTRACE_GETREGS / PTRACE_SETREGS.
 // Matches the kernel's struct user_regs_struct from <sys/user.h>.
-const UserRegsStruct = extern struct {
+const X86UserRegs = extern struct {
     r15: u64,
     r14: u64,
     r13: u64,
@@ -48,6 +54,13 @@ const UserRegsStruct = extern struct {
     es: u64,
     fs: u64,
     gs: u64,
+};
+
+const Aarch64UserRegs = extern struct {
+    regs: [31]u64,
+    sp: u64,
+    pc: u64,
+    pstate: u64,
 };
 
 pub const PtraceProcessControl = struct {
@@ -132,44 +145,27 @@ pub const PtraceProcessControl = struct {
         return error.NoProcess;
     }
 
-    /// Read the tracee's general-purpose registers via PTRACE_GETREGS.
-    /// Maps x86_64 registers to the platform-independent RegisterState using
-    /// the DWARF register numbering: gprs[0]=rax, [1]=rdx, [2]=rcx, [3]=rbx,
-    /// [4]=rsi, [5]=rdi, [6]=rbp, [7]=rsp, [8..15]=r8..r15.
+    /// Read the tracee's general-purpose registers using the native Linux ABI.
     pub fn readRegisters(self: *PtraceProcessControl) !process_types.RegisterState {
         const pid = self.pid orelse return error.NoProcess;
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
-        if (builtin.os.tag == .linux) {
-            var regs: UserRegsStruct = undefined;
-            const rc = std.os.linux.ptrace(PTRACE_GETREGS, pid, 0, @intFromPtr(&regs), 0);
-            if (rc != 0) return error.PtraceGetRegsFailed;
-
-            var state = process_types.RegisterState{};
-            // DWARF x86_64 register mapping
-            state.gprs[0] = regs.rax;
-            state.gprs[1] = regs.rdx;
-            state.gprs[2] = regs.rcx;
-            state.gprs[3] = regs.rbx;
-            state.gprs[4] = regs.rsi;
-            state.gprs[5] = regs.rdi;
-            state.gprs[6] = regs.rbp;
-            state.gprs[7] = regs.rsp;
-            state.gprs[8] = regs.r8;
-            state.gprs[9] = regs.r9;
-            state.gprs[10] = regs.r10;
-            state.gprs[11] = regs.r11;
-            state.gprs[12] = regs.r12;
-            state.gprs[13] = regs.r13;
-            state.gprs[14] = regs.r14;
-            state.gprs[15] = regs.r15;
-            state.pc = regs.rip;
-            state.sp = regs.rsp;
-            state.fp = regs.rbp;
-            state.flags = regs.eflags;
-            return state;
-        }
-        unreachable;
+        return switch (builtin.cpu.arch) {
+            .x86_64 => blk: {
+                var regs: X86UserRegs = undefined;
+                const rc = std.os.linux.ptrace(PTRACE_GETREGS, pid, 0, @intFromPtr(&regs), 0);
+                if (linuxPtraceFailed(rc)) return error.PtraceGetRegsFailed;
+                break :blk stateFromX86Registers(regs);
+            },
+            .aarch64 => blk: {
+                var regs: Aarch64UserRegs = undefined;
+                var iov = std.posix.iovec{ .base = std.mem.asBytes(&regs).ptr, .len = @sizeOf(Aarch64UserRegs) };
+                const rc = std.os.linux.ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, @intFromPtr(&iov), 0);
+                if (linuxPtraceFailed(rc) or iov.len != @sizeOf(Aarch64UserRegs)) return error.PtraceGetRegsFailed;
+                break :blk stateFromAarch64Registers(regs);
+            },
+            else => error.UnsupportedArchitecture,
+        };
     }
 
     /// Read floating point / SIMD registers from the traced process.
@@ -182,42 +178,28 @@ pub const PtraceProcessControl = struct {
         return .{};
     }
 
-    /// Write registers back to the tracee via PTRACE_SETREGS.
-    /// Reverses the DWARF register mapping from RegisterState back to
-    /// the kernel's user_regs_struct layout.
+    /// Write registers back to the tracee using the native Linux ABI.
     pub fn writeRegisters(self: *PtraceProcessControl, regs: process_types.RegisterState) !void {
         const pid = self.pid orelse return error.NoProcess;
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
-        if (builtin.os.tag == .linux) {
-            // First read current registers so we preserve fields not in RegisterState
-            // (orig_rax, cs, ss, segment bases, etc.)
-            var kregs: UserRegsStruct = undefined;
-            var rc = std.os.linux.ptrace(PTRACE_GETREGS, pid, 0, @intFromPtr(&kregs), 0);
-            if (rc != 0) return error.PtraceGetRegsFailed;
-
-            // Map RegisterState back to kernel struct
-            kregs.rax = regs.gprs[0];
-            kregs.rdx = regs.gprs[1];
-            kregs.rcx = regs.gprs[2];
-            kregs.rbx = regs.gprs[3];
-            kregs.rsi = regs.gprs[4];
-            kregs.rdi = regs.gprs[5];
-            kregs.rbp = regs.gprs[6];
-            kregs.rsp = regs.gprs[7];
-            kregs.r8 = regs.gprs[8];
-            kregs.r9 = regs.gprs[9];
-            kregs.r10 = regs.gprs[10];
-            kregs.r11 = regs.gprs[11];
-            kregs.r12 = regs.gprs[12];
-            kregs.r13 = regs.gprs[13];
-            kregs.r14 = regs.gprs[14];
-            kregs.r15 = regs.gprs[15];
-            kregs.rip = regs.pc;
-            kregs.eflags = regs.flags;
-
-            rc = std.os.linux.ptrace(PTRACE_SETREGS, pid, 0, @intFromPtr(&kregs), 0);
-            if (rc != 0) return error.PtraceSetRegsFailed;
+        switch (builtin.cpu.arch) {
+            .x86_64 => {
+                // Preserve fields that RegisterState does not represent.
+                var kernel_regs: X86UserRegs = undefined;
+                var rc = std.os.linux.ptrace(PTRACE_GETREGS, pid, 0, @intFromPtr(&kernel_regs), 0);
+                if (linuxPtraceFailed(rc)) return error.PtraceGetRegsFailed;
+                applyStateToX86Registers(regs, &kernel_regs);
+                rc = std.os.linux.ptrace(PTRACE_SETREGS, pid, 0, @intFromPtr(&kernel_regs), 0);
+                if (linuxPtraceFailed(rc)) return error.PtraceSetRegsFailed;
+            },
+            .aarch64 => {
+                var kernel_regs = aarch64RegistersFromState(regs);
+                var iov = std.posix.iovec{ .base = std.mem.asBytes(&kernel_regs).ptr, .len = @sizeOf(Aarch64UserRegs) };
+                const rc = std.os.linux.ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, @intFromPtr(&iov), 0);
+                if (linuxPtraceFailed(rc) or iov.len != @sizeOf(Aarch64UserRegs)) return error.PtraceSetRegsFailed;
+            },
+            else => return error.UnsupportedArchitecture,
         }
     }
 
@@ -320,56 +302,31 @@ pub const PtraceProcessControl = struct {
         }
     }
 
-    /// Get the text segment base address by parsing /proc/{pid}/maps.
-    /// Finds the first executable mapping (permissions contain 'x') and
-    /// returns its start address. Used by the engine for ASLR slide calculation.
+    /// Get the executable image base by parsing the bounded /proc process maps.
     pub fn getTextBase(self: *PtraceProcessControl) !u64 {
         const pid = self.pid orelse return error.NoProcess;
         if (builtin.os.tag != .linux) return error.UnsupportedPlatform;
 
-        if (builtin.os.tag == .linux) {
-            // Format: /proc/<pid>/maps
-            var path_buf: [64]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/maps", .{pid}) catch return error.TextBaseNotFound;
+        var maps_path_buf: [64]u8 = undefined;
+        const maps_path = std.fmt.bufPrint(&maps_path_buf, "/proc/{d}/maps", .{pid}) catch return error.TextBaseNotFound;
+        var exe_path_buf: [64]u8 = undefined;
+        const exe_link = std.fmt.bufPrint(&exe_path_buf, "/proc/{d}/exe", .{pid}) catch return error.TextBaseNotFound;
 
-            const file = std.fs.openFileAbsolute(path, .{}) catch return error.TextBaseNotFound;
-            defer file.close();
+        var executable_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const executable_path = std.fs.readLinkAbsolute(exe_link, &executable_buf) catch return error.TextBaseNotFound;
+        debug_log.log("ptrace: reading {s} for executable {s}", .{ maps_path, executable_path });
 
-            // Read the entire maps file into a stack buffer and parse lines manually.
-            var buf: [16384]u8 = undefined;
-            var read_buf: [4096]u8 = undefined;
-            var total: usize = 0;
-            while (total < buf.len) {
-                const n = file.read(&read_buf) catch return error.TextBaseNotFound;
-                if (n == 0) break;
-                @memcpy(buf[total..][0..n], read_buf[0..n]);
-                total += n;
-            }
-            const data = buf[0..total];
+        const file = std.fs.openFileAbsolute(maps_path, .{}) catch return error.TextBaseNotFound;
+        defer file.close();
+        const maps = file.readToEndAlloc(std.heap.page_allocator, MAX_PROC_MAPS_SIZE) catch |err| switch (err) {
+            error.FileTooBig => return error.ProcMapsTooLarge,
+            else => return error.TextBaseNotFound,
+        };
+        defer std.heap.page_allocator.free(maps);
 
-            // Parse line by line
-            var iter = std.mem.splitScalar(u8, data, '\n');
-            while (iter.next()) |line| {
-                // Format: <start>-<end> <perms> <offset> <dev> <inode> <pathname>
-                // Example: 00400000-00452000 r-xp 00000000 08:02 173521 /usr/bin/foo
-                // We want the first mapping with execute permission ('x' in perms)
-                const dash_pos = std.mem.indexOfScalar(u8, line, '-') orelse continue;
-                const after_dash = line[dash_pos + 1 ..];
-                const space_pos = std.mem.indexOfScalar(u8, after_dash, ' ') orelse continue;
-                const perms_start = space_pos + 1;
-                if (perms_start + 4 > after_dash.len) continue;
-                const perms = after_dash[perms_start .. perms_start + 4];
-
-                // Check for execute permission (third char is 'x')
-                if (perms[2] == 'x') {
-                    const start_hex = line[0..dash_pos];
-                    const addr = std.fmt.parseUnsigned(u64, start_hex, 16) catch continue;
-                    return addr;
-                }
-            }
-            return error.TextBaseNotFound;
-        }
-        unreachable;
+        const base = try parseProcMapsTextBase(maps, executable_path);
+        debug_log.log("ptrace: executable base for pid {d} is 0x{x}", .{ pid, base });
+        return base;
     }
 
     /// On Linux there is no Mach task port equivalent. Return error so the
@@ -434,12 +391,242 @@ pub const PtraceProcessControl = struct {
     }
 };
 
+fn linuxPtraceFailed(result: usize) bool {
+    return std.os.linux.E.init(result) != .SUCCESS;
+}
+
+fn stateFromX86Registers(regs: X86UserRegs) process_types.RegisterState {
+    var state = process_types.RegisterState{};
+    state.gprs[0] = regs.rax;
+    state.gprs[1] = regs.rdx;
+    state.gprs[2] = regs.rcx;
+    state.gprs[3] = regs.rbx;
+    state.gprs[4] = regs.rsi;
+    state.gprs[5] = regs.rdi;
+    state.gprs[6] = regs.rbp;
+    state.gprs[7] = regs.rsp;
+    state.gprs[8] = regs.r8;
+    state.gprs[9] = regs.r9;
+    state.gprs[10] = regs.r10;
+    state.gprs[11] = regs.r11;
+    state.gprs[12] = regs.r12;
+    state.gprs[13] = regs.r13;
+    state.gprs[14] = regs.r14;
+    state.gprs[15] = regs.r15;
+    state.pc = regs.rip;
+    state.sp = regs.rsp;
+    state.fp = regs.rbp;
+    state.flags = regs.eflags;
+    return state;
+}
+
+fn applyStateToX86Registers(state: process_types.RegisterState, regs: *X86UserRegs) void {
+    regs.rax = state.gprs[0];
+    regs.rdx = state.gprs[1];
+    regs.rcx = state.gprs[2];
+    regs.rbx = state.gprs[3];
+    regs.rsi = state.gprs[4];
+    regs.rdi = state.gprs[5];
+    regs.rbp = state.gprs[6];
+    regs.rsp = state.gprs[7];
+    regs.r8 = state.gprs[8];
+    regs.r9 = state.gprs[9];
+    regs.r10 = state.gprs[10];
+    regs.r11 = state.gprs[11];
+    regs.r12 = state.gprs[12];
+    regs.r13 = state.gprs[13];
+    regs.r14 = state.gprs[14];
+    regs.r15 = state.gprs[15];
+    regs.rip = state.pc;
+    regs.eflags = state.flags;
+}
+
+fn stateFromAarch64Registers(regs: Aarch64UserRegs) process_types.RegisterState {
+    var state = process_types.RegisterState{};
+    state.gprs[0..31].* = regs.regs;
+    state.sp = regs.sp;
+    state.pc = regs.pc;
+    state.flags = regs.pstate;
+    state.fp = regs.regs[29];
+    return state;
+}
+
+fn aarch64RegistersFromState(state: process_types.RegisterState) Aarch64UserRegs {
+    return .{
+        .regs = state.gprs[0..31].*,
+        .sp = state.sp,
+        .pc = state.pc,
+        .pstate = state.flags,
+    };
+}
+
+fn parseProcMapsTextBase(maps: []const u8, executable_path: []const u8) !u64 {
+    if (maps.len > MAX_PROC_MAPS_SIZE) return error.ProcMapsTooLarge;
+    if (maps.len == 0 or maps[maps.len - 1] != '\n') return error.MalformedProcMaps;
+
+    var base: ?u64 = null;
+    var lines = std.mem.splitScalar(u8, maps, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const mapping = parseProcMapsLine(line) orelse return error.MalformedProcMaps;
+        if (!pathsMatchExecutable(mapping.pathname, executable_path)) continue;
+
+        const candidate = std.math.sub(u64, mapping.start, mapping.file_offset) catch return error.MalformedProcMaps;
+        if (base) |existing| {
+            if (candidate != existing) return error.MalformedProcMaps;
+        } else {
+            base = candidate;
+        }
+    }
+    return base orelse error.TextBaseNotFound;
+}
+
+const ProcMapsEntry = struct {
+    start: u64,
+    file_offset: u64,
+    pathname: []const u8,
+};
+
+fn parseProcMapsLine(line: []const u8) ?ProcMapsEntry {
+    var cursor: usize = 0;
+    const address_range = nextProcMapsField(line, &cursor) orelse return null;
+    const perms = nextProcMapsField(line, &cursor) orelse return null;
+    const offset_field = nextProcMapsField(line, &cursor) orelse return null;
+    const device = nextProcMapsField(line, &cursor) orelse return null;
+    const inode = nextProcMapsField(line, &cursor) orelse return null;
+    _ = perms;
+
+    if (std.mem.indexOfScalar(u8, device, ':') == null) return null;
+    _ = std.fmt.parseUnsigned(u64, inode, 10) catch return null;
+
+    const dash = std.mem.indexOfScalar(u8, address_range, '-') orelse return null;
+    if (dash == 0 or dash + 1 == address_range.len) return null;
+    const start = std.fmt.parseUnsigned(u64, address_range[0..dash], 16) catch return null;
+    const end = std.fmt.parseUnsigned(u64, address_range[dash + 1 ..], 16) catch return null;
+    if (end <= start) return null;
+    const file_offset = std.fmt.parseUnsigned(u64, offset_field, 16) catch return null;
+
+    while (cursor < line.len and line[cursor] == ' ') cursor += 1;
+    if (cursor == line.len) return null;
+    return .{ .start = start, .file_offset = file_offset, .pathname = line[cursor..] };
+}
+
+fn nextProcMapsField(line: []const u8, cursor: *usize) ?[]const u8 {
+    while (cursor.* < line.len and line[cursor.*] == ' ') cursor.* += 1;
+    const start = cursor.*;
+    while (cursor.* < line.len and line[cursor.*] != ' ') cursor.* += 1;
+    if (start == cursor.*) return null;
+    return line[start..cursor.*];
+}
+
+fn pathsMatchExecutable(mapping_path: []const u8, executable_path: []const u8) bool {
+    const clean_mapping = if (std.mem.endsWith(u8, mapping_path, DELETED_SUFFIX))
+        mapping_path[0 .. mapping_path.len - DELETED_SUFFIX.len]
+    else
+        mapping_path;
+    const clean_executable = if (std.mem.endsWith(u8, executable_path, DELETED_SUFFIX))
+        executable_path[0 .. executable_path.len - DELETED_SUFFIX.len]
+    else
+        executable_path;
+    return std.mem.eql(u8, clean_mapping, clean_executable);
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "PtraceProcessControl initial state" {
     const pc = PtraceProcessControl{};
     try std.testing.expect(pc.pid == null);
     try std.testing.expect(!pc.is_running);
+}
+
+test "x86 register mapping uses DWARF register slots" {
+    var kernel_regs: X86UserRegs = std.mem.zeroes(X86UserRegs);
+    kernel_regs.rax = 0;
+    kernel_regs.rdx = 1;
+    kernel_regs.rcx = 2;
+    kernel_regs.rbx = 3;
+    kernel_regs.rsi = 4;
+    kernel_regs.rdi = 5;
+    kernel_regs.rbp = 6;
+    kernel_regs.rsp = 7;
+    kernel_regs.r8 = 8;
+    kernel_regs.r15 = 15;
+    kernel_regs.rip = 16;
+    kernel_regs.eflags = 17;
+
+    const state = stateFromX86Registers(kernel_regs);
+    for (0..9) |index| try std.testing.expectEqual(@as(u64, @intCast(index)), state.gprs[index]);
+    try std.testing.expectEqual(@as(u64, 15), state.gprs[15]);
+    try std.testing.expectEqual(@as(u64, 16), state.pc);
+    try std.testing.expectEqual(@as(u64, 17), state.flags);
+    try std.testing.expectEqual(state.gprs[6], state.fp);
+    try std.testing.expectEqual(state.gprs[7], state.sp);
+}
+
+test "aarch64 register mapping round trips NT_PRSTATUS layout" {
+    var state = process_types.RegisterState{};
+    for (0..31) |index| state.gprs[index] = 0x100 + index;
+    state.sp = 0x200;
+    state.pc = 0x201;
+    state.flags = 0x202;
+    state.fp = state.gprs[29];
+
+    const round_trip = stateFromAarch64Registers(aarch64RegistersFromState(state));
+    try std.testing.expectEqualSlices(u64, state.gprs[0..31], round_trip.gprs[0..31]);
+    try std.testing.expectEqual(state.sp, round_trip.sp);
+    try std.testing.expectEqual(state.pc, round_trip.pc);
+    try std.testing.expectEqual(state.flags, round_trip.flags);
+    try std.testing.expectEqual(state.fp, round_trip.fp);
+}
+
+test "proc maps parser matches executable path with spaces and computes load bias" {
+    const maps =
+        \\70000000-70001000 r-xp 00000000 08:01 1 /usr/lib/ld-linux.so
+        \\55555000-55556000 r--p 00000000 08:01 2 /opt/My Program/bin/app
+        \\55556000-55557000 r-xp 00001000 08:01 2 /opt/My Program/bin/app
+        \\55557000-55558000 rw-p 00002000 08:01 2 /opt/My Program/bin/app
+        \\
+    ;
+    try std.testing.expectEqual(@as(u64, 0x55555000), try parseProcMapsTextBase(maps, "/opt/My Program/bin/app"));
+}
+
+test "proc maps parser accepts deleted executable suffix" {
+    const maps =
+        \\400000-401000 r--p 00000000 08:01 2 /tmp/app (deleted)
+        \\401000-402000 r-xp 00001000 08:01 2 /tmp/app (deleted)
+        \\
+    ;
+    try std.testing.expectEqual(@as(u64, 0x400000), try parseProcMapsTextBase(maps, "/tmp/app"));
+    try std.testing.expectEqual(@as(u64, 0x400000), try parseProcMapsTextBase(maps, "/tmp/app (deleted)"));
+}
+
+test "proc maps parser ignores other executable mappings" {
+    const maps =
+        \\70000000-70001000 r-xp 00000000 08:01 1 /usr/lib/loader.so
+        \\400000-401000 r-xp 00000000 08:01 2 /usr/bin/target
+        \\
+    ;
+    try std.testing.expectEqual(@as(u64, 0x400000), try parseProcMapsTextBase(maps, "/usr/bin/target"));
+}
+
+test "proc maps parser rejects malformed and truncated input" {
+    try std.testing.expectError(error.MalformedProcMaps, parseProcMapsTextBase("not a maps line\n", "/usr/bin/app"));
+    try std.testing.expectError(
+        error.MalformedProcMaps,
+        parseProcMapsTextBase("400000-401000 r-xp 00000000 08:01 2 /usr/bin/app", "/usr/bin/app"),
+    );
+}
+
+test "proc maps parser rejects oversized input" {
+    const maps = try std.testing.allocator.alloc(u8, MAX_PROC_MAPS_SIZE + 1);
+    defer std.testing.allocator.free(maps);
+    @memset(maps, '\n');
+    try std.testing.expectError(error.ProcMapsTooLarge, parseProcMapsTextBase(maps, "/usr/bin/app"));
+}
+
+test "proc maps parser reports no executable pathname match" {
+    const maps = "400000-401000 r-xp 00000000 08:01 2 /usr/bin/other\n";
+    try std.testing.expectError(error.TextBaseNotFound, parseProcMapsTextBase(maps, "/usr/bin/app"));
 }
 
 test "PtraceProcessControl getTask returns NotSupported" {
