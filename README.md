@@ -96,6 +96,10 @@ That's it. The interactive setup walks you through everything:
 
 For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents or the closest host-native specialist surface, installs runtime policy assets where the host supports them, and, where available, auto-allows Cog tool permissions. Specialist capabilities drive both asset installation and prompt generation: Cog renders each prompt only after installation and mandates a specialist only when every selected host that reads that prompt successfully received it. It also writes `.cog/client-context.json` plus a local `.cog/.gitignore` for generated Cog artifacts, so the local MCP runtime can identify the installed host integrations and compile richer hosted-memory context without changing your repo-root ignore rules. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
 
+### Skills
+
+`npx skills add trycog/cog-cli` installs the public [`setup-cog`](skills/setup-cog/SKILL.md) skill from the [skills.sh](https://skills.sh) directory — it walks any supported agent through installing the binary, running `cog init`, and verifying with `cog doctor`. The project-local skills that `cog init` generates (`cog-explore`, `cog-remember`, and the specialist skills) follow the [Agent Skills specification](https://agentskills.io), carry a `cog-version` stamp so `cog doctor` can report asset drift, and are marked `internal` so they stay out of public skill directories.
+
 ### Supported agents
 
 | Agent | MCP Config | Specialist Surface | Tool Permissions | Cog-First Override | Context Packaging | Memory Write Enrichment |

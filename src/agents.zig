@@ -1797,3 +1797,26 @@ test "generated skill files satisfy the agent skills specification" {
         try std.testing.expect(std.mem.endsWith(u8, agent.skills_dir, "skills"));
     }
 }
+
+test "public setup-cog skill is spec-compliant and discoverable" {
+    const allocator = std.testing.allocator;
+    const source = std.fs.cwd().readFileAlloc(allocator, "skills/setup-cog/SKILL.md", 64 * 1024) catch
+        return error.TestUnexpectedResult;
+    defer allocator.free(source);
+
+    try std.testing.expect(std.mem.startsWith(u8, source, "---\n"));
+    try std.testing.expect(std.mem.indexOf(u8, source, "name: setup-cog\n") != null);
+
+    const desc_start = (std.mem.indexOf(u8, source, "description: ") orelse
+        return error.TestUnexpectedResult) + "description: ".len;
+    const desc_end = std.mem.indexOfScalarPos(u8, source, desc_start, '\n') orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(desc_end - desc_start >= 1 and desc_end - desc_start <= 1024);
+    // Trigger keywords drive discovery on skills directories.
+    try std.testing.expect(std.mem.indexOf(u8, source, "Use when") != null);
+
+    // The public skill must be discoverable — never marked internal — and
+    // must route interactive setup to the user rather than the agent.
+    try std.testing.expect(std.mem.indexOf(u8, source, "internal:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "ask the user to run it in their terminal") != null);
+}
