@@ -35,11 +35,16 @@ pub const RemoteMemoryCapabilities = struct {
 pub fn isWriteTool(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "mem_learn") or
         std.mem.eql(u8, tool_name, "mem_associate") or
+        std.mem.eql(u8, tool_name, "mem_unlink") or
         std.mem.eql(u8, tool_name, "mem_refactor") or
         std.mem.eql(u8, tool_name, "mem_update") or
         std.mem.eql(u8, tool_name, "mem_deprecate") or
         std.mem.eql(u8, tool_name, "mem_reinforce") or
-        std.mem.eql(u8, tool_name, "mem_flush");
+        std.mem.eql(u8, tool_name, "mem_flush") or
+        std.mem.eql(u8, tool_name, "mem_verify") or
+        std.mem.eql(u8, tool_name, "mem_meld") or
+        std.mem.eql(u8, tool_name, "mem_assert_mark_reviewed") or
+        std.mem.eql(u8, tool_name, "mem_assert_supersede");
 }
 
 pub fn supportsEnhancedWrite(capabilities: *const RemoteMemoryCapabilities) bool {
@@ -263,6 +268,8 @@ test "write tool classification covers hosted memory mutations" {
         "mem_flush",
         "mem_verify",
         "mem_meld",
+        "mem_assert_mark_reviewed",
+        "mem_assert_supersede",
     };
     for (mutating_tools) |tool_name| {
         try std.testing.expect(isWriteTool(tool_name));
