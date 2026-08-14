@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const debug_log = @import("debug_log.zig");
+const fs_util = @import("fs_util.zig");
 
 /// Environment variable that disables all polling and notices when set to "0".
 pub const OPT_OUT_ENV = "COG_UPDATE_CHECK";
@@ -85,6 +87,182 @@ pub fn shouldNotify(
     const same_version = if (compareVersions(notified, latest)) |o| o == .eq else std.mem.eql(u8, notified, latest);
     if (!same_version) return true;
     return now_unix - last_notified_unix >= renotify_interval_seconds;
+}
+
+// ── Cache file ──────────────────────────────────────────────────────────
+
+/// Cache file basename inside the global config dir (~/.config/cog/).
+pub const cache_basename = "update-check.json";
+pub const cache_version: u32 = 1;
+const max_cache_bytes: usize = 64 * 1024;
+
+/// On-disk schema. Every field has a default so a partial file still loads;
+/// tolerance matters more than completeness for an advisory cache.
+const CacheSchema = struct {
+    version: u32 = 0,
+    last_check_unix: i64 = 0,
+    latest_version: ?[]const u8 = null,
+    last_notified_version: ?[]const u8 = null,
+    last_notified_unix: i64 = 0,
+};
+
+/// In-memory cache state with owned strings.
+const Cache = struct {
+    last_check_unix: i64 = 0,
+    latest_version: ?[]u8 = null,
+    last_notified_version: ?[]u8 = null,
+    last_notified_unix: i64 = 0,
+
+    fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
+        if (self.latest_version) |v| allocator.free(v);
+        if (self.last_notified_version) |v| allocator.free(v);
+        self.latest_version = null;
+        self.last_notified_version = null;
+    }
+};
+
+/// Load the cache from a directory. Any failure — missing file, malformed
+/// JSON, version mismatch, allocation — degrades to "never checked".
+fn loadCache(allocator: std.mem.Allocator, dir: std.fs.Dir) Cache {
+    const data = dir.readFileAlloc(allocator, cache_basename, max_cache_bytes) catch |err| {
+        debug_log.log("update_check.loadCache: unavailable: {s}", .{@errorName(err)});
+        return .{};
+    };
+    defer allocator.free(data);
+
+    const parsed = std.json.parseFromSlice(CacheSchema, allocator, data, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        debug_log.log("update_check.loadCache: malformed cache: {s}", .{@errorName(err)});
+        return .{};
+    };
+    defer parsed.deinit();
+    if (parsed.value.version != cache_version) {
+        debug_log.log("update_check.loadCache: unsupported version={d}", .{parsed.value.version});
+        return .{};
+    }
+
+    var cache: Cache = .{
+        .last_check_unix = parsed.value.last_check_unix,
+        .last_notified_unix = parsed.value.last_notified_unix,
+    };
+    if (parsed.value.latest_version) |v| {
+        cache.latest_version = allocator.dupe(u8, v) catch null;
+    }
+    if (parsed.value.last_notified_version) |v| {
+        cache.last_notified_version = allocator.dupe(u8, v) catch null;
+    }
+    return cache;
+}
+
+/// Atomically write the cache as pretty-printed JSON with a trailing newline.
+/// Config files are always pretty-printed, never minified. Returns false on
+/// failure; callers log and continue — the cache is advisory.
+fn writeCache(allocator: std.mem.Allocator, dir: std.fs.Dir, cache: Cache) bool {
+    const schema: CacheSchema = .{
+        .version = cache_version,
+        .last_check_unix = cache.last_check_unix,
+        .latest_version = cache.latest_version,
+        .last_notified_version = cache.last_notified_version,
+        .last_notified_unix = cache.last_notified_unix,
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var stringify: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
+    stringify.write(schema) catch |err| {
+        debug_log.log("update_check.writeCache: encode failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    aw.writer.writeByte('\n') catch return false;
+
+    fs_util.writeFileAtomic(dir, allocator, cache_basename, aw.writer.buffered()) catch |err| {
+        debug_log.log("update_check.writeCache: write failed: {s}", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
+// ── Tests: cache round-trip ─────────────────────────────────────────────
+
+test "cache round-trips through pretty-printed JSON" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var cache: Cache = .{
+        .last_check_unix = 1_755_000_000,
+        .latest_version = try allocator.dupe(u8, "0.27.0"),
+        .last_notified_version = try allocator.dupe(u8, "0.27.0"),
+        .last_notified_unix = 1_755_000_100,
+    };
+    defer cache.deinit(allocator);
+    try std.testing.expect(writeCache(allocator, tmp.dir, cache));
+
+    // Configuration files are always pretty-printed, never minified.
+    const raw = try tmp.dir.readFileAlloc(allocator, cache_basename, 8192);
+    defer allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\n  \"version\": 1") != null);
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\n"));
+
+    var loaded = loadCache(allocator, tmp.dir);
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 1_755_000_000), loaded.last_check_unix);
+    try std.testing.expectEqualStrings("0.27.0", loaded.latest_version.?);
+    try std.testing.expectEqualStrings("0.27.0", loaded.last_notified_version.?);
+    try std.testing.expectEqual(@as(i64, 1_755_000_100), loaded.last_notified_unix);
+}
+
+test "cache write serializes absent versions as null" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expect(writeCache(allocator, tmp.dir, .{ .last_check_unix = 42 }));
+    var loaded = loadCache(allocator, tmp.dir);
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 42), loaded.last_check_unix);
+    try std.testing.expect(loaded.latest_version == null);
+    try std.testing.expect(loaded.last_notified_version == null);
+}
+
+test "cache load treats missing, malformed, and mismatched files as never-checked" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var missing = loadCache(allocator, tmp.dir);
+    defer missing.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 0), missing.last_check_unix);
+    try std.testing.expect(missing.latest_version == null);
+
+    try tmp.dir.writeFile(.{ .sub_path = cache_basename, .data = "{not json" });
+    var malformed = loadCache(allocator, tmp.dir);
+    defer malformed.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 0), malformed.last_check_unix);
+
+    try tmp.dir.writeFile(.{ .sub_path = cache_basename, .data = 
+        \\{
+        \\  "version": 99,
+        \\  "last_check_unix": 7
+        \\}
+    });
+    var mismatched = loadCache(allocator, tmp.dir);
+    defer mismatched.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 0), mismatched.last_check_unix);
+
+    // Unknown fields and missing optionals are tolerated.
+    try tmp.dir.writeFile(.{ .sub_path = cache_basename, .data = 
+        \\{
+        \\  "version": 1,
+        \\  "last_check_unix": 7,
+        \\  "future_field": true
+        \\}
+    });
+    var partial = loadCache(allocator, tmp.dir);
+    defer partial.deinit(allocator);
+    try std.testing.expectEqual(@as(i64, 7), partial.last_check_unix);
+    try std.testing.expect(partial.latest_version == null);
 }
 
 // ── Tests: decision helpers ─────────────────────────────────────────────
