@@ -11,6 +11,7 @@ const debug_log = @import("../../debug_log.zig");
 const paths = @import("../../paths.zig");
 
 extern "c" fn getpgrp() std.posix.pid_t;
+extern "c" fn getpgid(pid: std.posix.pid_t) std.posix.pid_t;
 
 // Debug logging to file (stderr not visible when running as MCP subprocess)
 var dap_log_file: ?std.fs.File = null;
@@ -4963,6 +4964,8 @@ test "DetachedProcess terminateAndReap kills process group descendants" {
     const leader_pid = process.id;
     const descendant_pid = try readTestPid(process.stdout.?);
     try std.testing.expect(leader_pid != getpgrp());
+    try std.testing.expectEqual(leader_pid, getpgid(leader_pid));
+    try std.testing.expectEqual(leader_pid, getpgid(descendant_pid));
     try std.testing.expect(descendant_pid != leader_pid);
 
     process.terminateAndReap();
