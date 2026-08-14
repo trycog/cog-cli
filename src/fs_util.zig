@@ -518,7 +518,8 @@ test "replaceDirectoryTransactional succeeds when backup cleanup fails after pro
             var iterator = parent.?.iterate();
             while (try iterator.next()) |entry| {
                 if (std.mem.startsWith(u8, entry.name, ".live.backup-")) {
-                    var backup = try parent.?.openDir(entry.name, .{});
+                    // .iterate avoids Linux O_PATH descriptors, which fchmod() rejects.
+                    var backup = try parent.?.openDir(entry.name, .{ .iterate = true });
                     defer backup.close();
                     try backup.chmod(0o000);
                 }

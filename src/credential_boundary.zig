@@ -1515,7 +1515,7 @@ test "validated global config directory supports chmod and durability sync" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.makeDir("config");
-    var initial = try tmp.dir.openDir("config", .{});
+    var initial = try tmp.dir.openDir("config", .{ .iterate = true });
     try initial.chmod(0o755);
     initial.close();
     const config_path = try tmp.dir.realpathAlloc(allocator, "config");
@@ -1535,7 +1535,7 @@ test "approved origin operations retain the validated directory handle" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.makeDir("config");
-    var initial = try tmp.dir.openDir("config", .{});
+    var initial = try tmp.dir.openDir("config", .{ .iterate = true });
     try initial.chmod(0o700);
     initial.close();
     const config_path = try tmp.dir.realpathAlloc(allocator, "config");
