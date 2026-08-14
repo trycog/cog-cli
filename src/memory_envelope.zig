@@ -251,6 +251,40 @@ fn writeStringArray(s: *json.Stringify, strings: []const []const u8) !void {
     try s.endArray();
 }
 
+test "write tool classification covers hosted memory mutations" {
+    const mutating_tools = [_][]const u8{
+        "mem_learn",
+        "mem_update",
+        "mem_associate",
+        "mem_unlink",
+        "mem_refactor",
+        "mem_deprecate",
+        "mem_reinforce",
+        "mem_flush",
+        "mem_verify",
+        "mem_meld",
+    };
+    for (mutating_tools) |tool_name| {
+        try std.testing.expect(isWriteTool(tool_name));
+    }
+
+    const read_tools = [_][]const u8{
+        "mem_recall",
+        "mem_get",
+        "mem_list_short_term",
+        "mem_connections",
+        "mem_trace",
+        "mem_stats",
+        "mem_orphans",
+        "mem_connectivity",
+        "mem_list_terms",
+        "mem_stale",
+    };
+    for (read_tools) |tool_name| {
+        try std.testing.expect(!isWriteTool(tool_name));
+    }
+}
+
 test "supportsEnhancedWrite requires provenance and tool" {
     var capabilities = RemoteMemoryCapabilities{};
     defer capabilities.deinit(std.testing.allocator);
