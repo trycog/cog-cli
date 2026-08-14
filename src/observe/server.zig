@@ -176,11 +176,21 @@ pub const ObserveServer = struct {
         const sid = session_val.string;
         debug_log.log("toolStop: session_id={s}", .{sid});
 
-        self.session_manager.finalizeSession(sid) catch {
-            return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
+        self.session_manager.finalizeSession(sid) catch |err| switch (err) {
+            error.SessionNotFound => {
+                debug_log.log("toolStop: session not found id={s}", .{sid});
+                return .{ .err = .{ .code = INVALID_PARAMS, .message = "Session not found" } };
+            },
+            else => {
+                debug_log.log("toolStop: finalization failed id={s} error={s}", .{ sid, @errorName(err) });
+                return err;
+            },
         };
 
-        const event_count = self.session_manager.getEventCount(sid) catch 0;
+        const event_count = self.session_manager.getEventCount(sid) catch |err| {
+            debug_log.log("toolStop: event count failed id={s} error={s}", .{ sid, @errorName(err) });
+            return err;
+        };
 
         return okJson(allocator, .{ .session_id = sid, .status = "finalized", .event_count = event_count });
     }
@@ -675,6 +685,104 @@ test "observe_start rejects unavailable backend without creating database" {
         else => return error.UnexpectedResult,
     }
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(".cog/observe", .{}));
+}
+
+test "observe_stop maps missing session to invalid params" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    var server = try ObserveServer.init(std.testing.allocator);
+    defer server.deinit();
+
+    var args = json.ObjectMap.init(std.testing.allocator);
+    defer args.deinit();
+    try args.put("session_id", .{ .string = "missing-session" });
+
+    const result = try server.callTool(std.testing.allocator, "observe_stop", .{ .object = args });
+    switch (result) {
+        .err => |err| try std.testing.expectEqual(INVALID_PARAMS, err.code),
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "observe_stop propagates injected finalization database error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    var server = try ObserveServer.init(std.testing.allocator);
+    defer server.deinit();
+    const session_id = try server.session_manager.createSession(.syscall, null);
+    const session = server.session_manager.getSession(session_id).?;
+    try session.db.exec(
+        \\CREATE TRIGGER inject_finalize_failure
+        \\BEFORE UPDATE OF status ON sessions
+        \\WHEN NEW.status = 'finalized'
+        \\BEGIN
+        \\  SELECT RAISE(ABORT, 'injected finalization failure');
+        \\END
+    );
+
+    var args = json.ObjectMap.init(std.testing.allocator);
+    defer args.deinit();
+    try args.put("session_id", .{ .string = session_id });
+
+    const result = server.callTool(std.testing.allocator, "observe_stop", .{ .object = args }) catch |err| {
+        try std.testing.expectEqual(error.SqliteConstraint, err);
+        try std.testing.expectEqual(types.SessionStatus.capturing, session.status);
+        return;
+    };
+    switch (result) {
+        .ok => |payload| std.testing.allocator.free(payload),
+        else => {},
+    }
+    return error.ExpectedSqliteConstraint;
+}
+
+test "observe_stop propagates injected event count database error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.setAsCwd();
+
+    var server = try ObserveServer.init(std.testing.allocator);
+    defer server.deinit();
+    const session_id = try server.session_manager.createSession(.syscall, null);
+    const session = server.session_manager.getSession(session_id).?;
+    try session.db.exec("DROP TABLE events");
+
+    var args = json.ObjectMap.init(std.testing.allocator);
+    defer args.deinit();
+    try args.put("session_id", .{ .string = session_id });
+
+    const result = server.callTool(std.testing.allocator, "observe_stop", .{ .object = args }) catch |err| {
+        try std.testing.expectEqual(error.SqliteError, err);
+        try std.testing.expectEqual(types.SessionStatus.finalized, session.status);
+        return;
+    };
+    switch (result) {
+        .ok => |payload| std.testing.allocator.free(payload),
+        else => {},
+    }
+    return error.ExpectedSqliteError;
 }
 
 test "callTool returns error for unknown tool" {

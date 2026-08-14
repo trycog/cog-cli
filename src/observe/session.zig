@@ -274,10 +274,19 @@ pub const SessionManager = struct {
 
         // Update status in the database
         {
-            var stmt = try session.db.prepare("UPDATE sessions SET status = 'finalized', stopped_at = datetime('now') WHERE id = ?");
+            var stmt = session.db.prepare("UPDATE sessions SET status = 'finalized', stopped_at = datetime('now') WHERE id = ?") catch |err| {
+                debug_log.log("SessionManager.finalizeSession: prepare failed id={s} error={s}", .{ id, @errorName(err) });
+                return err;
+            };
             defer stmt.finalize();
-            try stmt.bindText(1, id);
-            _ = try stmt.step();
+            stmt.bindText(1, id) catch |err| {
+                debug_log.log("SessionManager.finalizeSession: bind failed id={s} error={s}", .{ id, @errorName(err) });
+                return err;
+            };
+            _ = stmt.step() catch |err| {
+                debug_log.log("SessionManager.finalizeSession: update failed id={s} error={s}", .{ id, @errorName(err) });
+                return err;
+            };
         }
 
         session.status = .finalized;
@@ -352,10 +361,19 @@ pub const SessionManager = struct {
     /// Get event count for a session.
     pub fn getEventCount(self: *SessionManager, id: []const u8) !i64 {
         const session = self.sessions.get(id) orelse return error.SessionNotFound;
-        var stmt = try session.db.prepare("SELECT count(*) FROM events WHERE session_id = ?");
+        var stmt = session.db.prepare("SELECT count(*) FROM events WHERE session_id = ?") catch |err| {
+            debug_log.log("SessionManager.getEventCount: prepare failed id={s} error={s}", .{ id, @errorName(err) });
+            return err;
+        };
         defer stmt.finalize();
-        try stmt.bindText(1, id);
-        const result = try stmt.step();
+        stmt.bindText(1, id) catch |err| {
+            debug_log.log("SessionManager.getEventCount: bind failed id={s} error={s}", .{ id, @errorName(err) });
+            return err;
+        };
+        const result = stmt.step() catch |err| {
+            debug_log.log("SessionManager.getEventCount: query failed id={s} error={s}", .{ id, @errorName(err) });
+            return err;
+        };
         if (result == .row) return stmt.columnInt(0);
         return 0;
     }
