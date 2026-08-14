@@ -183,6 +183,327 @@ fn writeCache(allocator: std.mem.Allocator, dir: std.fs.Dir, cache: Cache) bool 
     return true;
 }
 
+// ── Orchestration ───────────────────────────────────────────────────────
+
+/// An update the caller may want to mention. Both strings are copies owned by
+/// the allocator passed to the producing call; release them with `deinit`
+/// (or free each field) when done.
+pub const NoticeInfo = struct {
+    installed: []const u8,
+    latest: []const u8,
+
+    pub fn deinit(self: NoticeInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.installed);
+        allocator.free(self.latest);
+    }
+};
+
+/// Doctor-facing summary. `update_available` carries an owned NoticeInfo the
+/// caller must deinit.
+pub const UpdateStatus = union(enum) {
+    disabled,
+    unknown,
+    up_to_date,
+    update_available: NoticeInfo,
+};
+
+/// Seam for the network poll: returns the latest release version (bare
+/// "x.y.z", allocator-owned) or null on any failure. Tests substitute stubs;
+/// production uses the curl-backed GitHub fetch.
+pub const FetchLatestFn = *const fn (allocator: std.mem.Allocator) ?[]u8;
+
+/// Extract "tag_name" from a GitHub releases/latest response body and
+/// normalize it to bare "x.y.z". Null for malformed bodies, missing tags,
+/// or tags that are not plain semver — those must never notify.
+pub fn parseLatestTag(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    const Release = struct { tag_name: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Release, allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        debug_log.log("update_check.parseLatestTag: malformed response: {s}", .{@errorName(err)});
+        return null;
+    };
+    defer parsed.deinit();
+
+    const tag = parsed.value.tag_name;
+    if (parseVersion(tag) == null) {
+        debug_log.log("update_check.parseLatestTag: unparseable tag_name={s}", .{tag});
+        return null;
+    }
+    const bare = if (std.mem.startsWith(u8, tag, "v")) tag[1..] else tag;
+    return allocator.dupe(u8, bare) catch null;
+}
+
+/// Poll the release feed if the 24h throttle allows, then persist the
+/// attempt. A failed fetch still stamps last_check_unix — a dead network
+/// must not be retried on every invocation — and keeps the previously
+/// cached latest version.
+fn pollIfDue(allocator: std.mem.Allocator, dir: std.fs.Dir, now_unix: i64, fetch: FetchLatestFn) void {
+    var cache = loadCache(allocator, dir);
+    defer cache.deinit(allocator);
+
+    if (!shouldPoll(now_unix, cache.last_check_unix)) {
+        debug_log.log("update_check.pollIfDue: throttled, last_check_unix={d}", .{cache.last_check_unix});
+        return;
+    }
+
+    debug_log.log("update_check.pollIfDue: polling for the latest release", .{});
+    const fetched = fetch(allocator);
+    cache.last_check_unix = now_unix;
+    if (fetched) |latest| {
+        if (cache.latest_version) |old| allocator.free(old);
+        cache.latest_version = latest;
+        debug_log.log("update_check.pollIfDue: latest={s}", .{latest});
+    } else {
+        debug_log.log("update_check.pollIfDue: poll failed; keeping cached latest", .{});
+    }
+    _ = writeCache(allocator, dir, cache);
+}
+
+/// Read-only cache evaluation: the notice that is currently due, if any.
+fn noticeFromCacheInDir(allocator: std.mem.Allocator, dir: std.fs.Dir, now_unix: i64, installed: []const u8) ?NoticeInfo {
+    var cache = loadCache(allocator, dir);
+    defer cache.deinit(allocator);
+
+    const latest = cache.latest_version orelse return null;
+    if (!shouldNotify(now_unix, installed, latest, cache.last_notified_version, cache.last_notified_unix)) {
+        return null;
+    }
+    return makeNotice(allocator, installed, latest);
+}
+
+fn makeNotice(allocator: std.mem.Allocator, installed: []const u8, latest: []const u8) ?NoticeInfo {
+    const installed_copy = allocator.dupe(u8, installed) catch return null;
+    const latest_copy = allocator.dupe(u8, latest) catch {
+        allocator.free(installed_copy);
+        return null;
+    };
+    return .{ .installed = installed_copy, .latest = latest_copy };
+}
+
+/// Poll (throttle permitting), update the cache, and report the notice that
+/// is now due. Does not record the notification — callers that actually
+/// display it confirm via markNotified.
+fn checkNowInDir(allocator: std.mem.Allocator, dir: std.fs.Dir, now_unix: i64, installed: []const u8, fetch: FetchLatestFn) ?NoticeInfo {
+    pollIfDue(allocator, dir, now_unix, fetch);
+    return noticeFromCacheInDir(allocator, dir, now_unix, installed);
+}
+
+/// Record that a notice for `latest` was actually shown, starting the 7-day
+/// renotify window for that version.
+fn markNotifiedInDir(allocator: std.mem.Allocator, dir: std.fs.Dir, now_unix: i64, latest: []const u8) void {
+    var cache = loadCache(allocator, dir);
+    defer cache.deinit(allocator);
+
+    if (cache.last_notified_version) |old| allocator.free(old);
+    cache.last_notified_version = allocator.dupe(u8, latest) catch null;
+    cache.last_notified_unix = now_unix;
+    if (writeCache(allocator, dir, cache)) {
+        debug_log.log("update_check.markNotified: recorded version={s}", .{latest});
+    }
+}
+
+/// Doctor-grade status: polls synchronously (throttle permitting) and always
+/// reports the comparison outcome, ignoring the renotify window — an explicit
+/// diagnostic run deserves the unfiltered answer.
+fn statusInDir(allocator: std.mem.Allocator, dir: std.fs.Dir, now_unix: i64, installed: []const u8, fetch: FetchLatestFn) UpdateStatus {
+    pollIfDue(allocator, dir, now_unix, fetch);
+
+    var cache = loadCache(allocator, dir);
+    defer cache.deinit(allocator);
+    const latest = cache.latest_version orelse return .unknown;
+    const order = compareVersions(latest, installed) orelse return .unknown;
+    if (order == .gt) {
+        const notice = makeNotice(allocator, installed, latest) orelse return .unknown;
+        return .{ .update_available = notice };
+    }
+    return .up_to_date;
+}
+
+/// Format the once-per-session MCP notice. The wording instructs the agent
+/// to offer the update to the user — never to apply it on its own.
+pub fn formatAgentNotice(allocator: std.mem.Allocator, notice: NoticeInfo) ?[]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "NOTE: Cog v{s} is available (installed v{s}). Ask the user before updating; " ++
+            "brew upgrade cog or https://github.com/trycog/cog-cli/releases\n\n",
+        .{ notice.latest, notice.installed },
+    ) catch null;
+}
+
+// ── Tests: orchestration seams ──────────────────────────────────────────
+
+var stub_fetch_calls: usize = 0;
+
+fn stubFetchNewer(allocator: std.mem.Allocator) ?[]u8 {
+    stub_fetch_calls += 1;
+    return allocator.dupe(u8, "0.27.0") catch null;
+}
+
+fn stubFetchFails(allocator: std.mem.Allocator) ?[]u8 {
+    _ = allocator;
+    stub_fetch_calls += 1;
+    return null;
+}
+
+test "checkNowInDir polls, caches, and applies the renotify window" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    stub_fetch_calls = 0;
+
+    const now: i64 = 1_755_000_000;
+    const first = checkNowInDir(allocator, tmp.dir, now, "0.26.0", stubFetchNewer) orelse
+        return error.TestUnexpectedResult;
+    defer first.deinit(allocator);
+    try std.testing.expectEqualStrings("0.26.0", first.installed);
+    try std.testing.expectEqualStrings("0.27.0", first.latest);
+    try std.testing.expectEqual(@as(usize, 1), stub_fetch_calls);
+
+    var cache = loadCache(allocator, tmp.dir);
+    defer cache.deinit(allocator);
+    try std.testing.expectEqual(now, cache.last_check_unix);
+    try std.testing.expectEqualStrings("0.27.0", cache.latest_version.?);
+
+    // The caller displayed the notice; within the window it stays quiet and
+    // the 24h throttle prevents another poll.
+    markNotifiedInDir(allocator, tmp.dir, now + 1, "0.27.0");
+    try std.testing.expect(checkNowInDir(allocator, tmp.dir, now + 2, "0.26.0", stubFetchNewer) == null);
+    try std.testing.expectEqual(@as(usize, 1), stub_fetch_calls);
+
+    // A week later the reminder is due again.
+    const again = checkNowInDir(allocator, tmp.dir, now + renotify_interval_seconds + 2, "0.26.0", stubFetchNewer) orelse
+        return error.TestUnexpectedResult;
+    defer again.deinit(allocator);
+    try std.testing.expectEqualStrings("0.27.0", again.latest);
+}
+
+test "checkNowInDir records failed polls to honor the throttle" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    stub_fetch_calls = 0;
+
+    const now: i64 = 1_755_000_000;
+    try std.testing.expect(checkNowInDir(allocator, tmp.dir, now, "0.26.0", stubFetchFails) == null);
+    try std.testing.expectEqual(@as(usize, 1), stub_fetch_calls);
+
+    var cache = loadCache(allocator, tmp.dir);
+    defer cache.deinit(allocator);
+    try std.testing.expectEqual(now, cache.last_check_unix);
+    try std.testing.expect(cache.latest_version == null);
+
+    // Ten seconds later the attempt is throttled — no hammering a dead network.
+    try std.testing.expect(checkNowInDir(allocator, tmp.dir, now + 10, "0.26.0", stubFetchFails) == null);
+    try std.testing.expectEqual(@as(usize, 1), stub_fetch_calls);
+}
+
+test "checkNowInDir keeps the cached latest when a poll fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    stub_fetch_calls = 0;
+
+    const now: i64 = 1_755_000_000;
+    try std.testing.expect(writeCache(allocator, tmp.dir, .{
+        .last_check_unix = now - poll_interval_seconds,
+        .latest_version = @constCast("0.27.0"),
+    }));
+
+    // The re-poll fails, but the previously seen latest still notifies.
+    const notice = checkNowInDir(allocator, tmp.dir, now, "0.26.0", stubFetchFails) orelse
+        return error.TestUnexpectedResult;
+    defer notice.deinit(allocator);
+    try std.testing.expectEqualStrings("0.27.0", notice.latest);
+    try std.testing.expectEqual(@as(usize, 1), stub_fetch_calls);
+}
+
+test "noticeFromCacheInDir evaluates without network or mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const now: i64 = 1_755_000_000;
+    try std.testing.expect(writeCache(allocator, tmp.dir, .{
+        .last_check_unix = now,
+        .latest_version = @constCast("0.27.0"),
+    }));
+
+    // Read-only: asking twice yields the notice twice.
+    for (0..2) |_| {
+        const notice = noticeFromCacheInDir(allocator, tmp.dir, now, "0.26.0") orelse
+            return error.TestUnexpectedResult;
+        defer notice.deinit(allocator);
+        try std.testing.expectEqualStrings("0.27.0", notice.latest);
+    }
+
+    // Nothing newer, nothing to say.
+    try std.testing.expect(noticeFromCacheInDir(allocator, tmp.dir, now, "0.27.0") == null);
+    try std.testing.expect(noticeFromCacheInDir(allocator, tmp.dir, now, "0.28.0") == null);
+}
+
+test "statusInDir reports doctor-grade truth regardless of notify history" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    stub_fetch_calls = 0;
+
+    const now: i64 = 1_755_000_000;
+
+    // Nothing cached and the poll fails: unknown.
+    switch (statusInDir(allocator, tmp.dir, now, "0.26.0", stubFetchFails)) {
+        .unknown => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A later successful poll reports the update even after a notification
+    // was recorded — doctor is explicitly asked, so it always tells.
+    markNotifiedInDir(allocator, tmp.dir, now, "0.27.0");
+    switch (statusInDir(allocator, tmp.dir, now + poll_interval_seconds, "0.26.0", stubFetchNewer)) {
+        .update_available => |notice| {
+            defer notice.deinit(allocator);
+            try std.testing.expectEqualStrings("0.27.0", notice.latest);
+            try std.testing.expectEqualStrings("0.26.0", notice.installed);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (statusInDir(allocator, tmp.dir, now + poll_interval_seconds + 1, "0.27.0", stubFetchNewer)) {
+        .up_to_date => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parseLatestTag extracts and normalizes tag_name" {
+    const allocator = std.testing.allocator;
+
+    const tag = parseLatestTag(allocator, "{\"tag_name\": \"v0.27.0\", \"name\": \"Release\"}") orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(tag);
+    try std.testing.expectEqualStrings("0.27.0", tag);
+
+    const bare = parseLatestTag(allocator, "{\"tag_name\": \"0.27.0\"}") orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(bare);
+    try std.testing.expectEqualStrings("0.27.0", bare);
+
+    try std.testing.expect(parseLatestTag(allocator, "not json") == null);
+    try std.testing.expect(parseLatestTag(allocator, "{\"message\": \"rate limited\"}") == null);
+    try std.testing.expect(parseLatestTag(allocator, "{\"tag_name\": \"nightly\"}") == null);
+}
+
+test "formatAgentNotice instructs the agent to offer, never apply" {
+    const allocator = std.testing.allocator;
+    const line = formatAgentNotice(allocator, .{ .installed = "0.26.0", .latest = "0.27.0" }) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(line);
+    try std.testing.expect(std.mem.startsWith(u8, line, "NOTE: Cog v0.27.0 is available (installed v0.26.0)."));
+    try std.testing.expect(std.mem.indexOf(u8, line, "Ask the user before updating") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "brew upgrade cog") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "https://github.com/trycog/cog-cli/releases") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n\n"));
+}
+
 // ── Tests: cache round-trip ─────────────────────────────────────────────
 
 test "cache round-trips through pretty-printed JSON" {
