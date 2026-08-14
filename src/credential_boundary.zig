@@ -800,6 +800,7 @@ test "approved origin store rejects an existing permissive store" {
     defer tmp.cleanup();
     var existing = try tmp.dir.createFile(store_file_name, .{ .mode = 0o644 });
     try existing.writeAll("{\n  \"version\": 1,\n  \"origins\": []\n}\n");
+    try existing.chmod(0o644);
     existing.close();
     try std.testing.expectError(error.UnreadableStore, approveInDir(tmp.dir, allocator, "https://example.com"));
 }
