@@ -2860,6 +2860,11 @@ pub const DebugServer = struct {
         var driver = engine.activeDriver();
         driver.loadCore(allocator, core_path_val.string, executable) catch |err| {
             self.dashboard.onError("debug_load_core", @errorName(err));
+            // Returning a ToolResult error is a successful Zig return, so the
+            // errdefer above never runs; release the engine and any state the
+            // partial load retained here.
+            engine.deinit();
+            allocator.destroy(engine);
             return .{ .err = .{ .code = errorToCode(err), .message = @errorName(err) } };
         };
 
@@ -3836,6 +3841,26 @@ test "callTool returns error for unknown tool" {
     const result = try srv.callTool(allocator, "nonexistent_tool", null);
     switch (result) {
         .err => |e| try std.testing.expectEqual(METHOD_NOT_FOUND, e.code),
+        .ok, .ok_static => unreachable,
+    }
+}
+
+test "debug_load_core failure releases the native engine" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    const args_str =
+        \\{"core_path":"/nonexistent/cog-missing.core"}
+    ;
+    const args_parsed = try json.parseFromSlice(json.Value, allocator, args_str, .{});
+    defer args_parsed.deinit();
+
+    // The testing allocator flags the engine allocation as leaked if the
+    // ToolResult error path skips cleanup.
+    const result = try srv.callTool(allocator, "debug_load_core", args_parsed.value);
+    switch (result) {
+        .err => {},
         .ok, .ok_static => unreachable,
     }
 }
