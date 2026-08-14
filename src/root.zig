@@ -27,6 +27,7 @@ pub const sqlite = @import("sqlite.zig");
 pub const memory_schema = @import("memory_schema.zig");
 pub const memory = @import("memory.zig");
 pub const observe = @import("observe.zig");
+pub const credential_boundary = @import("credential_boundary.zig");
 
 test {
     _ = config;
@@ -58,4 +59,5 @@ test {
     _ = memory_schema;
     _ = memory;
     _ = observe;
+    _ = credential_boundary;
 }
