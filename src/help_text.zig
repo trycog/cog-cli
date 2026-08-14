@@ -76,6 +76,9 @@ pub const observe_query =
 pub const observe_export =
     bold ++ "  cog observe:export" ++ reset ++ "\n" ++ "\n" ++ "  Placeholder CLI command. Observation export is not implemented.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:export\n" ++ "\n";
 
+pub const observe_prune =
+    bold ++ "  cog observe:prune" ++ reset ++ "\n" ++ "\n" ++ "  Delete finalized observation session databases older than\n" ++ "  observe.retention_days (default: 30). Capturing, stopped, error,\n" ++ "  and unexpired finalized sessions are always preserved.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog observe:prune\n" ++ "\n";
+
 // ── Extensions ────────────────────────────────────────────────────────
 
 pub const ext_install =

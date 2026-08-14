@@ -67,6 +67,7 @@ const observe_commands = [_]CommandEntry{
     .{ .name = "observe:sessions", .summary = "Show the CLI placeholder session list" },
     .{ .name = "observe:query", .summary = "Show the CLI placeholder query status" },
     .{ .name = "observe:export", .summary = "Show the CLI placeholder export status" },
+    .{ .name = "observe:prune", .summary = "Delete expired finalized observation sessions" },
 };
 
 const memory_commands = [_]CommandEntry{
@@ -500,7 +501,7 @@ fn printObserveHelp() void {
     defer allocator.free(cli_help);
     tui.header();
     printErr(cli_help);
-    printErr(dim ++ "  The observe:* CLI commands are placeholders and do not yet perform capture, query, or export operations.\n" ++ reset ++ "\n" ++ cyan ++ bold ++ "  MCP Tools" ++ reset ++ dim ++ " (available only when observe is enabled)" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_start" ++ reset ++ "         " ++ dim ++ "Create a session for an implemented backend; automatic capture is not implemented" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_stop" ++ reset ++ "          " ++ dim ++ "Finalize an existing observation session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_events" ++ reset ++ "        " ++ dim ++ "Query stored events from a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_sessions" ++ reset ++ "      " ++ dim ++ "List stored observation sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_status" ++ reset ++ "        " ++ dim ++ "Report backend availability and session counts" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_causal_chains" ++ reset ++ " " ++ dim ++ "Query causal chains already stored in a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_query" ++ reset ++ "         " ++ dim ++ "Run bounded read-only SQL against a session database" ++ reset ++ "\n\n");
+    printErr(dim ++ "  Observe capture, query, and export CLI commands remain placeholders.\n" ++ reset ++ "\n" ++ cyan ++ bold ++ "  MCP Tools" ++ reset ++ dim ++ " (available only when observe is enabled)" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_start" ++ reset ++ "         " ++ dim ++ "Create a session for an implemented backend; automatic capture is not implemented" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_stop" ++ reset ++ "          " ++ dim ++ "Finalize an existing observation session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_events" ++ reset ++ "        " ++ dim ++ "Query stored events from a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_sessions" ++ reset ++ "      " ++ dim ++ "List stored observation sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_status" ++ reset ++ "        " ++ dim ++ "Report backend availability and session counts" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_causal_chains" ++ reset ++ " " ++ dim ++ "Query causal chains already stored in a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_query" ++ reset ++ "         " ++ dim ++ "Run bounded read-only SQL against a session database" ++ reset ++ "\n\n");
 }
 
 fn printMemHelp() void {

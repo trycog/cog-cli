@@ -4,7 +4,6 @@ const schema = @import("schema.zig");
 const types = @import("types.zig");
 const debug_log = @import("../debug_log.zig");
 const paths = @import("../paths.zig");
-const settings = @import("../settings.zig");
 const uuid = @import("uuid");
 
 const Db = sqlite.Db;
@@ -43,7 +42,6 @@ pub const SessionManager = struct {
         };
         errdefer manager.deinit();
         try manager.discoverPersistedSessions();
-        try manager.cleanupExpiredSessions(settings.observeRetentionDays(allocator));
         return manager;
     }
 
@@ -198,43 +196,70 @@ pub const SessionManager = struct {
         debug_log.log("SessionManager.discover: loaded id={s} status={s}", .{ id, status.toString() });
     }
 
-    /// Delete finalized, stopped, or failed sessions older than the configured retention.
-    pub fn cleanupExpiredSessions(self: *SessionManager, retention_days: i64) !void {
-        if (retention_days < 0) return error.InvalidRetention;
+    /// Explicitly delete finalized sessions older than the configured retention.
+    pub fn pruneExpiredSessions(self: *SessionManager, retention_days: i64) !usize {
+        if (retention_days < 0) {
+            debug_log.log("SessionManager.prune: invalid retention_days={d}", .{retention_days});
+            return error.InvalidRetention;
+        }
 
+        debug_log.log("SessionManager.prune: scanning sessions retention_days={d}", .{retention_days});
         var expired_ids: std.ArrayListUnmanaged([]const u8) = .empty;
         defer expired_ids.deinit(self.allocator);
 
         var iterator = self.sessions.iterator();
         while (iterator.next()) |entry| {
             const session = entry.value_ptr.*;
-            if (session.status == .capturing) {
-                debug_log.log("SessionManager.cleanup: preserving active id={s}", .{session.id});
+            if (session.status != .finalized) {
+                debug_log.log("SessionManager.prune: preserving id={s} status={s}", .{ session.id, session.status.toString() });
                 continue;
             }
 
-            var stmt = try session.db.prepare(
-                "SELECT 1 FROM sessions WHERE id = ? AND COALESCE(stopped_at, started_at) <= datetime('now', '-' || ? || ' days')",
-            );
+            var stmt = session.db.prepare(
+                "SELECT 1 FROM sessions WHERE id = ? AND status = 'finalized' AND stopped_at IS NOT NULL AND stopped_at <= datetime('now', '-' || ? || ' days')",
+            ) catch |err| {
+                debug_log.log("SessionManager.prune: expiration query prepare failed id={s} error={s}", .{ session.id, @errorName(err) });
+                return err;
+            };
             defer stmt.finalize();
-            try stmt.bindText(1, session.id);
-            try stmt.bindInt(2, retention_days);
-            if (try stmt.step() == .row) {
+            stmt.bindText(1, session.id) catch |err| {
+                debug_log.log("SessionManager.prune: expiration query bind id failed id={s} error={s}", .{ session.id, @errorName(err) });
+                return err;
+            };
+            stmt.bindInt(2, retention_days) catch |err| {
+                debug_log.log("SessionManager.prune: expiration query bind retention failed id={s} error={s}", .{ session.id, @errorName(err) });
+                return err;
+            };
+            const result = stmt.step() catch |err| {
+                debug_log.log("SessionManager.prune: expiration query failed id={s} error={s}", .{ session.id, @errorName(err) });
+                return err;
+            };
+            if (result == .row) {
+                debug_log.log("SessionManager.prune: expired finalized id={s}", .{session.id});
                 try expired_ids.append(self.allocator, session.id);
+            } else {
+                debug_log.log("SessionManager.prune: preserving unexpired finalized id={s}", .{session.id});
             }
         }
 
+        var pruned: usize = 0;
         for (expired_ids.items) |id| {
             const session = self.sessions.get(id) orelse continue;
             const path = try self.allocator.dupe(u8, session.db_path);
             defer self.allocator.free(path);
-            debug_log.log("SessionManager.cleanup: deleting expired id={s} path={s}", .{ id, path });
+            debug_log.log("SessionManager.prune: closing expired finalized id={s} path={s}", .{ id, path });
             std.debug.assert(self.destroySession(id));
+            debug_log.log("SessionManager.prune: deleting database path={s}", .{path});
             std.fs.deleteFileAbsolute(path) catch |err| {
-                debug_log.log("SessionManager.cleanup: delete failed path={s} error={s}", .{ path, @errorName(err) });
+                debug_log.log("SessionManager.prune: delete failed path={s} error={s}", .{ path, @errorName(err) });
                 return err;
             };
+            pruned += 1;
+            debug_log.log("SessionManager.prune: deleted database path={s}", .{path});
         }
+
+        debug_log.log("SessionManager.prune: completed pruned={d}", .{pruned});
+        return pruned;
     }
 
     /// Create a new observation session with its own investigation database.
@@ -554,7 +579,7 @@ test "SessionManager reports corrupt persisted databases without hiding healthy 
     try std.testing.expectEqualStrings(corrupt_path, second.corruptDatabasePaths()[0]);
 }
 
-test "cleanupExpiredSessions deletes expired completed databases and preserves active sessions" {
+test "pruneExpiredSessions deletes only expired finalized databases" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -568,21 +593,123 @@ test "cleanupExpiredSessions deletes expired completed databases and preserves a
 
     var mgr = try SessionManager.init(std.testing.allocator);
     defer mgr.deinit();
-    const expired_id = try std.testing.allocator.dupe(u8, try mgr.createSession(.syscall, null));
-    defer std.testing.allocator.free(expired_id);
+
+    const expired_finalized_id = try std.testing.allocator.dupe(u8, try mgr.createSession(.syscall, null));
+    defer std.testing.allocator.free(expired_finalized_id);
+    const recent_finalized_id = try std.testing.allocator.dupe(u8, try mgr.createSession(.cost, null));
+    defer std.testing.allocator.free(recent_finalized_id);
     const active_id = try std.testing.allocator.dupe(u8, try mgr.createSession(.gpu, null));
     defer std.testing.allocator.free(active_id);
-    try mgr.finalizeSession(expired_id);
+    const stopped_id = try std.testing.allocator.dupe(u8, try mgr.createSession(.net, null));
+    defer std.testing.allocator.free(stopped_id);
+    const error_id = try std.testing.allocator.dupe(u8, try mgr.createSession(.syscall, null));
+    defer std.testing.allocator.free(error_id);
 
-    const expired_path = try std.testing.allocator.dupe(u8, mgr.getSession(expired_id).?.db_path);
+    try mgr.finalizeSession(expired_finalized_id);
+    try mgr.finalizeSession(recent_finalized_id);
+    try mgr.stopSession(stopped_id);
+    mgr.getSession(error_id).?.status = .@"error";
+    try mgr.getSession(error_id).?.db.exec("UPDATE sessions SET status = 'error', stopped_at = datetime('now', '-40 days')");
+    try mgr.getSession(expired_finalized_id).?.db.exec("UPDATE sessions SET stopped_at = datetime('now', '-40 days')");
+    try mgr.getSession(stopped_id).?.db.exec("UPDATE sessions SET stopped_at = datetime('now', '-40 days')");
+    try mgr.getSession(active_id).?.db.exec("UPDATE sessions SET started_at = datetime('now', '-40 days')");
+
+    const expired_path = try std.testing.allocator.dupe(u8, mgr.getSession(expired_finalized_id).?.db_path);
     defer std.testing.allocator.free(expired_path);
-    try mgr.getSession(expired_id).?.db.exec("UPDATE sessions SET stopped_at = datetime('now', '-40 days')");
 
-    try mgr.cleanupExpiredSessions(30);
+    const pruned = try mgr.pruneExpiredSessions(30);
 
-    try std.testing.expect(mgr.getSession(expired_id) == null);
+    try std.testing.expectEqual(@as(usize, 1), pruned);
+    try std.testing.expect(mgr.getSession(expired_finalized_id) == null);
+    try std.testing.expect(mgr.getSession(recent_finalized_id) != null);
     try std.testing.expect(mgr.getSession(active_id) != null);
+    try std.testing.expect(mgr.getSession(stopped_id) != null);
+    try std.testing.expect(mgr.getSession(error_id) != null);
     try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expired_path, .{}));
+}
+
+test "SessionManager initialization never prunes expired finalized databases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.makePath(".cog");
+    try tmp.dir.setAsCwd();
+
+    var settings_file = try std.fs.cwd().createFile(".cog/settings.json", .{});
+    try settings_file.writeAll(
+        \\{
+        \\  "observe": {
+        \\    "retention_days": 0
+        \\  }
+        \\}
+        \\
+    );
+    settings_file.close();
+
+    var first = try SessionManager.init(std.testing.allocator);
+    const id = try std.testing.allocator.dupe(u8, try first.createSession(.syscall, null));
+    defer std.testing.allocator.free(id);
+    try first.finalizeSession(id);
+    try first.getSession(id).?.db.exec("UPDATE sessions SET stopped_at = datetime('now', '-1 day')");
+    first.deinit();
+
+    var second = try SessionManager.init(std.testing.allocator);
+    defer second.deinit();
+    try std.testing.expect(second.getSession(id) != null);
+}
+
+test "pruneExpiredSessions propagates database errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.makePath(".cog");
+    try tmp.dir.setAsCwd();
+
+    var mgr = try SessionManager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const id = try mgr.createSession(.syscall, null);
+    try mgr.finalizeSession(id);
+    try mgr.getSession(id).?.db.exec("DROP TABLE sessions");
+
+    try std.testing.expectError(error.SqliteError, mgr.pruneExpiredSessions(30));
+}
+
+test "pruneExpiredSessions propagates database deletion errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try tmp.dir.makePath(".cog");
+    try tmp.dir.setAsCwd();
+
+    var mgr = try SessionManager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const id = try mgr.createSession(.syscall, null);
+    try mgr.finalizeSession(id);
+    const db_path = try std.testing.allocator.dupe(u8, mgr.getSession(id).?.db_path);
+    defer std.testing.allocator.free(db_path);
+    try mgr.getSession(id).?.db.exec("UPDATE sessions SET stopped_at = datetime('now', '-40 days')");
+
+    try std.fs.deleteFileAbsolute(db_path);
+    try std.fs.makeDirAbsolute(db_path);
+
+    if (mgr.pruneExpiredSessions(30)) |_| {
+        return error.ExpectedDeleteError;
+    } else |_| {}
 }
 
 test "createSession and getSession" {
