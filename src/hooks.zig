@@ -3354,7 +3354,7 @@ test "specialist installers cover every capability in the registry" {
                             .validate => "You are a post-task memory validation sub-agent.",
                             .observe => "You are a system observability agent.",
                         };
-                        const content = readCwdFile(allocator, path) orelse return error.TestUnexpectedResult;
+                        const content = (try readCwdFile(allocator, path)) orelse return error.TestUnexpectedResult;
                         defer allocator.free(content);
                         try std.testing.expect(std.mem.indexOf(u8, content, marker) != null);
                     }
