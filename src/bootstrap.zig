@@ -2598,6 +2598,14 @@ fn buildSubsystemClusters(allocator: std.mem.Allocator, sources: []const SourceF
 
     // Clustering, subsystem ids and every SCIP lookup key off the logical
     // path; the readable path is attached again once clusters are final.
+    // Indexing it here keeps that reattachment from rescanning the whole
+    // source set once per clustered file.
+    var read_paths_by_logical: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer read_paths_by_logical.deinit(allocator);
+    for (sources) |source| {
+        read_paths_by_logical.put(allocator, source.logical_path, source.read_path) catch {};
+    }
+
     // Step 1: Seed by directory
     var dir_groups: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
     defer {
@@ -2962,7 +2970,9 @@ fn buildSubsystemClusters(allocator: std.mem.Allocator, sources: []const SourceF
             continue;
         };
         for (cluster.file_list.items, 0..) |f, fi| {
-            owned_read_paths[fi] = allocator.dupe(u8, readPathFor(sources, f)) catch "";
+            // Falling back to the logical name keeps a cluster usable even if
+            // the source set no longer lists the file.
+            owned_read_paths[fi] = allocator.dupe(u8, read_paths_by_logical.get(f) orelse f) catch "";
         }
 
         // Make owned label
@@ -3044,17 +3054,6 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     var i: usize = 0;
     while (i < min_len and a[i] == b[i]) : (i += 1) {}
     return i;
-}
-
-/// Look up the readable path for a logical source name.
-///
-/// Falls back to the logical name so a cluster built from a source set that
-/// no longer lists the file still produces a usable prompt.
-fn readPathFor(sources: []const SourceFile, logical_path: []const u8) []const u8 {
-    for (sources) |source| {
-        if (std.mem.eql(u8, source.logical_path, logical_path)) return source.read_path;
-    }
-    return logical_path;
 }
 
 /// Free all memory associated with a subsystem slice.
