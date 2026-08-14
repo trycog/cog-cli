@@ -265,12 +265,23 @@ const WatchRegistry = struct {
     /// an inotify descriptor is supplied. Allocation-free so it stays usable
     /// on the path where a directory has already vanished.
     fn removeSubtree(self: *WatchRegistry, prefix: []const u8, inotify_fd: ?posix.fd_t) usize {
+        // Callers naturally reach for the registry's own copy of the path being
+        // retired, and the first removal would free it out from under this
+        // loop, so the prefix is copied before anything is released.
+        var prefix_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (prefix.len > prefix_buf.len) {
+            debug_log.log("Watcher.registry: prefix too long to retire bytes={d}", .{prefix.len});
+            return 0;
+        }
+        @memcpy(prefix_buf[0..prefix.len], prefix);
+        const retained_prefix = prefix_buf[0..prefix.len];
+
         var removed: usize = 0;
         while (true) {
             var target: ?i32 = null;
             var it = self.entries.iterator();
             while (it.next()) |entry| {
-                if (!path_matcher.isContainedPath(entry.value_ptr.*, prefix)) continue;
+                if (!path_matcher.isContainedPath(entry.value_ptr.*, retained_prefix)) continue;
                 target = entry.key_ptr.*;
                 break;
             }
@@ -951,13 +962,18 @@ fn emitPhysicalSubtree(self: *Watcher, dir_path: []const u8) void {
     for (logical_paths.items) |logical_path| _ = emitWatcherRecord(self, logical_path);
 }
 
-/// Symlinks are what create second logical names for a physical path, so a link
-/// appearing or disappearing invalidates the alias table. Plain files and
-/// directories are already covered by the prefix of an existing alias.
+/// Refresh the alias table when a change could have altered which logical names
+/// a physical path answers to. Ordinary files and directories are already
+/// covered by the prefix of an existing alias, so only links and the endpoints
+/// of known aliases matter here.
 fn noteStructuralChange(self: *Watcher, physical_path: []const u8, is_directory: bool) void {
-    if (is_directory) return;
-    if (!isSymbolicLink(physical_path) and !self.matcher.isKnownAliasLink(physical_path)) return;
-    debug_log.log("Watcher.aliases: symlink change at {s}; refreshing logical aliases", .{physical_path});
+    const reason: []const u8 = blk: {
+        if (self.matcher.isKnownAliasLink(physical_path)) break :blk "alias link changed";
+        if (self.matcher.isKnownAliasTarget(physical_path)) break :blk "alias target changed";
+        if (!is_directory and isSymbolicLink(physical_path)) break :blk "symlink appeared";
+        return;
+    };
+    debug_log.log("Watcher.aliases: {s} at {s}; refreshing logical aliases", .{ reason, physical_path });
     self.matcher.invalidateAliases();
 }
 
@@ -1085,6 +1101,23 @@ test "watch registry prunes only the moved subtree" {
     try std.testing.expectEqualStrings("/project", registry.get(1).?);
     try std.testing.expectEqualStrings("/project/srcext", registry.get(4).?);
     try std.testing.expectEqualStrings("/project/docs", registry.get(5).?);
+}
+
+test "watch registry retires a subtree named by its own stored path" {
+    const allocator = std.testing.allocator;
+    var registry = WatchRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.put(1, "/project/src");
+    try registry.put(2, "/project/src/deep");
+    try registry.put(3, "/project/docs");
+
+    // The caller has nothing but the registry's own copy of the path, which the
+    // first removal frees.
+    const stored = registry.get(1).?;
+    try std.testing.expectEqual(@as(usize, 2), registry.removeSubtree(stored, null));
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try std.testing.expectEqualStrings("/project/docs", registry.get(3).?);
 }
 
 fn watchRegistryAllocationScenario(allocator: std.mem.Allocator) !void {

@@ -447,6 +447,16 @@ pub const PathMatcher = struct {
         return false;
     }
 
+    /// True when `physical_path` is the target a known alias resolves to. A
+    /// target that moves or disappears changes what the alias means, so the
+    /// watcher refreshes rather than keeping the stale mapping.
+    pub fn isKnownAliasTarget(self: *const PathMatcher, physical_path: []const u8) bool {
+        for (self.aliases.items) |alias| {
+            if (std.mem.eql(u8, alias.canonical_path, physical_path)) return true;
+        }
+        return false;
+    }
+
     fn isAllowedCanonical(self: *const PathMatcher, canonical_path: []const u8) bool {
         for (self.roots) |root| {
             if (isContainedPath(canonical_path, root.canonical_path)) return true;
@@ -1009,6 +1019,46 @@ test "PathMatcher rediscovers aliases created after startup" {
     try matcher.mapPhysicalToLogical(physical, &pruned);
     try std.testing.expectEqual(@as(usize, 1), pruned.items.len);
     try expectContainsLogical(pruned.items, "src/main.zig");
+}
+
+test "PathMatcher reports the link and target of every alias" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    var paths: std.ArrayListUnmanaged(MatchedPath) = .empty;
+    defer {
+        matcher.freeMatchedPaths(paths.items);
+        paths.deinit(allocator);
+    }
+    try matcher.collect(&paths);
+
+    const link = try std.fs.path.join(allocator, &.{ project_root, "src-link" });
+    defer allocator.free(link);
+    const target = try project.dir.realpathAlloc(allocator, "src");
+    defer allocator.free(target);
+    const unrelated = try std.fs.path.join(allocator, &.{ project_root, "src/main.zig" });
+    defer allocator.free(unrelated);
+
+    try std.testing.expect(matcher.isKnownAliasLink(link));
+    try std.testing.expect(matcher.isKnownAliasTarget(target));
+    try std.testing.expect(!matcher.isKnownAliasLink(unrelated));
+    try std.testing.expect(!matcher.isKnownAliasTarget(unrelated));
+
+    matcher.invalidateAliases();
+    try std.testing.expect(!matcher.isKnownAliasLink(link));
 }
 
 test "PathMatcher ignores physical paths no root can index" {
