@@ -1975,6 +1975,21 @@ fn collectMatchedFiles(
     try matcher.collect(out);
 }
 
+fn collectConfiguredFiles(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    patterns: []const []const u8,
+    external_roots: []const []const u8,
+    out: *std.ArrayListUnmanaged(path_matcher.MatchedPath),
+) !void {
+    debug_log.log(
+        "collectConfiguredFiles: project={s} patterns={d} external_roots={d}",
+        .{ project_root, patterns.len, external_roots.len },
+    );
+    try collectMatchedFiles(allocator, project_root, patterns, external_roots, out);
+    debug_log.log("collectConfiguredFiles: matched={d}", .{out.items.len});
+}
+
 /// Recursively walk a directory, building relative paths and matching against a glob pattern.
 fn collectGlobFilesRecursive(
     allocator: std.mem.Allocator,
@@ -2377,28 +2392,62 @@ fn removeDocument(allocator: std.mem.Allocator, index: *scip.Index, rel_path: []
     }
 }
 
-fn pathListContains(file_paths: []const []const u8, rel_path: []const u8) bool {
-    for (file_paths) |file_path| {
-        if (std.mem.eql(u8, file_path, rel_path)) return true;
+const ReindexPath = struct {
+    logical_path: []const u8,
+    physical_path: ?[]const u8,
+};
+
+const ExternalReindexPath = struct {
+    logical_path: []const u8,
+    physical_path: []const u8,
+};
+
+fn findPhysicalPath(matched_files: []const path_matcher.MatchedPath, logical_path: []const u8) ?[]const u8 {
+    for (matched_files) |file| {
+        if (std.mem.eql(u8, file.logical_path, logical_path)) return file.physical_path;
     }
-    return false;
+    return null;
 }
 
-fn pathMatchesConfiguredPatterns(file_path: []const u8, patterns: []const []const u8) bool {
-    var included = false;
-    for (patterns) |pattern| {
-        const normalized = normalizeGlobPattern(pattern);
-        if (normalized.len == 0 or !globMatch(normalized, file_path)) continue;
-        if (isNegativeGlobPattern(pattern)) return false;
-        included = true;
+fn remapExternalDocumentPaths(
+    mappings: []const ExternalReindexPath,
+    documents: []scip.Document,
+) void {
+    for (documents) |*doc| {
+        for (mappings) |mapping| {
+            if (!std.mem.eql(u8, doc.relative_path, mapping.physical_path)) continue;
+            doc.relative_path = mapping.logical_path;
+            break;
+        }
     }
-    return included;
+}
+
+fn appendConfiguredReindexPaths(
+    allocator: std.mem.Allocator,
+    matched_files: []const path_matcher.MatchedPath,
+    indexed_documents: []const scip.Document,
+    out: *std.ArrayListUnmanaged(ReindexPath),
+) !void {
+    try out.ensureTotalCapacity(allocator, matched_files.len + indexed_documents.len);
+    for (matched_files) |file| {
+        out.appendAssumeCapacity(.{
+            .logical_path = file.logical_path,
+            .physical_path = file.physical_path,
+        });
+    }
+    for (indexed_documents) |doc| {
+        if (findPhysicalPath(matched_files, doc.relative_path) != null) continue;
+        out.appendAssumeCapacity(.{
+            .logical_path = doc.relative_path,
+            .physical_path = null,
+        });
+    }
 }
 
 fn applyReindexBatch(
     allocator: std.mem.Allocator,
     master_index: *scip.Index,
-    file_paths: []const []const u8,
+    file_paths: []const ReindexPath,
 ) bool {
     var changed = false;
     var backing_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2429,8 +2478,12 @@ fn applyReindexBatch(
     var seen_names: [16][]const u8 = undefined;
     var unique_exts: [16]extensions.Extension = undefined;
     var ext_files: [16]std.ArrayListUnmanaged([]const u8) = [_]std.ArrayListUnmanaged([]const u8){.empty} ** 16;
+    var ext_mappings: [16]std.ArrayListUnmanaged(ExternalReindexPath) = [_]std.ArrayListUnmanaged(ExternalReindexPath){.empty} ** 16;
     var num_unique: usize = 0;
-    defer for (0..num_unique) |ext_idx| ext_files[ext_idx].deinit(allocator);
+    defer for (0..num_unique) |ext_idx| {
+        ext_files[ext_idx].deinit(allocator);
+        ext_mappings[ext_idx].deinit(allocator);
+    };
 
     var ext_cache_keys: [32][]const u8 = undefined;
     var ext_cache_vals: [32]?extensions.Extension = undefined;
@@ -2442,22 +2495,32 @@ fn applyReindexBatch(
         }
     };
 
-    for (file_paths) |file_path| {
+    for (file_paths) |file| {
+        const logical_path = file.logical_path;
+        const physical_path = file.physical_path orelse {
+            const before = master_index.documents.len;
+            removeDocument(allocator, master_index, logical_path);
+            if (master_index.documents.len != before) {
+                changed = true;
+                debug_log.log("reindexFiles: queued removal path={s}", .{logical_path});
+            }
+            continue;
+        };
         const exists = blk: {
-            std.fs.cwd().access(file_path, .{}) catch break :blk false;
+            std.fs.cwd().access(physical_path, .{}) catch break :blk false;
             break :blk true;
         };
         if (!exists) {
             const before = master_index.documents.len;
-            removeDocument(allocator, master_index, file_path);
+            removeDocument(allocator, master_index, logical_path);
             if (master_index.documents.len != before) {
                 changed = true;
-                debug_log.log("reindexFiles: queued removal path={s}", .{file_path});
+                debug_log.log("reindexFiles: queued removal path={s}", .{logical_path});
             }
             continue;
         }
 
-        const ext = std.fs.path.extension(file_path);
+        const ext = std.fs.path.extension(logical_path);
         if (ext.len == 0) continue;
         const resolved = blk: {
             for (ext_cache_keys[0..ext_cache_len], ext_cache_vals[0..ext_cache_len]) |key, value| {
@@ -2476,13 +2539,13 @@ fn applyReindexBatch(
 
         switch (idx) {
             .tree_sitter => |ts_config| {
-                debug_log.log("reindexFiles: reading path={s}", .{file_path});
-                const source = readFileContents(allocator, file_path) orelse continue;
+                debug_log.log("reindexFiles: reading logical={s} physical={s}", .{ logical_path, physical_path });
+                const source = readFileContents(allocator, physical_path) orelse continue;
                 defer allocator.free(source);
-                const result = indexer.indexFile(allocator, source, file_path, ts_config) catch {
+                const result = indexer.indexFile(allocator, source, logical_path, ts_config) catch {
                     mergeDocument(allocator, master_index, .{
                         .language = ts_config.scip_name,
-                        .relative_path = file_path,
+                        .relative_path = logical_path,
                         .occurrences = &.{},
                         .symbols = &.{},
                     });
@@ -2504,12 +2567,18 @@ fn applyReindexBatch(
                         break;
                     }
                 }
+                const mapping: ExternalReindexPath = .{
+                    .logical_path = logical_path,
+                    .physical_path = physical_path,
+                };
                 if (found_idx) |i| {
-                    ext_files[i].append(allocator, file_path) catch {};
+                    ext_files[i].append(allocator, physical_path) catch {};
+                    ext_mappings[i].append(allocator, mapping) catch {};
                 } else if (num_unique < unique_exts.len) {
                     seen_names[num_unique] = resolved.name;
                     unique_exts[num_unique] = resolved;
-                    ext_files[num_unique].append(allocator, file_path) catch {};
+                    ext_files[num_unique].append(allocator, physical_path) catch {};
+                    ext_mappings[num_unique].append(allocator, mapping) catch {};
                     num_unique += 1;
                 }
             },
@@ -2534,6 +2603,7 @@ fn applyReindexBatch(
             allocator.free(result.backing_data.?);
             continue;
         };
+        remapExternalDocumentPaths(ext_mappings[ext_idx].items, result.index.documents);
         for (result.index.documents) |doc| mergeDocument(allocator, master_index, doc);
         allocator.free(result.index.documents);
         for (result.index.external_symbols) |sym| mergeExternalSymbolList(allocator, &external_symbol_list, sym);
@@ -2567,7 +2637,15 @@ pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8
     defer scip.freeIndex(allocator, &master_index);
     defer if (loaded.backing_data) |data| allocator.free(data);
 
-    if (!applyReindexBatch(allocator, &master_index, unique)) return false;
+    var batch = allocator.alloc(ReindexPath, unique.len) catch return false;
+    defer allocator.free(batch);
+    for (unique, 0..) |file_path, i| {
+        batch[i] = .{
+            .logical_path = file_path,
+            .physical_path = file_path,
+        };
+    }
+    if (!applyReindexBatch(allocator, &master_index, batch)) return false;
     debug_log.log("reindexFiles: encoding documents={d}", .{master_index.documents.len});
     return saveIndex(allocator, master_index, index_path);
 }
@@ -2576,12 +2654,12 @@ pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8
 pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     const settings = settings_mod.Settings.load(allocator) orelse return false;
     defer settings.deinit(allocator);
-    const patterns = if (settings.code) |code| code.index orelse return false else return false;
+    const code = settings.code orelse return false;
+    const patterns = code.index orelse return false;
 
     const cog_dir = paths.findCogDir(allocator) catch return false;
     defer allocator.free(cog_dir);
     const project_root = std.fs.path.dirname(cog_dir) orelse return false;
-    const external_roots = if (settings.code) |code| code.external_roots orelse &.{} else &.{};
 
     var matched_files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
     defer {
@@ -2591,17 +2669,13 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
         }
         matched_files.deinit(allocator);
     }
-    collectMatchedFiles(allocator, project_root, patterns, external_roots, &matched_files) catch return false;
-
-    var current_files: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (current_files.items) |file_path| allocator.free(file_path);
-        current_files.deinit(allocator);
-    }
-    current_files.ensureTotalCapacity(allocator, matched_files.items.len) catch return false;
-    for (matched_files.items) |file| {
-        current_files.appendAssumeCapacity(allocator.dupe(u8, file.logical_path) catch return false);
-    }
+    collectConfiguredFiles(
+        allocator,
+        project_root,
+        patterns,
+        code.external_roots orelse &.{},
+        &matched_files,
+    ) catch return false;
 
     const lock_fd = acquireIndexLock(allocator, cog_dir) orelse return false;
     defer releaseIndexLock(lock_fd);
@@ -2612,16 +2686,10 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     defer scip.freeIndex(allocator, &master_index);
     defer if (loaded.backing_data) |data| allocator.free(data);
 
-    var batch: std.ArrayListUnmanaged([]const u8) = .empty;
+    var batch: std.ArrayListUnmanaged(ReindexPath) = .empty;
     defer batch.deinit(allocator);
-    batch.ensureTotalCapacity(allocator, current_files.items.len + master_index.documents.len) catch return false;
-    batch.appendSliceAssumeCapacity(current_files.items);
-    for (master_index.documents) |doc| {
-        if (!pathMatchesConfiguredPatterns(doc.relative_path, patterns)) continue;
-        if (pathListContains(current_files.items, doc.relative_path)) continue;
-        batch.appendAssumeCapacity(doc.relative_path);
-    }
-    debug_log.log("reindexConfiguredFiles: reconciliation current={d} batch={d}", .{ current_files.items.len, batch.items.len });
+    appendConfiguredReindexPaths(allocator, matched_files.items, master_index.documents, &batch) catch return false;
+    debug_log.log("reindexConfiguredFiles: reconciliation current={d} batch={d}", .{ matched_files.items.len, batch.items.len });
     if (!applyReindexBatch(allocator, &master_index, batch.items)) return false;
     return saveIndex(allocator, master_index, index_path);
 }
@@ -5194,6 +5262,99 @@ test "collectMatchedFiles applies shared excludes and preserves symlink aliases"
     try std.testing.expectEqual(@as(usize, 2), files.items.len);
     try std.testing.expectEqualStrings("apps/foo/assets/js/app.js", files.items[0].logical_path);
     try std.testing.expectEqualStrings("workspace-assets/js/app.js", files.items[1].logical_path);
+}
+
+test "external reindex remaps physical documents to logical aliases" {
+    const mappings = [_]ExternalReindexPath{
+        .{ .logical_path = "@external/shared/lib.rb", .physical_path = "/shared/lib.rb" },
+    };
+    var documents = [_]scip.Document{
+        .{ .language = "ruby", .relative_path = "/shared/lib.rb", .occurrences = &.{}, .symbols = &.{} },
+        .{ .language = "ruby", .relative_path = "other.rb", .occurrences = &.{}, .symbols = &.{} },
+    };
+
+    remapExternalDocumentPaths(&mappings, &documents);
+
+    try std.testing.expectEqualStrings("@external/shared/lib.rb", documents[0].relative_path);
+    try std.testing.expectEqualStrings("other.rb", documents[1].relative_path);
+}
+
+test "configured reconciliation retains physical reads and removes stale aliases" {
+    const allocator = std.testing.allocator;
+    const matched = [_]path_matcher.MatchedPath{
+        .{ .logical_path = "src/main.zig", .physical_path = "/project/src/main.zig" },
+        .{ .logical_path = "@external/shared/lib.zig", .physical_path = "/shared/lib.zig" },
+    };
+    const documents = [_]scip.Document{
+        .{ .language = "zig", .relative_path = "src/main.zig", .occurrences = &.{}, .symbols = &.{} },
+        .{ .language = "zig", .relative_path = "old/generated.zig", .occurrences = &.{}, .symbols = &.{} },
+    };
+
+    var batch: std.ArrayListUnmanaged(ReindexPath) = .empty;
+    defer batch.deinit(allocator);
+    try appendConfiguredReindexPaths(allocator, &matched, &documents, &batch);
+
+    try std.testing.expectEqual(@as(usize, 3), batch.items.len);
+    try std.testing.expectEqualStrings("src/main.zig", batch.items[0].logical_path);
+    try std.testing.expectEqualStrings("/project/src/main.zig", batch.items[0].physical_path.?);
+    try std.testing.expectEqualStrings("@external/shared/lib.zig", batch.items[1].logical_path);
+    try std.testing.expectEqualStrings("/shared/lib.zig", batch.items[1].physical_path.?);
+    try std.testing.expectEqualStrings("old/generated.zig", batch.items[2].logical_path);
+    try std.testing.expect(batch.items[2].physical_path == null);
+}
+
+test "collectConfiguredFiles uses PathMatcher logical paths and external roots" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var external = std.testing.tmpDir(.{});
+    defer external.cleanup();
+
+    try project.dir.makePath("src/generated");
+    try project.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "pub fn main() void {}\n" });
+    try project.dir.writeFile(.{ .sub_path = "src/generated/skip.zig", .data = "const skip = true;\n" });
+    try external.dir.writeFile(.{ .sub_path = "shared.zig", .data = "pub const shared = true;\n" });
+
+    const external_root = try external.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(external_root);
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+    try project.dir.symLink(external_root, "shared-link", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+    var files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer {
+        for (files.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
+        files.deinit(allocator);
+    }
+
+    try collectConfiguredFiles(
+        allocator,
+        project_root,
+        &.{ "**/*.zig", "!**/generated/**" },
+        &.{external_root},
+        &files,
+    );
+
+    var saw_main = false;
+    var saw_project_alias = false;
+    var saw_external_alias = false;
+    var saw_direct_external = false;
+    for (files.items) |file| {
+        if (std.mem.eql(u8, file.logical_path, "src/main.zig")) saw_main = true;
+        if (std.mem.eql(u8, file.logical_path, "src-link/main.zig")) saw_project_alias = true;
+        if (std.mem.eql(u8, file.logical_path, "shared-link/shared.zig")) saw_external_alias = true;
+        if (std.mem.startsWith(u8, file.logical_path, "@external/") and
+            std.mem.endsWith(u8, file.logical_path, "/shared.zig")) saw_direct_external = true;
+        try std.testing.expect(std.mem.indexOf(u8, file.logical_path, "generated") == null);
+    }
+    try std.testing.expect(saw_main);
+    try std.testing.expect(saw_project_alias);
+    try std.testing.expect(saw_external_alias);
+    try std.testing.expect(saw_direct_external);
 }
 
 test "pathIsTest" {
