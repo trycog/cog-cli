@@ -306,7 +306,11 @@ fn downloadToFileInternal(
         try setopt(handle, c.CURLOPT_HTTPHEADER, hl, "HTTPHEADER");
     }
 
-    try setopt(handle, c.CURLOPT_ACCEPT_ENCODING, @as([*:0]const u8, ""), "ACCEPT_ENCODING");
+    // Verified artifact digests cover the uploaded bytes. Do not ask curl to
+    // transparently decode Content-Encoding before hashing them.
+    if (expected_sha256 == null) {
+        try setopt(handle, c.CURLOPT_ACCEPT_ENCODING, @as([*:0]const u8, ""), "ACCEPT_ENCODING");
+    }
     try applyTransportPolicy(handle, transportPolicy(headers), max_bytes);
 
     var callback_data = FileWriteCallbackData{
