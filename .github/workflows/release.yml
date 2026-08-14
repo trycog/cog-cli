@@ -248,60 +248,7 @@ jobs:
 
   notify:
     needs: [release, update-tap]
-    runs-on: ubuntu-latest
-    env:
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-
-      - name: Extract changelog and notify Discord
-        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
-        env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          SEMVER="${VERSION#v}"
-          RELEASE_URL="https://github.com/trycog/cog-cli/releases/tag/${VERSION}"
-
-          CHANGELOG=$(sed -n "/^## \[${SEMVER}\]/,/^## \[/{/^## \[${SEMVER}\]/d;/^## \[/d;p;}" CHANGELOG.md)
-
-          # Discord rejects embed descriptions over 4096 characters with a 400;
-          # truncate at a line boundary and point at the release page instead.
-          if [ "${#CHANGELOG}" -gt 3800 ]; then
-            CHANGELOG=$(printf '%s' "$CHANGELOG" | head -c 3800)
-            CHANGELOG="${CHANGELOG%$'\n'*}"
-            CHANGELOG="${CHANGELOG}"$'\n'"*…truncated — see the release page for the full changelog.*"
-          fi
-
-          DESCRIPTION=$(cat <<'INNEREOF'
-          CHANGELOG_PLACEHOLDER
-
-          **Update:**
-          ```
-          brew upgrade trycog/tap/cog
-          ```
-          or
-          ```
-          curl -fsSL https://trycog.ai/cli/install | bash
-          ```
-          INNEREOF
-          )
-          DESCRIPTION="${DESCRIPTION/CHANGELOG_PLACEHOLDER/$CHANGELOG}"
-
-          PAYLOAD=$(jq -n \
-            --arg title "Cog ${VERSION} Released" \
-            --arg url "$RELEASE_URL" \
-            --arg desc "$DESCRIPTION" \
-            '{
-              embeds: [{
-                title: $title,
-                url: $url,
-                description: $desc,
-                color: 65535
-              }]
-            }')
-
-          curl -f -H "Content-Type: application/json" \
-            -d "$PAYLOAD" \
-            "$DISCORD_WEBHOOK_URL"
+    uses: ./.github/workflows/notify.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit
