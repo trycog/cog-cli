@@ -90,6 +90,17 @@ pub fn statFile(project_root: std.fs.Dir, path: []const u8) ?Entry {
     return .{ .path = path, .size = stat.size, .mtime_ns = stat.mtime };
 }
 
+/// Produce a manifest entry keyed by a logical path but statted through its
+/// physical location — external-root documents live outside the project and
+/// their `@external/...` aliases cannot be statted from the root.
+pub fn statPhysicalFile(physical_path: []const u8, logical_path: []const u8) ?Entry {
+    const stat = std.fs.cwd().statFile(physical_path) catch |err| {
+        debug_log.log("index_manifest.statPhysicalFile: {s}: {s}", .{ physical_path, @errorName(err) });
+        return null;
+    };
+    return .{ .path = logical_path, .size = stat.size, .mtime_ns = stat.mtime };
+}
+
 test "manifest round-trips entries through pretty-printed JSON" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

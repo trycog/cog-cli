@@ -2040,7 +2040,7 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         printErr("error: failed to write index file\n");
         return error.Explained;
     }
-    writeManifestForIndex(allocator, index_path, master_index.documents);
+    writeManifestForIndex(allocator, index_path, master_index.documents, null);
 
     // Add external symbols to total count
     total_symbols += master_index.external_symbols.len;
@@ -2991,9 +2991,6 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
     defer if (manifest_loaded) |*loaded| loaded.deinit();
     const manifest_missing = manifest_loaded == null;
 
-    var root_dir = std.fs.openDirAbsolute(project_root, .{}) catch return failed;
-    defer root_dir.close();
-
     // `drifted` borrows strings from matched_files; `removed` borrows from
     // the loaded manifest. Both outlive their use below.
     var drifted: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
@@ -3015,9 +3012,10 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
                 drifted.append(allocator, file) catch return failed;
                 continue;
             };
-            // Stat the logical path exactly as the manifest writer did so the
-            // comparison is like-for-like across symlink aliases.
-            const current = index_manifest.statFile(root_dir, file.logical_path) orelse {
+            // Stat the physical path — identical to the logical path through
+            // the project root for ordinary files, and the only statable
+            // location for external-root aliases.
+            const current = index_manifest.statPhysicalFile(file.physical_path, file.logical_path) orelse {
                 drifted.append(allocator, file) catch return failed;
                 continue;
             };
@@ -3087,7 +3085,7 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
     }
 
     if (!applyReindexBatch(allocator, &master_index, batch.items, &backing_store)) return failed;
-    if (!saveIndex(allocator, master_index, index_path)) return failed;
+    if (!saveIndex(allocator, master_index, index_path, matched_files.items)) return failed;
     return report;
 }
 
@@ -3458,7 +3456,7 @@ pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8
     appendAliasedReindexPaths(allocator, unique, alias_sources.items, &batch) catch return false;
     if (!applyReindexBatch(allocator, &master_index, batch.items, &backing_store)) return false;
     debug_log.log("reindexFiles: encoding documents={d}", .{master_index.documents.len});
-    return saveIndex(allocator, master_index, index_path);
+    return saveIndex(allocator, master_index, index_path, if (alias_sources.items.len > 0) alias_sources.items else null);
 }
 
 /// Reconcile all configured index patterns after watcher event loss.
@@ -3508,7 +3506,7 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     appendConfiguredReindexPaths(allocator, matched_files.items, master_index.documents, &batch) catch return false;
     debug_log.log("reindexConfiguredFiles: reconciliation current={d} batch={d}", .{ matched_files.items.len, batch.items.len });
     if (!applyReindexBatch(allocator, &master_index, batch.items, &backing_store)) return false;
-    return saveIndex(allocator, master_index, index_path);
+    return saveIndex(allocator, master_index, index_path, matched_files.items);
 }
 
 /// Remove a file from the SCIP index on disk.
@@ -3522,19 +3520,34 @@ pub fn reindexFile(allocator: std.mem.Allocator, file_path: []const u8) bool {
 }
 
 /// Write and save an index to disk.
-fn saveIndex(allocator: std.mem.Allocator, index: scip.Index, index_path: []const u8) bool {
+fn saveIndex(
+    allocator: std.mem.Allocator,
+    index: scip.Index,
+    index_path: []const u8,
+    aliases: ?[]const path_matcher.MatchedPath,
+) bool {
     const encoded = scip_encode.encodeIndex(allocator, index) catch return false;
     defer allocator.free(encoded);
 
     if (!writeEncodedIndexAtomically(allocator, index_path, encoded)) return false;
-    writeManifestForIndex(allocator, index_path, index.documents);
+    writeManifestForIndex(allocator, index_path, index.documents, aliases);
     return true;
 }
 
 /// Refresh the provenance manifest after a successful index write. Manifest
 /// problems are logged, never propagated: a missing manifest only means the
 /// next reconcile falls back to a full resync.
-fn writeManifestForIndex(allocator: std.mem.Allocator, index_path: []const u8, documents: []const scip.Document) void {
+///
+/// `aliases` maps logical to physical paths for documents that cannot be
+/// statted from the project root (external roots). Callers without one in
+/// hand may pass null; the writer resolves aliases itself when an
+/// `@external/` document requires it.
+fn writeManifestForIndex(
+    allocator: std.mem.Allocator,
+    index_path: []const u8,
+    documents: []const scip.Document,
+    aliases: ?[]const path_matcher.MatchedPath,
+) void {
     const cog_dir_path = std.fs.path.dirname(index_path) orelse return;
     const project_root = std.fs.path.dirname(cog_dir_path) orelse return;
 
@@ -3544,12 +3557,40 @@ fn writeManifestForIndex(allocator: std.mem.Allocator, index_path: []const u8, d
     };
     defer root_dir.close();
 
+    var resolved_aliases: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer {
+        for (resolved_aliases.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
+        resolved_aliases.deinit(allocator);
+    }
+    var alias_slice: []const path_matcher.MatchedPath = aliases orelse &.{};
+    if (aliases == null) {
+        for (documents) |doc| {
+            if (!std.mem.startsWith(u8, doc.relative_path, external_alias_prefix)) continue;
+            collectAliasSources(allocator, cog_dir_path, &resolved_aliases);
+            alias_slice = resolved_aliases.items;
+            break;
+        }
+    }
+
+    var physical_by_logical: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer physical_by_logical.deinit(allocator);
+    for (alias_slice) |file| {
+        physical_by_logical.put(allocator, file.logical_path, file.physical_path) catch return;
+    }
+
     var entries: std.ArrayListUnmanaged(index_manifest.Entry) = .empty;
     defer entries.deinit(allocator);
     for (documents) |doc| {
         if (!isManagedDocumentPath(doc.relative_path)) continue;
-        if (index_manifest.statFile(root_dir, doc.relative_path)) |entry| {
-            entries.append(allocator, entry) catch |err| {
+        const entry = if (physical_by_logical.get(doc.relative_path)) |physical|
+            index_manifest.statPhysicalFile(physical, doc.relative_path)
+        else
+            index_manifest.statFile(root_dir, doc.relative_path);
+        if (entry) |resolved| {
+            entries.append(allocator, resolved) catch |err| {
                 debug_log.log("writeManifestForIndex: entry collection failed: {s}", .{@errorName(err)});
                 return;
             };
@@ -3732,7 +3773,7 @@ fn removeFromIndex(allocator: std.mem.Allocator, file_path: []const u8) bool {
     defer if (loaded.backing_data) |data| allocator.free(data);
 
     removeDocument(allocator, &master_index, file_path);
-    return saveIndex(allocator, master_index, index_path);
+    return saveIndex(allocator, master_index, index_path, null);
 }
 
 fn builtinRename(old_path: []const u8, new_path: []const u8) !void {
@@ -5030,7 +5071,7 @@ pub fn codeRenameInner(allocator: std.mem.Allocator, old_path: []const u8, new_p
             }
         }
     }
-    _ = saveIndex(allocator, master_index, index_path);
+    _ = saveIndex(allocator, master_index, index_path, null);
 
     var aw: Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -5289,7 +5330,7 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
     defer allocator.free(encoded);
 
     if (!writeEncodedIndexAtomically(allocator, index_path, encoded)) return error.WriteFailed;
-    writeManifestForIndex(allocator, index_path, master_index.documents);
+    writeManifestForIndex(allocator, index_path, master_index.documents, null);
 
     total_symbols += master_index.external_symbols.len;
 
@@ -6007,21 +6048,31 @@ test "index writes refresh the provenance manifest for managed documents" {
     const index_path = try std.fs.path.join(allocator, &.{ root, ".cog", "index.scip" });
     defer allocator.free(index_path);
 
+    try tmp.dir.writeFile(.{ .sub_path = "external-dep.zig", .data = "const dep = 2;\n" });
+    const dep_physical = try tmp.dir.realpathAlloc(allocator, "external-dep.zig");
+    defer allocator.free(dep_physical);
+
     var documents = [_]scip.Document{
         .{ .language = "zig", .relative_path = "tracked.zig", .occurrences = &.{}, .symbols = &.{} },
-        // Deleted files and external aliases must not appear in the manifest.
+        // Deleted files must not appear; external aliases stat through their
+        // physical location.
         .{ .language = "zig", .relative_path = "deleted.zig", .occurrences = &.{}, .symbols = &.{} },
         .{ .language = "zig", .relative_path = "@external/lib/dep.zig", .occurrences = &.{}, .symbols = &.{} },
     };
-    writeManifestForIndex(allocator, index_path, &documents);
+    const aliases = [_]path_matcher.MatchedPath{
+        .{ .logical_path = "@external/lib/dep.zig", .physical_path = dep_physical },
+    };
+    writeManifestForIndex(allocator, index_path, &documents, &aliases);
 
     var cog_dir = try tmp.dir.openDir(".cog", .{});
     defer cog_dir.close();
     var loaded = index_manifest.load(allocator, cog_dir) orelse return error.TestUnexpectedResult;
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(usize, 1), loaded.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.value.entries.len);
     try std.testing.expectEqualStrings("tracked.zig", loaded.value.entries[0].path);
     try std.testing.expectEqual(@as(u64, 19), loaded.value.entries[0].size);
+    try std.testing.expectEqualStrings("@external/lib/dep.zig", loaded.value.entries[1].path);
+    try std.testing.expectEqual(@as(u64, 15), loaded.value.entries[1].size);
 }
 
 test "shouldFullResync escalates on missing manifest and large drift" {
@@ -6115,6 +6166,60 @@ test "syncConfiguredFiles repairs drift and converges" {
     try std.testing.expectEqual(@as(usize, 1), scanned.changed);
     try std.testing.expectEqual(SyncOutcome.changed, scanConfiguredDrift(allocator).outcome);
     try std.testing.expectEqual(SyncOutcome.changed, syncConfiguredFiles(allocator).outcome);
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
+}
+
+test "syncConfiguredFiles converges for external roots" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makePath("proj/.cog");
+    try tmp.dir.makePath("ext");
+    try tmp.dir.writeFile(.{ .sub_path = "ext/lib.go", .data = "package ext\n\nfunc Lib() int { return 1 }\n" });
+    const ext_root = try tmp.dir.realpathAlloc(allocator, "ext");
+    defer allocator.free(ext_root);
+
+    const settings_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "code": {{
+        \\    "index": ["**/*.go"],
+        \\    "external_roots": ["{s}"]
+        \\  }}
+        \\}}
+    , .{ext_root});
+    defer allocator.free(settings_json);
+    try tmp.dir.writeFile(.{ .sub_path = "proj/.cog/settings.json", .data = settings_json });
+
+    const names = [_][]const u8{ "a.go", "b.go", "c.go", "d.go" };
+    for (names, 0..) |name, i| {
+        var buffer: [96]u8 = undefined;
+        const source = try std.fmt.bufPrint(&buffer, "package p\n\nfunc F{d}() int {{ return {d} }}\n", .{ i, i });
+        var proj = try tmp.dir.openDir("proj", .{});
+        defer proj.close();
+        try proj.writeFile(.{ .sub_path = name, .data = source });
+    }
+
+    var proj_dir = try tmp.dir.openDir("proj", .{});
+    defer proj_dir.close();
+    try proj_dir.setAsCwd();
+
+    try std.testing.expect(reindexConfiguredFiles(allocator));
+
+    // External-root documents must have manifest entries statted through
+    // their physical paths, or every reconcile reports them drifted.
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
+
+    // An edit under the external root is real drift.
+    try tmp.dir.writeFile(.{ .sub_path = "ext/lib.go", .data = "package ext\n\nfunc Lib() int { return 2 }\n\nfunc More() int { return 3 }\n" });
+    const repaired = syncConfiguredFiles(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, repaired.outcome);
+    try std.testing.expectEqual(@as(usize, 1), repaired.changed);
     try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
 }
 
