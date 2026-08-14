@@ -19,8 +19,11 @@ pub fn main() !void {
     const lock_path = args[1];
     debug_log.log("grammar_lock: opening directory {s}", .{lock_path});
     // The lock descriptor must outlive main (see below), so it is never
-    // closed here; process exit reclaims it.
-    const lock_dir = try std.fs.cwd().openDir(lock_path, .{});
+    // closed here; process exit reclaims it. .iterate forces a real
+    // O_RDONLY|O_DIRECTORY descriptor: on Linux a plain openDir uses O_PATH,
+    // and flock() on an O_PATH descriptor fails with EBADF, which
+    // posix.flock treats as unreachable.
+    const lock_dir = try std.fs.cwd().openDir(lock_path, .{ .iterate = true });
     const lock_file = std.fs.File{ .handle = lock_dir.fd };
     // The protected process group inherits this descriptor. If the wrapper is
     // hard-killed, the kernel lock therefore remains held until every child
@@ -120,13 +123,14 @@ test "an exclusive directory lock rejects a concurrent owner" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    var first_dir = try temp_dir.dir.openDir(".", .{});
+    // .iterate avoids Linux O_PATH descriptors, which flock() rejects.
+    var first_dir = try temp_dir.dir.openDir(".", .{ .iterate = true });
     defer first_dir.close();
     const first = std.fs.File{ .handle = first_dir.fd };
     try first.lock(.exclusive);
     defer first.unlock();
 
-    var second_dir = try temp_dir.dir.openDir(".", .{});
+    var second_dir = try temp_dir.dir.openDir(".", .{ .iterate = true });
     defer second_dir.close();
     const second = std.fs.File{ .handle = second_dir.fd };
     try std.testing.expect(!(try second.tryLock(.exclusive)));
