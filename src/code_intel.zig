@@ -2578,15 +2578,31 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     defer settings.deinit(allocator);
     const patterns = if (settings.code) |code| code.index orelse return false else return false;
 
+    const cog_dir = paths.findCogDir(allocator) catch return false;
+    defer allocator.free(cog_dir);
+    const project_root = std.fs.path.dirname(cog_dir) orelse return false;
+    const external_roots = if (settings.code) |code| code.external_roots orelse &.{} else &.{};
+
+    var matched_files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer {
+        for (matched_files.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
+        matched_files.deinit(allocator);
+    }
+    collectMatchedFiles(allocator, project_root, patterns, external_roots, &matched_files) catch return false;
+
     var current_files: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (current_files.items) |file_path| allocator.free(file_path);
         current_files.deinit(allocator);
     }
-    collectFilesForPatterns(allocator, patterns, &current_files) catch return false;
+    current_files.ensureTotalCapacity(allocator, matched_files.items.len) catch return false;
+    for (matched_files.items) |file| {
+        current_files.appendAssumeCapacity(allocator.dupe(u8, file.logical_path) catch return false);
+    }
 
-    const cog_dir = paths.findCogDir(allocator) catch return false;
-    defer allocator.free(cog_dir);
     const lock_fd = acquireIndexLock(allocator, cog_dir) orelse return false;
     defer releaseIndexLock(lock_fd);
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
