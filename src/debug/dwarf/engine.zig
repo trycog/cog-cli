@@ -42,6 +42,45 @@ fn supportsNativeDataBreakpoints(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu
     return os_tag == .macos and arch == .aarch64;
 }
 
+const NativeBinary = union(binary_common.Format) {
+    macho: binary_macho.MachoBinary,
+    elf: binary_elf.ElfBinary,
+
+    fn detectFileFormat(path: []const u8) !binary_common.Format {
+        debug_log.log("dwarf.engine: detecting native binary format path={s}", .{path});
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        var magic: [4]u8 = undefined;
+        if (try file.readAll(&magic) != magic.len) return error.InvalidBinaryFormat;
+        const format = try binary_common.Format.detect(&magic);
+        debug_log.log("dwarf.engine: detected native binary format={s} path={s}", .{ @tagName(format), path });
+        return format;
+    }
+
+    fn loadFile(allocator: std.mem.Allocator, path: []const u8, format: binary_common.Format) !NativeBinary {
+        debug_log.log("dwarf.engine: loading native binary format={s} path={s}", .{ @tagName(format), path });
+        return switch (format) {
+            .macho => .{ .macho = try binary_macho.MachoBinary.loadFile(allocator, path) },
+            .elf => .{ .elf = try binary_elf.ElfBinary.loadFile(allocator, path) },
+        };
+    }
+
+    fn view(self: *NativeBinary) binary_common.Binary {
+        return switch (self.*) {
+            .macho => |*binary| binary.view(),
+            .elf => |*binary| binary.view(),
+        };
+    }
+
+    fn deinit(self: *NativeBinary, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .macho => |*binary| binary.deinit(allocator),
+            .elf => |*binary| binary.deinit(allocator),
+        }
+    }
+};
+
 pub const DwarfEngine = struct {
     process: ProcessControl = .{},
     allocator: std.mem.Allocator,
@@ -53,9 +92,8 @@ pub const DwarfEngine = struct {
     allocated_paths: [][]const u8 = &.{},
     functions: []parser.FunctionInfo = &.{},
     inlined_subs: []parser.InlinedSubroutineInfo = &.{},
-    binary: ?binary_macho.MachoBinary = null,
-    dsym_binary: ?binary_macho.MachoBinary = null,
-    elf_binary: ?binary_elf.ElfBinary = null,
+    binary: ?NativeBinary = null,
+    supplementary_binary: ?NativeBinary = null,
     /// Signed relocation between link-time DWARF addresses and runtime addresses.
     address_translation: binary_common.AddressTranslation = .{},
     /// Track whether we just hit a breakpoint and need to step past it
@@ -78,9 +116,8 @@ pub const DwarfEngine = struct {
     debug_names_index: ?parser.DebugNamesIndex = null,
     /// Parsed .debug_macro definitions for macro expansion
     macro_defs: []parser.MacroDef = &.{},
-    /// Split DWARF: loaded .dwo binaries for debug fission
-    dwo_binaries: []binary_macho.MachoBinary = &.{},
-    dwo_elf_binaries: []binary_elf.ElfBinary = &.{},
+    /// Split DWARF: loaded .dwo binaries for debug fission.
+    dwo_binaries: []NativeBinary = &.{},
     /// Type units: signature-to-offset mapping for DW_FORM_ref_sig8
     type_units: []parser.TypeUnitEntry = &.{},
     /// Split DWARF: skeleton CU info for matching DWO binaries
@@ -132,16 +169,8 @@ pub const DwarfEngine = struct {
         if (self.condition_context) |*ctx| ctx.deinit();
         if (self.debug_names_index) |*idx| idx.deinit(self.allocator);
         if (self.macro_defs.len > 0) self.allocator.free(self.macro_defs);
-        for (self.dwo_binaries) |*b| {
-            var bin = b.*;
-            bin.deinit(self.allocator);
-        }
+        for (self.dwo_binaries) |*binary| binary.deinit(self.allocator);
         if (self.dwo_binaries.len > 0) self.allocator.free(self.dwo_binaries);
-        for (self.dwo_elf_binaries) |*b| {
-            var bin = b.*;
-            bin.deinit(self.allocator);
-        }
-        if (self.dwo_elf_binaries.len > 0) self.allocator.free(self.dwo_elf_binaries);
         if (self.type_units.len > 0) self.allocator.free(self.type_units);
         if (self.skeleton_cus.len > 0) self.allocator.free(self.skeleton_cus);
         if (self.type_die_cache) |*tdc| tdc.deinit(self.allocator);
@@ -149,9 +178,8 @@ pub const DwarfEngine = struct {
         if (self.eh_frame_index) |*idx| idx.deinit(self.allocator);
         if (self.cie_cache) |*cc| cc.deinit(self.allocator);
         if (self.abbrev_cache) |*ac| ac.deinit(self.allocator);
-        if (self.dsym_binary) |*b| b.deinit(self.allocator);
-        if (self.binary) |*b| b.deinit(self.allocator);
-        if (self.elf_binary) |*b| b.deinit(self.allocator);
+        if (self.supplementary_binary) |*binary| binary.deinit(self.allocator);
+        if (self.binary) |*binary| binary.deinit(self.allocator);
     }
 
     pub fn activeDriver(self: *DwarfEngine) ActiveDriver {
@@ -165,6 +193,26 @@ pub const DwarfEngine = struct {
     fn readAccess(self: *DwarfEngine) process_mod.ProcessOrCoreAccess {
         if (self.core_dump) |*core| return .fromCore(core);
         return .fromProcess(&self.process);
+    }
+
+    fn mainBinary(self: *DwarfEngine) ?binary_common.Binary {
+        if (self.binary) |*binary| return binary.view();
+        return null;
+    }
+
+    fn debugBinary(self: *DwarfEngine) ?binary_common.Binary {
+        if (self.supplementary_binary) |*binary| {
+            const view = binary.view();
+            if (view.sections.debug_info != null) return view;
+        }
+        const main = self.mainBinary() orelse return null;
+        if (main.sections.debug_info != null) return main;
+        return null;
+    }
+
+    fn sectionData(self: *DwarfEngine, binary: binary_common.Binary, section: ?binary_common.SectionInfo) ?[]const u8 {
+        const info = section orelse return null;
+        return (binary.getSectionDataAlloc(self.allocator, info) catch null) orelse binary.getSectionData(info);
     }
 
     fn runtimeToDwarf(self: *const DwarfEngine, address: u64) u64 {
@@ -266,30 +314,55 @@ pub const DwarfEngine = struct {
     }
 
     fn resolveAddressTranslation(self: *DwarfEngine) !void {
+        const binary = self.mainBinary() orelse return;
         const actual_base = try self.process.getTextBase();
-        const preferred_base: u64 = if (self.binary) |bin|
-            bin.text_vmaddr
-        else if (self.elf_binary) |elf|
-            elf.preferred_base
-        else
-            0;
-        if (preferred_base == 0) return;
-
-        const runtime: i128 = actual_base;
-        const preferred: i128 = preferred_base;
-        self.address_translation.load_bias = @intCast(runtime - preferred);
+        self.address_translation.load_bias = binary.loadBias(actual_base);
         debug_log.log(
-            "dwarf.engine: resolved address translation runtime_base=0x{x} preferred_base=0x{x} load_bias={d}",
-            .{ actual_base, preferred_base, self.address_translation.load_bias },
+            "dwarf.engine: resolved address translation format={s} runtime_base=0x{x} preferred_base=0x{x} load_bias={d}",
+            .{ @tagName(binary.format), actual_base, binary.preferred_base, self.address_translation.load_bias },
+        );
+    }
+
+    fn resolveCoreAddressTranslation(self: *DwarfEngine, executable_path: []const u8) !void {
+        const core = if (self.core_dump) |*loaded| loaded else return error.NoCoreDump;
+        const binary = self.mainBinary() orelse return error.NoDebugInfo;
+
+        if (core.format != .elf) {
+            debug_log.log("dwarf.engine: core address translation unavailable core_format={s}", .{@tagName(core.format)});
+            return;
+        }
+        if (binary.format != .elf) {
+            debug_log.log("dwarf.engine: rejecting ELF core with executable format={s}", .{@tagName(binary.format)});
+            return error.InvalidCoreExecutableFormat;
+        }
+
+        const runtime_base = core.executableRuntimeBase(executable_path) catch |err| blk: {
+            if (err != error.ExecutableMappingNotFound) {
+                debug_log.log("dwarf.engine: failed core executable mapping path={s} error={s}", .{ executable_path, @errorName(err) });
+                return err;
+            }
+
+            const canonical_path = std.fs.cwd().realpathAlloc(self.allocator, executable_path) catch {
+                debug_log.log("dwarf.engine: ELF core lacks validated NT_FILE mapping path={s}", .{executable_path});
+                return err;
+            };
+            defer self.allocator.free(canonical_path);
+            break :blk core.executableRuntimeBase(canonical_path) catch |canonical_err| {
+                debug_log.log("dwarf.engine: failed canonical core executable mapping path={s} error={s}", .{ canonical_path, @errorName(canonical_err) });
+                return canonical_err;
+            };
+        };
+
+        self.address_translation.load_bias = binary.loadBias(runtime_base);
+        debug_log.log(
+            "dwarf.engine: resolved core address translation format={s} runtime_base=0x{x} preferred_base=0x{x} load_bias={d}",
+            .{ @tagName(binary.format), runtime_base, binary.preferred_base, self.address_translation.load_bias },
         );
     }
 
     fn loadDebugInfo(self: *DwarfEngine, program: []const u8) !void {
-        if (builtin.os.tag == .macos) {
-            self.loadDebugInfoMachO(program);
-        } else if (builtin.os.tag == .linux) {
-            self.loadDebugInfoElf(program);
-        }
+        const format = try NativeBinary.detectFileFormat(program);
+        self.loadNativeDebugInfo(program, format);
 
         // Build FDE index for fast CFA unwinding
         if (self.resolveFrameData()) |frame_data| {
@@ -327,137 +400,67 @@ pub const DwarfEngine = struct {
         }
     }
 
-    fn loadDebugInfoMachO(self: *DwarfEngine, program: []const u8) void {
-        debug_log.log("dwarf.engine: loading Mach-O debug info from {s}", .{program});
-        var binary = binary_macho.MachoBinary.loadFile(self.allocator, program) catch return;
-        errdefer binary.deinit(self.allocator);
+    fn loadNativeDebugInfo(self: *DwarfEngine, program: []const u8, format: binary_common.Format) void {
+        debug_log.log("dwarf.engine: loading debug info format={s} path={s}", .{ @tagName(format), program });
+        self.binary = NativeBinary.loadFile(self.allocator, program, format) catch |err| {
+            debug_log.log("dwarf.engine: failed to load binary format={s} path={s} error={s}", .{ @tagName(format), program, @errorName(err) });
+            return;
+        };
 
-        // Try loading debug_line from the binary itself (with transparent decompression)
-        if (binary.sections.debug_line) |line_section| {
-            const line_data = (binary.getSectionDataAlloc(self.allocator, line_section) catch null) orelse binary.getSectionData(line_section);
-            if (line_data) |ld| {
-                const line_str_data = if (binary.sections.debug_line_str) |ls|
-                    (binary.getSectionDataAlloc(self.allocator, ls) catch null) orelse binary.getSectionData(ls)
-                else
-                    null;
-                const result = parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data) catch {
-                    // Fallback to old method
-                    const entries = parser.parseLineProgram(ld, self.allocator) catch return;
-                    if (entries.len > 0) {
-                        self.line_entries = entries;
-                    }
-                    return;
-                };
-                if (result.line_entries.len > 0) {
-                    self.line_entries = result.line_entries;
-                    if (result.file_entries.len > 0) {
-                        self.file_entries = result.file_entries;
-                    }
-                    if (result.allocated_paths.len > 0) {
-                        self.allocated_paths = result.allocated_paths;
-                    }
-                }
-            }
-        }
+        const main_binary = self.mainBinary() orelse return;
+        self.loadLineInfo(main_binary);
 
-        // Fallback 1: on macOS, Apple clang stores DWARF in a .dSYM bundle
-        if (self.line_entries.len == 0) {
+        if (format == .macho and self.line_entries.len == 0) {
             debug_log.log("dwarf.engine: no line entries in binary, trying dSYM bundle", .{});
             self.loadDsymDebugInfo(program) catch {};
         }
-
-        // Fallback 2: on macOS, run dsymutil to generate a dSYM from N_OSO object files
-        if (self.line_entries.len == 0) {
+        if (format == .macho and self.line_entries.len == 0) {
             debug_log.log("dwarf.engine: no dSYM found, checking for N_OSO stab entries", .{});
             self.generateAndLoadDsym(program) catch {};
         }
 
-        // Parse function info from debug_info + debug_abbrev
-        self.loadFunctionInfo(&binary);
-
-        self.binary = binary;
+        const debug_binary = self.debugBinary() orelse return;
+        self.loadFunctionInfo(debug_binary);
     }
 
-    fn loadDebugInfoElf(self: *DwarfEngine, program: []const u8) void {
-        debug_log.log("dwarf.engine: loading ELF debug info from {s}", .{program});
-        var elf = binary_elf.ElfBinary.loadFile(self.allocator, program) catch return;
-        errdefer elf.deinit(self.allocator);
-
-        // Load debug_line (with transparent decompression)
-        if (elf.sections.debug_line) |line_section| {
-            const line_data = (elf.getSectionDataAlloc(self.allocator, line_section) catch null) orelse elf.getSectionData(line_section);
-            if (line_data) |ld| {
-                const line_str_data = if (elf.sections.debug_line_str) |ls|
-                    (elf.getSectionDataAlloc(self.allocator, ls) catch null) orelse elf.getSectionData(ls)
-                else
-                    null;
-                const result = parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data) catch {
-                    const entries = parser.parseLineProgram(ld, self.allocator) catch return;
-                    if (entries.len > 0) {
-                        self.line_entries = entries;
-                    }
-                    return;
-                };
-                if (result.line_entries.len > 0) {
-                    self.line_entries = result.line_entries;
-                    if (result.file_entries.len > 0) {
-                        self.file_entries = result.file_entries;
-                    }
-                    if (result.allocated_paths.len > 0) {
-                        self.allocated_paths = result.allocated_paths;
-                    }
-                }
-            }
-        }
-
-        // Parse function info from debug_info + debug_abbrev
-        self.loadFunctionInfoElf(&elf);
-
-        self.elf_binary = elf;
-    }
-
-    fn loadFunctionInfo(self: *DwarfEngine, binary: *binary_macho.MachoBinary) void {
-        // Try dSYM first, then main binary
-        const debug_binary: *binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_info != null) break :blk dsym;
-            }
-            if (binary.sections.debug_info != null) break :blk binary;
+    fn loadLineInfo(self: *DwarfEngine, binary: binary_common.Binary) void {
+        const line_data = self.sectionData(binary, binary.sections.debug_line) orelse return;
+        const line_str_data = self.sectionData(binary, binary.sections.debug_line_str);
+        const result = parser.parseLineProgramWithFilesEx(line_data, self.allocator, line_str_data) catch {
+            const entries = parser.parseLineProgram(line_data, self.allocator) catch return;
+            if (entries.len > 0) self.line_entries = entries;
             return;
         };
+        if (result.line_entries.len == 0) return;
 
-        const info_section = debug_binary.sections.debug_info orelse return;
-        const abbrev_section = debug_binary.sections.debug_abbrev orelse return;
-        const info_data = (debug_binary.getSectionDataAlloc(self.allocator, info_section) catch null) orelse debug_binary.getSectionData(info_section) orelse return;
-        const abbrev_data = (debug_binary.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse debug_binary.getSectionData(abbrev_section) orelse return;
-        const str_data = if (debug_binary.sections.debug_str) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null;
-        const str_offsets_data = if (debug_binary.sections.debug_str_offsets) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null;
-        const addr_data = if (debug_binary.sections.debug_addr) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null;
+        self.line_entries = result.line_entries;
+        if (result.file_entries.len > 0) self.file_entries = result.file_entries;
+        if (result.allocated_paths.len > 0) self.allocated_paths = result.allocated_paths;
+        debug_log.log("dwarf.engine: parsed line info format={s} lines={d} files={d}", .{ @tagName(binary.format), result.line_entries.len, result.file_entries.len });
+    }
+
+    fn loadFunctionInfo(self: *DwarfEngine, binary: binary_common.Binary) void {
+        const info_data = self.sectionData(binary, binary.sections.debug_info) orelse return;
+        const abbrev_data = self.sectionData(binary, binary.sections.debug_abbrev) orelse return;
+        const str_data = self.sectionData(binary, binary.sections.debug_str);
+        const str_offsets_data = self.sectionData(binary, binary.sections.debug_str_offsets);
+        const addr_data = self.sectionData(binary, binary.sections.debug_addr);
+        const extra_sections = parser.ExtraSections{
+            .debug_str_offsets = str_offsets_data,
+            .debug_addr = addr_data,
+            .debug_ranges = self.sectionData(binary, binary.sections.debug_ranges),
+            .debug_rnglists = self.sectionData(binary, binary.sections.debug_rnglists),
+        };
 
         const functions = parser.parseCompilationUnitEx(
             info_data,
             abbrev_data,
             str_data,
-            .{
-                .debug_str_offsets = str_offsets_data,
-                .debug_addr = addr_data,
-                .debug_ranges = if (debug_binary.sections.debug_ranges) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
-                .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
-            },
+            extra_sections,
             self.allocator,
         ) catch return;
+        if (functions.len > 0) self.functions = functions;
 
-        if (functions.len > 0) {
-            self.functions = functions;
-        }
-
-        // Also parse inlined subroutines
-        const extra_sections = parser.ExtraSections{
-            .debug_str_offsets = str_offsets_data,
-            .debug_addr = addr_data,
-            .debug_ranges = if (debug_binary.sections.debug_ranges) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
-            .debug_rnglists = if (debug_binary.sections.debug_rnglists) |s| (debug_binary.getSectionDataAlloc(self.allocator, s) catch null) orelse debug_binary.getSectionData(s) else null,
-        };
         const inlined = parser.parseInlinedSubroutines(
             info_data,
             abbrev_data,
@@ -465,35 +468,25 @@ pub const DwarfEngine = struct {
             extra_sections,
             self.allocator,
         ) catch return;
-        if (inlined.len > 0) {
-            self.inlined_subs = inlined;
+        if (inlined.len > 0) self.inlined_subs = inlined;
+
+        if (self.sectionData(binary, binary.sections.debug_names)) |names_data| {
+            self.debug_names_index = parser.parseDebugNames(names_data, str_data, self.allocator) catch null;
+        }
+        if (self.sectionData(binary, binary.sections.debug_macro)) |macro_data| {
+            self.macro_defs = parser.parseDebugMacro(
+                macro_data,
+                str_data,
+                str_offsets_data,
+                0,
+                false,
+                self.allocator,
+            ) catch &.{};
+        }
+        if (self.type_units.len == 0) {
+            self.type_units = parser.parseTypeUnits(info_data, self.allocator) catch &.{};
         }
 
-        // Load .debug_names index for accelerated symbol lookup
-        if (debug_binary.sections.debug_names) |names_section| {
-            if ((debug_binary.getSectionDataAlloc(self.allocator, names_section) catch null) orelse debug_binary.getSectionData(names_section)) |names_data| {
-                self.debug_names_index = parser.parseDebugNames(names_data, str_data, self.allocator) catch null;
-            }
-        }
-
-        // Load .debug_macro for macro expansion
-        if (debug_binary.sections.debug_macro) |macro_section| {
-            if ((debug_binary.getSectionDataAlloc(self.allocator, macro_section) catch null) orelse debug_binary.getSectionData(macro_section)) |macro_data| {
-                self.macro_defs = parser.parseDebugMacro(
-                    macro_data,
-                    str_data,
-                    str_offsets_data,
-                    0,
-                    false,
-                    self.allocator,
-                ) catch &.{};
-            }
-        }
-
-        // Parse type units for DW_FORM_ref_sig8 resolution
-        self.type_units = parser.parseTypeUnits(info_data, self.allocator) catch &.{};
-
-        // Detect and load Split DWARF .dwo files
         const skeletons = parser.detectSplitDwarf(
             info_data,
             abbrev_data,
@@ -504,178 +497,50 @@ pub const DwarfEngine = struct {
             },
             self.allocator,
         ) catch &.{};
+        if (skeletons.len == 0) return;
 
-        if (skeletons.len > 0) {
-            self.skeleton_cus = skeletons;
-            var dwo_list = std.ArrayListUnmanaged(binary_macho.MachoBinary).empty;
-            // Attempt to load each .dwo file
-            for (skeletons) |skel| {
-                // Construct full path: comp_dir/dwo_name
-                const dwo_path = if (skel.comp_dir.len > 0)
-                    std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ skel.comp_dir, skel.dwo_name }) catch continue
-                else
-                    self.allocator.dupe(u8, skel.dwo_name) catch continue;
-                defer self.allocator.free(dwo_path);
+        self.skeleton_cus = skeletons;
+        var dwo_list = std.ArrayListUnmanaged(NativeBinary).empty;
+        defer dwo_list.deinit(self.allocator);
+        for (skeletons) |skel| {
+            const dwo_path = if (skel.comp_dir.len > 0)
+                std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ skel.comp_dir, skel.dwo_name }) catch continue
+            else
+                self.allocator.dupe(u8, skel.dwo_name) catch continue;
+            defer self.allocator.free(dwo_path);
 
-                // Try to load as Mach-O .dwo
-                const dwo_binary = binary_macho.MachoBinary.loadFile(self.allocator, dwo_path) catch continue;
-                dwo_list.append(self.allocator, dwo_binary) catch continue;
-            }
-            if (dwo_list.items.len > 0) {
-                self.dwo_binaries = dwo_list.toOwnedSlice(self.allocator) catch &.{};
-            }
-
-            // Parse functions from DWO binaries and merge
-            for (self.dwo_binaries) |dwo| {
-                const dwo_info = if (dwo.sections.debug_info) |s| dwo.getSectionData(s) orelse continue else continue;
-                const dwo_abbrev = if (dwo.sections.debug_abbrev) |s| dwo.getSectionData(s) orelse continue else continue;
-                const dwo_str = if (dwo.sections.debug_str) |s| dwo.getSectionData(s) else null;
-                const dwo_funcs = parser.parseCompilationUnitEx(
-                    dwo_info,
-                    dwo_abbrev,
-                    dwo_str,
-                    .{
-                        .debug_str_offsets = if (dwo.sections.debug_str_offsets) |s| dwo.getSectionData(s) else null,
-                        .debug_addr = addr_data,
-                        .debug_ranges = if (dwo.sections.debug_ranges) |s| dwo.getSectionData(s) else null,
-                        .debug_rnglists = if (dwo.sections.debug_rnglists) |s| dwo.getSectionData(s) else null,
-                    },
-                    self.allocator,
-                ) catch continue;
-                if (dwo_funcs.len > 0 and self.functions.len == 0) {
-                    self.functions = dwo_funcs;
-                } else if (dwo_funcs.len > 0) {
-                    self.allocator.free(dwo_funcs);
-                }
-            }
+            var dwo_binary = NativeBinary.loadFile(self.allocator, dwo_path, binary.format) catch continue;
+            dwo_list.append(self.allocator, dwo_binary) catch {
+                dwo_binary.deinit(self.allocator);
+                continue;
+            };
         }
-    }
-
-    fn loadFunctionInfoElf(self: *DwarfEngine, elf: *binary_elf.ElfBinary) void {
-        const info_section = elf.sections.debug_info orelse return;
-        const abbrev_section = elf.sections.debug_abbrev orelse return;
-        const info_data = (elf.getSectionDataAlloc(self.allocator, info_section) catch null) orelse elf.getSectionData(info_section) orelse return;
-        const abbrev_data = (elf.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse elf.getSectionData(abbrev_section) orelse return;
-        const str_data = if (elf.sections.debug_str) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null;
-        const str_offsets_data = if (elf.sections.debug_str_offsets) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null;
-        const addr_data = if (elf.sections.debug_addr) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null;
-
-        const functions = parser.parseCompilationUnitEx(
-            info_data,
-            abbrev_data,
-            str_data,
-            .{
-                .debug_str_offsets = str_offsets_data,
-                .debug_addr = addr_data,
-                .debug_ranges = if (elf.sections.debug_ranges) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-                .debug_rnglists = if (elf.sections.debug_rnglists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            },
-            self.allocator,
-        ) catch return;
-
-        if (functions.len > 0) {
-            self.functions = functions;
-        }
-
-        // Also parse inlined subroutines
-        const elf_extra = parser.ExtraSections{
-            .debug_str_offsets = str_offsets_data,
-            .debug_addr = addr_data,
-            .debug_ranges = if (elf.sections.debug_ranges) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .debug_rnglists = if (elf.sections.debug_rnglists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+        self.dwo_binaries = dwo_list.toOwnedSlice(self.allocator) catch {
+            for (dwo_list.items) |*dwo| dwo.deinit(self.allocator);
+            return;
         };
-        const inlined = parser.parseInlinedSubroutines(
-            info_data,
-            abbrev_data,
-            str_data,
-            elf_extra,
-            self.allocator,
-        ) catch return;
-        if (inlined.len > 0) {
-            self.inlined_subs = inlined;
-        }
 
-        // Load .debug_names index for accelerated symbol lookup
-        if (elf.sections.debug_names) |names_section| {
-            if ((elf.getSectionDataAlloc(self.allocator, names_section) catch null) orelse elf.getSectionData(names_section)) |names_data| {
-                self.debug_names_index = parser.parseDebugNames(names_data, str_data, self.allocator) catch null;
-            }
-        }
-
-        // Load .debug_macro for macro expansion
-        if (elf.sections.debug_macro) |macro_section| {
-            if ((elf.getSectionDataAlloc(self.allocator, macro_section) catch null) orelse elf.getSectionData(macro_section)) |macro_data| {
-                self.macro_defs = parser.parseDebugMacro(
-                    macro_data,
-                    str_data,
-                    str_offsets_data,
-                    0,
-                    false,
-                    self.allocator,
-                ) catch &.{};
-            }
-        }
-
-        // Parse type units for DW_FORM_ref_sig8 resolution
-        if (self.type_units.len == 0) {
-            self.type_units = parser.parseTypeUnits(info_data, self.allocator) catch &.{};
-        }
-
-        // Detect and load Split DWARF .dwo files
-        const elf_skeletons = parser.detectSplitDwarf(
-            info_data,
-            abbrev_data,
-            str_data,
-            .{
-                .debug_str_offsets = str_offsets_data,
-                .debug_addr = addr_data,
-            },
-            self.allocator,
-        ) catch &.{};
-
-        if (elf_skeletons.len > 0) {
-            if (self.skeleton_cus.len == 0) {
-                self.skeleton_cus = elf_skeletons;
-            } else {
-                self.allocator.free(elf_skeletons);
-            }
-            var dwo_elf_list = std.ArrayListUnmanaged(binary_elf.ElfBinary).empty;
-            for (self.skeleton_cus) |skel| {
-                const dwo_path = if (skel.comp_dir.len > 0)
-                    std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ skel.comp_dir, skel.dwo_name }) catch continue
-                else
-                    self.allocator.dupe(u8, skel.dwo_name) catch continue;
-                defer self.allocator.free(dwo_path);
-
-                const dwo_binary = binary_elf.ElfBinary.loadFile(self.allocator, dwo_path) catch continue;
-                dwo_elf_list.append(self.allocator, dwo_binary) catch continue;
-            }
-            if (dwo_elf_list.items.len > 0) {
-                self.dwo_elf_binaries = dwo_elf_list.toOwnedSlice(self.allocator) catch &.{};
-            }
-
-            // Parse functions from DWO ELF binaries and merge
-            for (self.dwo_elf_binaries) |dwo_elf| {
-                const dwo_info = if (dwo_elf.sections.debug_info) |s| dwo_elf.getSectionData(s) orelse continue else continue;
-                const dwo_abbrev = if (dwo_elf.sections.debug_abbrev) |s| dwo_elf.getSectionData(s) orelse continue else continue;
-                const dwo_str = if (dwo_elf.sections.debug_str) |s| dwo_elf.getSectionData(s) else null;
-                const dwo_funcs = parser.parseCompilationUnitEx(
-                    dwo_info,
-                    dwo_abbrev,
-                    dwo_str,
-                    .{
-                        .debug_str_offsets = if (dwo_elf.sections.debug_str_offsets) |s| dwo_elf.getSectionData(s) else null,
-                        .debug_addr = addr_data,
-                        .debug_ranges = if (dwo_elf.sections.debug_ranges) |s| dwo_elf.getSectionData(s) else null,
-                        .debug_rnglists = if (dwo_elf.sections.debug_rnglists) |s| dwo_elf.getSectionData(s) else null,
-                    },
-                    self.allocator,
-                ) catch continue;
-                if (dwo_funcs.len > 0 and self.functions.len == 0) {
-                    self.functions = dwo_funcs;
-                } else if (dwo_funcs.len > 0) {
-                    self.allocator.free(dwo_funcs);
-                }
+        for (self.dwo_binaries) |*dwo| {
+            const dwo_binary = dwo.view();
+            const dwo_info = self.sectionData(dwo_binary, dwo_binary.sections.debug_info) orelse continue;
+            const dwo_abbrev = self.sectionData(dwo_binary, dwo_binary.sections.debug_abbrev) orelse continue;
+            const dwo_str = self.sectionData(dwo_binary, dwo_binary.sections.debug_str);
+            const dwo_funcs = parser.parseCompilationUnitEx(
+                dwo_info,
+                dwo_abbrev,
+                dwo_str,
+                .{
+                    .debug_str_offsets = self.sectionData(dwo_binary, dwo_binary.sections.debug_str_offsets),
+                    .debug_addr = addr_data,
+                    .debug_ranges = self.sectionData(dwo_binary, dwo_binary.sections.debug_ranges),
+                    .debug_rnglists = self.sectionData(dwo_binary, dwo_binary.sections.debug_rnglists),
+                },
+                self.allocator,
+            ) catch continue;
+            if (dwo_funcs.len > 0 and self.functions.len == 0) {
+                self.functions = dwo_funcs;
+            } else if (dwo_funcs.len > 0) {
+                self.allocator.free(dwo_funcs);
             }
         }
     }
@@ -692,37 +557,11 @@ pub const DwarfEngine = struct {
         );
         defer self.allocator.free(dsym_path);
 
-        var dsym_binary = binary_macho.MachoBinary.loadFile(self.allocator, dsym_path) catch return;
-        errdefer dsym_binary.deinit(self.allocator);
-
-        if (dsym_binary.sections.debug_line) |line_section| {
-            const line_data = (dsym_binary.getSectionDataAlloc(self.allocator, line_section) catch null) orelse dsym_binary.getSectionData(line_section);
-            if (line_data) |ld| {
-                const line_str_data = if (dsym_binary.sections.debug_line_str) |ls|
-                    (dsym_binary.getSectionDataAlloc(self.allocator, ls) catch null) orelse dsym_binary.getSectionData(ls)
-                else
-                    null;
-                const result = parser.parseLineProgramWithFilesEx(ld, self.allocator, line_str_data) catch {
-                    const entries = parser.parseLineProgram(ld, self.allocator) catch return;
-                    if (entries.len > 0) {
-                        self.line_entries = entries;
-                    }
-                    return;
-                };
-                if (result.line_entries.len > 0) {
-                    self.line_entries = result.line_entries;
-                    if (result.file_entries.len > 0) {
-                        self.file_entries = result.file_entries;
-                    }
-                    if (result.allocated_paths.len > 0) {
-                        self.allocated_paths = result.allocated_paths;
-                    }
-                }
-            }
-        }
+        var dsym_binary = NativeBinary.loadFile(self.allocator, dsym_path, .macho) catch return;
+        self.loadLineInfo(dsym_binary.view());
 
         debug_log.log("dwarf.engine: dSYM loaded, line_entries={d}", .{self.line_entries.len});
-        self.dsym_binary = dsym_binary;
+        self.supplementary_binary = dsym_binary;
     }
 
     /// When N_OSO stab entries exist but no dSYM bundle, run dsymutil to generate
@@ -1914,53 +1753,21 @@ pub const DwarfEngine = struct {
     }
 
     fn resolveDebugData(self: *DwarfEngine) ?DebugData {
-        // Try Mach-O binaries (dSYM first, then main)
-        if (self.dsym_binary) |*dsym| {
-            if (self.resolveDebugDataFromMacho(dsym)) |d| return d;
-        }
-        if (self.binary) |*bin| {
-            if (self.resolveDebugDataFromMacho(bin)) |d| return d;
-        }
-        // Try ELF binary
-        if (self.elf_binary) |*elf| {
-            return self.resolveDebugDataFromElf(elf);
-        }
-        return null;
+        const binary = self.debugBinary() orelse return null;
+        return self.resolveDebugDataFromBinary(binary);
     }
 
-    fn resolveDebugDataFromMacho(self: *DwarfEngine, bin: *binary_macho.MachoBinary) ?DebugData {
-        const info_section = bin.sections.debug_info orelse return null;
-        const abbrev_section = bin.sections.debug_abbrev orelse return null;
-        const info_data = (bin.getSectionDataAlloc(self.allocator, info_section) catch null) orelse bin.getSectionData(info_section) orelse return null;
-        const abbrev_data = (bin.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse bin.getSectionData(abbrev_section) orelse return null;
+    fn resolveDebugDataFromBinary(self: *DwarfEngine, binary: binary_common.Binary) ?DebugData {
         return .{
-            .info_data = info_data,
-            .abbrev_data = abbrev_data,
-            .str_data = if (bin.sections.debug_str) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-            .str_offsets_data = if (bin.sections.debug_str_offsets) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-            .addr_data = if (bin.sections.debug_addr) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-            .ranges_data = if (bin.sections.debug_ranges) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-            .rnglists_data = if (bin.sections.debug_rnglists) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-            .loc_data = if (bin.sections.debug_loc) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-            .loclists_data = if (bin.sections.debug_loclists) |s| (bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s) else null,
-        };
-    }
-
-    fn resolveDebugDataFromElf(self: *DwarfEngine, elf: *binary_elf.ElfBinary) ?DebugData {
-        const info_section = elf.sections.debug_info orelse return null;
-        const abbrev_section = elf.sections.debug_abbrev orelse return null;
-        const info_data = (elf.getSectionDataAlloc(self.allocator, info_section) catch null) orelse elf.getSectionData(info_section) orelse return null;
-        const abbrev_data = (elf.getSectionDataAlloc(self.allocator, abbrev_section) catch null) orelse elf.getSectionData(abbrev_section) orelse return null;
-        return .{
-            .info_data = info_data,
-            .abbrev_data = abbrev_data,
-            .str_data = if (elf.sections.debug_str) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .str_offsets_data = if (elf.sections.debug_str_offsets) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .addr_data = if (elf.sections.debug_addr) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .ranges_data = if (elf.sections.debug_ranges) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .rnglists_data = if (elf.sections.debug_rnglists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .loc_data = if (elf.sections.debug_loc) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
-            .loclists_data = if (elf.sections.debug_loclists) |s| (elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s) else null,
+            .info_data = self.sectionData(binary, binary.sections.debug_info) orelse return null,
+            .abbrev_data = self.sectionData(binary, binary.sections.debug_abbrev) orelse return null,
+            .str_data = self.sectionData(binary, binary.sections.debug_str),
+            .str_offsets_data = self.sectionData(binary, binary.sections.debug_str_offsets),
+            .addr_data = self.sectionData(binary, binary.sections.debug_addr),
+            .ranges_data = self.sectionData(binary, binary.sections.debug_ranges),
+            .rnglists_data = self.sectionData(binary, binary.sections.debug_rnglists),
+            .loc_data = self.sectionData(binary, binary.sections.debug_loc),
+            .loclists_data = self.sectionData(binary, binary.sections.debug_loclists),
         };
     }
 
@@ -1973,57 +1780,31 @@ pub const DwarfEngine = struct {
     /// Resolve .eh_frame or .debug_frame bytes together with the section PC base.
     /// The PC base is required for DW_EH_PE_pcrel encoded FDE addresses.
     fn resolveFrameData(self: *DwarfEngine) ?FrameData {
-        // Try .eh_frame first
-        if (self.dsym_binary) |*dsym| {
-            if (dsym.sections.eh_frame) |s| {
-                if ((dsym.getSectionDataAlloc(self.allocator, s) catch null) orelse dsym.getSectionData(s)) |d| {
-                    self.is_debug_frame = false;
-                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = false };
-                }
-            }
+        if (self.supplementary_binary) |*owned| {
+            if (self.resolveFrameSection(owned.view(), false)) |data| return data;
         }
-        if (self.binary) |*bin| {
-            if (bin.sections.eh_frame) |s| {
-                if ((bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s)) |d| {
-                    self.is_debug_frame = false;
-                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = false };
-                }
-            }
+        if (self.binary) |*owned| {
+            if (self.resolveFrameSection(owned.view(), false)) |data| return data;
         }
-        if (self.elf_binary) |*elf| {
-            if (elf.sections.eh_frame) |s| {
-                if ((elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s)) |d| {
-                    self.is_debug_frame = false;
-                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = false };
-                }
-            }
+        if (self.supplementary_binary) |*owned| {
+            if (self.resolveFrameSection(owned.view(), true)) |data| return data;
         }
-        // Fall back to .debug_frame
-        if (self.dsym_binary) |*dsym| {
-            if (dsym.sections.debug_frame) |s| {
-                if ((dsym.getSectionDataAlloc(self.allocator, s) catch null) orelse dsym.getSectionData(s)) |d| {
-                    self.is_debug_frame = true;
-                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = true };
-                }
-            }
-        }
-        if (self.binary) |*bin| {
-            if (bin.sections.debug_frame) |s| {
-                if ((bin.getSectionDataAlloc(self.allocator, s) catch null) orelse bin.getSectionData(s)) |d| {
-                    self.is_debug_frame = true;
-                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = true };
-                }
-            }
-        }
-        if (self.elf_binary) |*elf| {
-            if (elf.sections.debug_frame) |s| {
-                if ((elf.getSectionDataAlloc(self.allocator, s) catch null) orelse elf.getSectionData(s)) |d| {
-                    self.is_debug_frame = true;
-                    return .{ .data = d, .pc_base = s.virtual_address, .is_debug_frame = true };
-                }
-            }
+        if (self.binary) |*owned| {
+            if (self.resolveFrameSection(owned.view(), true)) |data| return data;
         }
         return null;
+    }
+
+    fn resolveFrameSection(self: *DwarfEngine, binary: binary_common.Binary, is_debug_frame: bool) ?FrameData {
+        const section = if (is_debug_frame) binary.sections.debug_frame else binary.sections.eh_frame;
+        const info = section orelse return null;
+        const data = self.sectionData(binary, info) orelse return null;
+        self.is_debug_frame = is_debug_frame;
+        return .{
+            .data = data,
+            .pc_base = info.virtual_address,
+            .is_debug_frame = is_debug_frame,
+        };
     }
 
     /// Context for CFA register/memory reader callbacks.
@@ -2464,28 +2245,14 @@ pub const DwarfEngine = struct {
 
         // 5b. Split DWARF fallback: if skeleton CU has no variables, try DWO binaries
         if (scoped.variables.len == 0) {
-            // Try Mach-O DWO binaries
-            for (self.dwo_binaries) |dwo| {
-                const dwo_scoped = self.parseDwoVariables(&dwo, addr_data, target_pc, allocator) catch continue;
+            for (self.dwo_binaries) |*dwo| {
+                const dwo_scoped = self.parseDwoVariables(dwo, addr_data, target_pc, allocator) catch continue;
                 if (dwo_scoped.variables.len > 0) {
                     parser.freeScopedVariables(scoped, allocator);
                     scoped = dwo_scoped;
                     break;
                 } else {
                     parser.freeScopedVariables(dwo_scoped, allocator);
-                }
-            }
-            // If still empty, try ELF DWO binaries
-            if (scoped.variables.len == 0) {
-                for (self.dwo_elf_binaries) |dwo_elf| {
-                    const dwo_scoped = self.parseDwoElfVariables(&dwo_elf, addr_data, target_pc, allocator) catch continue;
-                    if (dwo_scoped.variables.len > 0) {
-                        parser.freeScopedVariables(scoped, allocator);
-                        scoped = dwo_scoped;
-                        break;
-                    } else {
-                        parser.freeScopedVariables(dwo_scoped, allocator);
-                    }
                 }
             }
         }
@@ -2692,59 +2459,26 @@ pub const DwarfEngine = struct {
 
     // ── Split DWARF Helpers ────────────────────────────────────────
 
-    /// Parse scoped variables from a Mach-O DWO binary, using the main binary's .debug_addr.
+    /// Parse scoped variables from a DWO binary, using the main binary's .debug_addr.
     fn parseDwoVariables(
-        _: *const DwarfEngine,
-        dwo: *const binary_macho.MachoBinary,
+        self: *DwarfEngine,
+        dwo: *NativeBinary,
         main_addr_data: ?[]const u8,
         target_pc: u64,
         allocator: std.mem.Allocator,
     ) !parser.ScopedVariableResult {
-        const dwo_info = if (dwo.sections.debug_info) |s| dwo.getSectionData(s) orelse return error.NoData else return error.NoData;
-        const dwo_abbrev = if (dwo.sections.debug_abbrev) |s| dwo.getSectionData(s) orelse return error.NoData else return error.NoData;
-        const dwo_str = if (dwo.sections.debug_str) |s| dwo.getSectionData(s) else null;
+        const binary = dwo.view();
         return parser.parseScopedVariables(
-            dwo_info,
-            dwo_abbrev,
-            dwo_str,
+            self.sectionData(binary, binary.sections.debug_info) orelse return error.NoData,
+            self.sectionData(binary, binary.sections.debug_abbrev) orelse return error.NoData,
+            self.sectionData(binary, binary.sections.debug_str),
             .{
-                .debug_str_offsets = if (dwo.sections.debug_str_offsets) |s| dwo.getSectionData(s) else null,
+                .debug_str_offsets = self.sectionData(binary, binary.sections.debug_str_offsets),
                 .debug_addr = main_addr_data,
-                .debug_ranges = if (dwo.sections.debug_ranges) |s| dwo.getSectionData(s) else null,
-                .debug_rnglists = if (dwo.sections.debug_rnglists) |s| dwo.getSectionData(s) else null,
-                .debug_loc = if (dwo.sections.debug_loc) |s| dwo.getSectionData(s) else null,
-                .debug_loclists = if (dwo.sections.debug_loclists) |s| dwo.getSectionData(s) else null,
-            },
-            target_pc,
-            allocator,
-            null,
-            null,
-            null,
-        );
-    }
-
-    /// Parse scoped variables from an ELF DWO binary, using the main binary's .debug_addr.
-    fn parseDwoElfVariables(
-        _: *const DwarfEngine,
-        dwo: *const binary_elf.ElfBinary,
-        main_addr_data: ?[]const u8,
-        target_pc: u64,
-        allocator: std.mem.Allocator,
-    ) !parser.ScopedVariableResult {
-        const dwo_info = if (dwo.sections.debug_info) |s| dwo.getSectionData(s) orelse return error.NoData else return error.NoData;
-        const dwo_abbrev = if (dwo.sections.debug_abbrev) |s| dwo.getSectionData(s) orelse return error.NoData else return error.NoData;
-        const dwo_str = if (dwo.sections.debug_str) |s| dwo.getSectionData(s) else null;
-        return parser.parseScopedVariables(
-            dwo_info,
-            dwo_abbrev,
-            dwo_str,
-            .{
-                .debug_str_offsets = if (dwo.sections.debug_str_offsets) |s| dwo.getSectionData(s) else null,
-                .debug_addr = main_addr_data,
-                .debug_ranges = if (dwo.sections.debug_ranges) |s| dwo.getSectionData(s) else null,
-                .debug_rnglists = if (dwo.sections.debug_rnglists) |s| dwo.getSectionData(s) else null,
-                .debug_loc = if (dwo.sections.debug_loc) |s| dwo.getSectionData(s) else null,
-                .debug_loclists = if (dwo.sections.debug_loclists) |s| dwo.getSectionData(s) else null,
+                .debug_ranges = self.sectionData(binary, binary.sections.debug_ranges),
+                .debug_rnglists = self.sectionData(binary, binary.sections.debug_rnglists),
+                .debug_loc = self.sectionData(binary, binary.sections.debug_loc),
+                .debug_loclists = self.sectionData(binary, binary.sections.debug_loclists),
             },
             target_pc,
             allocator,
@@ -4034,8 +3768,9 @@ pub const DwarfEngine = struct {
         self.launched = true;
         if (executable_path) |exe| {
             self.program_path = try allocator.dupe(u8, exe);
-            self.loadDebugInfo(exe) catch {};
-            debug_log.log("dwarf.engine: loaded core executable {s}; runtime translation remains explicit", .{exe});
+            try self.loadDebugInfo(exe);
+            try self.resolveCoreAddressTranslation(exe);
+            debug_log.log("dwarf.engine: loaded core executable {s} with load_bias={d}", .{ exe, self.address_translation.load_bias });
         }
     }
 
@@ -4261,14 +3996,15 @@ pub const DwarfEngine = struct {
         }
 
         if (self.program_path) |path| {
-            const has_macho_debug = self.binary != null and self.binary.?.sections.debug_info != null;
-            const has_elf_debug = self.elf_binary != null and self.elf_binary.?.sections.debug_info != null;
-            const has_dsym = self.dsym_binary != null;
-            const sym_status: []const u8 = if (has_dsym) "dSYM loaded" else if (has_macho_debug or has_elf_debug) "debug info loaded" else "no debug info";
-            debug_log.log("dwarf.engine: module format={s}, symbols={s}", .{
-                if (self.elf_binary != null) "ELF" else "Mach-O",
-                sym_status,
-            });
+            const main_binary = self.mainBinary();
+            const has_debug = self.debugBinary() != null;
+            const has_supplementary = self.supplementary_binary != null;
+            const sym_status: []const u8 = if (has_supplementary) "dSYM loaded" else if (has_debug) "debug info loaded" else "no debug info";
+            const format_name: []const u8 = if (main_binary) |binary| switch (binary.format) {
+                .elf => "ELF",
+                .macho => "Mach-O",
+            } else "unknown";
+            debug_log.log("dwarf.engine: module format={s}, symbols={s}", .{ format_name, sym_status });
 
             try appendOwnedModule(
                 &mods,
@@ -5324,6 +5060,60 @@ test "native data breakpoints are advertised only for macOS AArch64" {
     try std.testing.expect(!supportsNativeDataBreakpoints(.linux, .x86_64));
 }
 
+test "DwarfEngine applies ELF core PIE translation from validated mappings" {
+    const allocator = std.testing.allocator;
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+
+    const path = try allocator.dupe(u8, "/tmp/pie");
+    const mappings = try allocator.alloc(core_dump_mod.CoreDump.FileMapping, 2);
+    mappings[0] = .{ .start = 0x700000, .end = 0x701000, .file_offset = 0, .pathname = path };
+    mappings[1] = .{ .start = 0x701000, .end = 0x703000, .file_offset = 0x1000, .pathname = path };
+    engine.core_dump = .{
+        .data = path,
+        .segments = &.{},
+        .registers = .{},
+        .allocator = allocator,
+        .format = .elf,
+        .file_mappings = mappings,
+    };
+    engine.binary = .{ .elf = .{
+        .data = &.{},
+        .owned = false,
+        .sections = .{},
+        .preferred_base = 0x400000,
+    } };
+
+    try engine.resolveCoreAddressTranslation("/tmp/pie");
+    try std.testing.expectEqual(@as(i64, 0x300000), engine.address_translation.load_bias);
+    try std.testing.expectEqual(@as(u64, 0x701234), engine.dwarfToRuntime(0x401234));
+}
+
+test "DwarfEngine gates ELF core translation without NT_FILE mappings" {
+    const allocator = std.testing.allocator;
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+
+    const path = try allocator.dupe(u8, "/tmp/pie");
+    engine.core_dump = .{
+        .data = path,
+        .segments = &.{},
+        .registers = .{},
+        .allocator = allocator,
+        .format = .elf,
+        .file_mappings = &.{},
+    };
+    engine.binary = .{ .elf = .{
+        .data = &.{},
+        .owned = false,
+        .sections = .{},
+        .preferred_base = 0x400000,
+    } };
+
+    try std.testing.expectError(error.ExecutableMappingNotFound, engine.resolveCoreAddressTranslation("/tmp/pie"));
+    try std.testing.expectEqual(@as(i64, 0), engine.address_translation.load_bias);
+}
+
 test "DwarfEngine launches fixture binary" {
     if (builtin.os.tag != .macos or !builtin.single_threaded) return error.SkipZigTest;
 
@@ -5385,7 +5175,7 @@ test "DwarfEngine reports ELF module and loaded sources" {
     engine.line_entries = line_result.line_entries;
     engine.file_entries = line_result.file_entries;
     engine.allocated_paths = line_result.allocated_paths;
-    engine.elf_binary = elf;
+    engine.binary = .{ .elf = elf };
     elf_owned = false;
 
     try std.testing.expect(engine.file_entries.len > 0);

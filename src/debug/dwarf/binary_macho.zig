@@ -109,6 +109,7 @@ pub const MachoBinary = struct {
     /// Return a format-neutral binary view for DWARF section consumers.
     pub fn view(self: *MachoBinary) binary_common.Binary {
         return .init(
+            .macho,
             @ptrCast(self),
             &self.sections,
             self.text_vmaddr,

@@ -45,8 +45,30 @@ pub const DebugSections = struct {
     }
 };
 
+/// Native object format backing a format-neutral binary view.
+pub const Format = enum {
+    macho,
+    elf,
+
+    /// Detect the supported native object format from its leading bytes.
+    pub fn detect(data: []const u8) !Format {
+        if (data.len < 4) return error.InvalidBinaryFormat;
+        if (std.mem.eql(u8, data[0..4], "\x7fELF")) return .elf;
+        if (std.mem.readInt(u32, data[0..4], .little) == 0xFEEDFACF) return .macho;
+        return error.InvalidBinaryFormat;
+    }
+};
+
+test "Format detection recognizes native object magic" {
+    try std.testing.expectEqual(Format.elf, try Format.detect("\x7fELF"));
+    try std.testing.expectEqual(Format.macho, try Format.detect("\xcf\xfa\xed\xfe"));
+    try std.testing.expectError(error.InvalidBinaryFormat, Format.detect("text"));
+    try std.testing.expectError(error.InvalidBinaryFormat, Format.detect(""));
+}
+
 /// Format-neutral view over native binary debug sections and image metadata.
 pub const Binary = struct {
+    format: Format,
     context: *anyopaque,
     sections: *const DebugSections,
     preferred_base: u64,
@@ -54,6 +76,7 @@ pub const Binary = struct {
     get_section_data_alloc_fn: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, info: SectionInfo) anyerror!?[]const u8,
 
     pub fn init(
+        format: Format,
         context: *anyopaque,
         sections: *const DebugSections,
         preferred_base: u64,
@@ -61,6 +84,7 @@ pub const Binary = struct {
         get_section_data_alloc_fn: ?*const fn (context: *anyopaque, allocator: std.mem.Allocator, info: SectionInfo) anyerror!?[]const u8,
     ) Binary {
         return .{
+            .format = format,
             .context = context,
             .sections = sections,
             .preferred_base = preferred_base,
@@ -149,6 +173,7 @@ test "Binary view exposes format-neutral section and load APIs" {
         .sections = .{ .debug_info = .{ .offset = 4, .size = 5, .virtual_address = 0x401000 } },
     };
     const view = Binary.init(
+        .elf,
         @ptrCast(&fixture),
         &fixture.sections,
         0x400000,
@@ -156,6 +181,7 @@ test "Binary view exposes format-neutral section and load APIs" {
         null,
     );
 
+    try std.testing.expectEqual(Format.elf, view.format);
     try std.testing.expectEqual(@as(u64, 0x400000), view.preferred_base);
     try std.testing.expectEqualStrings("debug", view.getSectionData(view.sections.debug_info.?).?);
     try std.testing.expectEqual(@as(i64, 0x300000), view.loadBias(0x700000));

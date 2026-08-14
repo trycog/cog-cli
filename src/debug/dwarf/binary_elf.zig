@@ -136,6 +136,7 @@ pub const ElfBinary = struct {
     /// Return a format-neutral binary view for DWARF section consumers.
     pub fn view(self: *ElfBinary) binary_common.Binary {
         return .init(
+            .elf,
             @ptrCast(self),
             &self.sections,
             self.preferred_base,
