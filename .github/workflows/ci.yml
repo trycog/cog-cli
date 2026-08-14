@@ -46,3 +46,6 @@ jobs:
 
       - name: Run indexing integration tests
         run: zig build test-indexing-integration
+
+      - name: Run deterministic indexing benchmark gate
+        run: zig build test-indexing-benchmark

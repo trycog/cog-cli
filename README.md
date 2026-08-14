@@ -423,11 +423,15 @@ Validates your Cog installation: config resolution, memory backend connectivity,
 ## Development
 
 ```sh
-zig build test            # Run tests
+zig build test                     # Run tests
 zig build test-indexing-integration  # Run real code:index integration coverage
-zig build run             # Build and run
-zig build run -- mcp      # Start MCP server
+zig build bench-indexing           # Run deterministic offline indexing benchmark
+zig build test-indexing-benchmark  # Run benchmark plus SCIP malformed-input fuzz smoke
+zig build run                      # Build and run
+zig build run -- mcp               # Start MCP server
 ```
+
+Index benchmark timings are informational. Its regression gate asserts fixed document, symbol, occurrence, and byte counts plus SHA-256 equality across full indexing, reindexing, and two independent fresh runs.
 
 ---
 
