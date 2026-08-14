@@ -78,6 +78,52 @@ fn expectNoProjectState(command_name: []const u8) !void {
     }
 }
 
+fn runMcpStartupPrivacyRegression(allocator: std.mem.Allocator, cog_path: []const u8) !void {
+    try recreateTestRoot();
+    var test_root = try std.fs.cwd().openDir(TEST_ROOT, .{});
+    defer test_root.close();
+    try test_root.makePath(".cog");
+    try test_root.makePath("home");
+    try test_root.makePath("runtime");
+    try test_root.makePath("tmp");
+    try test_root.writeFile(.{ .sub_path = ".cog/settings.json", .data = "{}\n" });
+
+    const home = try test_root.realpathAlloc(allocator, "home");
+    defer allocator.free(home);
+    const runtime = try test_root.realpathAlloc(allocator, "runtime");
+    defer allocator.free(runtime);
+    const temp = try test_root.realpathAlloc(allocator, "tmp");
+    defer allocator.free(temp);
+
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("XDG_RUNTIME_DIR", runtime);
+    try env.put("TMPDIR", temp);
+
+    var child = std.process.Child.init(&.{ cog_path, "mcp" }, allocator);
+    child.cwd = TEST_ROOT;
+    child.env_map = &env;
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    const child_stdin = child.stdin.?;
+    child.stdin = null;
+    try child_stdin.writeAll(&.{0x03});
+    child_stdin.close();
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) fail("MCP startup privacy probe exited with {d}\n", .{code}),
+        else => fail("MCP startup privacy probe terminated unexpectedly\n", .{}),
+    }
+
+    try std.testing.expectError(error.FileNotFound, test_root.access("tmp/cog-mcp.log", .{}));
+    try std.testing.expectError(error.FileNotFound, test_root.access("runtime/cog-mcp.log", .{}));
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -107,5 +153,6 @@ pub fn main() !void {
         try expectNoProjectState(command.name);
     }
 
-    std.debug.print("CLI state isolation test passed\n", .{});
+    try runMcpStartupPrivacyRegression(allocator, cog_path);
+    std.debug.print("CLI state isolation and MCP startup privacy tests passed\n", .{});
 }
