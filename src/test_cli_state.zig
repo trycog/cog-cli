@@ -127,8 +127,27 @@ fn runMcpStartupPrivacyRegression(allocator: std.mem.Allocator, cog_path: []cons
         else => fail("MCP startup privacy probe terminated unexpectedly\n", .{}),
     }
 
-    try std.testing.expectError(error.FileNotFound, test_root.access("tmp/cog-mcp.log", .{}));
-    try std.testing.expectError(error.FileNotFound, test_root.access("runtime/cog-mcp.log", .{}));
+    // The product's diagnostic file is cog.log, so asserting one hard-coded
+    // name would miss a regression; reject any Cog-named file in the isolated
+    // temp directory and any log file anywhere under the runtime directory.
+    var tmp_dir = try test_root.openDir("tmp", .{ .iterate = true });
+    defer tmp_dir.close();
+    var tmp_iter = tmp_dir.iterate();
+    while (try tmp_iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "cog")) {
+            fail("MCP startup created shared temp state tmp/{s}\n", .{entry.name});
+        }
+    }
+
+    var runtime_dir = try test_root.openDir("runtime", .{ .iterate = true });
+    defer runtime_dir.close();
+    var walker = try runtime_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".log")) {
+            fail("MCP startup created runtime log {s}\n", .{entry.path});
+        }
+    }
 }
 
 // ── Scratch init coverage for every registry host ───────────────────────
