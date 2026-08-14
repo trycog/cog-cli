@@ -480,6 +480,7 @@ test "SessionManager discovers persisted sessions after restart" {
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     try tmp.dir.setAsCwd();
 
     var first = try SessionManager.init(std.testing.allocator);
@@ -508,6 +509,7 @@ test "SessionManager filters persisted sessions by status" {
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     try tmp.dir.setAsCwd();
 
     var mgr = try SessionManager.init(std.testing.allocator);
@@ -532,6 +534,7 @@ test "SessionManager reports corrupt persisted databases without hiding healthy 
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     try tmp.dir.setAsCwd();
 
     var first = try SessionManager.init(std.testing.allocator);
@@ -560,6 +563,7 @@ test "cleanupExpiredSessions deletes expired completed databases and preserves a
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     try tmp.dir.setAsCwd();
 
     var mgr = try SessionManager.init(std.testing.allocator);
@@ -592,6 +596,7 @@ test "createSession and getSession" {
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     tmp.dir.setAsCwd() catch return;
 
     var mgr = try SessionManager.init(std.testing.allocator);
@@ -616,6 +621,7 @@ test "stopSession updates status" {
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     tmp.dir.setAsCwd() catch return;
 
     var mgr = try SessionManager.init(std.testing.allocator);
@@ -637,6 +643,7 @@ test "destroySession removes and cleans up" {
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     tmp.dir.setAsCwd() catch return;
 
     var mgr = try SessionManager.init(std.testing.allocator);
@@ -662,6 +669,7 @@ test "listSessions returns all active" {
         old_cwd.setAsCwd() catch {};
         old_cwd.close();
     }
+    try tmp.dir.makePath(".cog");
     tmp.dir.setAsCwd() catch return;
 
     var mgr = try SessionManager.init(std.testing.allocator);
