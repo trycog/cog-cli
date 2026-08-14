@@ -680,38 +680,134 @@ fn createPrivateTempFile(dir: std.fs.Dir, allocator: std.mem.Allocator, name: []
     return error.TempFileAttemptsExceeded;
 }
 
-fn openValidatedConfigDir(path: []const u8, create: bool) !std.fs.Dir {
-    if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
-    if (!std.fs.path.isAbsolute(path)) return error.InvalidConfigPath;
-    if (create) {
-        debug_log.log("credential_boundary.openValidatedConfigDir: creating global config directory", .{});
-        std.fs.cwd().makePath(path) catch |err| {
-            debug_log.log("credential_boundary.openValidatedConfigDir: create failed: {s}", .{@errorName(err)});
-            return error.UnreadableStore;
-        };
-    }
+/// Components of the credential-approval path that may be created when missing:
+/// `.config` and `cog`. The trusted home itself is never fabricated, so a
+/// missing or unusable account home fails closed instead of silently creating a
+/// new trust root.
+const creatable_tail_components: usize = 2;
 
-    var dir = std.fs.openDirAbsolute(path, .{
-        .no_follow = true,
-        .iterate = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
+/// Open one path component through its parent descriptor. `O_NOFOLLOW` refuses a
+/// symlinked component, `O_DIRECTORY` refuses a non-directory, and `O_NONBLOCK`
+/// keeps a device or FIFO planted mid-path from stalling the process. The
+/// descriptor deliberately omits `O_PATH`, which would satisfy the walk but
+/// reject the `fchmod` and `fsync` the store depends on.
+fn openTrustedComponent(parent_fd: posix.fd_t, name: []const u8) !posix.fd_t {
+    var flags: posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true };
+    if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+    if (@hasField(posix.O, "NONBLOCK")) flags.NONBLOCK = true;
+
+    return posix.openat(parent_fd, name, flags, 0) catch |err| switch (err) {
+        error.FileNotFound => error.FileNotFound,
+        error.SymLinkLoop, error.NotDir => classifyRejectedComponent(parent_fd, name),
         else => {
-            debug_log.log("credential_boundary.openValidatedConfigDir: open failed: {s}", .{@errorName(err)});
+            debug_log.log("credential_boundary.openTrustedComponent: rejected component: {s}", .{@errorName(err)});
             return error.UnreadableStore;
         },
     };
-    errdefer dir.close();
+}
 
-    const stat = posix.fstat(dir.fd) catch return error.UnreadableStore;
-    if (stat.mode & posix.S.IFMT != posix.S.IFDIR) return error.UnreadableStore;
+/// `O_NOFOLLOW` reports `ELOOP` on some systems and `ENOTDIR` on others for a
+/// symlinked component, so name the actual rejection from the link itself.
+fn classifyRejectedComponent(parent_fd: posix.fd_t, name: []const u8) anyerror {
+    const stat = posix.fstatat(parent_fd, name, posix.AT.SYMLINK_NOFOLLOW) catch return error.UnreadableStore;
+    if (stat.mode & posix.S.IFMT == posix.S.IFLNK) {
+        debug_log.log("credential_boundary.openTrustedComponent: rejected symlinked component", .{});
+        return error.ConfigPathSymlink;
+    }
+    debug_log.log("credential_boundary.openTrustedComponent: rejected non-directory component", .{});
+    return error.ConfigPathNotDirectory;
+}
+
+/// A shared ancestor may belong to the effective user or to root, but must not
+/// be writable by anyone else: a group- or world-writable ancestor lets another
+/// account replace a component and capture the approval store. A sticky bit is
+/// the one safe shared form, because entries stay removable only by their owner.
+fn validateTrustedAncestor(fd: posix.fd_t) !void {
+    const stat = posix.fstat(fd) catch return error.UnreadableStore;
+    if (stat.mode & posix.S.IFMT != posix.S.IFDIR) return error.ConfigPathNotDirectory;
+    if (stat.uid != posix.geteuid() and stat.uid != 0) {
+        debug_log.log("credential_boundary.validateTrustedAncestor: rejected foreign owner", .{});
+        return error.ConfigDirWrongOwner;
+    }
+    if (stat.mode & 0o022 != 0 and stat.mode & posix.S.ISVTX == 0) {
+        debug_log.log("credential_boundary.validateTrustedAncestor: rejected writable ancestor", .{});
+        return error.ConfigDirPermissionsTooOpen;
+    }
+}
+
+fn validateStoreDirectory(fd: posix.fd_t, create: bool) !void {
+    const stat = posix.fstat(fd) catch return error.UnreadableStore;
+    if (stat.mode & posix.S.IFMT != posix.S.IFDIR) return error.ConfigPathNotDirectory;
     if (stat.uid != posix.geteuid()) return error.ConfigDirWrongOwner;
     if (stat.mode & 0o077 != 0) {
         if (!create) return error.ConfigDirPermissionsTooOpen;
         debug_log.log("credential_boundary.openValidatedConfigDir: restricting global config directory", .{});
-        dir.chmod(0o700) catch return error.UnreadableStore;
+        posix.fchmod(fd, 0o700) catch return error.UnreadableStore;
     }
-    return dir;
+}
+
+fn countPathComponents(path: []const u8) usize {
+    var components = std.mem.tokenizeScalar(u8, path, '/');
+    var total: usize = 0;
+    while (components.next()) |_| total += 1;
+    return total;
+}
+
+/// Open the approval-store directory by walking every component of `path` from
+/// the filesystem root through descriptors. Applying `no_follow` to the final
+/// component alone is insufficient: any parent could be swapped for a symlink
+/// and silently redirect the whole store.
+fn openValidatedConfigDir(path: []const u8, create: bool) !std.fs.Dir {
+    if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
+    if (!std.fs.path.isAbsolute(path)) return error.InvalidConfigPath;
+
+    const total = countPathComponents(path);
+    if (total == 0) return error.InvalidConfigPath;
+    const first_creatable = if (create and total > creatable_tail_components)
+        total - creatable_tail_components
+    else if (create)
+        0
+    else
+        total;
+
+    debug_log.log("credential_boundary.openValidatedConfigDir: walking {d} trusted path components", .{total});
+    var current = posix.open("/", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0) catch return error.UnreadableStore;
+    errdefer posix.close(current);
+
+    var components = std.mem.tokenizeScalar(u8, path, '/');
+    var index: usize = 0;
+    while (components.next()) |component| : (index += 1) {
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) {
+            return error.InvalidConfigPath;
+        }
+
+        const may_create = index >= first_creatable;
+        const next = openTrustedComponent(current, component) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                if (!may_create) return error.FileNotFound;
+                debug_log.log("credential_boundary.openValidatedConfigDir: creating trusted component", .{});
+                posix.mkdirat(current, component, 0o700) catch |make_err| switch (make_err) {
+                    error.PathAlreadyExists => {},
+                    else => {
+                        debug_log.log("credential_boundary.openValidatedConfigDir: create failed: {s}", .{@errorName(make_err)});
+                        return error.UnreadableStore;
+                    },
+                };
+                break :blk try openTrustedComponent(current, component);
+            },
+            else => return err,
+        };
+        posix.close(current);
+        current = next;
+
+        if (index + 1 == total) {
+            try validateStoreDirectory(current, create);
+        } else {
+            try validateTrustedAncestor(current);
+        }
+    }
+
+    return .{ .fd = current };
 }
 
 /// Open `path` as a path-only descriptor. Linux `O_PATH` handles accept
@@ -1244,8 +1340,74 @@ test "global approved origin store rejects a config directory symlink" {
 
     try tmp.dir.makePath(".config/outside");
     try tmp.dir.symLink("outside", ".config/cog", .{ .is_directory = true });
-    try std.testing.expectError(error.UnreadableStore, approve(allocator, "https://example.com"));
-    try std.testing.expectError(error.UnreadableStore, isApproved(allocator, "https://example.com"));
+    try std.testing.expectError(error.ConfigPathSymlink, approve(allocator, "https://example.com"));
+    try std.testing.expectError(error.ConfigPathSymlink, isApproved(allocator, "https://example.com"));
+}
+
+test "global approved origin store rejects a symlinked config parent" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const home = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(home);
+    setTestTrustedHome(home);
+    defer setTestTrustedHome(null);
+
+    // Only the final component is opened with `no_follow` today, so a swapped
+    // `.config` silently redirects the whole store even though `cog` itself is a
+    // real directory.
+    try tmp.dir.makePath("outside/cog");
+    try tmp.dir.symLink("outside", ".config", .{ .is_directory = true });
+
+    try std.testing.expectError(error.ConfigPathSymlink, isApproved(allocator, "https://example.com"));
+    try std.testing.expectError(error.ConfigPathSymlink, approve(allocator, "https://example.com"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("outside/cog/" ++ store_file_name, .{}));
+}
+
+test "global approved origin store rejects a symlinked trusted home component" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try tmp.dir.makePath("real/.config/cog");
+    try tmp.dir.symLink("real", "linked", .{ .is_directory = true });
+    const linked_home = try std.fs.path.join(allocator, &.{ root, "linked" });
+    defer allocator.free(linked_home);
+
+    setTestTrustedHome(linked_home);
+    defer setTestTrustedHome(null);
+
+    try std.testing.expectError(error.ConfigPathSymlink, isApproved(allocator, "https://example.com"));
+    try std.testing.expectError(error.ConfigPathSymlink, approve(allocator, "https://example.com"));
+}
+
+test "global approved origin store rejects a group-writable trusted component" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try tmp.dir.makePath("home/.config/cog");
+    var shared = try tmp.dir.openDir("home", .{ .iterate = true });
+    try shared.chmod(0o777);
+    shared.close();
+    const home = try std.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(home);
+
+    setTestTrustedHome(home);
+    defer setTestTrustedHome(null);
+
+    try std.testing.expectError(error.ConfigDirPermissionsTooOpen, isApproved(allocator, "https://example.com"));
+    try std.testing.expectError(error.ConfigDirPermissionsTooOpen, approve(allocator, "https://example.com"));
 }
 
 test "global approvals resolve the trusted home instead of HOME" {
