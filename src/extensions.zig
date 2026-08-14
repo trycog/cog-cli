@@ -1353,7 +1353,6 @@ fn resolveGithubRelease(allocator: std.mem.Allocator, git_url: []const u8, reque
             error.MissingReleaseArchive => printErr("error: extension release must include one .tar.gz or .tgz asset\n"),
             error.MissingArtifactDigest => printErr("error: extension release archive is missing a GitHub SHA-256 digest\n"),
             error.AmbiguousReleaseArchive => printErr("error: extension release includes multiple digest-bearing tar archives\n"),
-            else => printErr("error: invalid extension release archive metadata\n"),
         }
         return error.Explained;
     };
