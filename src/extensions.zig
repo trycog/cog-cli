@@ -1235,16 +1235,12 @@ fn chooseReleaseArtifact(release: *const ReleaseInfo) !ReleaseAssetInfo {
     var selected: ?ReleaseAssetInfo = null;
     for (release.assets) |asset| {
         if (!isTarArchiveAsset(asset.name)) continue;
-        if (asset.digest == null) continue;
         if (selected != null) return error.AmbiguousReleaseArchive;
         selected = asset;
     }
-    if (selected) |asset| return asset;
-
-    for (release.assets) |asset| {
-        if (isTarArchiveAsset(asset.name)) return error.MissingArtifactDigest;
-    }
-    return error.MissingReleaseArchive;
+    const asset = selected orelse return error.MissingReleaseArchive;
+    if (asset.digest == null) return error.MissingArtifactDigest;
+    return asset;
 }
 
 fn parseSha256Digest(text: []const u8) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
@@ -2209,7 +2205,7 @@ test "parseSha256Digest accepts canonical GitHub asset digests" {
     try std.testing.expectError(error.InvalidArtifactDigest, parseSha256Digest("sha256:not-hex"));
 }
 
-test "chooseRelease requires one digest-bearing tar archive asset" {
+test "chooseRelease requires exactly one digest-bearing tar archive asset" {
     const releases = [_]ReleaseInfo{
         .{
             .tag_name = "v1.2.3",
