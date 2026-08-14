@@ -1626,6 +1626,7 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             // discoverRemoteTools).
             if (runtime.remote_tools == null) {
                 try discoverRemoteTools(runtime);
+                session_ctx = try runtime.ensureSessionContext();
             }
 
             const result = try callRemoteHostedTool(runtime, session_ctx, tool_name, arguments);
@@ -3117,7 +3118,7 @@ test "runtimeCallTool keeps runtime mutex held across remote calls and event rec
     try std.testing.expect(std.mem.indexOf(u8, remote_branch, "runtime.mutex.lock()") == null);
 
     const remote_call = std.mem.indexOf(u8, remote_branch, "callRemoteHostedTool(runtime, session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
-    const rebind_context = std.mem.indexOf(u8, remote_branch, "session_ctx = try runtime.ensureSessionContext()") orelse return error.TestUnexpectedResult;
+    const rebind_context = std.mem.indexOfPos(u8, remote_branch, remote_call, "session_ctx = try runtime.ensureSessionContext()") orelse return error.TestUnexpectedResult;
     const record_event = std.mem.indexOf(u8, remote_branch, "session_context_mod.recordToolEvent(session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(remote_call < rebind_context);
     try std.testing.expect(rebind_context < record_event);
