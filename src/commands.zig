@@ -40,11 +40,19 @@ const reset = "\x1B[0m";
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn printErr(msg: []const u8) void {
+/// `File.writer` starts in positional mode, so a fresh writer per message
+/// rewrites from offset 0 whenever stderr is redirected to a regular file —
+/// each message overwrites the previous one. Streaming mode appends, which is
+/// what diagnostics (and the credential-approval warnings) require.
+fn writeDiagnostic(file: std.fs.File, msg: []const u8) void {
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = file.writerStreaming(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
+}
+
+fn printErr(msg: []const u8) void {
+    writeDiagnostic(std.fs.File.stderr(), msg);
 }
 
 /// Returns true if the file should be written (new file, user said yes, or accept-all).
@@ -1857,8 +1865,18 @@ fn approveCredentialHostWith(
         return .official;
     }
 
-    const already = seams.is_approved(context, allocator, origin.serialized) catch |err| {
-        return explainApprovalFailure(err);
+    const already = seams.is_approved(context, allocator, origin.serialized) catch |err| switch (err) {
+        // A default 0755 ~/.config/cog makes the store untrusted for reads, which
+        // is the right answer for a credential check but would otherwise make
+        // approval impossible. Treat it as "not approved yet" and continue: the
+        // write path restricts the directory to 0700 and revalidates before
+        // persisting, so the user action repairs the state it reported.
+        error.ConfigDirPermissionsTooOpen => blk: {
+            debug_log.log("commands.doctor: store directory is too open; approval will restrict it", .{});
+            printErr("  note: ~/.config/cog is group- or world-accessible; approving will restrict it to 0700.\n");
+            break :blk false;
+        },
+        else => return explainApprovalFailure(err),
     };
     if (already) {
         printApprovalLine("  {s} is already an approved credential destination.\n", .{origin.serialized});
@@ -2889,6 +2907,29 @@ const ApprovalProbe = struct {
     }
 };
 
+test "diagnostics append when stderr is redirected to a file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("diagnostics.log", .{ .read = true });
+    defer file.close();
+
+    // Each diagnostic uses its own writer. A positional writer restarts at
+    // offset 0 every time, so the second message would overwrite the first and
+    // silently truncate a security warning.
+    writeDiagnostic(file, "  error: --approve-host expects one exact HTTPS origin\n");
+    writeDiagnostic(file, "         rejected: HttpsRequired\n");
+
+    const body = try tmp.dir.readFileAlloc(allocator, "diagnostics.log", 4096);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings(
+        "  error: --approve-host expects one exact HTTPS origin\n" ++
+            "         rejected: HttpsRequired\n",
+        body,
+    );
+}
+
 test "approve-host stores the canonical origin only after an explicit confirmation" {
     const allocator = std.testing.allocator;
     var probe: ApprovalProbe = .{};
@@ -2941,6 +2982,74 @@ test "approve-host reports an already approved origin without prompting" {
     try std.testing.expectEqual(CredentialApprovalOutcome.already_approved, outcome);
     try std.testing.expectEqual(@as(usize, 0), probe.confirm_calls);
     try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+}
+
+const FailingLookupProbe = struct {
+    probe: ApprovalProbe = .{},
+    lookup_error: anyerror = error.ConfigDirPermissionsTooOpen,
+
+    fn seams() CredentialApprovalSeams {
+        return .{
+            .is_interactive = isInteractive,
+            .confirm = confirm,
+            .is_approved = isApproved,
+            .approve = approve,
+        };
+    }
+
+    fn isInteractive(context: *anyopaque) bool {
+        return self(context).probe.interactive;
+    }
+
+    fn confirm(context: *anyopaque, prompt: []const u8) anyerror!bool {
+        return ApprovalProbe.confirm(&self(context).probe, prompt);
+    }
+
+    fn isApproved(context: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!bool {
+        return self(context).lookup_error;
+    }
+
+    fn approve(context: *anyopaque, allocator: std.mem.Allocator, origin: []const u8) anyerror!bool {
+        return ApprovalProbe.approve(&self(context).probe, allocator, origin);
+    }
+
+    fn self(context: *anyopaque) *FailingLookupProbe {
+        return @ptrCast(@alignCast(context));
+    }
+};
+
+test "approve-host repairs a too-open store directory instead of deadlocking on it" {
+    const allocator = std.testing.allocator;
+    var probe: FailingLookupProbe = .{};
+
+    // A default 0755 ~/.config/cog makes the lookup refuse to trust the store.
+    // That must not make approval impossible: the write path restricts the
+    // directory to 0700 and revalidates before persisting.
+    const outcome = try approveCredentialHostWith(allocator, "https://memory.example:8443", &probe, FailingLookupProbe.seams());
+    try std.testing.expectEqual(CredentialApprovalOutcome.approved, outcome);
+    try std.testing.expectEqual(@as(usize, 1), probe.probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.probe.approve_calls);
+}
+
+test "approve-host still fails closed on unrepairable store failures" {
+    const allocator = std.testing.allocator;
+    const fatal = [_]anyerror{
+        error.ConfigDirWrongOwner,
+        error.ConfigPathSymlink,
+        error.StoreWrongOwner,
+        error.MalformedStore,
+        error.UnsupportedPlatform,
+    };
+
+    for (fatal) |lookup_error| {
+        var probe: FailingLookupProbe = .{ .lookup_error = lookup_error };
+        try std.testing.expectError(
+            error.Explained,
+            approveCredentialHostWith(allocator, "https://memory.example:8443", &probe, FailingLookupProbe.seams()),
+        );
+        try std.testing.expectEqual(@as(usize, 0), probe.probe.confirm_calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.probe.approve_calls);
+    }
 }
 
 test "approve-host rejects ambiguous and non-HTTPS destinations" {

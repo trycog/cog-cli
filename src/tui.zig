@@ -125,7 +125,9 @@ const RawTerminal = struct {
 fn stderrWrite(data: []const u8) void {
     if (@import("builtin").is_test) return;
     var buf: [8192]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    // Streaming, not positional: a positional writer restarts at offset 0 for
+    // every message and silently overwrites earlier output when stderr is a file.
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.writeAll(data) catch {};
     w.interface.flush() catch {};
 }
