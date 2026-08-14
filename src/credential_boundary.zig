@@ -347,7 +347,10 @@ fn approveCanonicalOriginInDir(dir: std.fs.Dir, allocator: std.mem.Allocator, ca
     debug_log.log("credential_boundary.approve: acquiring global store lock", .{});
     var lock_file = acquireStoreLock(dir) catch |err| {
         debug_log.log("credential_boundary.approve: lock acquisition failed: {s}", .{@errorName(err)});
-        return error.UnreadableStore;
+        return switch (err) {
+            error.StoreWrongOwner, error.StorePermissionsTooOpen => err,
+            else => error.UnreadableStore,
+        };
     };
     defer lock_file.close();
 
@@ -382,6 +385,10 @@ fn loadStore(dir: std.fs.Dir, allocator: std.mem.Allocator) !Store {
         error.FileNotFound => {
             debug_log.log("credential_boundary.loadStore: store missing; using empty approvals", .{});
             return store;
+        },
+        error.StoreWrongOwner, error.StorePermissionsTooOpen => {
+            debug_log.log("credential_boundary.loadStore: unsafe store metadata: {s}", .{@errorName(err)});
+            return err;
         },
         else => {
             debug_log.log("credential_boundary.loadStore: unreadable store: {s}", .{@errorName(err)});
@@ -792,7 +799,7 @@ test "approved origin store rejects noncanonical and invalid stored origins" {
     try std.testing.expectError(error.MalformedStore, isApprovedInDir(tmp.dir, allocator, "https://example.com"));
 }
 
-test "approved origin store rejects an existing permissive store" {
+test "approved origin store reports unsafe store permissions" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -802,7 +809,19 @@ test "approved origin store rejects an existing permissive store" {
     try existing.writeAll("{\n  \"version\": 1,\n  \"origins\": []\n}\n");
     try existing.chmod(0o644);
     existing.close();
-    try std.testing.expectError(error.UnreadableStore, approveInDir(tmp.dir, allocator, "https://example.com"));
+    try std.testing.expectError(error.StorePermissionsTooOpen, approveInDir(tmp.dir, allocator, "https://example.com"));
+}
+
+test "approved origin store reports unsafe lock permissions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var lock = try tmp.dir.createFile(lock_file_name, .{ .mode = 0o644 });
+    try lock.chmod(0o644);
+    lock.close();
+    try std.testing.expectError(error.StorePermissionsTooOpen, approveInDir(tmp.dir, allocator, "https://example.com"));
 }
 
 test "approved origin store rejects symlink store and lock files" {
