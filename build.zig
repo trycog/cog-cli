@@ -2,7 +2,7 @@ const std = @import("std");
 const zon = @import("build.zig.zon");
 
 const version = zon.version;
-const BENCH_INDEXING_CWD = "/private/tmp/cog-indexing-benchmark";
+const BENCH_INDEXING_CWD = ".zig-cache/indexing-benchmark";
 
 const tree_sitter_version = "v0.25.4";
 
@@ -167,11 +167,13 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "cog", .module = mod }},
         }),
     });
+    const prepare_indexing_bench = b.addSystemCommand(&.{ "mkdir", "-p", BENCH_INDEXING_CWD });
     const indexing_bench_run = b.addSystemCommand(&.{ "sh", "-c", "exec \"$1\"", "bench-indexing" });
     indexing_bench_run.addFileArg(indexing_bench_exe.getEmittedBin());
     indexing_bench_run.setCwd(.{ .cwd_relative = BENCH_INDEXING_CWD });
-    indexing_bench_run.setEnvironmentVariable("COG_INDEX_BENCH_ROOT", BENCH_INDEXING_CWD);
-    indexing_bench_run.setEnvironmentVariable("PWD", BENCH_INDEXING_CWD);
+    indexing_bench_run.setEnvironmentVariable("COG_INDEX_BENCH_ROOT", b.pathFromRoot(BENCH_INDEXING_CWD));
+    indexing_bench_run.setEnvironmentVariable("PWD", b.pathFromRoot(BENCH_INDEXING_CWD));
+    indexing_bench_run.step.dependOn(&prepare_indexing_bench.step);
     indexing_bench_run.step.dependOn(&check_grammars.step);
     const indexing_bench_step = b.step("bench-indexing", "Run deterministic offline indexing benchmark");
     indexing_bench_step.dependOn(&indexing_bench_run.step);

@@ -10,6 +10,15 @@ const SOURCE_FILE_COUNT: usize = 48;
 const EXPECTED_SYMBOLS_PER_FILE: usize = 4;
 const EXPECTED_DOCUMENTS = SOURCE_FILE_COUNT;
 const EXPECTED_SYMBOLS = SOURCE_FILE_COUNT * EXPECTED_SYMBOLS_PER_FILE;
+const EXPECTED_OCCURRENCES: usize = 288;
+const EXPECTED_INDEX_BYTES: usize = 25_166;
+const EXPECTED_QUERY_BYTES: usize = 1_468;
+const EXPECTED_INDEX_SHA256 = [_]u8{
+    0x2f, 0x33, 0xd1, 0xad, 0xa0, 0x05, 0xde, 0x91,
+    0x42, 0x82, 0xf6, 0x60, 0xf4, 0x03, 0x41, 0x4c,
+    0x99, 0xbb, 0xa8, 0x56, 0x35, 0x0c, 0x44, 0x83,
+    0xbd, 0xb5, 0x73, 0x23, 0x7d, 0xf9, 0xdd, 0x07,
+};
 const REINDEX_BATCH_SIZE: usize = 8;
 const QUERY_COUNT: usize = 4;
 
@@ -102,8 +111,14 @@ fn expectSnapshot(snapshot: Snapshot) void {
     if (snapshot.symbols != EXPECTED_SYMBOLS) {
         fail("indexing benchmark expected {d} symbols, found {d}\n", .{ EXPECTED_SYMBOLS, snapshot.symbols });
     }
-    if (snapshot.encoded_bytes == 0 or snapshot.occurrences < snapshot.symbols) {
-        fail("indexing benchmark produced invalid bytes/occurrences: bytes={d} occurrences={d}\n", .{ snapshot.encoded_bytes, snapshot.occurrences });
+    if (snapshot.occurrences != EXPECTED_OCCURRENCES) {
+        fail("indexing benchmark expected {d} occurrences, found {d}\n", .{ EXPECTED_OCCURRENCES, snapshot.occurrences });
+    }
+    if (snapshot.encoded_bytes != EXPECTED_INDEX_BYTES) {
+        fail("indexing benchmark expected {d} encoded bytes, found {d}\n", .{ EXPECTED_INDEX_BYTES, snapshot.encoded_bytes });
+    }
+    if (!std.mem.eql(u8, &snapshot.hash, &EXPECTED_INDEX_SHA256)) {
+        fail("indexing benchmark index hash changed: {x}\n", .{snapshot.hash});
     }
 }
 
@@ -160,7 +175,9 @@ fn runLoadAndQueries(allocator: std.mem.Allocator) !struct { u64, u64, usize } {
     {
         fail("indexing benchmark representative queries returned unexpected output:\n{s}\n", .{output});
     }
-    if (output.len == 0) fail("indexing benchmark query output was empty\n", .{});
+    if (output.len != EXPECTED_QUERY_BYTES) {
+        fail("indexing benchmark expected {d} query bytes, found {d}\n", .{ EXPECTED_QUERY_BYTES, output.len });
+    }
 
     debug_log.log("bench_indexing: load/cache and queries done query_bytes={d}", .{output.len});
     return .{ load_elapsed, query_elapsed, output.len };
