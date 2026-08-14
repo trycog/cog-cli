@@ -330,13 +330,17 @@ pub const DashboardTui = struct {
         if (self.listener) |l| {
             posix.close(l);
         }
-        // Remove socket file
+        // Remove only the socket node this process could have created. If
+        // startup rejected an unsafe regular file or symlink, preserve it.
         if (self.socket_path) |path| {
-            debug_log.log("DashboardTui.deinit: removing socket {s}", .{path});
-            std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => debug_log.log("DashboardTui.deinit: failed to remove {s}: {s}", .{ path, @errorName(err) }),
+            debug_log.log("DashboardTui.deinit: removing owned socket {s}", .{path});
+            paths.removeOwnedSocketIfPresent(path) catch |err| {
+                debug_log.log(
+                    "DashboardTui.deinit: preserving unsafe socket path {s}: {s}",
+                    .{ path, @errorName(err) },
+                );
             };
+            g_socket_path_len = 0;
             self.allocator.free(path);
             self.socket_path = null;
         }
@@ -357,11 +361,6 @@ pub const DashboardTui = struct {
         errdefer self.allocator.free(path);
         try paths.validateUnixSocketPath(path);
         self.socket_path = path;
-
-        // Copy to global for signal handler
-        if (path.len >= g_socket_path.len) return error.PathTooLong;
-        @memcpy(g_socket_path[0..path.len], path);
-        g_socket_path_len = path.len;
 
         // Remove only an owned socket node. Never unlink a regular file or
         // symlink that happens to occupy the runtime pathname.
@@ -386,6 +385,12 @@ pub const DashboardTui = struct {
         if (@import("builtin").os.tag != .windows) try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o600, 0);
         try posix.listen(sock, 5);
         self.listener = sock;
+
+        // The signal handler may unlink this path only after this process has
+        // successfully bound and begun listening on the socket.
+        if (path.len >= g_socket_path.len) return error.PathTooLong;
+        @memcpy(g_socket_path[0..path.len], path);
+        g_socket_path_len = path.len;
 
         // Enter raw terminal mode
         self.original_termios = try posix.tcgetattr(posix.STDIN_FILENO);
@@ -2526,4 +2531,21 @@ test "countSidebarItems with no session returns 0" {
     const tui = DashboardTui.init(std.testing.allocator);
     const count = tui.countSidebarItems(null);
     try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "dashboard teardown preserves an unsafe pre-existing socket path" {
+    if (@import("builtin").os.tag == .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "dashboard.sock", .data = "not a socket" });
+
+    const socket_path = try tmp.dir.realpathAlloc(std.testing.allocator, "dashboard.sock");
+    defer std.testing.allocator.free(socket_path);
+
+    var tui = DashboardTui.init(std.testing.allocator);
+    tui.socket_path = try std.testing.allocator.dupe(u8, socket_path);
+    tui.deinit();
+
+    try tmp.dir.access("dashboard.sock", .{});
 }
