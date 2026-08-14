@@ -304,23 +304,38 @@ test "ensureSchema migrates version 1 databases without losing data" {
     try std.testing.expectEqual(@as(i64, 1), getSchemaVersion(&db));
 }
 
-test "schema commit retries busy writers" {
+test "schema migration retries the whole transaction after busy" {
     var db = try Db.open(":memory:");
     defer db.close();
-    try db.exec("BEGIN");
 
-    const Committer = struct {
+    const Migration = struct {
         var attempts: usize = 0;
+        var rollbacks: usize = 0;
+        var transaction_open = false;
+        var completed_steps: usize = 0;
 
-        fn commit(test_db: *Db, sql: [*:0]const u8) sqlite.Error!void {
+        fn run(_: *Db) sqlite.Error!void {
+            std.debug.assert(!transaction_open);
             attempts += 1;
+            transaction_open = true;
+            errdefer {
+                transaction_open = false;
+                completed_steps = 0;
+                rollbacks += 1;
+            }
+
+            completed_steps += 1;
             if (attempts == 1) return error.SqliteBusy;
-            try test_db.exec(sql);
+            completed_steps += 1;
+            transaction_open = false;
         }
     };
 
-    try commitSchemaMigration(&db, Committer.commit);
-    try std.testing.expectEqual(@as(usize, 2), Committer.attempts);
+    try retrySchemaMigration(&db, Migration.run);
+    try std.testing.expectEqual(@as(usize, 2), Migration.attempts);
+    try std.testing.expectEqual(@as(usize, 1), Migration.rollbacks);
+    try std.testing.expect(!Migration.transaction_open);
+    try std.testing.expectEqual(@as(usize, 2), Migration.completed_steps);
 }
 
 test "concurrent schema migration is idempotent" {
