@@ -105,6 +105,9 @@ pub const ElfBinary = struct {
     owned: bool,
     sections: DebugSections,
     preferred_base: u64 = 0,
+    // Defaults to the strict relocatable assumption; parseElf records the
+    // real ELF type so fixed-address (ET_EXEC) cores can accept a zero bias.
+    is_pie: bool = true,
     decompressed_buffers: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !ElfBinary {
@@ -226,12 +229,32 @@ fn parseElf(data: []const u8) !ElfBinary {
 
     const elf_class = data[4];
     if (elf_class == ELFCLASS32) {
-        return parseElf32(data);
+        var result = try parseElf32(data);
+        result.is_pie = elfTypeIsPie(data);
+        return result;
     } else if (elf_class == ELFCLASS64) {
-        return parseElf64(data);
+        var result = try parseElf64(data);
+        result.is_pie = elfTypeIsPie(data);
+        return result;
     } else {
         return error.UnsupportedFormat;
     }
+}
+
+/// Only ET_DYN images relocate at load time; ET_EXEC executables map at their
+/// link-time addresses, so a zero load bias is valid for them.
+fn elfTypeIsPie(data: []const u8) bool {
+    const ET_DYN: u16 = 3;
+    if (data.len < 18) return true;
+    return std.mem.readInt(u16, data[16..18], .little) == ET_DYN;
+}
+
+test "ELF type detection distinguishes fixed-address executables" {
+    var header: [18]u8 = [_]u8{0} ** 18;
+    std.mem.writeInt(u16, header[16..18], 2, .little); // ET_EXEC
+    try std.testing.expect(!elfTypeIsPie(&header));
+    std.mem.writeInt(u16, header[16..18], 3, .little); // ET_DYN
+    try std.testing.expect(elfTypeIsPie(&header));
 }
 
 fn parseElf32(data: []const u8) !ElfBinary {

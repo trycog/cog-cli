@@ -227,6 +227,16 @@ pub const DwarfEngine = struct {
         return self.address_translation.runtimeToDwarf(address);
     }
 
+    /// Whether the loaded main binary maps at fixed link-time addresses
+    /// (ELF ET_EXEC) rather than relocating at load time.
+    fn mainBinaryIsFixedAddress(self: *const DwarfEngine) bool {
+        const native = self.binary orelse return false;
+        return switch (native) {
+            .elf => |elf| !elf.is_pie,
+            .macho => false,
+        };
+    }
+
     /// Whether a runtime PC lands inside a DWARF-space [low, high) range.
     fn pcWithinDwarfRange(self: *const DwarfEngine, runtime_pc: u64, low: u64, high: u64) bool {
         const dwarf_pc = self.runtimeToDwarf(runtime_pc);
@@ -357,11 +367,21 @@ pub const DwarfEngine = struct {
             }
 
             const canonical_path = std.fs.cwd().realpathAlloc(self.allocator, executable_path) catch {
+                if (self.mainBinaryIsFixedAddress()) break :blk fixed: {
+                    debug_log.log("dwarf.engine: fixed-address executable without NT_FILE mapping; using its link-time base", .{});
+                    break :fixed binary.preferred_base;
+                };
                 debug_log.log("dwarf.engine: ELF core lacks validated NT_FILE mapping path={s}", .{executable_path});
                 return err;
             };
             defer self.allocator.free(canonical_path);
             break :blk core.executableRuntimeBase(canonical_path) catch |canonical_err| {
+                // ET_EXEC images map at their link-time addresses, so a zero
+                // bias is correct and no NT_FILE evidence is required.
+                if (canonical_err == error.ExecutableMappingNotFound and self.mainBinaryIsFixedAddress()) {
+                    debug_log.log("dwarf.engine: fixed-address executable without NT_FILE mapping; using its link-time base", .{});
+                    break :blk binary.preferred_base;
+                }
                 debug_log.log("dwarf.engine: failed canonical core executable mapping path={s} error={s}", .{ canonical_path, @errorName(canonical_err) });
                 return canonical_err;
             };
@@ -369,8 +389,10 @@ pub const DwarfEngine = struct {
 
         // NT_FILE only requires page alignment, so a hostile core can carry a
         // base whose bias does not fit i64; loadBias would trap on @intCast.
+        // minInt(i64) itself is excluded because downstream translation
+        // negates the bias.
         const bias_wide = @as(i128, runtime_base) - @as(i128, binary.preferred_base);
-        if (bias_wide > std.math.maxInt(i64) or bias_wide < std.math.minInt(i64)) {
+        if (bias_wide > std.math.maxInt(i64) or bias_wide < -@as(i128, std.math.maxInt(i64))) {
             debug_log.log(
                 "dwarf.engine: rejecting out-of-range core load bias runtime_base=0x{x} preferred_base=0x{x}",
                 .{ runtime_base, binary.preferred_base },
@@ -5196,6 +5218,35 @@ test "DwarfEngine rejects core runtime bases that overflow the load bias" {
 
     try std.testing.expectError(error.InvalidExecutableMapping, engine.resolveCoreAddressTranslation("/tmp/pie"));
     try std.testing.expectEqual(@as(i64, 0), engine.address_translation.load_bias);
+}
+
+test "DwarfEngine accepts fixed-address ELF cores without NT_FILE mappings" {
+    const allocator = std.testing.allocator;
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+
+    const path = try allocator.dupe(u8, "/tmp/fixed");
+    engine.core_dump = .{
+        .data = path,
+        .segments = &.{},
+        .registers = .{},
+        .allocator = allocator,
+        .format = .elf,
+        .file_mappings = &.{},
+    };
+    engine.binary = .{ .elf = .{
+        .data = &.{},
+        .owned = false,
+        .sections = .{},
+        .preferred_base = 0x400000,
+        .is_pie = false,
+    } };
+
+    // ET_EXEC maps at its link-time addresses; missing NT_FILE evidence must
+    // not reject the core, and the bias must be zero.
+    try engine.resolveCoreAddressTranslation("/tmp/fixed");
+    try std.testing.expectEqual(@as(i64, 0), engine.address_translation.load_bias);
+    try std.testing.expectEqual(@as(u64, 0x401234), engine.dwarfToRuntime(0x401234));
 }
 
 test "DwarfEngine gates ELF core translation without NT_FILE mappings" {
