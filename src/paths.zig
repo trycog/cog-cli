@@ -94,6 +94,7 @@ pub fn getGlobalConfigDir(allocator: std.mem.Allocator) ![]const u8 {
 pub fn getProjectTempDir(allocator: std.mem.Allocator) ![]const u8 {
     const cog_dir = try findCogDir(allocator);
     defer allocator.free(cog_dir);
+    try validateOwnedCogDir(cog_dir);
 
     const temp_dir = try std.fs.path.join(allocator, &.{ cog_dir, "tmp" });
     errdefer allocator.free(temp_dir);
@@ -231,8 +232,76 @@ pub fn removeOwnedSocketIfPresent(path: []const u8) !void {
     }
     try validateRuntimeDirectoryOwner(path, stat.uid, std.posix.geteuid());
 
+    if (unixSocketHasListener(path)) {
+        debug_log.log("removeOwnedSocketIfPresent: preserving live socket {s}", .{path});
+        return error.SocketInUse;
+    }
+
     debug_log.log("removeOwnedSocketIfPresent: removing owned stale socket {s}", .{path});
     try std.fs.deleteFileAbsolute(path);
+}
+
+/// Probe whether a Unix socket path still has a live listener. Any ambiguous
+/// probe result is treated as live so cleanup never unlinks an endpoint that
+/// another same-user process is actively serving.
+fn unixSocketHasListener(path: []const u8) bool {
+    var address: std.posix.sockaddr.un = .{ .path = undefined };
+    if (path.len >= address.path.len) return true;
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch |err| {
+        debug_log.log("unixSocketHasListener: probe socket failed: {s}; treating {s} as live", .{ @errorName(err), path });
+        return true;
+    };
+    defer std.posix.close(fd);
+
+    std.posix.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un)) catch |err| switch (err) {
+        error.ConnectionRefused => {
+            debug_log.log("unixSocketHasListener: {s} refused the probe; stale", .{path});
+            return false;
+        },
+        error.FileNotFound => return false,
+        else => {
+            debug_log.log("unixSocketHasListener: probe error {s}; treating {s} as live", .{ @errorName(err), path });
+            return true;
+        },
+    };
+    debug_log.log("unixSocketHasListener: {s} accepted the probe; live", .{path});
+    return true;
+}
+
+/// The project `.cog` directory is the trust boundary for temporary paths
+/// handed to external indexers, which reopen them by name. Reject a symlinked
+/// or foreign-owned `.cog` (a repository can commit `.cog` as a symlink), and
+/// clear group/world write bits so no other account can swap entries under it
+/// after validation.
+fn validateOwnedCogDir(path: []const u8) !void {
+    if (builtin.os.tag == .windows) return;
+
+    const stat = try std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW);
+    const kind = stat.mode & std.posix.S.IFMT;
+    if (kind == std.posix.S.IFLNK) {
+        debug_log.log("validateOwnedCogDir: rejected symlinked .cog {s}", .{path});
+        return error.CogDirSymlink;
+    }
+    if (kind != std.posix.S.IFDIR) {
+        debug_log.log("validateOwnedCogDir: rejected non-directory .cog {s}", .{path});
+        return error.RuntimePathNotDirectory;
+    }
+
+    var dir = std.fs.openDirAbsolute(path, .{ .no_follow = true }) catch |err| {
+        debug_log.log("validateOwnedCogDir: cannot open {s}: {s}", .{ path, @errorName(err) });
+        return err;
+    };
+    defer dir.close();
+
+    const open_stat = try std.posix.fstat(dir.fd);
+    try validateRuntimeDirectoryOwner(path, open_stat.uid, std.posix.geteuid());
+    if (open_stat.mode & 0o022 != 0) {
+        debug_log.log("validateOwnedCogDir: clearing group/world write bits on {s}", .{path});
+        try dir.chmod(open_stat.mode & 0o777 & ~@as(std.posix.mode_t, 0o022));
+    }
 }
 
 fn ensurePrivateProjectTempDir(path: []const u8) !void {
@@ -408,6 +477,54 @@ test "getProjectTempDir creates a private directory under .cog" {
     defer dir.close();
     const stat = try std.posix.fstat(dir.fd);
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o700), stat.mode & 0o777);
+}
+
+test "getProjectTempDir rejects a symlinked .cog directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    // A repository can commit `.cog` as a symlink; everything below it would
+    // resolve outside the project trust boundary.
+    try tmp.dir.makeDir("outside");
+    try tmp.dir.symLink("outside", ".cog", .{ .is_directory = true });
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expectError(error.CogDirSymlink, getProjectTempDir(allocator));
+}
+
+test "getProjectTempDir clears group and world write bits on .cog" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    var cog = try tmp.dir.openDir(".cog", .{});
+    defer cog.close();
+    try cog.chmod(0o777);
+    try tmp.dir.setAsCwd();
+
+    const temp_dir = try getProjectTempDir(allocator);
+    defer allocator.free(temp_dir);
+
+    // Another account with write access to `.cog` could swap `tmp` out after
+    // validation, so the write bits must be gone before the path is trusted.
+    const stat = try std.posix.fstat(cog.fd);
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), stat.mode & 0o777);
 }
 
 test "getProjectTempDir rejects a symlinked temp directory" {
@@ -679,6 +796,32 @@ test "removeOwnedSocketIfPresent removes an owned Unix socket" {
 
     try removeOwnedSocketIfPresent(socket_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
+}
+
+test "removeOwnedSocketIfPresent preserves a live listening socket" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const socket_path = try std.fs.path.join(allocator, &.{ root, "live.sock" });
+    defer allocator.free(socket_path);
+    try validateUnixSocketPath(socket_path);
+
+    const socket = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(socket);
+    var address: std.posix.sockaddr.un = .{ .path = undefined };
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..socket_path.len], socket_path);
+    try std.posix.bind(socket, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un));
+    try std.posix.listen(socket, 1);
+
+    // A second same-user process must not unlink an endpoint that another
+    // daemon is actively serving.
+    try std.testing.expectError(error.SocketInUse, removeOwnedSocketIfPresent(socket_path));
+    try tmp.dir.access("live.sock", .{});
 }
 
 fn allocatorFilledPath(allocator: std.mem.Allocator, len: usize) ![]u8 {
