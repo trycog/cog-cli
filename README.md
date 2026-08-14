@@ -377,6 +377,18 @@ cog code:index "**/*.ts"    # Specific pattern
 
 Results go into `.cog/index.scip`. A built-in file watcher automatically keeps the index up to date as files are created, modified, deleted, or renamed — only watching files that match the glob patterns configured in `.cog/settings.json` under `code.index`. No manual re-indexing needed after the initial build.
 
+### Staying in sync
+
+The watcher only sees changes while `cog mcp` is running, so every index write also records a provenance manifest (`.cog/index-manifest.json`) with the size and mtime of each indexed file. A reconcile pass compares that manifest against the working tree and repairs exactly what drifted — modified and new files are reindexed, deleted files are dropped, and the pass escalates to a full rebuild when most of the tree changed or no manifest exists. When nothing drifted, the pass is a stat scan that never opens the index.
+
+Reconciliation runs automatically:
+
+- at MCP startup, covering everything that changed while no server was running;
+- when the git sentinel (`.git/HEAD`, the active ref, and `.git/index` mtimes) reports a checkout, pull, merge, or rebase — linked worktrees included;
+- periodically, when file watching is unavailable on the host.
+
+While a reconcile is in flight, `code_query` and `code_explore` results begin with an explicit staleness warning so agents verify critical answers with direct file reads instead of trusting a converging index. `cog doctor` reports drift counts, and `cog code:sync` runs the same reconcile on demand — useful in scripts and git hooks.
+
 Scan, bootstrap, reconciliation, and watcher paths share the same symlink-aware boundary policy. Symlinks that resolve inside the project are followed while preserving their logical alias; targets outside the project are excluded unless their root is explicitly listed under `code.external_roots`. Project-scan recommendations for external roots require interactive approval before `cog init` persists them.
 
 ### CLI compatibility

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Self-healing index synchronization: every index write records a provenance manifest (`.cog/index-manifest.json`), and a reconcile pass repairs exactly what drifted — automatically at MCP startup, when the git sentinel detects a checkout/pull/merge (linked worktrees included), periodically when file watching is unavailable, and on demand via the new `cog code:sync`. Small drifts reindex only the affected files; unknown provenance or large drifts escalate to a full rebuild, and an in-sync check is a stat scan that never opens the index.
+- `code_query` and `code_explore` results disclose an in-flight reconcile with an explicit staleness warning, and `cog doctor` reports index drift counts with a `code:sync` hint.
+
 - Exact-origin approval workflow for self-hosted memory credentials through `cog doctor --approve-host` and interactively during `cog init`, backed by a user-global approval store that repository configuration cannot override; non-interactive setup fails closed before any credential is read.
 - Explicit `cog observe:prune` command that deletes only expired finalized observation session databases according to `observe.retention_days`, always preserving capturing, stopped, error, and unexpired sessions; sessions are never pruned implicitly at startup.
 - Public, byte-exact MCP transport contract in CLI help and README: newline-delimited JSON with a maximum inbound frame size of 4 MiB (4,194,304 bytes); oversized frames are rejected as invalid requests and parsing resynchronizes at the next newline.
