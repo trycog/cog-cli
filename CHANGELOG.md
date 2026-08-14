@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.27.0] - 2026-08-14
 
 ### Added
 
@@ -788,6 +788,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
 [0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
+[0.27.0]: https://github.com/trycog/cog-cli/releases/tag/v0.27.0
 [0.26.0]: https://github.com/trycog/cog-cli/releases/tag/v0.26.0
 [0.25.0]: https://github.com/trycog/cog-cli/releases/tag/v0.25.0
 [0.24.2]: https://github.com/trycog/cog-cli/releases/tag/v0.24.2
