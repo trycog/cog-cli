@@ -267,6 +267,9 @@ For hosted memory:
 {"memory": {"brain": "https://trycog.ai/username/brain"}}
 ```
 
+Cog sends `COG_API_KEY` automatically only to the exact official origin `https://trycog.ai:443`. A self-hosted HTTPS origin must be approved explicitly in the global `~/.config/cog/approved-origins.json` store; an exact approved origin is allowed, while an unapproved origin is rejected before network I/O. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding.
+
+On Windows, global approved-origin reads and writes return `error.UnsupportedPlatform` because Zig 0.15 does not expose reparse-point-resistant file access needed for credential authorization state. URL parsing remains available; approval fails closed.
 **2.** For hosted memory, set your API key:
 
 ```sh
