@@ -205,9 +205,51 @@ pub fn validateUnixSocketPath(path: []const u8) !void {
     debug_log.log("validateUnixSocketPath: accepted {d}-byte path", .{path.len});
 }
 
+/// Held exclusive lock making one process the owner of a runtime socket path.
+/// The liveness probe in `removeOwnedSocketIfPresent` narrows but cannot close
+/// the same-user probe→unlink→bind race; every Cog starter must take this lock
+/// before touching the socket path and hold it for the socket's lifetime, so a
+/// second starter can neither steal a mid-bind endpoint nor unlink a
+/// successor's socket at teardown.
+pub const SocketOwnerLock = struct {
+    fd: ?std.posix.fd_t,
+
+    pub fn release(self: *SocketOwnerLock) void {
+        if (self.fd) |fd| {
+            // Closing the descriptor drops the flock.
+            std.posix.close(fd);
+            self.fd = null;
+        }
+    }
+};
+
+/// Acquire the exclusive owner lock for a runtime socket path. The lock file
+/// lives beside the socket in the private runtime directory and is never
+/// deleted, so the flock identity stays stable across owners.
+pub fn acquireSocketOwnerLock(allocator: std.mem.Allocator, socket_path: []const u8) !SocketOwnerLock {
+    if (builtin.os.tag == .windows) return .{ .fd = null };
+
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{socket_path});
+    defer allocator.free(lock_path);
+
+    const fd = try std.posix.open(lock_path, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o600);
+    errdefer std.posix.close(fd);
+
+    std.posix.flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB) catch |err| switch (err) {
+        error.WouldBlock => {
+            debug_log.log("acquireSocketOwnerLock: {s} is owned by another process", .{socket_path});
+            return error.SocketOwnedElsewhere;
+        },
+        else => return err,
+    };
+    debug_log.log("acquireSocketOwnerLock: acquired {s}", .{lock_path});
+    return .{ .fd = fd };
+}
+
 /// Remove a stale runtime socket only after proving it is an owned socket node.
 /// Runtime directories are private, so the validated node cannot be replaced by
-/// another user between this check and unlink.
+/// another user between this check and unlink. Callers that later bind the path
+/// must serialize the whole takeover with `acquireSocketOwnerLock`.
 pub fn removeOwnedSocketIfPresent(path: []const u8) !void {
     if (builtin.os.tag == .windows) {
         std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
@@ -796,6 +838,27 @@ test "removeOwnedSocketIfPresent removes an owned Unix socket" {
 
     try removeOwnedSocketIfPresent(socket_path);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
+}
+
+test "socket owner lock excludes concurrent takeover" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const socket_path = try std.fs.path.join(allocator, &.{ root, "owned.sock" });
+    defer allocator.free(socket_path);
+
+    var lock = try acquireSocketOwnerLock(allocator, socket_path);
+    // flock is per open file description, so a second acquisition conflicts
+    // even inside one process.
+    try std.testing.expectError(error.SocketOwnedElsewhere, acquireSocketOwnerLock(allocator, socket_path));
+    lock.release();
+
+    var second = try acquireSocketOwnerLock(allocator, socket_path);
+    second.release();
 }
 
 test "removeOwnedSocketIfPresent preserves a live listening socket" {

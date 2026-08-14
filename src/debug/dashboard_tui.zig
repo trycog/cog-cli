@@ -285,6 +285,7 @@ pub const DashboardTui = struct {
     running: bool,
 
     socket_path: ?[]const u8,
+    socket_owner_lock: ?paths.SocketOwnerLock,
 
     original_termios: ?posix.termios,
 
@@ -311,6 +312,7 @@ pub const DashboardTui = struct {
             .global_log = .{},
             .running = true,
             .socket_path = null,
+            .socket_owner_lock = null,
             .original_termios = null,
             .term_width = getTerminalSize().width,
             .term_height = getTerminalSize().height,
@@ -344,6 +346,13 @@ pub const DashboardTui = struct {
             self.allocator.free(path);
             self.socket_path = null;
         }
+        // Released only after the socket unlink above so no other starter can
+        // take over the path mid-teardown.
+        if (self.socket_owner_lock) |*lock| {
+            debug_log.log("DashboardTui.deinit: releasing socket owner lock", .{});
+            lock.release();
+            self.socket_owner_lock = null;
+        }
         // Restore terminal
         if (self.original_termios) |orig| {
             posix.tcsetattr(posix.STDIN_FILENO, .NOW, orig) catch {};
@@ -361,6 +370,17 @@ pub const DashboardTui = struct {
         errdefer self.allocator.free(path);
         try paths.validateUnixSocketPath(path);
         self.socket_path = path;
+
+        // Serialize the whole takeover — probe, unlink, bind — against every
+        // other same-user starter, and hold the lock until teardown finishes.
+        std.debug.assert(self.socket_owner_lock == null);
+        self.socket_owner_lock = paths.acquireSocketOwnerLock(self.allocator, path) catch |err| {
+            if (err == error.SocketOwnedElsewhere) {
+                printErr("error: Another dashboard is already running\n");
+                return error.Explained;
+            }
+            return err;
+        };
 
         // Remove only an owned socket node. Never unlink a regular file or
         // symlink that happens to occupy the runtime pathname.

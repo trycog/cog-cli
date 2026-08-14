@@ -20,6 +20,7 @@ pub const DaemonServer = struct {
     server: DebugServer,
     socket_fd: ?posix.socket_t = null,
     socket_path: ?[]const u8 = null,
+    socket_owner_lock: ?paths.SocketOwnerLock = null,
     pid_path: ?[]const u8 = null,
     last_activity: i64 = 0,
     session_idle_timeout_ms: i64 = DEFAULT_SESSION_IDLE_TIMEOUT_MS,
@@ -56,6 +57,13 @@ pub const DaemonServer = struct {
             self.allocator.free(path);
             self.pid_path = null;
         }
+        // Released only after the socket unlink above so no other starter can
+        // take over the path mid-teardown.
+        if (self.socket_owner_lock) |*lock| {
+            debug_log.log("DaemonServer.deinit: releasing socket owner lock", .{});
+            lock.release();
+            self.socket_owner_lock = null;
+        }
         self.server.deinit();
     }
 
@@ -75,6 +83,15 @@ pub const DaemonServer = struct {
 
         const sock_path = try paths.getDaemonSocketPath(self.allocator);
         paths.validateUnixSocketPath(sock_path) catch |err| {
+            self.allocator.free(sock_path);
+            return err;
+        };
+
+        // Serialize the whole takeover — probe, unlink, bind — against every
+        // other same-user starter, and hold the lock until teardown finishes.
+        std.debug.assert(self.socket_owner_lock == null);
+        self.socket_owner_lock = paths.acquireSocketOwnerLock(self.allocator, sock_path) catch |err| {
+            debug_log.log("DaemonServer.run: socket owner lock unavailable for {s}: {s}", .{ sock_path, @errorName(err) });
             self.allocator.free(sock_path);
             return err;
         };
@@ -361,6 +378,26 @@ test "daemon teardown preserves unsafe socket and removes published PID file" {
 
     try tmp.dir.access("daemon.sock", .{});
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("daemon.pid", .{}));
+}
+
+test "daemon teardown releases the socket owner lock" {
+    if (@import("builtin").os.tag == .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+    const socket_path = try std.fs.path.join(std.testing.allocator, &.{ root, "daemon.sock" });
+    defer std.testing.allocator.free(socket_path);
+
+    var daemon = DaemonServer.init(std.testing.allocator, null);
+    daemon.socket_owner_lock = try paths.acquireSocketOwnerLock(std.testing.allocator, socket_path);
+    daemon.socket_path = try std.testing.allocator.dupe(u8, socket_path);
+    daemon.deinit();
+
+    // A successor must be able to take over the path once teardown finished.
+    var lock = try paths.acquireSocketOwnerLock(std.testing.allocator, socket_path);
+    lock.release();
 }
 
 test "reaping a session queues dashboard end until delivery" {
