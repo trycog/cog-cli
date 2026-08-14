@@ -8,7 +8,7 @@ const help_text = @import("help_text.zig");
 const config_mod = @import("config.zig");
 const client = @import("client.zig");
 const settings_mod = @import("settings.zig");
-const code_intel = @import("code_intel.zig");
+const path_matcher = @import("path_matcher.zig");
 const debug_log = @import("debug_log.zig");
 const fs_util = @import("fs_util.zig");
 const memory_mod = @import("memory.zig");
@@ -3447,7 +3447,7 @@ fn replacePlaceholder(allocator: std.mem.Allocator, template: []const u8, placeh
 /// match a pattern are included — plus any pattern-matched files that aren't
 /// in the SCIP index (e.g. "**/*.md").  When no patterns are defined, all
 /// SCIP-indexed files are included (backwards-compatible default).
-fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.ArrayListUnmanaged([]const u8) {
+pub fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.ArrayListUnmanaged([]const u8) {
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
@@ -3458,35 +3458,26 @@ fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.Ar
     const patterns = if (settings) |s| if (s.code) |c| c.index else null else null;
 
     if (patterns) |pats| {
-        // Patterns defined — they are the source of truth.
-        // 1. Collect SCIP paths but only keep those matching a pattern.
-        var scip_paths: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer scip_paths.deinit(allocator);
-        loadScipFiles(allocator, cog_dir, &scip_paths, &seen);
+        const project_root = std.fs.path.dirname(cog_dir) orelse return files;
+        var matcher = try path_matcher.PathMatcher.init(allocator, .{
+            .project_root = project_root,
+            .patterns = pats,
+            .external_roots = if (settings) |s| if (s.code) |code| code.external_roots orelse &.{} else &.{} else &.{},
+        });
+        defer matcher.deinit();
 
-        for (scip_paths.items) |path| {
-            var matched = false;
-            for (pats) |pat| {
-                if (code_intel.globMatch(pat, path)) {
-                    matched = true;
-                    break;
-                }
-            }
-            if (matched) {
-                files.append(allocator, path) catch {
-                    allocator.free(path);
-                    continue;
-                };
-            } else {
-                // Remove from seen so pattern collection can re-add if needed
-                _ = seen.fetchRemove(path);
-                allocator.free(path);
-            }
+        var matched: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+        defer {
+            matcher.freeMatchedPaths(matched.items);
+            matched.deinit(allocator);
         }
-
-        // 2. Collect additional pattern-matched files not in the SCIP index
-        //    (e.g. **/*.md files that have no indexer).
-        loadSettingsPatternFiles(allocator, pats, &files, &seen);
+        try matcher.collect(&matched);
+        for (matched.items) |path| {
+            if (seen.contains(path.logical_path)) continue;
+            const duped = try allocator.dupe(u8, path.logical_path);
+            try files.append(allocator, duped);
+            try seen.put(allocator, duped, {});
+        }
     } else {
         // No patterns — include all SCIP-indexed files (legacy behavior).
         loadScipFiles(allocator, cog_dir, &files, &seen);
@@ -3549,33 +3540,6 @@ fn extractDocumentPath(data: []const u8) ?[]const u8 {
         dec.skipField(field.wire_type) catch return null;
     }
     return null;
-}
-
-/// Collect files matching patterns that aren't already in the file list.
-fn loadSettingsPatternFiles(
-    allocator: std.mem.Allocator,
-    patterns: []const []const u8,
-    files: *std.ArrayListUnmanaged([]const u8),
-    seen: *std.StringHashMapUnmanaged(void),
-) void {
-    for (patterns) |pattern| {
-        var pattern_files: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer pattern_files.deinit(allocator);
-
-        code_intel.collectGlobFiles(allocator, pattern, &pattern_files) catch continue;
-
-        for (pattern_files.items) |path| {
-            if (!seen.contains(path)) {
-                files.append(allocator, path) catch {
-                    allocator.free(path);
-                    continue;
-                };
-                seen.put(allocator, path, {}) catch {};
-            } else {
-                allocator.free(path);
-            }
-        }
-    }
 }
 
 fn sortFiles(items: [][]const u8) void {
@@ -3910,6 +3874,63 @@ test "replacePlaceholder no match" {
     const result = try replacePlaceholder(allocator, "no placeholder here", "{file_path}", "src/main.zig");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("no placeholder here", result);
+}
+
+test "collectSourceFiles uses PathMatcher logical source set" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var external = std.testing.tmpDir(.{});
+    defer external.cleanup();
+
+    try project.dir.makeDir(".cog");
+    try project.dir.makePath("src/generated");
+    try project.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "pub fn main() void {}\n" });
+    try project.dir.writeFile(.{ .sub_path = "src/generated/skip.zig", .data = "const skip = true;\n" });
+    try external.dir.writeFile(.{ .sub_path = "shared.zig", .data = "pub const shared = true;\n" });
+    const external_root = try external.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(external_root);
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+    try project.dir.symLink(external_root, "shared-link", .{ .is_directory = true });
+
+    const settings_data = try std.fmt.allocPrint(
+        allocator,
+        "{{\n  \"code\": {{\n    \"index\": [\"**/*.zig\", \"!**/generated/**\"],\n    \"external_roots\": [\"{s}\"]\n  }}\n}}\n",
+        .{external_root},
+    );
+    defer allocator.free(settings_data);
+    try project.dir.writeFile(.{ .sub_path = ".cog/settings.json", .data = settings_data });
+
+    const original = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(original);
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+    try std.posix.chdir(project_root);
+    defer std.posix.chdir(original) catch {};
+
+    const cog_dir = try project.dir.realpathAlloc(allocator, ".cog");
+    defer allocator.free(cog_dir);
+    var files = try collectSourceFiles(allocator, cog_dir);
+    defer {
+        for (files.items) |file| allocator.free(file);
+        files.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), files.items.len);
+    var saw_src = false;
+    var saw_src_alias = false;
+    var saw_shared_alias = false;
+    var saw_external_alias = false;
+    for (files.items) |file| {
+        if (std.mem.eql(u8, file, "src/main.zig")) saw_src = true;
+        if (std.mem.eql(u8, file, "src-link/main.zig")) saw_src_alias = true;
+        if (std.mem.eql(u8, file, "shared-link/shared.zig")) saw_shared_alias = true;
+        if (std.mem.startsWith(u8, file, "@external/") and std.mem.endsWith(u8, file, "/shared.zig")) saw_external_alias = true;
+    }
+    try std.testing.expect(saw_src);
+    try std.testing.expect(saw_src_alias);
+    try std.testing.expect(saw_shared_alias);
+    try std.testing.expect(saw_external_alias);
 }
 
 test "sortFiles" {
