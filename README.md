@@ -94,25 +94,33 @@ That's it. The interactive setup walks you through everything:
 2. **Agent selection**: pick which AI coding agents you use
 3. **Tool permissions**: optionally auto-allow all Cog tools so your agent doesn't prompt you on every call
 
-For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents or the closest host-native specialist surface, installs runtime policy assets where the host supports them, and, where available, auto-allows Cog tool permissions. It also writes `.cog/client-context.json` plus a local `.cog/.gitignore` for generated Cog artifacts, so the local MCP runtime can identify the installed host integrations and compile richer hosted-memory context without changing your repo-root ignore rules. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
+For each agent you select, `cog init` writes the system prompt, configures the MCP server connection, deploys specialized sub-agents or the closest host-native specialist surface, installs runtime policy assets where the host supports them, and, where available, auto-allows Cog tool permissions. Specialist capabilities drive both asset installation and prompt generation: Cog renders each prompt only after installation and mandates a specialist only when every selected host that reads that prompt successfully received it. It also writes `.cog/client-context.json` plus a local `.cog/.gitignore` for generated Cog artifacts, so the local MCP runtime can identify the installed host integrations and compile richer hosted-memory context without changing your repo-root ignore rules. Agent menus start alphabetically and then adapt over time based on your global selection history in `~/.config/cog/agent-selection-counts.json`.
 
 ### Supported agents
 
-| Agent | MCP Config | Sub-Agents | Tool Permissions | Cog-First Override | Context Packaging | Memory Write Enrichment |
-|-------|------------|:----------:|------------------|--------------------|------------------|-------------------------|
-| Amp | `.amp/settings.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
-| Claude Code | `.mcp.json` | Yes | Auto-allow | Hard sub-agent allowlist + hooks + project MCP approval | Yes | Hook/config reminders |
-| Cursor | `.cursor/mcp.json` | | | Soft AGENTS.md + rules | Yes | Prompt guidance |
-| Gemini CLI | `.gemini/settings.json` | Yes | Auto-allow | Medium hooks + sub-agent tool scoping | Yes | Hook/config reminders |
-| GitHub Copilot | `.vscode/mcp.json` | Yes | | Soft specialist tool scoping | Yes | Prompt guidance |
-| Goose | Global config | Yes | | Soft skill guidance | Yes | Prompt guidance |
-| OpenAI Codex CLI | `.codex/config.toml` | Yes | | Soft shared-config specialist guidance | Yes | Prompt guidance |
-| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
-| Pi | `.pi/mcp.json` | Yes | | Medium extension hooks + skills | Yes | Runtime reminders |
-| Roo Code | `.roo/mcp.json` | Yes | | Medium native mode groups | Yes | Prompt guidance |
-| Windsurf | Global config | Yes | | Soft skills + rules | Yes | Prompt guidance |
+| Agent | MCP Config | Specialist Surface | Tool Permissions | Cog-First Override | Context Packaging | Memory Write Enrichment |
+|-------|------------|--------------------|------------------|--------------------|------------------|-------------------------|
+| Amp | `.amp/settings.json` | `.agents/skills/` | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
+| Claude Code | `.mcp.json` | `.claude/agents/` | Auto-allow | Hard sub-agent allowlist + hooks + project MCP approval | Yes | Hook/config reminders |
+| Cursor | `.cursor/mcp.json` | `.cursor/rules/` | | Soft AGENTS.md + project rules | Yes | Prompt guidance |
+| Gemini CLI | `.gemini/settings.json` | `.gemini/agents/` | Auto-allow | Medium hooks + sub-agent tool scoping | Yes | Hook/config reminders |
+| GitHub Copilot | `.vscode/mcp.json` | `.github/agents/` | | Soft specialist tool scoping | Yes | Prompt guidance |
+| Goose | Global config | `.goose/skills/` | | Soft skill guidance | Yes | Prompt guidance |
+| OpenAI Codex CLI | `.codex/config.toml` | `[agents.*]` TOML sections | | Soft shared-config specialist guidance | Yes | Prompt guidance |
+| OpenCode | `opencode.json` | `.opencode/agents/` | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
+| Pi | `.pi/mcp.json` | `.pi/skills/` | | Medium extension hooks + skills | Yes | Runtime reminders |
+| Roo Code | `.roo/mcp.json` | `.roomodes` custom modes | | Medium native mode groups | Yes | Prompt guidance |
+| Windsurf | Global config | `.windsurf/skills/` | | Soft skills + rules | Yes | Prompt guidance |
 
-`cog init` now installs Cog-first code exploration guidance everywhere. Stronger enforcement depends on what each host agent can actually express: Claude Code now combines hard-scoped subagents with project hooks and a memory-completion stop gate, Gemini adds repo-local hook enforcement on top of sub-agent tool scoping, Amp ships an experimental workspace plugin with runtime memory reminders, OpenCode uses runtime plugins for code, debug, and memory workflow enforcement, Pi uses its extension system with `tool_call` hooks for runtime enforcement plus skills for specialist delegation, Windsurf and Goose use native skill folders, Roo can scope native mode groups, and Cursor falls back to AGENTS.md plus Cursor rules because Cursor does not currently expose a documented repo-local custom-subagent file format.
+Every registered host can receive the closest native equivalent of all five Cog specialists: `cog-code-query`, `cog-debug`, `cog-mem`, `cog-mem-validate`, and `cog-observe`. Memory and memory-validation assets are installed only when memory is configured; the experimental observe asset is installed only when observe is explicitly enabled. If the user skips a specialist file, prompt generation treats that specialist as unavailable, while write or configuration failures abort setup instead of leaving a partial mandatory configuration. For shared prompt targets such as `AGENTS.md`, Cog uses the intersection of successful installations across all selected readers, so one host never inherits a mandate it cannot fulfill.
+
+Stronger enforcement depends on what each host can express:
+
+- Claude Code, Gemini CLI, GitHub Copilot, and OpenCode receive dedicated agent files; tool isolation ranges from hard allowlists to advisory host configuration.
+- Cursor receives project rules rather than callable custom sub-agents because Cursor does not expose a documented repo-local custom-subagent format. Rules provide workflow guidance but cannot hard-deny tools per specialist.
+- Windsurf, Amp, Goose, and Pi receive native skill/workflow files. These are portable delegation surfaces, not guaranteed hard isolation; Amp and Pi add broader runtime policy assets where their extension systems allow it.
+- OpenAI Codex CLI stores each Cog specialist additively in its shared `.codex/config.toml` as an `[agents.<name>]` section. Cog refreshes its own sections while preserving unrelated TOML, but the host surface provides guidance rather than a per-file sandbox.
+- Roo Code stores each specialist as a custom mode in `.roomodes`. Native mode groups provide the closest tool scoping Roo supports, but they do not offer the same isolation guarantees as a dedicated subprocess.
 
 Hosted memory writes now pass through a client-side context compiler in `cog-cli`. When the remote brain supports enriched write APIs, Cog attaches trusted local provenance such as workspace, repo identity, MCP session, host integration, recent code/debug evidence, and write-reason hints before sending the write upstream. Legacy hosted servers still receive the original tool calls unchanged.
 
@@ -162,16 +170,17 @@ Tool families your agent discovers:
 - `debug_*` for the debugger (36 tools across core, extended, and specialist tiers; individual drivers may report unsupported operations).
 - `observe_*` for the experimental observation subsystem only when explicitly enabled. Observe is off by default; set `observe.enabled` to `true` in `.cog/settings.json` or set `COG_OBSERVE_ENABLED=1` to opt in.
 
-### Sub-agents
+### Specialists
 
-For hosts that support specialist delegation surfaces, `cog init` deploys code-query, debug, and memory specialists as sub-agents, skills, or role configs that your primary agent can delegate to:
+For every registered host, `cog init` deploys the closest supported delegation surface—sub-agent, skill, project rule, shared config section, or custom mode:
 
 - **cog-code-query** — code exploration via the SCIP index. Finds definitions, references, and symbols in a single call.
 - **cog-debug** — autonomous hypothesis-driven debugging. Sets breakpoints, inspects variables, steps through code, and reports findings.
 - **cog-mem** — memory lifecycle management. Handles recall, consolidation, and maintenance of your agent's knowledge graph.
 - **cog-mem-validate** — post-task memory validation. Consolidates short-term memories, reinforces validated knowledge, and flushes incorrect entries.
+- **cog-observe** — optional access to persisted observation sessions, backend status, and causal analysis. It is omitted unless observe is explicitly enabled; unsupported capture backends report their limitation instead of claiming an active capture.
 
-These specialists keep the primary agent's context clean by offloading specialized work.
+These specialists keep the primary agent's context clean by offloading specialized work. Host capability levels determine the installed asset format and whether guidance is advisory, config-scoped, or runtime-enforced.
 
 ---
 
