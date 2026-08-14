@@ -180,6 +180,26 @@ pub fn build(b: *std.Build) void {
     grammar_setup_tests.addFileArg(verify_source_test_exe.getEmittedBin());
     grammar_setup_tests.addFileArg(b.path("build.zig"));
 
+    // Windows cross-compilation gate. The credential boundary documents Windows
+    // as fail-closed (`error.UnsupportedPlatform`), which is only meaningful if
+    // the module still compiles for Windows — the POSIX store paths must stay
+    // behind comptime guards. Compile-only: there is no Windows runner in CI.
+    const windows_cross_step = b.step("test-windows-cross", "Compile the credential boundary for Windows (no execution)");
+    for ([_]std.Target.Cpu.Arch{ .x86_64, .aarch64 }) |arch| {
+        const windows_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/credential_boundary.zig"),
+                .target = b.resolveTargetQuery(.{
+                    .cpu_arch = arch,
+                    .os_tag = .windows,
+                    .abi = .gnu,
+                }),
+                .optimize = .Debug,
+            }),
+        });
+        windows_cross_step.dependOn(&windows_tests.step);
+    }
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -189,6 +209,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_fetch_source_tests.step);
     test_step.dependOn(&run_live_mcp_client_tests.step);
     test_step.dependOn(&grammar_setup_tests.step);
+    test_step.dependOn(windows_cross_step);
 
     // Benchmark
     const bench_exe = b.addExecutable(.{
