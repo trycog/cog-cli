@@ -1709,6 +1709,101 @@ test "observe specialist files preserve all-host parity when enabled" {
     try std.testing.expectEqual(agents.len, supported);
 }
 
+/// A marker that only appears in tool lists belonging to this specialist's
+/// own tool family. Used to derive "never reference an unsupported
+/// specialist's tools" checks from the registry instead of per-host tests.
+fn specialistToolMarker(kind: SpecialistKind) []const u8 {
+    return switch (kind) {
+        .code_query => "code_query",
+        .debug => "debug_launch",
+        .memory => "mem_learn",
+        .validate => "mem_reinforce",
+        .observe => "observe_start",
+    };
+}
+
+/// True when a header scopes individual Cog tools by name (Claude/Gemini
+/// `cog__` style or Copilot `cog/` style) rather than wildcard permissions.
+fn headerScopesCogToolsExplicitly(header: []const u8) bool {
+    return std.mem.indexOf(u8, header, "cog__") != null or
+        std.mem.indexOf(u8, header, "cog/") != null;
+}
+
+test "registry assets match declared capabilities for every host" {
+    for (agents) |agent| {
+        const caps = agent.capabilities();
+
+        // MCP install assets must follow the repo-local MCP capability.
+        try std.testing.expectEqual(caps.repo_local_mcp, agent.mcp_path != null);
+        try std.testing.expectEqual(caps.repo_local_mcp, agent.mcp_format != .global_only);
+
+        inline for (std.meta.tags(SpecialistKind)) |kind| {
+            const supported = caps.specialists.supports(kind);
+            try std.testing.expectEqual(supported, agent.specialistPath(kind) != null);
+
+            if (caps.subagent_support == .shared_config) {
+                // Shared-config hosts synthesize specialist sections inside
+                // one host config file; they never carry per-file headers.
+                try std.testing.expect(agent.specialistHeader(kind) == null);
+            } else {
+                try std.testing.expectEqual(supported, agent.specialistHeader(kind) != null);
+            }
+        }
+    }
+}
+
+test "hosts never receive instruction files referencing unsupported specialists" {
+    inline for (std.meta.tags(SpecialistKind)) |kind| {
+        for (agents) |agent| {
+            const caps = agent.capabilities();
+            if (caps.specialists.supports(kind)) continue;
+
+            // An unsupported specialist must not install any asset...
+            try std.testing.expect(agent.specialistPath(kind) == null);
+            try std.testing.expect(agent.specialistHeader(kind) == null);
+
+            // ...and no other instruction header for this host may reference
+            // that specialist's tool family (e.g. no debug delegation when
+            // debug tools are absent).
+            inline for (std.meta.tags(SpecialistKind)) |other| {
+                if (agent.specialistHeader(other)) |header| {
+                    try std.testing.expect(std.mem.indexOf(u8, header, specialistToolMarker(kind)) == null);
+                }
+            }
+        }
+    }
+}
+
+test "explicit tool scoping always covers the specialist's own tool family" {
+    inline for (std.meta.tags(SpecialistKind)) |kind| {
+        for (agents) |agent| {
+            const header = agent.specialistHeader(kind) orelse continue;
+            if (!headerScopesCogToolsExplicitly(header)) continue;
+            try std.testing.expect(std.mem.indexOf(u8, header, specialistToolMarker(kind)) != null);
+        }
+    }
+}
+
+test "specialist availability derives from capabilities and memory gating" {
+    for (agents) |agent| {
+        const specialists = agent.capabilities().specialists;
+        const with_memory = specialists.availability(true);
+        const without_memory = specialists.availability(false);
+
+        inline for (std.meta.tags(SpecialistKind)) |kind| {
+            try std.testing.expectEqual(specialists.supports(kind), with_memory.has(kind));
+        }
+
+        // Disabling memory must always strip memory-backed specialists while
+        // leaving the rest of the host's declared surface intact.
+        try std.testing.expect(!without_memory.memory);
+        try std.testing.expect(!without_memory.validate);
+        try std.testing.expectEqual(specialists.supports(.code_query), without_memory.code_query);
+        try std.testing.expectEqual(specialists.supports(.debug), without_memory.debug);
+        try std.testing.expectEqual(specialists.supports(.observe), without_memory.observe);
+    }
+}
+
 test "hosts that advertise specialist files have debug_file_path" {
     for (agents) |agent| {
         if (agent.subAgentsSummary().len != 0) {

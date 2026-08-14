@@ -2720,6 +2720,107 @@ test "runtimePolicyAssets stay capability-driven" {
     try std.testing.expectEqual(@as(usize, 0), runtimePolicyAssets(agents_mod.agents[2]).len);
 }
 
+/// Order-independent digest of every file below `dir`, so tests can detect
+/// whether an installer changed any host state at all.
+fn scratchStateDigest(allocator: std.mem.Allocator, dir: std.fs.Dir) !u64 {
+    var digest: u64 = 0;
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const content = try entry.dir.readFileAlloc(allocator, entry.basename, max_host_config_bytes);
+        defer allocator.free(content);
+        var h = std.hash.Wyhash.init(0);
+        h.update(entry.path);
+        h.update(&[_]u8{0});
+        h.update(content);
+        digest ^= h.final();
+    }
+    return digest;
+}
+
+test "tool permission installers derive from registry capabilities" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var base = try std.fs.cwd().openDir(".", .{});
+            defer base.close();
+
+            for (agents_mod.agents) |agent| {
+                var scratch = try base.makeOpenPath(agent.id, .{ .iterate = true });
+                defer scratch.close();
+                try scratch.setAsCwd();
+                defer base.setAsCwd() catch {};
+
+                // Init installs the MCP config before tool permissions; mirror
+                // that order so permission writers that merge into the MCP
+                // config observe the same starting state as a real init run.
+                try configureMcp(allocator, agent);
+                const before = try scratchStateDigest(allocator, scratch);
+                try configureToolPermissions(allocator, agent);
+                const after = try scratchStateDigest(allocator, scratch);
+
+                try std.testing.expectEqual(agent.capabilities().auto_tool_permissions, before != after);
+            }
+        }
+    }.run);
+}
+
+test "runtime policy installers derive from registry capabilities" {
+    for (agents_mod.agents) |agent| {
+        const caps = agent.capabilities();
+        const expects_assets = caps.runtime_policy_plugins or caps.memory_write_enrichment == .config;
+        try std.testing.expectEqual(expects_assets, runtimePolicyAssets(agent).len != 0);
+    }
+
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var base = try std.fs.cwd().openDir(".", .{});
+            defer base.close();
+
+            for (agents_mod.agents) |agent| {
+                var scratch = try base.makeOpenPath(agent.id, .{ .iterate = true });
+                defer scratch.close();
+                try scratch.setAsCwd();
+                defer base.setAsCwd() catch {};
+
+                try configureRuntimePolicy(allocator, agent);
+
+                var it = scratch.iterate();
+                const wrote_config = (try it.next()) != null;
+                try std.testing.expectEqual(
+                    agent.capabilities().memory_write_enrichment == .config,
+                    wrote_config,
+                );
+            }
+        }
+    }.run);
+}
+
+test "mcp installers derive from registry capabilities" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var base = try std.fs.cwd().openDir(".", .{});
+            defer base.close();
+
+            for (agents_mod.agents) |agent| {
+                var scratch = try base.makeOpenPath(agent.id, .{ .iterate = true });
+                defer scratch.close();
+                try scratch.setAsCwd();
+                defer base.setAsCwd() catch {};
+
+                try configureMcp(allocator, agent);
+
+                if (agent.capabilities().repo_local_mcp) {
+                    try std.testing.expect(fileExistsInCwd(agent.mcp_path.?));
+                } else {
+                    var it = scratch.iterate();
+                    try std.testing.expect((try it.next()) == null);
+                }
+            }
+        }
+    }.run);
+}
+
 test "writeTomlMcp appends once and is idempotent" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
