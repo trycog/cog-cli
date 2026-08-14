@@ -2153,6 +2153,30 @@ pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         printErr(msg);
         passed += 1;
         debug_log.log("doctor: code index ready, {d} docs, {d} bytes", .{ info.document_count, info.file_size });
+
+        // Freshness: does the index still describe the working tree?
+        const drift = code_intel.scanConfiguredDrift(allocator);
+        switch (drift.outcome) {
+            .unchanged => {
+                printErr("    " ++ cyan ++ check ++ reset ++ " Index in sync with the working tree\n");
+                passed += 1;
+            },
+            .changed => {
+                var drift_buf: [192]u8 = undefined;
+                const drift_msg = std.fmt.bufPrint(
+                    &drift_buf,
+                    "    " ++ yellow ++ "!" ++ reset ++ " Index drift: {d} changed, {d} removed{s} — run cog code:sync\n",
+                    .{ drift.changed, drift.removed, if (drift.full_resync) " (no provenance manifest)" else "" },
+                ) catch "    " ++ yellow ++ "!" ++ reset ++ " Index drift detected — run cog code:sync\n";
+                printErr(drift_msg);
+                warnings += 1;
+            },
+            .failed => {
+                printErr("    " ++ yellow ++ "!" ++ reset ++ " Index freshness unknown (no index patterns configured)\n");
+                warnings += 1;
+            },
+        }
+        debug_log.log("doctor: index drift outcome={s} changed={d} removed={d}", .{ @tagName(drift.outcome), drift.changed, drift.removed });
     } else {
         printErr("    " ++ yellow ++ "!" ++ reset ++ " Index unavailable\n");
         warnings += 1;
