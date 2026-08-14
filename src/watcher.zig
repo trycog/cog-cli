@@ -11,6 +11,9 @@ const debug_log = @import("debug_log.zig");
 pub const QUIET_WINDOW_NS: i128 = 200 * std.time.ns_per_ms;
 pub const MAX_BATCH_EVENTS: usize = 64;
 const MAX_WATCHER_LINE_BYTES: usize = std.fs.max_path_bytes;
+// How long teardown waits for the watcher thread before abandoning the join
+// so MCP shutdown cannot hang on a stuck CFRunLoop mach trap.
+const watcher_join_grace_ns: u64 = 2 * std.time.ns_per_s;
 
 pub const DrainEvent = union(enum) {
     path: []const u8,
@@ -99,6 +102,9 @@ pub const Watcher = struct {
     read_buf: [4096]u8,
     decoder: LineDecoder,
     overflow_pending: std.atomic.Value(bool),
+    // Set by the watcher thread as its final action so teardown can bound the
+    // join: a thread stuck in the macOS CFRunLoop mach trap never sets it.
+    exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // CFRunLoop cross-thread wakeup (macOS only).
     // Stored as usize for atomic access; 0 means not yet set.
     macos_run_loop: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -176,8 +182,19 @@ pub const Watcher = struct {
         }
     }
 
-    /// Stop the watcher thread and release resources.
+    /// Stop the watcher thread and release resources. The join is bounded:
+    /// a thread that stays stuck in the macOS CFRunLoop mach trap is abandoned
+    /// for process exit to reclaim rather than hanging shutdown.
     pub fn deinit(self: *Watcher) void {
+        if (!self.deinitWithin(watcher_join_grace_ns)) {
+            debug_log.log("Watcher.deinit: thread did not exit within grace; abandoning join for process exit", .{});
+        }
+    }
+
+    /// Bounded teardown. Returns false when the watcher thread had to be
+    /// abandoned; in that case the pipe descriptors and matcher are
+    /// deliberately left alive because the stuck thread may still touch them.
+    pub fn deinitWithin(self: *Watcher, timeout_ns: u64) bool {
         self.stop_flag.store(true, .release);
 
         // Wake up the macOS CFRunLoop so the thread exits immediately
@@ -192,11 +209,22 @@ pub const Watcher = struct {
         // Write a byte to unblock any pending read on the pipe
         _ = posix.write(self.pipe_write, "!") catch {};
 
-        if (self.thread) |t| t.join();
+        if (self.thread) |t| {
+            const poll_ns = 1 * std.time.ns_per_ms;
+            var waited: u64 = 0;
+            while (!self.exited.load(.acquire)) {
+                if (waited >= timeout_ns) return false;
+                std.Thread.sleep(poll_ns);
+                waited += poll_ns;
+            }
+            t.join();
+            self.thread = null;
+        }
 
         posix.close(self.pipe_read);
         posix.close(self.pipe_write);
         self.matcher.deinit();
+        return true;
     }
 
     /// File descriptor for the read end of the pipe, for use with poll().
@@ -620,6 +648,7 @@ const CF = struct {
 
 fn watcherThreadMacos(self: *Watcher) void {
     if (builtin.os.tag != .macos) return;
+    defer self.exited.store(true, .release);
 
     // Load frameworks dynamically
     var cf = CF.load() orelse return;
@@ -779,6 +808,7 @@ fn fseventsCallback(
 
 fn watcherThreadLinux(self: *Watcher) void {
     if (builtin.os.tag != .linux) return;
+    defer self.exited.store(true, .release);
 
     const linux = std.os.linux;
 
@@ -1402,6 +1432,77 @@ test "Watcher.init releases the settings it copies" {
 
     var watcher = Watcher.init(allocator) orelse return error.TestUnexpectedResult;
     watcher.deinit();
+}
+
+test "watcher teardown abandons a thread that never exits" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, ".cog/index.scip", "");
+    try writeTestFile(project.dir, ".cog/settings.json",
+        \\{"code": {"index": ["**/*.zig"]}}
+    );
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    try project.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var watcher = Watcher.init(allocator) orelse return error.TestUnexpectedResult;
+
+    // Stand in for a watcher thread stuck in the CFRunLoop mach trap: it
+    // never sets `exited`, so teardown must abandon the join within grace
+    // instead of hanging MCP shutdown.
+    const Stuck = struct {
+        fn run() void {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+    };
+    watcher.thread = try std.Thread.spawn(.{}, Stuck.run, .{});
+
+    try std.testing.expect(!watcher.deinitWithin(5 * std.time.ns_per_ms));
+
+    // Reclaim the stand-in so the test process stays clean; the abandoned
+    // resources are then released through the normal path.
+    watcher.thread.?.join();
+    watcher.thread = null;
+    try std.testing.expect(watcher.deinitWithin(5 * std.time.ns_per_ms));
+}
+
+test "watcher teardown joins a thread that exits within grace" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, ".cog/index.scip", "");
+    try writeTestFile(project.dir, ".cog/settings.json",
+        \\{"code": {"index": ["**/*.zig"]}}
+    );
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    try project.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var watcher = Watcher.init(allocator) orelse return error.TestUnexpectedResult;
+
+    const Exiting = struct {
+        fn run(w: *Watcher) void {
+            std.Thread.sleep(2 * std.time.ns_per_ms);
+            w.exited.store(true, .release);
+        }
+    };
+    watcher.thread = try std.Thread.spawn(.{}, Exiting.run, .{&watcher});
+
+    try std.testing.expect(watcher.deinitWithin(watcher_join_grace_ns));
+    try std.testing.expect(watcher.thread == null);
 }
 
 test "watcher events match initial PathMatcher collection" {
