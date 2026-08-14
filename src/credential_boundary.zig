@@ -539,9 +539,22 @@ fn validatePrivateRegularFile(file: std.fs.File) !void {
     }
 }
 
+/// Flush the store directory entry. `std.posix.fsync` treats `EBADF` as
+/// `unreachable`, which turns a path-only (Linux `O_PATH`) descriptor into a
+/// process abort instead of a refusal, so the syscall errno is mapped directly
+/// and every failure fails the commit closed.
 fn syncStoreDirectory(dir: std.fs.Dir) !void {
     if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
-    try posix.fsync(dir.fd);
+    while (true) {
+        switch (posix.errno(posix.system.fsync(dir.fd))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| {
+                debug_log.log("credential_boundary.syncStoreDirectory: fsync failed errno={s}", .{@tagName(err)});
+                return error.StoreDirectorySyncFailed;
+            },
+        }
+    }
 }
 
 fn writePrivateFileAtomic(dir: std.fs.Dir, allocator: std.mem.Allocator, name: []const u8, data: []const u8) !void {
@@ -637,6 +650,17 @@ fn openValidatedConfigDir(path: []const u8, create: bool) !std.fs.Dir {
         dir.chmod(0o700) catch return error.UnreadableStore;
     }
     return dir;
+}
+
+/// Open `path` as a path-only descriptor. Linux `O_PATH` handles accept
+/// `openat`/`renameat` but reject `fchmod` and `fsync` with `EBADF`, which is
+/// exactly the descriptor shape the approval store must never rely on.
+fn openPathOnlyDirForTest(path: []const u8) !std.fs.Dir {
+    if (!@hasField(posix.O, "PATH")) return error.SkipZigTest;
+    var flags: posix.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true };
+    @field(flags, "PATH") = true;
+    const fd = try posix.open(path, flags, 0);
+    return .{ .fd = fd };
 }
 
 fn makeTestFifo(dir: std.fs.Dir, name: []const u8) !void {
@@ -797,7 +821,7 @@ test "parseBrainUrl rejects canonical representation beyond the URL limit" {
 
 test "approved origin store defaults missing to empty and checks exact origins" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try std.testing.expect(!try isApprovedInDir(tmp.dir, allocator, "https://example.com"));
@@ -819,7 +843,7 @@ test "approved origin store does not leak on allocation failure" {
 
 test "approved origin store persists canonical sorted deduplicated pretty JSON" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     try std.testing.expect(try approveInDir(tmp.dir, allocator, "https://ZETA.example"));
@@ -843,21 +867,21 @@ test "approved origin store persists canonical sorted deduplicated pretty JSON" 
 test "approved origin store distinguishes malformed oversized and unreadable state" {
     const allocator = std.testing.allocator;
 
-    var malformed = std.testing.tmpDir(.{});
+    var malformed = std.testing.tmpDir(.{ .iterate = true });
     defer malformed.cleanup();
     var malformed_file = try malformed.dir.createFile(store_file_name, .{ .mode = 0o600 });
     try malformed_file.writeAll("{not-json}\n");
     malformed_file.close();
     try std.testing.expectError(error.MalformedStore, isApprovedInDir(malformed.dir, allocator, "https://example.com"));
 
-    var oversized = std.testing.tmpDir(.{});
+    var oversized = std.testing.tmpDir(.{ .iterate = true });
     defer oversized.cleanup();
     var oversized_file = try oversized.dir.createFile(store_file_name, .{ .mode = 0o600 });
     try oversized_file.setEndPos(max_store_bytes + 1);
     oversized_file.close();
     try std.testing.expectError(error.StoreTooLarge, isApprovedInDir(oversized.dir, allocator, "https://example.com"));
 
-    var unreadable = std.testing.tmpDir(.{});
+    var unreadable = std.testing.tmpDir(.{ .iterate = true });
     defer unreadable.cleanup();
     try unreadable.dir.makeDir(store_file_name);
     try std.testing.expectError(error.UnreadableStore, isApprovedInDir(unreadable.dir, allocator, "https://example.com"));
@@ -874,7 +898,7 @@ test "approved origin store requires an integer schema version token" {
 
     for (invalid_versions) |invalid_version| {
         const allocator = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
 
         var invalid_file = try tmp.dir.createFile(store_file_name, .{ .mode = 0o600 });
@@ -891,7 +915,7 @@ test "approved origin store requires an integer schema version token" {
 
 test "approved origin store rejects noncanonical and invalid stored origins" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var invalid_file = try tmp.dir.createFile(store_file_name, .{ .mode = 0o600 });
@@ -910,7 +934,7 @@ test "approved origin store reports unsafe store permissions" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var existing = try tmp.dir.createFile(store_file_name, .{ .mode = 0o644 });
     try existing.writeAll("{\n  \"version\": 1,\n  \"origins\": []\n}\n");
@@ -923,7 +947,7 @@ test "approved origin store reports unsafe lock permissions" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var lock = try tmp.dir.createFile(lock_file_name, .{ .mode = 0o644 });
     try lock.chmod(0o644);
@@ -935,7 +959,7 @@ test "approved origin store rejects symlink store and lock files" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var store_link = std.testing.tmpDir(.{});
+    var store_link = std.testing.tmpDir(.{ .iterate = true });
     defer store_link.cleanup();
     var target = try store_link.dir.createFile("target", .{ .mode = 0o600 });
     try target.writeAll("{\n  \"version\": 1,\n  \"origins\": []\n}\n");
@@ -943,7 +967,7 @@ test "approved origin store rejects symlink store and lock files" {
     try store_link.dir.symLink("target", store_file_name, .{});
     try std.testing.expectError(error.UnreadableStore, isApprovedInDir(store_link.dir, allocator, "https://example.com"));
 
-    var lock_link = std.testing.tmpDir(.{});
+    var lock_link = std.testing.tmpDir(.{ .iterate = true });
     defer lock_link.cleanup();
     var lock_target = try lock_link.dir.createFile("target", .{ .mode = 0o600 });
     lock_target.close();
@@ -955,7 +979,7 @@ test "approved origin store rejects FIFO store and lock files without blocking" 
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var store_fifo = std.testing.tmpDir(.{});
+    var store_fifo = std.testing.tmpDir(.{ .iterate = true });
     defer store_fifo.cleanup();
     try makeTestFifo(store_fifo.dir, store_file_name);
     try std.testing.expectError(
@@ -963,7 +987,7 @@ test "approved origin store rejects FIFO store and lock files without blocking" 
         isApprovedInDir(store_fifo.dir, allocator, "https://example.com"),
     );
 
-    var lock_fifo = std.testing.tmpDir(.{});
+    var lock_fifo = std.testing.tmpDir(.{ .iterate = true });
     defer lock_fifo.cleanup();
     try makeTestFifo(lock_fifo.dir, lock_file_name);
     try std.testing.expectError(
@@ -974,7 +998,7 @@ test "approved origin store rejects FIFO store and lock files without blocking" 
 
 test "approved origin store enforces the persisted size cap" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     var store: Store = .{};
@@ -1003,6 +1027,48 @@ test "approved origin store writes mode 0600 atomically" {
     while (try iterator.next()) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".approved-origins.json.tmp-"));
     }
+}
+
+test "validated config directory descriptor supports chmod and fsync" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("config");
+    var initial = try tmp.dir.openDir("config", .{ .iterate = true });
+    try initial.chmod(0o700);
+    initial.close();
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config");
+    defer allocator.free(config_path);
+
+    var validated = try openValidatedConfigDir(config_path, false);
+    defer validated.close();
+
+    // A Linux `O_PATH` handle fails both of these with `EBADF`, which makes the
+    // retained descriptor useless for restricting or durably committing the store.
+    try posix.fchmod(validated.fd, 0o700);
+    try posix.fsync(validated.fd);
+}
+
+test "atomic store fails closed when the directory descriptor cannot be synced" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!@hasField(posix.O, "PATH")) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const body = "{\n  \"version\": 1,\n  \"origins\": []\n}\n";
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var path_only = try openPathOnlyDirForTest(tmp_path);
+    defer path_only.close();
+
+    try std.testing.expectError(
+        error.StoreCommittedDurabilityUncertain,
+        writePrivateFileAtomic(path_only, allocator, store_file_name, body),
+    );
 }
 
 fn failDirectorySync(_: std.fs.Dir) anyerror!void {
@@ -1091,7 +1157,7 @@ test "global approval validates input before missing filesystem state" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const home = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(home);
@@ -1108,7 +1174,7 @@ test "global approved origin store rejects a config directory symlink" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const home = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(home);
@@ -1126,7 +1192,7 @@ test "validated global config directory supports chmod and durability sync" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.makeDir("config");
     var initial = try tmp.dir.openDir("config", .{});
@@ -1146,7 +1212,7 @@ test "approved origin operations retain the validated directory handle" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.makeDir("config");
     var initial = try tmp.dir.openDir("config", .{});
@@ -1169,7 +1235,7 @@ test "global approved origin store ignores repository-local configuration" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const home = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(home);
