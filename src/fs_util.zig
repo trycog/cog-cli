@@ -486,3 +486,41 @@ test "replaceDirectoryTransactional restores live after post-backup failure" {
     defer allocator.free(staged_version);
     try std.testing.expectEqualStrings("new\n", staged_version);
 }
+
+test "replaceDirectoryTransactional restores live when promotion itself fails" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("live");
+    try tmp.dir.makeDir("staged");
+    try tmp.dir.writeFile(.{ .sub_path = "live/version", .data = "old\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "staged/version", .data = "new\n" });
+
+    // Delete the staged directory from the hook so the promotion rename fails
+    // organically after the backup rename, exercising the real promotion
+    // catch/rollback path rather than the hook's own failure branch.
+    const Sabotage = struct {
+        var parent: ?std.fs.Dir = null;
+        fn removeStaged() anyerror!void {
+            try parent.?.deleteTree("staged");
+        }
+    };
+    Sabotage.parent = tmp.dir;
+    defer Sabotage.parent = null;
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        replaceDirectoryTransactionalWithHook(tmp.dir, allocator, "live", "staged", Sabotage.removeStaged),
+    );
+
+    const live_version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(live_version);
+    try std.testing.expectEqualStrings("old\n", live_version);
+
+    // Rollback must leave no backup residue behind.
+    var iterator = tmp.dir.iterate();
+    while (try iterator.next()) |entry| {
+        try std.testing.expectEqualStrings("live", entry.name);
+    }
+}
