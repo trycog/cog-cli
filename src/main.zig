@@ -513,7 +513,7 @@ fn printMemHelp() void {
 
 fn printMcpHelp() void {
     tui.header();
-    printErr(bold ++ "  cog mcp" ++ reset ++ " — MCP server over stdio\n" ++ "\n" ++ bold ++ "  Usage: " ++ reset ++ "cog mcp [options]\n" ++ "\n" ++ dim ++ "  Starts a local Model Context Protocol server on stdio.\n" ++ dim ++ "  This command is intended to be launched by MCP clients.\n" ++ "\n" ++ bold ++ "  Options\n" ++ reset ++ "    " ++ bold ++ "--help, -h" ++ reset ++ "            " ++ dim ++ "Show this help message\n" ++ reset ++ "    " ++ bold ++ "--debug-tools=TIER" ++ reset ++ "    " ++ dim ++ "Limit exposed debug tools (core, extended, all)\n" ++ "                              core: 7 essential tools (launch, breakpoint, run, inspect, stacktrace, stop, sessions)\n" ++ "                              extended: core + threads, attach, set_variable, watchpoint, exception_info, restart\n" ++ "                              all: all 36 debug tools (default)" ++ reset ++ "\n" ++ "\n");
+    printErr(help.mcp);
 }
 
 fn printStdout(msg: []const u8) void {

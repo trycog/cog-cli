@@ -745,7 +745,12 @@ fn drainConsumed(allocator: std.mem.Allocator, input: *std.ArrayListUnmanaged(u8
     _ = allocator;
 }
 
-const max_mcp_message_bytes: usize = 4 * 1024 * 1024;
+/// Maximum byte length accepted for one inbound newline-delimited JSON frame.
+/// Frames above this transport contract are rejected before JSON-RPC dispatch.
+pub const max_transport_frame_bytes: usize = 4 * 1024 * 1024;
+
+/// Stable human-readable rendering of `max_transport_frame_bytes` for CLI/docs.
+pub const max_transport_frame_size_label = "4 MiB (4,194,304 bytes)";
 
 const BufferedMessage = union(enum) {
     message: []u8,
@@ -801,8 +806,8 @@ fn nextMessageFromBuffer(
     // Find the newline that terminates this JSON message.
     const newline_pos = std.mem.indexOfScalar(u8, input.items, '\n');
     if (newline_pos) |pos| {
-        if (pos > max_mcp_message_bytes) {
-            debug_log_mod.log("mcp.framing: oversized complete message bytes={d}, limit={d}", .{ pos, max_mcp_message_bytes });
+        if (pos > max_transport_frame_bytes) {
+            debug_log_mod.log("mcp.framing: oversized complete message bytes={d}, limit={d}", .{ pos, max_transport_frame_bytes });
             try drainConsumed(allocator, input, pos + 1);
             return .oversized_complete;
         }
@@ -820,7 +825,7 @@ fn nextMessageFromBuffer(
         var depth: usize = 0;
         var in_string = false;
         var escape = false;
-        const scan_len = @min(input.items.len, max_mcp_message_bytes + 1);
+        const scan_len = @min(input.items.len, max_transport_frame_bytes + 1);
         for (input.items[0..scan_len], 0..) |c, i| {
             if (escape) {
                 escape = false;
@@ -840,8 +845,8 @@ fn nextMessageFromBuffer(
                     depth -= 1;
                     if (depth == 0) {
                         const end = i + 1;
-                        if (end > max_mcp_message_bytes) {
-                            debug_log_mod.log("mcp.framing: oversized complete brace-framed message bytes={d}, limit={d}", .{ end, max_mcp_message_bytes });
+                        if (end > max_transport_frame_bytes) {
+                            debug_log_mod.log("mcp.framing: oversized complete brace-framed message bytes={d}, limit={d}", .{ end, max_transport_frame_bytes });
                             try drainConsumed(allocator, input, end);
                             return .oversized_complete;
                         }
@@ -854,8 +859,8 @@ fn nextMessageFromBuffer(
         }
     }
 
-    if (input.items.len > max_mcp_message_bytes) {
-        debug_log_mod.log("mcp.framing: oversized partial message buffered={d}, limit={d}; discarding until newline", .{ input.items.len, max_mcp_message_bytes });
+    if (input.items.len > max_transport_frame_bytes) {
+        debug_log_mod.log("mcp.framing: oversized partial message buffered={d}, limit={d}; discarding until newline", .{ input.items.len, max_transport_frame_bytes });
         input.clearRetainingCapacity();
         state.discarding_oversized = true;
         return .oversized_partial;
@@ -3003,20 +3008,25 @@ test "nextMessageFromBuffer returns null for incomplete JSON" {
     try std.testing.expect(buf.items.len == partial.len);
 }
 
+test "MCP transport frame limit is a public byte-exact contract" {
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), max_transport_frame_bytes);
+    try std.testing.expectEqualStrings("4 MiB (4,194,304 bytes)", max_transport_frame_size_label);
+}
+
 test "nextMessageFromBuffer accepts a message at the size limit" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     var state: MessageFramingState = .{};
 
-    try buf.appendNTimes(allocator, 'x', max_mcp_message_bytes);
+    try buf.appendNTimes(allocator, 'x', max_transport_frame_bytes);
     try buf.append(allocator, '\n');
 
     const framed = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
     switch (framed) {
         .message => |msg| {
             defer allocator.free(msg);
-            try std.testing.expectEqual(max_mcp_message_bytes, msg.len);
+            try std.testing.expectEqual(max_transport_frame_bytes, msg.len);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -3028,7 +3038,7 @@ test "nextMessageFromBuffer tags an oversized complete line and resyncs" {
     defer buf.deinit(allocator);
     var state: MessageFramingState = .{};
 
-    try buf.appendNTimes(allocator, 'x', max_mcp_message_bytes + 1);
+    try buf.appendNTimes(allocator, 'x', max_transport_frame_bytes + 1);
     try buf.appendSlice(allocator, "\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
 
     const oversized = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
@@ -3051,7 +3061,7 @@ test "nextMessageFromBuffer tags an oversized brace-complete message" {
     var state: MessageFramingState = .{};
 
     try buf.append(allocator, '{');
-    try buf.appendNTimes(allocator, ' ', max_mcp_message_bytes - 1);
+    try buf.appendNTimes(allocator, ' ', max_transport_frame_bytes - 1);
     try buf.append(allocator, '}');
 
     const oversized = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
@@ -3065,7 +3075,7 @@ test "nextMessageFromBuffer tags an oversized partial line and discards through 
     defer buf.deinit(allocator);
     var state: MessageFramingState = .{};
 
-    try buf.appendNTimes(allocator, 'x', max_mcp_message_bytes + 1);
+    try buf.appendNTimes(allocator, 'x', max_transport_frame_bytes + 1);
     const oversized = (try nextMessageFromBuffer(allocator, &buf, &state)).?;
     try std.testing.expect(oversized == .oversized_partial);
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);

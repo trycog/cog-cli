@@ -156,6 +156,8 @@ For hosts with runtime support, `cog init` also installs repo-local enforcement 
 
 Cog runs as an [MCP server](https://modelcontextprotocol.io/) over stdio. Your AI agent connects to it and discovers tools at runtime. You don't type Cog commands yourself. Your agent calls them through MCP.
 
+The stdio transport accepts newline-delimited JSON objects with a maximum inbound frame size of **4 MiB (4,194,304 bytes)**. Cog rejects oversized frames as JSON-RPC invalid requests before dispatch and then resynchronizes at the next newline.
+
 ```
 Your Agent  <->  MCP (stdio)  <->  cog mcp
                                      |-- Memory (local SQLite or trycog.ai)
