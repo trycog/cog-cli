@@ -42,6 +42,7 @@ fi
 if [ "$has_debug" = true ]; then
   printf '%s\n' '- A Cog debug daemon is running. Check for active debug sessions and stop them when done.'
 fi
+printf '%s\n' '- Load the cog-explore skill before code-intelligence calls and the cog-remember skill before memory writes.'
 printf '%s\n' '- If Cog code tools were used, ensure durable findings are stored via cog-mem-validate before finishing.'
 
 exit 0

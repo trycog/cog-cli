@@ -54,6 +54,14 @@ export default function activate(ctx: ExtensionContext) {
     sessionState.pendingConsolidation = false
   })
 
+  // Compaction rewrites the context and can drop the always-on Cog
+  // guidance; re-inject a compact kernel reminder so the workflow survives.
+  ctx.on('session_compact', () => {
+    process.stderr.write(
+      'Cog workflow reminder (post-compaction): use Cog code intelligence (cog_code_explore, cog_code_query) instead of shell search; recall with cog_mem_recall before broad exploration; load the cog-explore skill before code-intelligence calls and the cog-remember skill before memory writes; consolidate durable knowledge before finishing.\n',
+    )
+  })
+
   ctx.on('tool_call', (event) => {
     const toolName = getToolName(event)
     const text = eventText(event)
