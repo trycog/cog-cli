@@ -236,6 +236,22 @@ pub const PathMatcher = struct {
         }
     }
 
+    /// True when a physical path is one the watcher should not react to at all:
+    /// it sits under no approved root, or every root that contains it places it
+    /// inside a policy-excluded directory (dotfiles, vendor and build output).
+    ///
+    /// Directory churn in those trees is constant — build caches, VCS internals
+    /// — and reacting to it would schedule reconciliation work for paths that
+    /// can never be indexed.
+    pub fn ignoresPhysicalPath(self: *const PathMatcher, physical_path: []const u8) bool {
+        for (self.roots) |root| {
+            const suffix = relativeContained(physical_path, root.canonical_path) orelse continue;
+            if (suffix.len == 0) return false;
+            if (!isPolicyExcluded(suffix)) return false;
+        }
+        return true;
+    }
+
     pub fn allowsPhysicalPath(self: *const PathMatcher, physical_path: []const u8) bool {
         const canonical = std.fs.realpathAlloc(self.allocator, physical_path) catch return false;
         defer self.allocator.free(canonical);
@@ -993,6 +1009,42 @@ test "PathMatcher rediscovers aliases created after startup" {
     try matcher.mapPhysicalToLogical(physical, &pruned);
     try std.testing.expectEqual(@as(usize, 1), pruned.items.len);
     try expectContainsLogical(pruned.items, "src/main.zig");
+}
+
+test "PathMatcher ignores physical paths no root can index" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+    const outside_root = try outside.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(outside_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    const watched = try std.fs.path.join(allocator, &.{ project_root, "src/new-dir" });
+    defer allocator.free(watched);
+    const vendored = try std.fs.path.join(allocator, &.{ project_root, "node_modules/pkg/dist" });
+    defer allocator.free(vendored);
+    const hidden = try std.fs.path.join(allocator, &.{ project_root, ".git/objects/tmp" });
+    defer allocator.free(hidden);
+    const unrelated = try std.fs.path.join(allocator, &.{ outside_root, "somewhere" });
+    defer allocator.free(unrelated);
+
+    try std.testing.expect(!matcher.ignoresPhysicalPath(watched));
+    try std.testing.expect(!matcher.ignoresPhysicalPath(project_root));
+    try std.testing.expect(matcher.ignoresPhysicalPath(vendored));
+    try std.testing.expect(matcher.ignoresPhysicalPath(hidden));
+    try std.testing.expect(matcher.ignoresPhysicalPath(unrelated));
 }
 
 test "PathMatcher refuses aliases that collection cannot reach" {

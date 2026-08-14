@@ -720,6 +720,7 @@ fn fseventsCallback(
         if (flags & interesting == 0) continue;
 
         const abs_path = std.mem.span(event_paths[i]);
+        if (self.matcher.ignoresPhysicalPath(abs_path)) continue;
 
         // A symlink appearing or disappearing changes which logical names a
         // physical path answers to — same rule the inotify backend applies.
@@ -835,6 +836,8 @@ fn watcherThreadLinux(self: *Watcher) void {
                 continue;
             };
             defer self.allocator.free(abs_path);
+
+            if (self.matcher.ignoresPhysicalPath(abs_path)) continue;
 
             const is_directory = event.mask & linux.IN.ISDIR != 0;
             const appeared = event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0;
@@ -1296,9 +1299,12 @@ test "watcher events match initial PathMatcher collection" {
     try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
     try writeTestFile(project.dir, "src/generated/skip.zig", "const skip = true;\n");
     try writeTestFile(external.dir, "shared.zig", "pub const shared = true;\n");
+    try external.dir.symLink("lib", "lib-link", .{ .is_directory = true });
+    try writeTestFile(external.dir, "lib/inner.zig", "pub const inner = true;\n");
     const external_root = try external.dir.realpathAlloc(allocator, ".");
     defer allocator.free(external_root);
     try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+    try project.dir.symLink("src/main.zig", "entry.zig", .{});
     try project.dir.symLink(external_root, "shared-link", .{ .is_directory = true });
 
     const project_root = try project.dir.realpathAlloc(allocator, ".");
