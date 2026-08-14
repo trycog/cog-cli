@@ -103,6 +103,14 @@ export default async () => ({
         " Targeted follow-up only. Repeated file-scoped architecture queries across multiple files may be rejected; batch with cog_code_explore instead."
     }
   },
+  // Compaction rewrites the context; push the Cog workflow kernel into the
+  // continuation summary so the policy survives, mirroring the Claude
+  // PreCompact carry-forward.
+  "experimental.session.compacting": async (_, output) => {
+    output.context.push(
+      "[Cog compact carry-forward] Use Cog code intelligence (cog_code_explore, cog_code_query) instead of shell search for structural exploration; recall with cog_mem_recall before broad exploration; load the cog-explore skill before code-intelligence calls and the cog-remember skill before memory writes; consolidate durable knowledge via cog-mem-validate before finishing."
+    )
+  },
   "experimental.chat.system.transform": async (_, output) => {
     output.system.push(
       "Cog batching policy: for repository-understanding tasks, make one initial batched cog_code_explore call with include_architecture=true and overview_scope=repo.",
