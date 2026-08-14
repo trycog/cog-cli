@@ -9,18 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Exact-origin approval workflow for self-hosted memory credentials through `cog doctor --approve-host`, backed by a user-global approval store that repository configuration cannot override.
+- Exact-origin approval workflow for self-hosted memory credentials through `cog doctor --approve-host` and interactively during `cog init`, backed by a user-global approval store that repository configuration cannot override; non-interactive setup fails closed before any credential is read.
+- Explicit `cog observe:prune` command that deletes only expired finalized observation session databases according to `observe.retention_days`, always preserving capturing, stopped, error, and unexpired sessions; sessions are never pruned implicitly at startup.
+- Public, byte-exact MCP transport contract in CLI help and README: newline-delimited JSON with a maximum inbound frame size of 4 MiB (4,194,304 bytes); oversized frames are rejected as invalid requests and parsing resynchronizes at the next newline.
 - Deterministic SCIP indexing benchmark and fuzz-smoke gates covering full indexing, batched reindexing, cache loading, representative queries, and malformed protobuf input.
 - Capability-negotiated hosted-memory write envelopes with local session, repository, host-integration, and code/debug provenance.
 - Capability-driven Cog specialist assets for all eleven supported agent hosts, including optional validation and observe specialists where each host can represent them.
-- Persisted observe-session discovery, status filtering, retention cleanup, corrupt-database reporting, and project-root storage resolution for the opt-in observe scaffold.
-- Format-neutral native debugger support for ELF modules, stable loaded sources, process-or-core memory access, and validated x86_64 and AArch64 core register notes.
+- Persisted observe-session discovery, status filtering, explicit retention pruning, corrupt-database reporting, and project-root storage resolution for the opt-in observe scaffold.
+- Format-neutral native debugger support for ELF modules, stable loaded sources, process-or-core memory access, and validated x86_64 and AArch64 core register notes; main binaries, dSYMs, and split-DWARF files now share one format-neutral binary abstraction detected from file magic.
+- ELF core dumps now derive the executable's runtime load bias from validated `NT_FILE` mappings, so position-independent executables resolve correctly in core sessions instead of assuming an unverified zero bias.
 
 ### Changed
 
 - Initial indexing, bootstrap scans, configured resyncs, and filesystem watching now share one symlink-aware path policy, preserve logical aliases, and support explicitly approved `code.external_roots`.
 - Watcher updates are deduplicated and applied in bounded batched index transactions, with cache generation checks so external index replacements become visible without restarting MCP.
-- DAP transport now serializes reads and writes, uses absolute deadlines, tracks breakpoint events, bounds retained adapter events, and owns detached process groups through cleanup.
+- DAP transport now serializes reads and writes behind one connection owner, correlates responses by explicit request sequence, uses absolute deadlines, tracks breakpoint events, bounds retained adapter events and breakpoint registries with drop counters surfaced through `debug_poll_events`, and owns detached process groups through cleanup.
+- Debug orphan reaping now retains sessions with active or pending runs, and event polling counts as intentional session activity; repeated launch/stop lifecycles are stress-tested for descriptor, zombie, and pipe leaks.
+- Native data watchpoints are advertised only where the backend implements them (macOS AArch64); other platforms report the capability as unsupported instead of failing at use.
 - Extension installation now consumes one GitHub release archive, verifies its published SHA-256 digest, requires separate `--trust-build` consent for manifest shell commands, and transactionally preserves the previous install on failure.
 - Release automation now validates tag/version/changelog consistency, archive formats, checksums, provenance, and artifact metadata before publication.
 - CLI help, README, extension authoring guidance, and the agent support matrix now match the registered command surface, tool names, observe gating, debugger architecture, credential boundary, and extension trust model.
@@ -50,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `COG_API_KEY` is sent automatically only to exact `https://trycog.ai:443`; every other credential destination must be an explicitly approved HTTPS origin, authenticated redirects remain disabled, and Windows approval persistence fails closed when safe path traversal is unavailable.
 - Debug sockets, PID files, entitlements, DAP diagnostics, and temporary outputs now live in verified user-owned private runtime paths with restrictive modes, symlink rejection, peer/process identity checks, safe stale-socket teardown, and no Cog-owned shared `/tmp` state; retired shared debug paths are detected but never trusted or removed.
+- Stale-socket cleanup now probes for a live listener first and preserves an actively served endpoint, and daemon teardown removes only nodes it proved it owns while unsafe pre-existing paths are preserved.
+- The project `.cog` directory is validated as a trust boundary before temporary paths under it are handed to external indexers: a symlinked or foreign-owned `.cog` is rejected and group/world write bits are cleared.
+- MCP shutdown now stops handler intake, drains in-flight handlers, and only then deinitializes the full runtime, so no worker can observe freed runtime state during teardown.
 - MCP frames, handler concurrency, observe queries, DAP queues, HTTP responses, redirects, downloads, subprocess lifetimes, and SQLite contention now have explicit bounds and failure behavior.
 - Built-in grammar sources are pinned to immutable revisions with verified hashes, external index output uses private pre-created files, and archive extraction rejects traversal, links, and ambiguous release assets.
 
