@@ -225,6 +225,7 @@ fn isLegacyNumericComponent(component: []const u8) bool {
 }
 
 fn validateDomainHost(host: []const u8) !void {
+    if (host.len > 253) return error.InvalidHost;
     if (host[0] == '.' or host[host.len - 1] == '.') return error.InvalidHost;
     var label_len: usize = 0;
     var label_starts_with_hyphen = false;
@@ -282,11 +283,6 @@ const Store = struct {
         }
         return false;
     }
-};
-
-const PersistedStore = struct {
-    version: u32,
-    origins: []const []const u8,
 };
 
 /// Return whether an exact canonical origin is present in the global store.
@@ -419,7 +415,7 @@ fn loadStore(dir: std.fs.Dir, allocator: std.mem.Allocator) !Store {
         else => return error.UnreadableStore,
     };
     defer allocator.free(body);
-    var parsed = std.json.parseFromSlice(PersistedStore, allocator, body, .{}) catch |err| switch (err) {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             debug_log.log("credential_boundary.loadStore: malformed JSON", .{});
@@ -427,9 +423,29 @@ fn loadStore(dir: std.fs.Dir, allocator: std.mem.Allocator) !Store {
         },
     };
     defer parsed.deinit();
-    if (parsed.value.version != 1 or parsed.value.origins.len > max_origins) return error.MalformedStore;
 
-    for (parsed.value.origins) |stored| {
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.MalformedStore,
+    };
+    if (object.count() != 2) return error.MalformedStore;
+    const version = object.get("version") orelse return error.MalformedStore;
+    switch (version) {
+        .integer => |integer| if (integer != 1) return error.MalformedStore,
+        else => return error.MalformedStore,
+    }
+    const origins_value = object.get("origins") orelse return error.MalformedStore;
+    const origins = switch (origins_value) {
+        .array => |array| array.items,
+        else => return error.MalformedStore,
+    };
+    if (origins.len > max_origins) return error.MalformedStore;
+
+    for (origins) |stored_value| {
+        const stored = switch (stored_value) {
+            .string => |string| string,
+            else => return error.MalformedStore,
+        };
         if (stored.len > max_url_bytes) return error.MalformedStore;
         var canonical = parseOrigin(allocator, stored) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -475,13 +491,18 @@ fn acquireStoreLock(dir: std.fs.Dir) anyerror!std.fs.File {
         return error.UnsupportedPlatform;
     }
 
-    var flags: posix.O = .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true };
+    var flags: posix.O = .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .NOFOLLOW = true,
+        .NONBLOCK = true,
+    };
     if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
     const fd = try posix.openat(dir.fd, lock_file_name, flags, 0o600);
     errdefer posix.close(fd);
-    try posix.flock(fd, posix.LOCK.EX);
     const file: std.fs.File = .{ .handle = fd };
     try validatePrivateRegularFile(file);
+    try posix.flock(fd, posix.LOCK.EX);
     return file;
 }
 
@@ -498,6 +519,7 @@ fn openPrivateFileNoFollow(dir: std.fs.Dir, name: []const u8, mode: std.fs.File.
             .read_write => .RDWR,
         },
         .NOFOLLOW = true,
+        .NONBLOCK = true,
     };
     if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
     const fd = try posix.openat(dir.fd, name, flags, 0);
@@ -594,7 +616,10 @@ fn openValidatedConfigDir(path: []const u8, create: bool) !std.fs.Dir {
         };
     }
 
-    var dir = std.fs.openDirAbsolute(path, .{ .no_follow = true }) catch |err| switch (err) {
+    var dir = std.fs.openDirAbsolute(path, .{
+        .no_follow = true,
+        .iterate = true,
+    }) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => {
             debug_log.log("credential_boundary.openValidatedConfigDir: open failed: {s}", .{@errorName(err)});
@@ -612,6 +637,23 @@ fn openValidatedConfigDir(path: []const u8, create: bool) !std.fs.Dir {
         dir.chmod(0o700) catch return error.UnreadableStore;
     }
     return dir;
+}
+
+fn makeTestFifo(dir: std.fs.Dir, name: []const u8) !void {
+    if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
+
+    const c_fns = struct {
+        extern fn mkfifoat(
+            dir_fd: c_int,
+            path: [*:0]const u8,
+            mode: posix.mode_t,
+        ) c_int;
+    };
+    const name_z = try std.testing.allocator.dupeZ(u8, name);
+    defer std.testing.allocator.free(name_z);
+    if (c_fns.mkfifoat(dir.fd, name_z.ptr, 0o600) != 0) {
+        return error.CreateFifoFailed;
+    }
 }
 
 fn expectOrigin(input: []const u8, expected: []const u8, official: bool) !void {
@@ -659,10 +701,24 @@ test "parseRequestOrigin canonicalizes authenticated request destinations" {
     try std.testing.expect(!self_hosted.is_official);
 }
 
-test "parseOrigin rejects canonical output beyond the URL limit" {
-    const input = "https://" ++ ("a." ** 2043) ++ "aa";
-    try std.testing.expectEqual(max_url_bytes, input.len);
-    try std.testing.expectError(error.UrlTooLong, parseOrigin(std.testing.allocator, input));
+test "parseOrigin enforces the DNS hostname length limit" {
+    const max_host = ("a" ** 63) ++ "." ++
+        ("b" ** 63) ++ "." ++
+        ("c" ** 63) ++ "." ++
+        ("d" ** 61);
+    const oversized_host = max_host ++ "d";
+    try std.testing.expectEqual(@as(usize, 253), max_host.len);
+    try std.testing.expectEqual(@as(usize, 254), oversized_host.len);
+
+    try expectOrigin(
+        "https://" ++ max_host,
+        "https://" ++ max_host ++ ":443",
+        false,
+    );
+    try std.testing.expectError(
+        error.InvalidHost,
+        parseOrigin(std.testing.allocator, "https://" ++ oversized_host),
+    );
 }
 
 test "parseOrigin supports canonical IPv6 literals" {
@@ -807,6 +863,32 @@ test "approved origin store distinguishes malformed oversized and unreadable sta
     try std.testing.expectError(error.UnreadableStore, isApprovedInDir(unreadable.dir, allocator, "https://example.com"));
 }
 
+test "approved origin store requires an integer schema version token" {
+    const invalid_versions = [_][]const u8{
+        "\"1\"",
+        "1.0",
+        "1e0",
+        "true",
+        "null",
+    };
+
+    for (invalid_versions) |invalid_version| {
+        const allocator = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var invalid_file = try tmp.dir.createFile(store_file_name, .{ .mode = 0o600 });
+        try invalid_file.writeAll("{\n  \"version\": ");
+        try invalid_file.writeAll(invalid_version);
+        try invalid_file.writeAll(",\n  \"origins\": []\n}\n");
+        invalid_file.close();
+        try std.testing.expectError(
+            error.MalformedStore,
+            isApprovedInDir(tmp.dir, allocator, "https://example.com"),
+        );
+    }
+}
+
 test "approved origin store rejects noncanonical and invalid stored origins" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -867,6 +949,27 @@ test "approved origin store rejects symlink store and lock files" {
     lock_target.close();
     try lock_link.dir.symLink("target", lock_file_name, .{});
     try std.testing.expectError(error.UnreadableStore, approveInDir(lock_link.dir, allocator, "https://example.com"));
+}
+
+test "approved origin store rejects FIFO store and lock files without blocking" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var store_fifo = std.testing.tmpDir(.{});
+    defer store_fifo.cleanup();
+    try makeTestFifo(store_fifo.dir, store_file_name);
+    try std.testing.expectError(
+        error.UnreadableStore,
+        isApprovedInDir(store_fifo.dir, allocator, "https://example.com"),
+    );
+
+    var lock_fifo = std.testing.tmpDir(.{});
+    defer lock_fifo.cleanup();
+    try makeTestFifo(lock_fifo.dir, lock_file_name);
+    try std.testing.expectError(
+        error.UnreadableStore,
+        approveInDir(lock_fifo.dir, allocator, "https://example.com"),
+    );
 }
 
 test "approved origin store enforces the persisted size cap" {
@@ -1017,6 +1120,26 @@ test "global approved origin store rejects a config directory symlink" {
     try tmp.dir.symLink("outside", ".config/cog", .{ .is_directory = true });
     try std.testing.expectError(error.UnreadableStore, approve(allocator, "https://example.com"));
     try std.testing.expectError(error.UnreadableStore, isApproved(allocator, "https://example.com"));
+}
+
+test "validated global config directory supports chmod and durability sync" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("config");
+    var initial = try tmp.dir.openDir("config", .{});
+    try initial.chmod(0o755);
+    initial.close();
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config");
+    defer allocator.free(config_path);
+
+    var validated = try openValidatedConfigDir(config_path, true);
+    defer validated.close();
+    const stat = try posix.fstat(validated.fd);
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o700), stat.mode & 0o777);
+    try syncStoreDirectory(validated);
 }
 
 test "approved origin operations retain the validated directory handle" {
