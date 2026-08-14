@@ -373,7 +373,27 @@ pub const DapProxy = struct {
         condition_description: []const u8 = "",
     };
 
+    const LoadedModuleId = union(enum) {
+        integer: i64,
+        string: []const u8,
+
+        fn matches(self: LoadedModuleId, value: std.json.Value) bool {
+            return switch (self) {
+                .integer => |id| value == .integer and value.integer == id,
+                .string => |id| value == .string and std.mem.eql(u8, value.string, id),
+            };
+        }
+
+        fn deinit(self: LoadedModuleId, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .integer => {},
+                .string => |id| allocator.free(id),
+            }
+        }
+    };
+
     const LoadedModuleEntry = struct {
+        id: LoadedModuleId,
         name: []const u8,
     };
 
@@ -438,6 +458,7 @@ pub const DapProxy = struct {
         self.output_buffer.deinit(self.allocator);
         // Clean up loaded modules
         for (self.loaded_modules.items) |entry| {
+            entry.id.deinit(self.allocator);
             self.allocator.free(entry.name);
         }
         self.loaded_modules.deinit(self.allocator);
@@ -2351,10 +2372,14 @@ pub const DapProxy = struct {
     }
 
     fn handleInvalidatedEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
-        const stack_frame_id: ?u32 = if (body_obj.get("stackFrameId")) |v|
-            (if (v == .integer) @as(u32, @intCast(v.integer)) else null)
-        else
-            null;
+        const stack_frame_id: ?u32 = blk: {
+            const value = body_obj.get("stackFrameId") orelse break :blk null;
+            if (value != .integer or value.integer < 0 or value.integer > std.math.maxInt(u32)) {
+                debug_log.log("dap.proxy: ignored invalidated event with out-of-range stack frame id", .{});
+                return;
+            }
+            break :blk @intCast(value.integer);
+        };
 
         for (self.invalidated_areas.items) |event| {
             if (invalidatedEventMatchesBody(event, body_obj, stack_frame_id)) {
@@ -2596,15 +2621,28 @@ pub const DapProxy = struct {
         return val == .bool and val.bool;
     }
 
+    fn freeLoadedModule(self: *DapProxy, entry: LoadedModuleEntry) void {
+        entry.id.deinit(self.allocator);
+        self.allocator.free(entry.name);
+    }
+
     fn handleModuleEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
         const reason = if (body_obj.get("reason")) |r| (if (r == .string) r.string else return) else return;
         const module = body_obj.get("module") orelse return;
         if (module != .object) return;
+        const id_value = module.object.get("id") orelse {
+            debug_log.log("dap.proxy: ignored module event without protocol id", .{});
+            return;
+        };
+        if (id_value != .integer and id_value != .string) {
+            debug_log.log("dap.proxy: ignored module event with invalid protocol id type", .{});
+            return;
+        }
         const name = if (module.object.get("name")) |n| (if (n == .string) n.string else "unknown") else "unknown";
 
         var existing_index: ?usize = null;
         for (self.loaded_modules.items, 0..) |entry, index| {
-            if (std.mem.eql(u8, entry.name, name)) {
+            if (entry.id.matches(id_value)) {
                 existing_index = index;
                 break;
             }
@@ -2613,28 +2651,42 @@ pub const DapProxy = struct {
         if (std.mem.eql(u8, reason, "removed")) {
             if (existing_index) |index| {
                 const removed = self.loaded_modules.orderedRemove(index);
-                self.allocator.free(removed.name);
+                self.freeLoadedModule(removed);
                 debug_log.log("dap.proxy: removed loaded module name={s}", .{name});
             }
             return;
         }
         if (!std.mem.eql(u8, reason, "new") and !std.mem.eql(u8, reason, "changed")) return;
 
-        if (existing_index != null) {
+        if (existing_index) |index| {
+            const entry = &self.loaded_modules.items[index];
+            if (!std.mem.eql(u8, entry.name, name)) {
+                const owned_name = self.allocator.dupe(u8, name) catch return;
+                self.allocator.free(entry.name);
+                entry.name = owned_name;
+            }
             self.retention_deduplications.loaded_modules += 1;
-            debug_log.log("dap.proxy: deduplicated loaded module name={s}", .{name});
+            debug_log.log("dap.proxy: updated loaded module name={s}", .{name});
             return;
         }
 
-        const owned_name = self.allocator.dupe(u8, name) catch return;
-        const new_entry: LoadedModuleEntry = .{ .name = owned_name };
+        const owned_id: LoadedModuleId = switch (id_value) {
+            .integer => |id| .{ .integer = id },
+            .string => |id| .{ .string = self.allocator.dupe(u8, id) catch return },
+            else => unreachable,
+        };
+        const owned_name = self.allocator.dupe(u8, name) catch {
+            owned_id.deinit(self.allocator);
+            return;
+        };
+        const new_entry: LoadedModuleEntry = .{ .id = owned_id, .name = owned_name };
         if (self.loaded_modules.items.len == MAX_LOADED_MODULES) {
             const dropped = self.loaded_modules.orderedRemove(0);
-            self.allocator.free(dropped.name);
+            self.freeLoadedModule(dropped);
             self.retention_drops.loaded_modules += 1;
             debug_log.log("dap.proxy: loaded module retention full; dropped oldest total={d}", .{self.retention_drops.loaded_modules});
         }
-        self.loaded_modules.append(self.allocator, new_entry) catch self.allocator.free(owned_name);
+        self.loaded_modules.append(self.allocator, new_entry) catch self.freeLoadedModule(new_entry);
     }
 
     fn proxySetBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32, condition: ?[]const u8, hit_condition: ?[]const u8, log_message: ?[]const u8) anyerror!BreakpointInfo {
@@ -4862,17 +4914,17 @@ test "DapProxy caps and deduplicates adversarial event queues" {
     var json_buf: [256]u8 = undefined;
 
     for (0..MAX_LOADED_MODULES) |i| {
-        const event = try std.fmt.bufPrint(&json_buf, "{{\"reason\":\"new\",\"module\":{{\"name\":\"module-{d}\"}}}}", .{i});
+        const event = try std.fmt.bufPrint(&json_buf, "{{\"reason\":\"new\",\"module\":{{\"id\":{d},\"name\":\"module-{d}\"}}}}", .{ i, i });
         try handleTestEvent(&proxy, allocator, event, DapProxy.handleModuleEvent);
     }
-    try handleTestEvent(&proxy, allocator, "{\"reason\":\"changed\",\"module\":{\"name\":\"module-0\"}}", DapProxy.handleModuleEvent);
-    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"name\":\"module-overflow\"}}", DapProxy.handleModuleEvent);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"changed\",\"module\":{\"id\":0,\"name\":\"module-0\"}}", DapProxy.handleModuleEvent);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"id\":9999,\"name\":\"module-overflow\"}}", DapProxy.handleModuleEvent);
     try std.testing.expectEqual(MAX_LOADED_MODULES, proxy.loaded_modules.items.len);
     try std.testing.expectEqualStrings("module-1", proxy.loaded_modules.items[0].name);
     try std.testing.expectEqualStrings("module-overflow", proxy.loaded_modules.items[MAX_LOADED_MODULES - 1].name);
     try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.loaded_modules);
     try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.loaded_modules);
-    try handleTestEvent(&proxy, allocator, "{\"reason\":\"removed\",\"module\":{\"name\":\"module-1\"}}", DapProxy.handleModuleEvent);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"removed\",\"module\":{\"id\":1,\"name\":\"module-1\"}}", DapProxy.handleModuleEvent);
     try std.testing.expectEqual(MAX_LOADED_MODULES - 1, proxy.loaded_modules.items.len);
 
     for (0..MAX_MEMORY_EVENTS) |i| {
@@ -4914,6 +4966,37 @@ test "DapProxy caps and deduplicates adversarial event queues" {
     try std.testing.expectEqual(@as(?u32, 9999), proxy.invalidated_areas.items[MAX_INVALIDATED_AREAS - 1].stack_frame_id);
     try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.invalidated_areas);
     try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.invalidated_areas);
+}
+
+test "DapProxy keys loaded modules by protocol id" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"id\":1,\"name\":\"libshared.so\"}}", DapProxy.handleModuleEvent);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"id\":\"two\",\"name\":\"libshared.so\"}}", DapProxy.handleModuleEvent);
+    try std.testing.expectEqual(@as(usize, 2), proxy.loaded_modules.items.len);
+
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"changed\",\"module\":{\"id\":\"two\",\"name\":\"libshared-renamed.so\"}}", DapProxy.handleModuleEvent);
+    try std.testing.expectEqualStrings("libshared-renamed.so", proxy.loaded_modules.items[1].name);
+
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"removed\",\"module\":{\"id\":1,\"name\":\"libshared.so\"}}", DapProxy.handleModuleEvent);
+    try std.testing.expectEqual(@as(usize, 1), proxy.loaded_modules.items.len);
+    try std.testing.expectEqualStrings("libshared-renamed.so", proxy.loaded_modules.items[0].name);
+}
+
+test "DapProxy ignores invalid stack frame id ranges" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":-1}", DapProxy.handleInvalidatedEvent);
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":4294967296}", DapProxy.handleInvalidatedEvent);
+    try std.testing.expectEqual(@as(usize, 0), proxy.invalidated_areas.items.len);
+
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":4294967295}", DapProxy.handleInvalidatedEvent);
+    try std.testing.expectEqual(@as(usize, 1), proxy.invalidated_areas.items.len);
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), proxy.invalidated_areas.items[0].stack_frame_id);
 }
 
 fn readTestPid(file: std.fs.File) !std.posix.pid_t {
