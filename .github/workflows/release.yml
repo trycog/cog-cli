@@ -266,6 +266,14 @@ jobs:
 
           CHANGELOG=$(sed -n "/^## \[${SEMVER}\]/,/^## \[/{/^## \[${SEMVER}\]/d;/^## \[/d;p;}" CHANGELOG.md)
 
+          # Discord rejects embed descriptions over 4096 characters with a 400;
+          # truncate at a line boundary and point at the release page instead.
+          if [ "${#CHANGELOG}" -gt 3800 ]; then
+            CHANGELOG=$(printf '%s' "$CHANGELOG" | head -c 3800)
+            CHANGELOG="${CHANGELOG%$'\n'*}"
+            CHANGELOG="${CHANGELOG}"$'\n'"*…truncated — see the release page for the full changelog.*"
+          fi
+
           DESCRIPTION=$(cat <<'INNEREOF'
           CHANGELOG_PLACEHOLDER
 
