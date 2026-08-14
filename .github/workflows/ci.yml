@@ -38,6 +38,10 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+          # Temporarily disabled: the restored caches were saved by runs whose
+          # test step crashed or hung, so rule out cache poisoning while
+          # diagnosing the aarch64 test-step hang.
+          use-cache: false
 
 
       - name: Select an Xcode SDK compatible with Zig 0.15
@@ -60,6 +64,23 @@ jobs:
 
       - name: Run tests
         run: zig build test
+        timeout-minutes: 10
+
+      - name: Dump hung test processes
+        if: failure() && runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq gdb >/dev/null 2>&1 || true
+          echo "=== process tree ==="
+          ps auxww --forest || true
+          for pid in $(pgrep -x test); do
+            echo "=== kernel stacks for test pid $pid ==="
+            for tid in /proc/$pid/task/*; do
+              echo "--- tid ${tid##*/} wchan=$(cat "$tid/wchan" 2>/dev/null)"
+              sudo cat "$tid/stack" 2>/dev/null || true
+            done
+            echo "=== gdb backtrace for test pid $pid ==="
+            sudo timeout 30 gdb -p "$pid" -batch -ex "thread apply all bt" 2>/dev/null | head -120 || true
+          done
 
       - name: Run Windows cross-compilation gate
         run: zig build test-windows-cross
