@@ -1215,6 +1215,49 @@ pub const VariableLocationInfo = struct {
     }
 };
 
+/// Bounded debug-driver queue, retention, and breakpoint counters.
+/// Drivers return this snapshot without allocating so polling can expose
+/// resource pressure alongside events.
+pub const DebugDiagnostics = struct {
+    pending_notifications: usize = 0,
+    pending_notifications_capacity: usize = 0,
+    dropped_notifications: usize = 0,
+    buffered_events: usize = 0,
+    buffered_events_capacity: usize = 0,
+    dropped_buffered_events: usize = 0,
+    output_entries: usize = 0,
+    output_entries_capacity: usize = 0,
+    dropped_output_entries: usize = 0,
+
+    loaded_modules: usize = 0,
+    loaded_modules_capacity: usize = 0,
+    dropped_loaded_modules: usize = 0,
+    deduplicated_loaded_modules: usize = 0,
+    memory_events: usize = 0,
+    memory_events_capacity: usize = 0,
+    dropped_memory_events: usize = 0,
+    deduplicated_memory_events: usize = 0,
+    active_progress: usize = 0,
+    active_progress_capacity: usize = 0,
+    dropped_active_progress: usize = 0,
+    deduplicated_active_progress: usize = 0,
+    invalidated_areas: usize = 0,
+    invalidated_areas_capacity: usize = 0,
+    dropped_invalidated_areas: usize = 0,
+    deduplicated_invalidated_areas: usize = 0,
+
+    breakpoint_files: usize = 0,
+    line_breakpoints: usize = 0,
+    line_breakpoints_capacity: usize = 0,
+    rejected_line_breakpoints: usize = 0,
+    function_breakpoints: usize = 0,
+    function_breakpoints_capacity: usize = 0,
+    rejected_function_breakpoints: usize = 0,
+    adapter_breakpoint_mappings: usize = 0,
+    adapter_breakpoint_mappings_capacity: usize = 0,
+    dropped_adapter_breakpoint_mappings: usize = 0,
+};
+
 pub const DebugNotification = struct {
     method: []const u8,
     params_json: []const u8,

@@ -271,7 +271,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "debug_poll_events",
-        .description = "Check for pending debug events like breakpoint hits, program exits, or thread stops. Call this after a 'continue' or 'step' action to see what happened.",
+        .description = "Check for pending debug events like breakpoint hits, program exits, or thread stops. Results include per-session bounded queue, drop, retention, and breakpoint counters.",
         .input_schema = debug_poll_events_schema,
     },
     .{
@@ -2717,14 +2717,36 @@ pub const DebugServer = struct {
         var aw: Writer.Allocating = .init(allocator);
         defer aw.deinit();
         var jw: Stringify = .{ .writer = &aw.writer };
+        const now = std.time.milliTimestamp();
 
         try jw.beginObject();
+        try jw.objectField("diagnostics");
+        try jw.beginArray();
+        var diagnostics_it = self.session_manager.sessions.iterator();
+        while (diagnostics_it.next()) |entry| {
+            if (session_id_filter) |filter| {
+                if (!std.mem.eql(u8, entry.key_ptr.*, filter)) continue;
+            }
+            const session = entry.value_ptr.*;
+            session.last_activity = now;
+            debug_log.log("DebugServer.toolPollEvents: refreshed activity session_id={s}", .{entry.key_ptr.*});
+            const counters = session.driver.diagnostics() orelse continue;
+            debug_log.log("DebugServer.toolPollEvents: reporting driver diagnostics session_id={s} dropped_notifications={d} dropped_events={d} dropped_output={d}", .{ entry.key_ptr.*, counters.dropped_notifications, counters.dropped_buffered_events, counters.dropped_output_entries });
+            try jw.beginObject();
+            try jw.objectField("session_id");
+            try jw.write(entry.key_ptr.*);
+            try jw.objectField("driver");
+            try jw.write(@tagName(session.driver.driver_type));
+            try jw.objectField("counters");
+            try jw.write(counters);
+            try jw.endObject();
+        }
+        try jw.endArray();
+
         try jw.objectField("events");
         try jw.beginArray();
 
-        // Collect notifications from all or specific sessions. Polling is
-        // intentional activity even when no event is currently available.
-        const now = std.time.milliTimestamp();
+        // Collect notifications from all or specific sessions.
         var it = self.session_manager.sessions.iterator();
         while (it.next()) |entry| {
             if (session_id_filter) |filter| {
@@ -2732,8 +2754,6 @@ pub const DebugServer = struct {
             }
 
             const session = entry.value_ptr.*;
-            session.last_activity = now;
-            debug_log.log("DebugServer.toolPollEvents: refreshed activity session_id={s}", .{entry.key_ptr.*});
 
             // Check for completed async run
             if (session.pending_run) |pr| {
@@ -4000,6 +4020,48 @@ test "debug_poll_events refreshes intentional session activity" {
 
     try std.testing.expect(session1.last_activity > stale);
     try std.testing.expect(session2.last_activity > stale);
+}
+
+test "debug_poll_events exposes driver queue and drop diagnostics" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    mock.diagnostics = .{
+        .pending_notifications = 3,
+        .dropped_notifications = 4,
+        .buffered_events = 5,
+        .dropped_buffered_events = 6,
+        .output_entries = 7,
+        .dropped_output_entries = 8,
+        .rejected_line_breakpoints = 9,
+    };
+    _ = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
+
+    const result = try srv.callTool(allocator, "debug_poll_events", null);
+    const raw = switch (result) {
+        .ok => |value| value,
+        .ok_static => return error.UnexpectedStaticResult,
+        .err => return error.UnexpectedToolError,
+    };
+    defer allocator.free(raw);
+
+    const parsed = try json.parseFromSlice(json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const diagnostics = parsed.value.object.get("diagnostics").?.array;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    const entry = diagnostics.items[0].object;
+    try std.testing.expectEqualStrings("session-1", entry.get("session_id").?.string);
+    try std.testing.expectEqualStrings("dap", entry.get("driver").?.string);
+    const counters = entry.get("counters").?.object;
+    try std.testing.expectEqual(@as(i64, 3), counters.get("pending_notifications").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), counters.get("dropped_notifications").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), counters.get("buffered_events").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), counters.get("dropped_buffered_events").?.integer);
+    try std.testing.expectEqual(@as(i64, 7), counters.get("output_entries").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), counters.get("dropped_output_entries").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), counters.get("rejected_line_breakpoints").?.integer);
 }
 
 test "debug_poll_events does not consume synchronous run completion" {

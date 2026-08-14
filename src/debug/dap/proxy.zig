@@ -81,6 +81,9 @@ const DriverVTable = driver_mod.DriverVTable;
 const MAX_PENDING_NOTIFICATIONS: usize = 256;
 const MAX_BUFFERED_EVENTS: usize = 256;
 const MAX_OUTPUT_ENTRIES: usize = 512;
+const MAX_LINE_BREAKPOINTS: usize = 512;
+const MAX_FUNCTION_BREAKPOINTS: usize = 128;
+const MAX_ADAPTER_BREAKPOINT_MAPPINGS: usize = MAX_LINE_BREAKPOINTS;
 
 const BufferedEvent = struct {
     event_name: []const u8,
@@ -311,6 +314,9 @@ pub const DapProxy = struct {
     buffered_events: std.ArrayListUnmanaged(BufferedEvent) = .empty,
     dropped_buffered_events: usize = 0,
     dropped_output_entries: usize = 0,
+    rejected_line_breakpoints: usize = 0,
+    rejected_function_breakpoints: usize = 0,
+    dropped_adapter_breakpoint_mappings: usize = 0,
     // Only one thread may read/decode or write a framed DAP message at a time.
     // Request/response transactions hold this mutex across both operations so
     // explicit request_seq correlation stays deterministic under concurrency.
@@ -571,6 +577,7 @@ pub const DapProxy = struct {
         .gotoTargetsFn = proxyGotoTargets,
         .findSymbolFn = proxyFindSymbol,
         .drainNotificationsFn = proxyDrainNotifications,
+        .diagnosticsFn = proxyDiagnostics,
         .rawRequestFn = proxyRawRequest,
         .sendPauseFn = proxySendPause,
         .getPidFn = proxyGetPid,
@@ -2388,6 +2395,47 @@ pub const DapProxy = struct {
         return result;
     }
 
+    /// Snapshot bounded queue, retention, and breakpoint registry counters.
+    pub fn debugDiagnostics(self: *const DapProxy) types.DebugDiagnostics {
+        return .{
+            .pending_notifications = self.pending_notifications.items.len,
+            .pending_notifications_capacity = MAX_PENDING_NOTIFICATIONS,
+            .dropped_notifications = self.dropped_notifications,
+            .buffered_events = self.buffered_events.items.len,
+            .buffered_events_capacity = MAX_BUFFERED_EVENTS,
+            .dropped_buffered_events = self.dropped_buffered_events,
+            .output_entries = self.output_buffer.items.len,
+            .output_entries_capacity = MAX_OUTPUT_ENTRIES,
+            .dropped_output_entries = self.dropped_output_entries,
+            .loaded_modules = self.loaded_modules.items.len,
+            .loaded_modules_capacity = MAX_LOADED_MODULES,
+            .dropped_loaded_modules = self.retention_drops.loaded_modules,
+            .deduplicated_loaded_modules = self.retention_deduplications.loaded_modules,
+            .memory_events = self.memory_events.items.len,
+            .memory_events_capacity = MAX_MEMORY_EVENTS,
+            .dropped_memory_events = self.retention_drops.memory_events,
+            .deduplicated_memory_events = self.retention_deduplications.memory_events,
+            .active_progress = self.active_progress.count(),
+            .active_progress_capacity = MAX_ACTIVE_PROGRESS,
+            .dropped_active_progress = self.retention_drops.active_progress,
+            .deduplicated_active_progress = self.retention_deduplications.active_progress,
+            .invalidated_areas = self.invalidated_areas.items.len,
+            .invalidated_areas_capacity = MAX_INVALIDATED_AREAS,
+            .dropped_invalidated_areas = self.retention_drops.invalidated_areas,
+            .deduplicated_invalidated_areas = self.retention_deduplications.invalidated_areas,
+            .breakpoint_files = self.file_breakpoints.count(),
+            .line_breakpoints = self.bp_registry.count(),
+            .line_breakpoints_capacity = MAX_LINE_BREAKPOINTS,
+            .rejected_line_breakpoints = self.rejected_line_breakpoints,
+            .function_breakpoints = self.function_breakpoints.items.len,
+            .function_breakpoints_capacity = MAX_FUNCTION_BREAKPOINTS,
+            .rejected_function_breakpoints = self.rejected_function_breakpoints,
+            .adapter_breakpoint_mappings = self.adapter_bp_ids.count(),
+            .adapter_breakpoint_mappings_capacity = MAX_ADAPTER_BREAKPOINT_MAPPINGS,
+            .dropped_adapter_breakpoint_mappings = self.dropped_adapter_breakpoint_mappings,
+        };
+    }
+
     fn parseAdapterCapabilities(self: *DapProxy, allocator: std.mem.Allocator, resp_body: []const u8) void {
         const parsed = json.parseFromSlice(json.Value, allocator, resp_body, .{}) catch return;
         defer parsed.deinit();
@@ -2535,6 +2583,11 @@ pub const DapProxy = struct {
 
     fn proxySetBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32, condition: ?[]const u8, hit_condition: ?[]const u8, log_message: ?[]const u8) anyerror!BreakpointInfo {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
+        if (self.bp_registry.count() >= MAX_LINE_BREAKPOINTS) {
+            self.rejected_line_breakpoints += 1;
+            debug_log.log("dap.proxy: rejected line breakpoint file={s} line={d} active={d} capacity={d}", .{ file, line, self.bp_registry.count(), MAX_LINE_BREAKPOINTS });
+            return error.ResourceLimit;
+        }
 
         // Assign a local bp_id
         const bp_id = self.next_bp_id;
@@ -2618,6 +2671,27 @@ pub const DapProxy = struct {
         self.updateBreakpointRegistryFromResponse(allocator, bp_list, resp);
     }
 
+    fn rememberAdapterBreakpoint(self: *DapProxy, adapter_id: u32, local_id: u32) void {
+        var prior_adapter_id: ?u32 = null;
+        var mappings = self.adapter_bp_ids.iterator();
+        while (mappings.next()) |mapping| {
+            if (mapping.value_ptr.* == local_id and mapping.key_ptr.* != adapter_id) {
+                prior_adapter_id = mapping.key_ptr.*;
+                break;
+            }
+        }
+        if (prior_adapter_id) |prior| _ = self.adapter_bp_ids.remove(prior);
+
+        if (!self.adapter_bp_ids.contains(adapter_id) and self.adapter_bp_ids.count() >= MAX_ADAPTER_BREAKPOINT_MAPPINGS) {
+            self.dropped_adapter_breakpoint_mappings += 1;
+            debug_log.log("dap.proxy: dropped adapter breakpoint mapping adapter_id={d} local_id={d} active={d} capacity={d}", .{ adapter_id, local_id, self.adapter_bp_ids.count(), MAX_ADAPTER_BREAKPOINT_MAPPINGS });
+            return;
+        }
+        self.adapter_bp_ids.put(self.allocator, adapter_id, local_id) catch |err| {
+            debug_log.log("dap.proxy: failed to map breakpoint adapter_id={d} local_id={d} error={s}", .{ adapter_id, local_id, @errorName(err) });
+        };
+    }
+
     fn updateBreakpointRegistryFromResponse(self: *DapProxy, allocator: std.mem.Allocator, bp_list: []const BreakpointEntry, resp: []const u8) void {
         const parsed = json.parseFromSlice(json.Value, allocator, resp, .{}) catch return;
         defer parsed.deinit();
@@ -2638,9 +2712,7 @@ pub const DapProxy = struct {
                 if (item.object.get("id")) |value| {
                     if (value == .integer and value.integer >= 0) {
                         const adapter_id: u32 = @intCast(value.integer);
-                        self.adapter_bp_ids.put(self.allocator, adapter_id, local_id) catch |err| {
-                            debug_log.log("dap.proxy: failed to map breakpoint adapter_id={d} local_id={d} error={s}", .{ adapter_id, local_id, @errorName(err) });
-                        };
+                        self.rememberAdapterBreakpoint(adapter_id, local_id);
                     }
                 }
             }
@@ -2655,6 +2727,7 @@ pub const DapProxy = struct {
         const file = entry.file;
 
         // Remove from per-file list
+        var remove_file_entry = false;
         if (self.file_breakpoints.getPtr(file)) |bp_list| {
             var i: usize = 0;
             while (i < bp_list.items.len) {
@@ -2678,6 +2751,7 @@ pub const DapProxy = struct {
                     dapLog("[DAP removeBreakpoint] Failed to re-send breakpoints for file={s}: {any}", .{ file, err });
                 };
             }
+            remove_file_entry = bp_list.items.len == 0;
         }
 
         var adapter_id_to_remove: ?u32 = null;
@@ -2690,6 +2764,13 @@ pub const DapProxy = struct {
         }
         if (adapter_id_to_remove) |adapter_id| _ = self.adapter_bp_ids.remove(adapter_id);
         _ = self.bp_registry.remove(id);
+        if (remove_file_entry) {
+            if (self.file_breakpoints.fetchRemove(file)) |removed| {
+                var breakpoints = removed.value;
+                breakpoints.deinit(self.allocator);
+                self.allocator.free(removed.key);
+            }
+        }
     }
 
     fn proxyListBreakpoints(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const BreakpointInfo {
@@ -3165,14 +3246,22 @@ pub const DapProxy = struct {
     fn proxySetFunctionBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, condition: ?[]const u8) anyerror!BreakpointInfo {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         if (!self.adapter_capabilities.supports_function_breakpoints) return error.NotSupported;
+        if (self.function_breakpoints.items.len >= MAX_FUNCTION_BREAKPOINTS) {
+            self.rejected_function_breakpoints += 1;
+            debug_log.log("dap.proxy: rejected function breakpoint name={s} active={d} capacity={d}", .{ name, self.function_breakpoints.items.len, MAX_FUNCTION_BREAKPOINTS });
+            return error.ResourceLimit;
+        }
         const bp_id = self.next_bp_id;
         self.next_bp_id += 1;
 
-        // Track the function breakpoint
+        const name_owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_owned);
+        const condition_owned: ?[]const u8 = if (condition) |value| try self.allocator.dupe(u8, value) else null;
+        errdefer if (condition_owned) |value| self.allocator.free(value);
         try self.function_breakpoints.append(self.allocator, .{
             .bp_id = bp_id,
-            .name = try self.allocator.dupe(u8, name),
-            .condition = if (condition) |c| try self.allocator.dupe(u8, c) else null,
+            .name = name_owned,
+            .condition = condition_owned,
         });
 
         if (self.initialized and self.transport != .none) {
@@ -4193,6 +4282,11 @@ pub const DapProxy = struct {
         return self.drainNotifications(allocator);
     }
 
+    fn proxyDiagnostics(ctx: *anyopaque) types.DebugDiagnostics {
+        const self: *DapProxy = @ptrCast(@alignCast(ctx));
+        return self.debugDiagnostics();
+    }
+
     fn proxyRawRequest(ctx: *anyopaque, allocator: std.mem.Allocator, command: []const u8, arguments: ?[]const u8) anyerror![]const u8 {
         const self: *DapProxy = @ptrCast(@alignCast(ctx));
         const seq = self.nextSeq();
@@ -4595,6 +4689,81 @@ fn exerciseBoundedQueueAllocationFailures(allocator: std.mem.Allocator) !void {
     try proxy.queueNotificationAlloc("debug/output", "{}");
     try proxy.bufferEventAlloc("stopped", "{}");
     try proxy.bufferOutputAlloc("stdout", "x");
+}
+
+test "DapProxy bounds line function and adapter breakpoint registries" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+    var driver = proxy.activeDriver();
+
+    for (0..MAX_LINE_BREAKPOINTS) |index| {
+        _ = try driver.setBreakpoint(allocator, "/tmp/bounded.zig", @intCast(index + 1), null);
+    }
+    try std.testing.expectError(error.ResourceLimit, driver.setBreakpoint(allocator, "/tmp/overflow.zig", 1, null));
+    try std.testing.expectEqual(MAX_LINE_BREAKPOINTS, proxy.bp_registry.count());
+    try std.testing.expectEqual(@as(usize, 1), proxy.rejected_line_breakpoints);
+
+    proxy.adapter_capabilities.supports_function_breakpoints = true;
+    for (0..MAX_FUNCTION_BREAKPOINTS) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "function_{d}", .{index});
+        _ = try driver.setFunctionBreakpoint(allocator, name, null);
+    }
+    try std.testing.expectError(error.ResourceLimit, driver.setFunctionBreakpoint(allocator, "overflow", null));
+    try std.testing.expectEqual(MAX_FUNCTION_BREAKPOINTS, proxy.function_breakpoints.items.len);
+    try std.testing.expectEqual(@as(usize, 1), proxy.rejected_function_breakpoints);
+
+    for (0..MAX_ADAPTER_BREAKPOINT_MAPPINGS) |index| {
+        try proxy.adapter_bp_ids.put(allocator, @intCast(index), std.math.maxInt(u32));
+    }
+    const response =
+        \\{"type":"response","body":{"breakpoints":[{"id":9001,"verified":true,"line":1}]}}
+    ;
+    var file_iterator = proxy.file_breakpoints.iterator();
+    const breakpoints = file_iterator.next().?.value_ptr;
+    proxy.updateBreakpointRegistryFromResponse(allocator, breakpoints.items[0..1], response);
+    try std.testing.expectEqual(MAX_ADAPTER_BREAKPOINT_MAPPINGS, proxy.adapter_bp_ids.count());
+    try std.testing.expectEqual(@as(usize, 1), proxy.dropped_adapter_breakpoint_mappings);
+}
+
+test "DapProxy removes empty line breakpoint registries" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+    var driver = proxy.activeDriver();
+
+    const breakpoint = try driver.setBreakpoint(allocator, "/tmp/remove.zig", 10, null);
+    try std.testing.expectEqual(@as(usize, 1), proxy.file_breakpoints.count());
+    try std.testing.expectEqual(@as(usize, 1), proxy.bp_registry.count());
+
+    try driver.removeBreakpoint(allocator, breakpoint.id);
+    try std.testing.expectEqual(@as(usize, 0), proxy.file_breakpoints.count());
+    try std.testing.expectEqual(@as(usize, 0), proxy.bp_registry.count());
+}
+
+test "DapProxy diagnostics expose queue retention and breakpoint counters" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    for (0..MAX_PENDING_NOTIFICATIONS + 2) |_| proxy.queueNotification("debug/output", "{}");
+    for (0..MAX_BUFFERED_EVENTS + 3) |_| proxy.bufferEvent("stopped", "{}");
+    for (0..MAX_OUTPUT_ENTRIES + 4) |_| proxy.bufferOutput("stdout", "x");
+    proxy.rejected_line_breakpoints = 5;
+    proxy.rejected_function_breakpoints = 6;
+    proxy.dropped_adapter_breakpoint_mappings = 7;
+
+    const diagnostics = proxy.debugDiagnostics();
+    try std.testing.expectEqual(MAX_PENDING_NOTIFICATIONS, diagnostics.pending_notifications);
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.dropped_notifications);
+    try std.testing.expectEqual(MAX_BUFFERED_EVENTS, diagnostics.buffered_events);
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.dropped_buffered_events);
+    try std.testing.expectEqual(MAX_OUTPUT_ENTRIES, diagnostics.output_entries);
+    try std.testing.expectEqual(@as(usize, 4), diagnostics.dropped_output_entries);
+    try std.testing.expectEqual(@as(usize, 5), diagnostics.rejected_line_breakpoints);
+    try std.testing.expectEqual(@as(usize, 6), diagnostics.rejected_function_breakpoints);
+    try std.testing.expectEqual(@as(usize, 7), diagnostics.dropped_adapter_breakpoint_mappings);
 }
 
 test "DapProxy bounded queues release partial allocations" {

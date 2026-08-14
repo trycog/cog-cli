@@ -74,6 +74,7 @@ pub const DriverVTable = struct {
     gotoTargetsFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32) anyerror![]const types.GotoTarget = null,
     findSymbolFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror![]const types.SymbolInfo = null,
     drainNotificationsFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) []const types.DebugNotification = null,
+    diagnosticsFn: ?*const fn (ctx: *anyopaque) types.DebugDiagnostics = null,
     writeRegistersFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, thread_id: u32, name: []const u8, value: u64) anyerror!void = null,
     variableLocationFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, frame_id: u32) anyerror!types.VariableLocationInfo = null,
     // Core dump loading and DAP passthrough
@@ -311,6 +312,12 @@ pub const ActiveDriver = struct {
         return f(self.ptr, allocator);
     }
 
+    /// Return bounded driver resource counters when the implementation exposes them.
+    pub fn diagnostics(self: *ActiveDriver) ?types.DebugDiagnostics {
+        const f = self.vtable.diagnosticsFn orelse return null;
+        return f(self.ptr);
+    }
+
     pub fn writeRegisters(self: *ActiveDriver, allocator: std.mem.Allocator, thread_id: u32, name: []const u8, value: u64) !void {
         const f = self.vtable.writeRegistersFn orelse return error.NotSupported;
         return f(self.ptr, allocator, thread_id, name, value);
@@ -366,6 +373,7 @@ pub const MockDriver = struct {
     deinitialized: bool = false,
     run_count: u32 = 0,
     breakpoint_count: u32 = 0,
+    diagnostics: ?types.DebugDiagnostics = null,
     lifecycle_mutex: std.Thread.Mutex = .{},
     lifecycle_changed: std.Thread.Condition = .{},
     block_run: bool = false,
@@ -426,6 +434,7 @@ pub const MockDriver = struct {
         .terminateFn = mockTerminate,
         .cancelFn = mockCancel,
         .detachFn = mockDetach,
+        .diagnosticsFn = mockDiagnostics,
         .sendPauseFn = mockSendPause,
         .interruptRunFn = mockInterruptRun,
     };
@@ -527,6 +536,11 @@ pub const MockDriver = struct {
         self.cancelled = true;
         self.run_released = true;
         self.lifecycle_changed.broadcast();
+    }
+
+    fn mockDiagnostics(ctx: *anyopaque) types.DebugDiagnostics {
+        const self: *MockDriver = @ptrCast(@alignCast(ctx));
+        return self.diagnostics orelse .{};
     }
 
     fn mockDeinit(ctx: *anyopaque) void {
