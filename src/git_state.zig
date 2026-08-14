@@ -172,6 +172,133 @@ fn isCommitHash(candidate: []const u8) bool {
     return true;
 }
 
+/// Drift candidates for the git fast path: everything that moved between the
+/// recorded commit and the current worktree, from `git diff` (committed
+/// changes) and `git status` (staged, unstaged, and untracked changes).
+/// Files git ignores are invisible here, so callers only use this when the
+/// pattern set tracks git-visible sources — the stat walk stays the fallback.
+pub const Candidates = struct {
+    diff_output: []u8,
+    status_output: []u8,
+    paths: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *Candidates, allocator: std.mem.Allocator) void {
+        self.paths.deinit(allocator);
+        allocator.free(self.diff_output);
+        allocator.free(self.status_output);
+    }
+};
+
+const max_git_output_bytes: usize = 64 * 1024 * 1024;
+
+/// Collect the changed-path candidate set since `old_commit`, or null when
+/// git is unavailable, the commit is unknown, or output cannot be parsed —
+/// callers then fall back to the full stat walk.
+pub fn collectChangedSince(allocator: std.mem.Allocator, project_root: []const u8, old_commit: []const u8) ?Candidates {
+    const diff_output = runGit(allocator, project_root, &.{
+        "git", "-c", "core.quotepath=false", "diff", "--name-only", "--no-renames", old_commit, "HEAD",
+    }) orelse return null;
+    const status_output = runGit(allocator, project_root, &.{
+        "git", "-c", "core.quotepath=false", "status", "--porcelain=v1", "--untracked-files=all",
+    }) orelse {
+        allocator.free(diff_output);
+        return null;
+    };
+
+    var candidates: Candidates = .{ .diff_output = diff_output, .status_output = status_output };
+    appendCandidatePaths(allocator, diff_output, status_output, &candidates.paths) catch {
+        candidates.deinit(allocator);
+        return null;
+    };
+    debug_log.log("git_state.collectChangedSince: candidates={d}", .{candidates.paths.items.len});
+    return candidates;
+}
+
+/// Parse diff and porcelain-v1 status output into a deduplicated path list.
+/// Slices borrow the output buffers.
+pub fn appendCandidatePaths(
+    allocator: std.mem.Allocator,
+    diff_output: []const u8,
+    status_output: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+
+    var diff_lines = std.mem.splitScalar(u8, diff_output, '\n');
+    while (diff_lines.next()) |line| {
+        const path = std.mem.trimRight(u8, line, "\r");
+        if (path.len == 0) continue;
+        try appendUnique(allocator, &seen, out, path);
+    }
+
+    var status_lines = std.mem.splitScalar(u8, status_output, '\n');
+    while (status_lines.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (trimmed.len < 4) continue;
+        if (std.mem.startsWith(u8, trimmed, "!!")) continue;
+        const body = trimmed[3..];
+        if (std.mem.indexOf(u8, body, " -> ")) |arrow| {
+            try appendUnique(allocator, &seen, out, body[0..arrow]);
+            try appendUnique(allocator, &seen, out, body[arrow + 4 ..]);
+        } else {
+            try appendUnique(allocator, &seen, out, body);
+        }
+    }
+}
+
+fn appendUnique(
+    allocator: std.mem.Allocator,
+    seen: *std.StringHashMapUnmanaged(void),
+    out: *std.ArrayListUnmanaged([]const u8),
+    path: []const u8,
+) !void {
+    const entry = try seen.getOrPut(allocator, path);
+    if (entry.found_existing) return;
+    try out.append(allocator, path);
+}
+
+fn runGit(allocator: std.mem.Allocator, project_root: []const u8, argv: []const []const u8) ?[]u8 {
+    const run = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .cwd = project_root,
+        .max_output_bytes = max_git_output_bytes,
+    }) catch |err| {
+        debug_log.log("git_state.runGit: spawn failed: {s}", .{@errorName(err)});
+        return null;
+    };
+    allocator.free(run.stderr);
+    switch (run.term) {
+        .Exited => |code| if (code == 0) return run.stdout,
+        else => {},
+    }
+    debug_log.log("git_state.runGit: {s} failed", .{argv[3]});
+    allocator.free(run.stdout);
+    return null;
+}
+
+test "candidate parsing merges diff and status output" {
+    const allocator = std.testing.allocator;
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer out.deinit(allocator);
+
+    const diff = "src/a.go\nsrc/b.go\n";
+    const status =
+        " M src/b.go\n" ++
+        "?? src/new.go\n" ++
+        " D src/gone.go\n" ++
+        "R  src/old.go -> src/renamed.go\n" ++
+        "!! ignored.go\n";
+    try appendCandidatePaths(allocator, diff, status, &out);
+
+    const expected = [_][]const u8{ "src/a.go", "src/b.go", "src/new.go", "src/gone.go", "src/old.go", "src/renamed.go" };
+    try std.testing.expectEqual(expected.len, out.items.len);
+    for (expected, out.items) |want, got| {
+        try std.testing.expectEqualStrings(want, got);
+    }
+}
+
 test "resolveHeadCommit reads loose refs, packed refs, and detached heads" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

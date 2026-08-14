@@ -2927,6 +2927,10 @@ pub const SYNC_WORKER_COMMAND = "__mcp-sync";
 /// merging the mostly-invalid old index is pure overhead.
 const sync_full_resync_percent: usize = 40;
 
+/// Manifest size at which reconciliation asks git for the changed-path set
+/// instead of walking and statting the whole tree. A test seam, not a knob.
+var git_fast_path_min_entries: usize = 10_000;
+
 pub const SyncOutcome = enum { unchanged, changed, failed };
 
 pub const SyncResult = struct {
@@ -2970,6 +2974,28 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
     defer sources.deinit(allocator);
     const manifest_missing = sources.manifest == null;
 
+    // Git fast path: for large manifests in a git checkout, ask git for the
+    // changed-path set instead of walking the whole tree. Git-ignored files
+    // are invisible to it, and external roots live outside the repository,
+    // so either condition keeps the full walk.
+    var candidates: ?git_state.Candidates = null;
+    defer if (candidates) |*c| c.deinit(allocator);
+    var scan_all = true;
+    if (sources.manifest) |m| {
+        if (m.value.head_commit != null and
+            sources.external_roots.len == 0 and
+            m.value.entries.len >= git_fast_path_min_entries)
+        {
+            candidates = git_state.collectChangedSince(allocator, project_root, m.value.head_commit.?);
+            if (candidates != null) {
+                scan_all = false;
+                debug_log.log("syncConfiguredFiles: git fast path candidates={d}", .{candidates.?.paths.items.len});
+            } else {
+                debug_log.log("syncConfiguredFiles: git fast path unavailable; walking the tree", .{});
+            }
+        }
+    }
+
     var matched_files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
     defer {
         for (matched_files.items) |file| {
@@ -2978,13 +3004,36 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
         }
         matched_files.deinit(allocator);
     }
-    collectConfiguredFiles(
-        allocator,
-        project_root,
-        sources.patterns,
-        sources.external_roots,
-        &matched_files,
-    ) catch return failed;
+    if (scan_all) {
+        collectConfiguredFiles(
+            allocator,
+            project_root,
+            sources.patterns,
+            sources.external_roots,
+            &matched_files,
+        ) catch return failed;
+    } else {
+        // Only candidates the pattern set actually manages become work.
+        var matcher = path_matcher.PathMatcher.init(allocator, .{
+            .project_root = project_root,
+            .patterns = sources.patterns,
+            .external_roots = &.{},
+        }) catch return failed;
+        defer matcher.deinit();
+        for (candidates.?.paths.items) |candidate| {
+            if (!matcher.matches(candidate)) continue;
+            const logical = allocator.dupe(u8, candidate) catch return failed;
+            const physical = std.fs.path.join(allocator, &.{ project_root, candidate }) catch {
+                allocator.free(logical);
+                return failed;
+            };
+            matched_files.append(allocator, .{ .logical_path = logical, .physical_path = physical }) catch {
+                allocator.free(logical);
+                allocator.free(physical);
+                return failed;
+            };
+        }
+    }
 
     // `drifted` borrows strings from matched_files; `removed` and `refreshed`
     // borrow from the loaded manifest and matched set. All outlive their use.
@@ -3005,23 +3054,31 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
 
         for (matched_files.items) |file| {
             matched_set.put(allocator, file.logical_path, {}) catch return failed;
-            const recorded = by_path.get(file.logical_path) orelse {
-                drifted.append(allocator, file) catch return failed;
-                continue;
-            };
+            const recorded = by_path.get(file.logical_path);
             // Stat the physical path — identical to the logical path through
             // the project root for ordinary files, and the only statable
             // location for external-root aliases.
             const current = index_manifest.statPhysicalFile(file.physical_path, file.logical_path) orelse {
+                if (scan_all) {
+                    // The walk saw the file an instant ago; treat the vanish
+                    // as drift and let the batch settle it.
+                    drifted.append(allocator, file) catch return failed;
+                } else if (recorded != null) {
+                    // A git candidate whose file is gone is a deletion.
+                    removed.append(allocator, file.logical_path) catch return failed;
+                }
+                continue;
+            };
+            const known = recorded orelse {
                 drifted.append(allocator, file) catch return failed;
                 continue;
             };
-            if (current.size == recorded.size and current.mtime_ns == recorded.mtime_ns) continue;
+            if (current.size == known.size and current.mtime_ns == known.mtime_ns) continue;
 
             // Content confirmation: checkout churn restores identical bytes
             // under fresh mtimes; those files need a manifest refresh, not a
             // reindex.
-            if (recorded.hash) |expected| {
+            if (known.hash) |expected| {
                 if (index_manifest.hashPhysicalFile(allocator, file.physical_path)) |actual| {
                     if (actual == expected) {
                         var refreshed_entry = current;
@@ -3033,9 +3090,13 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
             }
             drifted.append(allocator, file) catch return failed;
         }
-        for (loaded.value.entries) |entry| {
-            if (!matched_set.contains(entry.path)) {
-                removed.append(allocator, entry.path) catch return failed;
+        if (scan_all) {
+            // Absence-based removal needs the complete matched set; the fast
+            // path detects deletions through its candidates instead.
+            for (loaded.value.entries) |entry| {
+                if (!matched_set.contains(entry.path)) {
+                    removed.append(allocator, entry.path) catch return failed;
+                }
             }
         }
     }
@@ -3056,7 +3117,13 @@ fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResul
         return .{ .outcome = .unchanged };
     }
 
-    const full = shouldFullResync(manifest_missing, drifted.items.len, removed.items.len, matched_files.items.len);
+    // The fast path's matched set is only the candidates, so drift ratios
+    // are judged against the manifest's full document count.
+    const drift_denominator = if (scan_all)
+        matched_files.items.len
+    else
+        sources.manifest.?.value.entries.len;
+    const full = shouldFullResync(manifest_missing, drifted.items.len, removed.items.len, drift_denominator);
     const report: SyncResult = .{
         .outcome = .changed,
         .changed = if (manifest_missing) matched_files.items.len else drifted.items.len,
@@ -6401,6 +6468,85 @@ test "content hashes rescue mtime churn and catch same-size edits" {
     const repaired = syncConfiguredFiles(allocator);
     try std.testing.expectEqual(SyncOutcome.changed, repaired.outcome);
     try std.testing.expectEqual(@as(usize, 1), repaired.changed);
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
+}
+
+fn runGitForTest(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !void {
+    const run = std.process.Child.run(.{ .allocator = allocator, .argv = argv, .cwd = cwd }) catch return error.SkipZigTest;
+    allocator.free(run.stdout);
+    allocator.free(run.stderr);
+    switch (run.term) {
+        .Exited => |code| if (code != 0) return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "git candidate fast path repairs drift without walking" {
+    const allocator = std.testing.allocator;
+
+    const probe = std.process.Child.run(.{ .allocator = allocator, .argv = &.{ "git", "--version" } }) catch return error.SkipZigTest;
+    allocator.free(probe.stdout);
+    allocator.free(probe.stderr);
+    switch (probe.term) {
+        .Exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.writeFile(.{ .sub_path = ".cog/settings.json", .data = 
+        \\{
+        \\  "code": {
+        \\    "index": ["**/*.go"]
+        \\  }
+        \\}
+    });
+    const names = [_][]const u8{ "a.go", "b.go", "c.go", "d.go", "e.go", "f.go" };
+    for (names, 0..) |name, i| {
+        var buffer: [96]u8 = undefined;
+        const source = try std.fmt.bufPrint(&buffer, "package p\n\nfunc F{d}() int {{ return {d} }}\n", .{ i, i });
+        try tmp.dir.writeFile(.{ .sub_path = name, .data = source });
+    }
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    try runGitForTest(allocator, root, &.{ "git", "init" });
+    try runGitForTest(allocator, root, &.{ "git", "add", "-A" });
+    try runGitForTest(allocator, root, &.{
+        "git", "-c", "user.email=cog@test", "-c", "user.name=cog", "-c", "commit.gpgsign=false", "commit", "-m", "init",
+    });
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expect(reindexConfiguredFiles(allocator));
+
+    const saved_threshold = git_fast_path_min_entries;
+    git_fast_path_min_entries = 0;
+    defer git_fast_path_min_entries = saved_threshold;
+
+    // A worktree edit and an untracked file surface through git status.
+    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package p\n\nfunc F1() int { return 100 }\n\nfunc Extra() int { return 7 }\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "g.go", .data = "package p\n\nfunc G() int { return 9 }\n" });
+    const repaired = syncConfiguredFiles(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, repaired.outcome);
+    try std.testing.expectEqual(@as(usize, 2), repaired.changed);
+    try std.testing.expectEqual(@as(usize, 0), repaired.removed);
+    try std.testing.expect(!repaired.full_resync);
+
+    // A deletion surfaces as a candidate whose file is gone.
+    try tmp.dir.deleteFile("a.go");
+    const pruned = syncConfiguredFiles(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, pruned.outcome);
+    try std.testing.expectEqual(@as(usize, 0), pruned.changed);
+    try std.testing.expectEqual(@as(usize, 1), pruned.removed);
+    try std.testing.expect(!pruned.full_resync);
+
+    // Persistent worktree dirt stays a candidate but proves clean.
     try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
 }
 
