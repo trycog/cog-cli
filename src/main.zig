@@ -9,6 +9,7 @@ const debug_log = @import("cog").debug_log;
 const settings_mod = @import("cog").settings;
 const tui = @import("cog").tui;
 const help = @import("cog").help_text;
+const update_check_mod = @import("cog").update_check;
 
 const version = build_options.version;
 
@@ -197,6 +198,15 @@ fn mainInner() !void {
         if (cmd_args.len != 0) return error.InvalidArguments;
         debug_log.log("dispatch hidden index sync worker", .{});
         std.process.exit(code_intel.runSyncWorker(allocator));
+    }
+    if (std.mem.eql(u8, subcmd, update_check_mod.UPDATE_CHECK_WORKER_COMMAND)) {
+        if (cmd_args.len != 0) return error.InvalidArguments;
+        debug_log.log("dispatch hidden update check worker", .{});
+        // checkNow honors the 24h throttle and the COG_UPDATE_CHECK=0
+        // opt-out; every failure inside is silent. The worker always
+        // exits 0 — an update check must never look like a broken command.
+        if (update_check_mod.checkNow(allocator)) |notice| notice.deinit(allocator);
+        std.process.exit(0);
     }
 
     // For non-MCP commands, close the log header now. MCP mode defers
