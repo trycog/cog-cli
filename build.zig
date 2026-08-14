@@ -37,6 +37,9 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "prompt_md", @embedFile("priv/prompts/PROMPT.md"));
+    // README is embedded for docs-vs-registry drift tests only; release
+    // builds never reference it, so it stays out of release_options.
+    build_options.addOption([]const u8, "readme_md", @embedFile("README.md"));
     build_options.addOption([]const u8, "agent_body", @embedFile("priv/agents/cog-code-query.md"));
     build_options.addOption([]const u8, "debug_agent_body", @embedFile("priv/agents/cog-debug.md"));
     build_options.addOption([]const u8, "mem_agent_body", @embedFile("priv/agents/cog-mem.md"));

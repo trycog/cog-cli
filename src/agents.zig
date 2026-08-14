@@ -1,6 +1,7 @@
 const std = @import("std");
 const tui = @import("tui.zig");
 const agent_usage = @import("agent_usage.zig");
+const debug_log = @import("debug_log.zig");
 
 // ── Agent Configuration Types ───────────────────────────────────────────
 
@@ -678,7 +679,7 @@ pub const Agent = struct {
         }
 
         if (std.mem.eql(u8, self.id, "cursor")) {
-            return "Soft AGENTS.md + rules";
+            return "Soft AGENTS.md + project rules";
         }
 
         if (std.mem.eql(u8, self.id, "copilot")) {
@@ -686,7 +687,9 @@ pub const Agent = struct {
         }
 
         if (std.mem.eql(u8, self.id, "claude_code")) {
-            return "Hard sub-agent allowlist + hooks";
+            // Init also approves the project-scoped MCP server for Claude via
+            // enabledMcpjsonServers, so the summary names all three surfaces.
+            return "Hard sub-agent allowlist + hooks + project MCP approval";
         }
 
         if (std.mem.eql(u8, self.id, "gemini")) {
@@ -713,18 +716,100 @@ pub const Agent = struct {
         return "Soft prompt guidance";
     }
 
+    /// Registry-derived description of where this host's specialist surface
+    /// lives — the README support-matrix "Specialist Surface" column.
+    pub fn specialistSurfaceSummary(self: *const Agent, allocator: std.mem.Allocator) ![]u8 {
+        const caps = self.capabilities();
+        const path = self.agent_file_path orelse return try allocator.dupe(u8, "");
+
+        if (caps.subagent_support == .shared_config) {
+            if (self.mcp_format == .toml) {
+                return try allocator.dupe(u8, "`[agents.*]` TOML sections");
+            }
+            return try std.fmt.allocPrint(allocator, "`{s}` custom modes", .{path});
+        }
+
+        // Dedicated files and skills live under a per-host directory; skill
+        // layouts add a per-specialist folder that is stripped so the summary
+        // names the shared root.
+        const basename_start = (std.mem.lastIndexOfScalar(u8, path, '/') orelse return try allocator.dupe(u8, "")) + 1;
+        var dir = path[0..basename_start];
+        if (std.mem.lastIndexOfScalar(u8, dir[0 .. dir.len - 1], '/')) |parent_end| {
+            if (std.mem.startsWith(u8, dir[parent_end + 1 ..], "cog-")) {
+                dir = path[0 .. parent_end + 1];
+            }
+        }
+        return try std.fmt.allocPrint(allocator, "`{s}`", .{dir});
+    }
+
+    /// One README support-matrix row, byte-for-byte in the committed format.
     pub fn supportMatrixRow(self: *const Agent, allocator: std.mem.Allocator) ![]u8 {
-        return try std.fmt.allocPrint(allocator, "| {s} | `{s}` | {s} | {s} | {s} | {s} | {s} |", .{
+        const surface = try self.specialistSurfaceSummary(allocator);
+        defer allocator.free(surface);
+
+        const mcp_cell = if (self.mcp_format == .global_only)
+            try allocator.dupe(u8, "Global config")
+        else
+            try std.fmt.allocPrint(allocator, "`{s}`", .{self.mcp_path.?});
+        defer allocator.free(mcp_cell);
+
+        var row: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer row.deinit(allocator);
+
+        const cells = [_][]const u8{
             self.display_name,
-            self.mcpConfigSummary(),
-            self.subAgentsSummary(),
+            mcp_cell,
+            surface,
             self.toolPermissionsSummary(),
             self.overrideSummary(),
             self.contextPackagingSummary(),
             self.memoryEnrichmentSummary(),
-        });
+        };
+        for (cells) |cell| {
+            try row.appendSlice(allocator, "| ");
+            if (cell.len != 0) {
+                try row.appendSlice(allocator, cell);
+                try row.append(allocator, ' ');
+            }
+        }
+        try row.append(allocator, '|');
+        return try row.toOwnedSlice(allocator);
     }
 };
+
+pub const support_matrix_header =
+    "| Agent | MCP Config | Specialist Surface | Tool Permissions | Cog-First Override | Context Packaging | Memory Write Enrichment |\n" ++
+    "|-------|------------|--------------------|------------------|--------------------|------------------|-------------------------|";
+
+/// Render the complete support matrix from the registry, sorted by display
+/// name, exactly as committed in README.md. A test compares this output with
+/// the README table so registry/docs drift fails the build.
+pub fn renderSupportMatrix(allocator: std.mem.Allocator) ![]u8 {
+    debug_log.log("agents.renderSupportMatrix: rendering {d} hosts", .{agents.len});
+
+    var sorted: [agents.len]usize = undefined;
+    for (0..agents.len) |i| sorted[i] = i;
+    var i: usize = 1;
+    while (i < sorted.len) : (i += 1) {
+        const current = sorted[i];
+        var j = i;
+        while (j > 0 and std.mem.order(u8, agents[current].display_name, agents[sorted[j - 1]].display_name) == .lt) : (j -= 1) {
+            sorted[j] = sorted[j - 1];
+        }
+        sorted[j] = current;
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, support_matrix_header);
+    for (sorted) |agent_index| {
+        const row = try agents[agent_index].supportMatrixRow(allocator);
+        defer allocator.free(row);
+        try out.append(allocator, '\n');
+        try out.appendSlice(allocator, row);
+    }
+    return try out.toOwnedSlice(allocator);
+}
 
 // ── Agent Registry ──────────────────────────────────────────────────────
 
@@ -1677,11 +1762,11 @@ test "support summaries stay capability-driven" {
     try std.testing.expectEqualStrings("Auto-allow", agents[0].toolPermissionsSummary());
     try std.testing.expectEqualStrings("", agents[2].toolPermissionsSummary());
 
-    try std.testing.expectEqualStrings("Hard sub-agent allowlist + hooks", agents[0].overrideSummary());
+    try std.testing.expectEqualStrings("Hard sub-agent allowlist + hooks + project MCP approval", agents[0].overrideSummary());
     try std.testing.expectEqualStrings("Medium hooks + sub-agent tool scoping", agents[1].overrideSummary());
     try std.testing.expectEqualStrings("Soft specialist tool scoping", agents[2].overrideSummary());
     try std.testing.expectEqualStrings("Soft skills + rules", agents[3].overrideSummary());
-    try std.testing.expectEqualStrings("Soft AGENTS.md + rules", agents[4].overrideSummary());
+    try std.testing.expectEqualStrings("Soft AGENTS.md + project rules", agents[4].overrideSummary());
     try std.testing.expectEqualStrings("Soft shared-config specialist guidance", agents[5].overrideSummary());
     try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[6].overrideSummary());
     try std.testing.expectEqualStrings("Soft skill guidance", agents[7].overrideSummary());
@@ -1702,16 +1787,55 @@ test "support matrix helpers stay aligned" {
     const opencode_row = try agents[9].supportMatrixRow(std.testing.allocator);
     defer std.testing.allocator.free(opencode_row);
     try std.testing.expectEqualStrings(
-        "| OpenCode | `opencode.json` | Yes | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |",
+        "| OpenCode | `opencode.json` | `.opencode/agents/` | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |",
         opencode_row,
     );
 
     const goose_row = try agents[7].supportMatrixRow(std.testing.allocator);
     defer std.testing.allocator.free(goose_row);
     try std.testing.expectEqualStrings(
-        "| Goose | `Global config` | Yes |  | Soft skill guidance | Yes | Prompt guidance |",
+        "| Goose | Global config | `.goose/skills/` | | Soft skill guidance | Yes | Prompt guidance |",
         goose_row,
     );
+}
+
+test "specialist surface summaries derive from registry paths" {
+    const allocator = std.testing.allocator;
+
+    const claude = try agents[0].specialistSurfaceSummary(allocator);
+    defer allocator.free(claude);
+    try std.testing.expectEqualStrings("`.claude/agents/`", claude);
+
+    const amp = try agents[6].specialistSurfaceSummary(allocator);
+    defer allocator.free(amp);
+    try std.testing.expectEqualStrings("`.agents/skills/`", amp);
+
+    const codex = try agents[5].specialistSurfaceSummary(allocator);
+    defer allocator.free(codex);
+    try std.testing.expectEqualStrings("`[agents.*]` TOML sections", codex);
+
+    const roo = try agents[8].specialistSurfaceSummary(allocator);
+    defer allocator.free(roo);
+    try std.testing.expectEqualStrings("`.roomodes` custom modes", roo);
+}
+
+test "renderSupportMatrix lists every registry host alphabetically" {
+    const allocator = std.testing.allocator;
+    const matrix = try renderSupportMatrix(allocator);
+    defer allocator.free(matrix);
+
+    var line_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, matrix, '\n');
+    while (lines.next()) |_| line_count += 1;
+    try std.testing.expectEqual(agents.len + 2, line_count);
+
+    for (agents) |agent| {
+        try std.testing.expect(std.mem.indexOf(u8, matrix, agent.display_name) != null);
+    }
+
+    const amp_pos = std.mem.indexOf(u8, matrix, "| Amp |") orelse return error.TestUnexpectedResult;
+    const windsurf_pos = std.mem.indexOf(u8, matrix, "| Windsurf |") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(amp_pos < windsurf_pos);
 }
 
 test "observe specialist files are hidden while feature is disabled" {

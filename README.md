@@ -112,6 +112,8 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 | Roo Code | `.roo/mcp.json` | `.roomodes` custom modes | | Medium native mode groups | Yes | Prompt guidance |
 | Windsurf | Global config | `.windsurf/skills/` | | Soft skills + rules | Yes | Prompt guidance |
 
+The support matrix above is rendered from the agent registry inside `cog-cli` and validated by the test suite, so any drift between the registry and this table fails the build. All eleven hosts receive the identical Cog-first code-exploration policy with the same narrow raw-text fallback exceptions (index unavailable, index incomplete for the target code, or raw string literals, log messages, and other non-symbol text); the policy text is embedded once and rendered into every host prompt and specialist surface.
+
 Every registered host can receive the closest native equivalent of all five Cog specialists: `cog-code-query`, `cog-debug`, `cog-mem`, `cog-mem-validate`, and `cog-observe`. Memory and memory-validation assets are installed only when memory is configured; the experimental observe asset is installed only when observe is explicitly enabled. If the user skips a specialist file, prompt generation treats that specialist as unavailable, while write or configuration failures abort setup instead of leaving a partial mandatory configuration. For shared prompt targets such as `AGENTS.md`, Cog uses the intersection of successful installations across all selected readers, so one host never inherits a mandate it cannot fulfill.
 
 Stronger enforcement depends on what each host can express:

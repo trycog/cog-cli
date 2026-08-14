@@ -2711,6 +2711,17 @@ test "prompt markdown includes stronger memory gate guidance" {
     try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "Budget: 2-3 code-intelligence calls before responding.") != null);
 }
 
+test "README support matrix matches the registry" {
+    const allocator = std.testing.allocator;
+    const rendered = try agents_mod.renderSupportMatrix(allocator);
+    defer allocator.free(rendered);
+
+    const readme = build_options.readme_md;
+    const start = std.mem.indexOf(u8, readme, "| Agent | MCP Config |") orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, readme, start, "\n\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(readme[start..end], rendered);
+}
+
 test "every host prompt carries the identical Cog-first policy and raw-text exceptions" {
     const allocator = std.testing.allocator;
     for (agents_mod.agents) |agent| {
