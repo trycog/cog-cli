@@ -353,7 +353,8 @@ fn validateOwnedCogDir(path: []const u8) !void {
         return error.RuntimePathNotDirectory;
     }
 
-    var dir = std.fs.openDirAbsolute(path, .{ .no_follow = true }) catch |err| {
+    // .iterate avoids Linux O_PATH descriptors, which fchmod() rejects.
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true, .no_follow = true }) catch |err| {
         debug_log.log("validateOwnedCogDir: cannot open {s}: {s}", .{ path, @errorName(err) });
         return err;
     };
@@ -616,7 +617,7 @@ test "getProjectTempDir clears group and world write bits on .cog" {
         original_cwd.close();
     }
     try tmp.dir.makeDir(".cog");
-    var cog = try tmp.dir.openDir(".cog", .{});
+    var cog = try tmp.dir.openDir(".cog", .{ .iterate = true });
     defer cog.close();
     try cog.chmod(0o777);
     try tmp.dir.setAsCwd();

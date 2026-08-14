@@ -8084,7 +8084,7 @@ test "external indexer uses private project output and cleans it up" {
     defer allocator.free(hex);
     const script = try std.fmt.allocPrint(
         allocator,
-        "case \"$1\" in \"$PWD/.cog/tmp/\"*) ;; *) exit 41 ;; esac; [ \"$(stat -f %Lp \"$1\")\" = 600 ] || exit 42; printf '%s' '{s}' | xxd -r -p > \"$1\"",
+        "case \"$1\" in \"$PWD/.cog/tmp/\"*) ;; *) exit 41 ;; esac; perm=$(stat -c %a \"$1\" 2>/dev/null) || perm=$(stat -f %Lp \"$1\") || exit 42; [ \"$perm\" = 600 ] || exit 42; printf '%s' '{s}' | xxd -r -p > \"$1\"",
         .{hex},
     );
     defer allocator.free(script);
