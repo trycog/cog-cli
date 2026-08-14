@@ -3,6 +3,7 @@ const scip = @import("scip.zig");
 
 const COG_BINARY = "zig-out/bin/cog";
 const TEST_ROOT = ".zig-cache/indexing-integration";
+const EXTERNAL_ROOT = ".zig-cache/indexing-external";
 
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print(fmt, args);
@@ -20,6 +21,10 @@ fn recreateTestRoot() !void {
         std.fs.cwd().deleteTree(TEST_ROOT) catch |err| return err;
     } else |_| {}
     try std.fs.cwd().makePath(TEST_ROOT);
+    if (std.fs.cwd().access(EXTERNAL_ROOT, .{})) {
+        std.fs.cwd().deleteTree(EXTERNAL_ROOT) catch |err| return err;
+    } else |_| {}
+    try std.fs.cwd().makePath(EXTERNAL_ROOT);
 }
 
 fn writeFile(rel_path: []const u8, content: []const u8) !void {
@@ -28,6 +33,15 @@ fn writeFile(rel_path: []const u8, content: []const u8) !void {
     if (std.fs.path.dirname(full_path)) |dir_name| {
         try std.fs.cwd().makePath(dir_name);
     }
+    const file = try std.fs.cwd().createFile(full_path, .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
+fn writeExternalFile(rel_path: []const u8, content: []const u8) !void {
+    const full_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ EXTERNAL_ROOT, rel_path });
+    defer std.heap.page_allocator.free(full_path);
+    if (std.fs.path.dirname(full_path)) |dir_name| try std.fs.cwd().makePath(dir_name);
     const file = try std.fs.cwd().createFile(full_path, .{});
     defer file.close();
     try file.writeAll(content);
@@ -167,11 +181,28 @@ pub fn main() !void {
         \\
         \\This is an indexed markdown file.
     );
+    try writeFile("src/generated/skip.js", "export function generatedSkip() {}\n");
+    try writeExternalFile("shared.js", "export function externalShared() {}\n");
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const external_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, EXTERNAL_ROOT });
+    defer allocator.free(external_root);
+    const test_root_abs = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, TEST_ROOT });
+    defer allocator.free(test_root_abs);
+    {
+        var project_dir = try std.fs.openDirAbsolute(test_root_abs, .{});
+        defer project_dir.close();
+        try project_dir.symLink("src", "src-link", .{ .is_directory = true });
+        try project_dir.symLink(external_root, "shared-link", .{ .is_directory = true });
+    }
+    try writeFile(".cog/settings.json", "{\n  \"code\": {\n    \"external_roots\": [\"../indexing-external\"]\n  }\n}\n");
 
     const index_result = try runCog(allocator, &.{
         cog_path,
         "code:index",
         "**/*.js",
+        "!**/generated/**",
         "**/*.go",
         "**/*.py",
         "**/*.ts",
@@ -233,6 +264,25 @@ pub fn main() !void {
         !indexHasOccurrence(&index, "src/lib.rs", "cog/call/new"))
     {
         fail("decoded index missing valid Rust `new` symbol or call\n", .{});
+    }
+    if (!indexHasSymbol(&index, "src-link/types.ts", "WidgetProps")) {
+        fail("decoded index missing project symlink alias `src-link/types.ts`\n", .{});
+    }
+    if (!indexHasSymbol(&index, "shared-link/shared.js", "externalShared")) {
+        fail("decoded index missing approved external symlink alias\n", .{});
+    }
+    var saw_direct_external = false;
+    for (index.documents) |doc| {
+        if (std.mem.startsWith(u8, doc.relative_path, "@external/") and
+            std.mem.endsWith(u8, doc.relative_path, "/shared.js"))
+        {
+            saw_direct_external = true;
+            break;
+        }
+    }
+    if (!saw_direct_external) fail("decoded index missing stable direct external alias\n", .{});
+    if (indexHasDocument(&index, "src/generated/skip.js") or indexHasDocument(&index, "src-link/generated/skip.js")) {
+        fail("decoded index included negated generated source\n", .{});
     }
 
     std.debug.print("indexing integration test passed\n", .{});
