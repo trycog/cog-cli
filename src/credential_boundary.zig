@@ -1133,25 +1133,61 @@ test "approved origin store rejects symlink store and lock files" {
     try std.testing.expectError(error.UnreadableStore, approveInDir(lock_link.dir, allocator, "https://example.com"));
 }
 
-test "approved origin store rejects FIFO store and lock files without blocking" {
+/// Runs one approval-store operation on another thread so a blocking open shows
+/// up as a bounded failure instead of an indefinitely hung test process.
+const FifoProbe = struct {
+    dir: std.fs.Dir,
+    name: []const u8,
+    approve_instead: bool,
+    done: std.Thread.ResetEvent = .{},
+    result: anyerror!bool = false,
+
+    fn run(self: *FifoProbe) void {
+        self.result = if (self.approve_instead)
+            approveInDir(self.dir, std.testing.allocator, "https://example.com")
+        else
+            isApprovedInDir(self.dir, std.testing.allocator, "https://example.com");
+        self.done.set();
+    }
+
+    fn expectFailsClosedPromptly(self: *FifoProbe) !void {
+        var thread = try std.Thread.spawn(.{}, FifoProbe.run, .{self});
+        self.done.timedWait(5 * std.time.ns_per_s) catch {
+            // Opening the write end releases a reader parked in open(2) so the
+            // process can still shut down, then report the real defect.
+            if (self.dir.openFile(self.name, .{ .mode = .write_only })) |writer| {
+                writer.close();
+            } else |_| {}
+            thread.join();
+            return error.ApprovalStoreBlockedOnNamedPipe;
+        };
+        thread.join();
+        try std.testing.expectError(error.UnreadableStore, self.result);
+    }
+};
+
+test "approved origin store never parks on a FIFO store or lock path" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
-    const allocator = std.testing.allocator;
     var store_fifo = std.testing.tmpDir(.{ .iterate = true });
     defer store_fifo.cleanup();
     try makeTestFifo(store_fifo.dir, store_file_name);
-    try std.testing.expectError(
-        error.UnreadableStore,
-        isApprovedInDir(store_fifo.dir, allocator, "https://example.com"),
-    );
+    var store_probe: FifoProbe = .{
+        .dir = store_fifo.dir,
+        .name = store_file_name,
+        .approve_instead = false,
+    };
+    try store_probe.expectFailsClosedPromptly();
 
     var lock_fifo = std.testing.tmpDir(.{ .iterate = true });
     defer lock_fifo.cleanup();
     try makeTestFifo(lock_fifo.dir, lock_file_name);
-    try std.testing.expectError(
-        error.UnreadableStore,
-        approveInDir(lock_fifo.dir, allocator, "https://example.com"),
-    );
+    var lock_probe: FifoProbe = .{
+        .dir = lock_fifo.dir,
+        .name = lock_file_name,
+        .approve_instead = true,
+    };
+    try lock_probe.expectFailsClosedPromptly();
 }
 
 test "approved origin store enforces the persisted size cap" {
