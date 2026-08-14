@@ -136,6 +136,31 @@ pub const SpecialistAvailability = struct {
     }
 };
 
+pub const cog_version_token = "{{COG_VERSION}}";
+
+// ── Shared Agent Skills headers ─────────────────────────────────────────
+// One spec-compliant SKILL.md frontmatter per specialist, shared by every
+// host whose specialist surface is a skills directory. metadata.internal
+// keeps generated project-local skills out of public skill directories, and
+// cog-version records the generating binary so doctor can report asset
+// drift. The version token is replaced at write time.
+fn skillHeader(comptime name: []const u8, comptime description: []const u8) []const u8 {
+    return "---\n" ++
+        "name: " ++ name ++ "\n" ++
+        "description: " ++ description ++ "\n" ++
+        "compatibility: Requires the Cog MCP server (cog mcp) configured in this project\n" ++
+        "metadata:\n" ++
+        "  internal: \"true\"\n" ++
+        "  cog-version: \"" ++ cog_version_token ++ "\"\n" ++
+        "---\n";
+}
+
+const skill_header_code_query = skillHeader("cog-code-query", "Explore, analyze, and map code structure using the Cog SCIP index. Use for code exploration, symbol lookup, reference finding, call graphs, or architecture questions instead of grep, glob, or file search.");
+const skill_header_debug = skillHeader("cog-debug", "Investigate runtime behavior with the Cog interactive debugger: breakpoints, stepping, variable inspection, and stack traces. Use when wrong output, crashes, or unexpected state cannot be explained from reading code.");
+const skill_header_mem = skillHeader("cog-mem", "Recall project knowledge from Cog persistent memory before exploring code, escalating to code intelligence only when memory is insufficient. Use when prior knowledge may answer how something works.");
+const skill_header_validate = skillHeader("cog-mem-validate", "Consolidate Cog memory after completing work: learn durable facts, reinforce validated short-term memories, and flush incorrect ones. Use before finishing any task that explored code or created memories.");
+const skill_header_observe = skillHeader("cog-observe", "Investigate system-level behavior with Cog observability: syscalls, GPU, network, and resource costs. Use when a performance issue cannot be explained at the application level.");
+
 pub const AgentCapabilities = struct {
     repo_local_mcp: bool,
     auto_tool_permissions: bool,
@@ -161,22 +186,6 @@ const gemini_observe_tools =
     \\  - cog__mem_recall
     \\  - read_file
     \\  - run_shell_command
-;
-
-const copilot_observe_tools =
-    \\tools:
-    \\  - cog/observe_start
-    \\  - cog/observe_stop
-    \\  - cog/observe_events
-    \\  - cog/observe_causal_chains
-    \\  - cog/observe_query
-    \\  - cog/observe_sessions
-    \\  - cog/observe_status
-    \\  - cog/code_explore
-    \\  - cog/code_query
-    \\  - cog/mem_recall
-    \\  - read
-    \\  - execute
 ;
 
 const gemini_code_query_tools =
@@ -241,70 +250,6 @@ const gemini_validate_tools =
     \\  - cog__mem_reinforce
     \\  - cog__mem_flush
     \\  - cog__mem_verify
-;
-
-const copilot_validate_tools =
-    \\tools:
-    \\  - cog/mem_learn
-    \\  - cog/mem_associate
-    \\  - cog/mem_refactor
-    \\  - cog/mem_update
-    \\  - cog/mem_deprecate
-    \\  - cog/mem_list_short_term
-    \\  - cog/mem_reinforce
-    \\  - cog/mem_flush
-    \\  - cog/mem_verify
-;
-
-const copilot_code_query_tools =
-    \\tools:
-    \\  - cog/code_explore
-    \\  - cog/code_query
-    \\  - read
-;
-
-const copilot_debug_tools =
-    \\tools:
-    \\  - cog/debug_launch
-    \\  - cog/debug_breakpoint
-    \\  - cog/debug_run
-    \\  - cog/debug_inspect
-    \\  - cog/debug_stacktrace
-    \\  - cog/debug_stop
-    \\  - cog/debug_sessions
-    \\  - cog/debug_scopes
-    \\  - cog/code_explore
-    \\  - cog/code_query
-    \\  - cog/mem_recall
-    \\  - read
-    \\  - execute
-;
-
-const copilot_memory_tools =
-    \\tools:
-    \\  - cog/mem_recall
-    \\  - cog/code_explore
-    \\  - cog/code_query
-    \\  - cog/mem_trace
-    \\  - cog/mem_connections
-    \\  - cog/mem_get
-    \\  - cog/mem_learn
-    \\  - cog/mem_list_short_term
-    \\  - cog/mem_reinforce
-    \\  - cog/mem_flush
-    \\  - cog/mem_stale
-    \\  - cog/mem_verify
-    \\  - cog/mem_stats
-    \\  - cog/mem_orphans
-    \\  - cog/mem_connectivity
-    \\  - cog/mem_list_terms
-    \\  - cog/mem_unlink
-    \\  - cog/mem_meld
-    \\  - cog/mem_associate
-    \\  - cog/mem_refactor
-    \\  - cog/mem_update
-    \\  - cog/mem_deprecate
-    \\  - read
 ;
 
 // ── Shared Cog-first policy (single source for every host surface) ──────
@@ -397,7 +342,7 @@ pub const Agent = struct {
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
-                .subagent_support = .dedicated_files,
+                .subagent_support = .workflow_files,
                 .specialists = .{
                     .code_query = .prompt_only,
                     .debug = .prompt_only,
@@ -453,8 +398,8 @@ pub const Agent = struct {
                 .repo_local_mcp = true,
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
-                .dedicated_subagent_files = false,
-                .subagent_support = .shared_config,
+                .dedicated_subagent_files = true,
+                .subagent_support = .workflow_files,
                 .specialists = .{
                     .code_query = .prompt_only,
                     .debug = .prompt_only,
@@ -675,15 +620,15 @@ pub const Agent = struct {
         }
 
         if (std.mem.eql(u8, self.id, "codex")) {
-            return "Soft shared-config specialist guidance";
+            return "Soft shared skills directory";
         }
 
         if (std.mem.eql(u8, self.id, "cursor")) {
-            return "Soft AGENTS.md + project rules";
+            return "Soft AGENTS.md + shared skills";
         }
 
         if (std.mem.eql(u8, self.id, "copilot")) {
-            return "Soft specialist tool scoping";
+            return "Soft shared skills directory";
         }
 
         if (std.mem.eql(u8, self.id, "claude_code")) {
@@ -1009,55 +954,16 @@ pub const agents = [_]Agent{
         .prompt_target = .copilot_instructions,
         .mcp_path = ".vscode/mcp.json",
         .mcp_format = .json_servers,
-        .agent_file_path = ".github/agents/cog-code-query.agent.md",
-        .agent_file_header = (
-            \\---
-            \\name: cog-code-query
-            \\description: Explore code structure using the Cog SCIP index
-        ++ copilot_code_query_tools ++
-            \\---
-            \\
-        ),
-        .debug_file_path = ".github/agents/cog-debug.agent.md",
-        .debug_file_header = (
-            \\---
-            \\name: cog-debug
-            \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        ++ copilot_debug_tools ++
-            \\user-invokable: false
-            \\---
-            \\
-        ),
-        .mem_file_path = ".github/agents/cog-mem.agent.md",
-        .mem_file_header = (
-            \\---
-            \\name: cog-mem
-            \\description: Memory sub-agent for recall, consolidation, and maintenance
-        ++ copilot_memory_tools ++
-            \\user-invokable: false
-            \\---
-            \\
-        ),
-        .validate_file_path = ".github/agents/cog-mem-validate.agent.md",
-        .validate_file_header = (
-            \\---
-            \\name: cog-mem-validate
-            \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-        ++ copilot_validate_tools ++
-            \\user-invokable: false
-            \\---
-            \\
-        ),
-        .observe_file_path = ".github/agents/cog-observe.agent.md",
-        .observe_file_header = (
-            \\---
-            \\name: cog-observe
-            \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
-        ++ copilot_observe_tools ++
-            \\user-invokable: false
-            \\---
-            \\
-        ),
+        .agent_file_path = ".agents/skills/cog-code-query/SKILL.md",
+        .agent_file_header = skill_header_code_query,
+        .debug_file_path = ".agents/skills/cog-debug/SKILL.md",
+        .debug_file_header = skill_header_debug,
+        .mem_file_path = ".agents/skills/cog-mem/SKILL.md",
+        .mem_file_header = skill_header_mem,
+        .validate_file_path = ".agents/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header = skill_header_validate,
+        .observe_file_path = ".agents/skills/cog-observe/SKILL.md",
+        .observe_file_header = skill_header_observe,
     },
     // ── Windsurf ────────────────────────────────────────────────────
     .{
@@ -1067,45 +973,15 @@ pub const agents = [_]Agent{
         .mcp_path = null,
         .mcp_format = .global_only,
         .agent_file_path = ".windsurf/skills/cog-code-query/SKILL.md",
-        .agent_file_header =
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-        \\---
-        \\
-        ,
+        .agent_file_header = skill_header_code_query,
         .debug_file_path = ".windsurf/skills/cog-debug/SKILL.md",
-        .debug_file_header =
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\---
-        \\
-        ,
+        .debug_file_header = skill_header_debug,
         .mem_file_path = ".windsurf/skills/cog-mem/SKILL.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-        \\---
-        \\
-        ,
+        .mem_file_header = skill_header_mem,
         .validate_file_path = ".windsurf/skills/cog-mem-validate/SKILL.md",
-        .validate_file_header =
-        \\---
-        \\name: cog-mem-validate
-        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-        \\---
-        \\
-        ,
+        .validate_file_header = skill_header_validate,
         .observe_file_path = ".windsurf/skills/cog-observe/SKILL.md",
-        .observe_file_header =
-        \\---
-        \\name: cog-observe
-        \\description: System observability specialist for syscall, GPU, network, and cost investigation
-        \\---
-        \\
-        ,
+        .observe_file_header = skill_header_observe,
     },
     // ── Cursor ──────────────────────────────────────────────────────
     .{
@@ -1114,51 +990,16 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = ".cursor/mcp.json",
         .mcp_format = .json_mcpServers,
-        .agent_file_path = ".cursor/rules/cog-code-query.mdc",
-        .agent_file_header =
-        \\---
-        \\description: Explore code structure using the Cog SCIP index
-        \\globs:
-        \\alwaysApply: false
-        \\---
-        \\
-        ,
-        .debug_file_path = ".cursor/rules/cog-debug.mdc",
-        .debug_file_header =
-        \\---
-        \\description: Debug runtime behavior with Cog debugger tools
-        \\globs:
-        \\alwaysApply: false
-        \\---
-        \\
-        ,
-        .mem_file_path = ".cursor/rules/cog-mem.mdc",
-        .mem_file_header =
-        \\---
-        \\description: Recall and maintain durable project memory with Cog
-        \\globs:
-        \\alwaysApply: false
-        \\---
-        \\
-        ,
-        .validate_file_path = ".cursor/rules/cog-mem-validate.mdc",
-        .validate_file_header =
-        \\---
-        \\description: Validate and consolidate Cog memory after work
-        \\globs:
-        \\alwaysApply: false
-        \\---
-        \\
-        ,
-        .observe_file_path = ".cursor/rules/cog-observe.mdc",
-        .observe_file_header =
-        \\---
-        \\description: Investigate system behavior with Cog observability tools
-        \\globs:
-        \\alwaysApply: false
-        \\---
-        \\
-        ,
+        .agent_file_path = ".agents/skills/cog-code-query/SKILL.md",
+        .agent_file_header = skill_header_code_query,
+        .debug_file_path = ".agents/skills/cog-debug/SKILL.md",
+        .debug_file_header = skill_header_debug,
+        .mem_file_path = ".agents/skills/cog-mem/SKILL.md",
+        .mem_file_header = skill_header_mem,
+        .validate_file_path = ".agents/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header = skill_header_validate,
+        .observe_file_path = ".agents/skills/cog-observe/SKILL.md",
+        .observe_file_header = skill_header_observe,
     },
     // ── OpenAI Codex CLI ────────────────────────────────────────────
     .{
@@ -1167,16 +1008,16 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = ".codex/config.toml",
         .mcp_format = .toml,
-        .agent_file_path = ".codex/config.toml",
-        .agent_file_header = null,
-        .debug_file_path = ".codex/config.toml",
-        .debug_file_header = null,
-        .mem_file_path = ".codex/config.toml",
-        .mem_file_header = null,
-        .validate_file_path = ".codex/config.toml",
-        .validate_file_header = null,
-        .observe_file_path = ".codex/config.toml",
-        .observe_file_header = null,
+        .agent_file_path = ".agents/skills/cog-code-query/SKILL.md",
+        .agent_file_header = skill_header_code_query,
+        .debug_file_path = ".agents/skills/cog-debug/SKILL.md",
+        .debug_file_header = skill_header_debug,
+        .mem_file_path = ".agents/skills/cog-mem/SKILL.md",
+        .mem_file_header = skill_header_mem,
+        .validate_file_path = ".agents/skills/cog-mem-validate/SKILL.md",
+        .validate_file_header = skill_header_validate,
+        .observe_file_path = ".agents/skills/cog-observe/SKILL.md",
+        .observe_file_header = skill_header_observe,
     },
     // ── Amp ─────────────────────────────────────────────────────────
     .{
@@ -1186,45 +1027,15 @@ pub const agents = [_]Agent{
         .mcp_path = ".amp/settings.json",
         .mcp_format = .json_amp,
         .agent_file_path = ".agents/skills/cog-code-query/SKILL.md",
-        .agent_file_header =
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-        \\---
-        \\
-        ,
+        .agent_file_header = skill_header_code_query,
         .debug_file_path = ".agents/skills/cog-debug/SKILL.md",
-        .debug_file_header =
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\---
-        \\
-        ,
+        .debug_file_header = skill_header_debug,
         .mem_file_path = ".agents/skills/cog-mem/SKILL.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-        \\---
-        \\
-        ,
+        .mem_file_header = skill_header_mem,
         .validate_file_path = ".agents/skills/cog-mem-validate/SKILL.md",
-        .validate_file_header =
-        \\---
-        \\name: cog-mem-validate
-        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-        \\---
-        \\
-        ,
+        .validate_file_header = skill_header_validate,
         .observe_file_path = ".agents/skills/cog-observe/SKILL.md",
-        .observe_file_header =
-        \\---
-        \\name: cog-observe
-        \\description: System observability specialist for syscall, GPU, network, and cost investigation
-        \\---
-        \\
-        ,
+        .observe_file_header = skill_header_observe,
     },
     // ── Goose ───────────────────────────────────────────────────────
     .{
@@ -1234,45 +1045,15 @@ pub const agents = [_]Agent{
         .mcp_path = null,
         .mcp_format = .global_only,
         .agent_file_path = ".goose/skills/cog-code-query/SKILL.md",
-        .agent_file_header =
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-        \\---
-        \\
-        ,
+        .agent_file_header = skill_header_code_query,
         .debug_file_path = ".goose/skills/cog-debug/SKILL.md",
-        .debug_file_header =
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\---
-        \\
-        ,
+        .debug_file_header = skill_header_debug,
         .mem_file_path = ".goose/skills/cog-mem/SKILL.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-        \\---
-        \\
-        ,
+        .mem_file_header = skill_header_mem,
         .validate_file_path = ".goose/skills/cog-mem-validate/SKILL.md",
-        .validate_file_header =
-        \\---
-        \\name: cog-mem-validate
-        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-        \\---
-        \\
-        ,
+        .validate_file_header = skill_header_validate,
         .observe_file_path = ".goose/skills/cog-observe/SKILL.md",
-        .observe_file_header =
-        \\---
-        \\name: cog-observe
-        \\description: System observability specialist for syscall, GPU, network, and cost investigation
-        \\---
-        \\
-        ,
+        .observe_file_header = skill_header_observe,
     },
     // ── Roo Code ────────────────────────────────────────────────────
     .{
@@ -1404,45 +1185,15 @@ pub const agents = [_]Agent{
         .mcp_path = ".pi/mcp.json",
         .mcp_format = .json_pi,
         .agent_file_path = ".pi/skills/cog-code-query/SKILL.md",
-        .agent_file_header =
-        \\---
-        \\name: cog-code-query
-        \\description: Explore code structure using the Cog SCIP index
-        \\---
-        \\
-        ,
+        .agent_file_header = skill_header_code_query,
         .debug_file_path = ".pi/skills/cog-debug/SKILL.md",
-        .debug_file_header =
-        \\---
-        \\name: cog-debug
-        \\description: Debug subagent that investigates runtime behavior via cog debugger, code, and memory tools
-        \\---
-        \\
-        ,
+        .debug_file_header = skill_header_debug,
         .mem_file_path = ".pi/skills/cog-mem/SKILL.md",
-        .mem_file_header =
-        \\---
-        \\name: cog-mem
-        \\description: Memory sub-agent for recall, consolidation, and maintenance
-        \\---
-        \\
-        ,
+        .mem_file_header = skill_header_mem,
         .validate_file_path = ".pi/skills/cog-mem-validate/SKILL.md",
-        .validate_file_header =
-        \\---
-        \\name: cog-mem-validate
-        \\description: Post-task memory validation — learns durable knowledge and consolidates short-term memories in one call
-        \\---
-        \\
-        ,
+        .validate_file_header = skill_header_validate,
         .observe_file_path = ".pi/skills/cog-observe/SKILL.md",
-        .observe_file_header =
-        \\---
-        \\name: cog-observe
-        \\description: System observability specialist for syscall, GPU, network, and cost investigation
-        \\---
-        \\
-        ,
+        .observe_file_header = skill_header_observe,
     },
 };
 
@@ -1563,13 +1314,13 @@ test "capability model matches mcp strategy" {
 test "capability model keeps subagent topology explicit" {
     try std.testing.expect(agents[3].capabilities().subagent_support == .workflow_files); // windsurf
     try std.testing.expect(agents[4].capabilities().subagent_support == .workflow_files); // cursor
-    try std.testing.expect(agents[5].capabilities().subagent_support == .shared_config); // codex
+    try std.testing.expect(agents[5].capabilities().subagent_support == .workflow_files); // codex
     try std.testing.expect(agents[7].capabilities().subagent_support == .workflow_files); // goose
     try std.testing.expect(agents[8].capabilities().subagent_support == .shared_config); // roo
     try std.testing.expect(agents[9].capabilities().subagent_support == .dedicated_files); // opencode
     try std.testing.expect(agents[10].capabilities().subagent_support == .workflow_files); // pi
     try std.testing.expectEqualStrings(".windsurf/skills/cog-code-query/SKILL.md", agents[3].agent_file_path.?); // windsurf
-    try std.testing.expectEqualStrings(".cursor/rules/cog-code-query.mdc", agents[4].agent_file_path.?); // cursor
+    try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[4].agent_file_path.?); // cursor
     try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[6].agent_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-debug/SKILL.md", agents[6].debug_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-mem/SKILL.md", agents[6].mem_file_path.?); // amp
@@ -1650,10 +1401,11 @@ test "code-query headers prefer cog-first exploration" {
     try std.testing.expect(std.mem.indexOf(u8, gemini_header, "glob") == null);
     try std.testing.expect(std.mem.indexOf(u8, gemini_header, "search_file_content") == null);
 
+    // Copilot consumes the shared spec-compliant skill header, which carries
+    // discovery keywords instead of host-prefixed tool lists.
     const copilot_header = agents[2].agent_file_header orelse unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/code_explore") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/code_query") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "cog/*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "name: cog-code-query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, copilot_header, "instead of grep, glob, or file search") != null);
 
     const opencode_header = agents[9].agent_file_header orelse unreachable;
     try std.testing.expect(std.mem.indexOf(u8, opencode_header, "glob: deny") != null);
@@ -1683,12 +1435,12 @@ test "opencode debug header stays debugger-focused" {
     try std.testing.expect(std.mem.indexOf(u8, opencode_debug_header, "cog_*: allow") != null);
 }
 
-test "cursor exposes project rule equivalents for every specialist" {
-    try std.testing.expectEqualStrings(".cursor/rules/cog-code-query.mdc", agents[4].agent_file_path.?);
-    try std.testing.expectEqualStrings(".cursor/rules/cog-debug.mdc", agents[4].debug_file_path.?);
-    try std.testing.expectEqualStrings(".cursor/rules/cog-mem.mdc", agents[4].mem_file_path.?);
-    try std.testing.expectEqualStrings(".cursor/rules/cog-mem-validate.mdc", agents[4].validate_file_path.?);
-    try std.testing.expectEqualStrings(".cursor/rules/cog-observe.mdc", agents[4].observe_file_path.?);
+test "cursor exposes shared skill equivalents for every specialist" {
+    try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[4].agent_file_path.?);
+    try std.testing.expectEqualStrings(".agents/skills/cog-debug/SKILL.md", agents[4].debug_file_path.?);
+    try std.testing.expectEqualStrings(".agents/skills/cog-mem/SKILL.md", agents[4].mem_file_path.?);
+    try std.testing.expectEqualStrings(".agents/skills/cog-mem-validate/SKILL.md", agents[4].validate_file_path.?);
+    try std.testing.expectEqualStrings(".agents/skills/cog-observe/SKILL.md", agents[4].observe_file_path.?);
 }
 
 test "specialist capabilities derive asset coverage across the full registry" {
@@ -1720,24 +1472,11 @@ test "gemini specialist headers stay capability-aligned" {
     try std.testing.expect(std.mem.indexOf(u8, gemini_mem_header, "cog__mem_associate") != null);
 }
 
-test "copilot specialist headers stay capability-aligned" {
-    try std.testing.expect(std.mem.eql(u8, copilot_code_query_tools,
-        \\tools:
-        \\  - cog/code_explore
-        \\  - cog/code_query
-        \\  - read
-    ));
-
-    const copilot_debug_header = agents[2].debug_file_header orelse unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/debug_sessions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/mem_recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_debug_header, "cog/*") == null);
-
-    const copilot_mem_header = agents[2].mem_file_header orelse unreachable;
-    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/code_explore") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_learn") != null);
-    try std.testing.expect(std.mem.indexOf(u8, copilot_mem_header, "cog/mem_associate") != null);
+test "copilot shares the spec-compliant skills surface" {
+    try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[2].agent_file_path.?);
+    const header = agents[2].debug_file_header orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, header, "name: cog-debug") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header, "internal: \"true\"") != null);
 }
 
 test "mcp strategy coverage stays explicit" {
@@ -1764,10 +1503,10 @@ test "support summaries stay capability-driven" {
 
     try std.testing.expectEqualStrings("Hard sub-agent allowlist + hooks + project MCP approval", agents[0].overrideSummary());
     try std.testing.expectEqualStrings("Medium hooks + sub-agent tool scoping", agents[1].overrideSummary());
-    try std.testing.expectEqualStrings("Soft specialist tool scoping", agents[2].overrideSummary());
+    try std.testing.expectEqualStrings("Soft shared skills directory", agents[2].overrideSummary());
     try std.testing.expectEqualStrings("Soft skills + rules", agents[3].overrideSummary());
-    try std.testing.expectEqualStrings("Soft AGENTS.md + project rules", agents[4].overrideSummary());
-    try std.testing.expectEqualStrings("Soft shared-config specialist guidance", agents[5].overrideSummary());
+    try std.testing.expectEqualStrings("Soft AGENTS.md + shared skills", agents[4].overrideSummary());
+    try std.testing.expectEqualStrings("Soft shared skills directory", agents[5].overrideSummary());
     try std.testing.expectEqualStrings("Medium runtime plugins + sub-agent permissions", agents[6].overrideSummary());
     try std.testing.expectEqualStrings("Soft skill guidance", agents[7].overrideSummary());
     try std.testing.expectEqualStrings("Medium native mode groups", agents[8].overrideSummary());
@@ -1812,7 +1551,7 @@ test "specialist surface summaries derive from registry paths" {
 
     const codex = try agents[5].specialistSurfaceSummary(allocator);
     defer allocator.free(codex);
-    try std.testing.expectEqualStrings("`[agents.*]` TOML sections", codex);
+    try std.testing.expectEqualStrings("`.agents/skills/`", codex);
 
     const roo = try agents[8].specialistSurfaceSummary(allocator);
     defer allocator.free(roo);
@@ -1962,4 +1701,53 @@ test "hosts that advertise specialist files have mem_file_path" {
             try std.testing.expect(agent.mem_file_path != null);
         }
     }
+}
+
+test "generated skill files satisfy the agent skills specification" {
+    const allocator = std.testing.allocator;
+    var validated: usize = 0;
+    for (agents) |agent| {
+        const kinds = [_]SpecialistKind{ .code_query, .debug, .memory, .validate, .observe };
+        for (kinds) |kind| {
+            const path = agent.specialistPath(kind) orelse continue;
+            if (!std.mem.endsWith(u8, path, "/SKILL.md")) continue;
+            const header = agent.specialistHeader(kind) orelse
+                return error.TestUnexpectedResult;
+
+            // name must equal the parent directory and follow the spec's
+            // lowercase/hyphen rules.
+            const dir_end = path.len - "/SKILL.md".len;
+            const dir_start = (std.mem.lastIndexOfScalar(u8, path[0..dir_end], '/') orelse 0) + 1;
+            const dir_name = path[dir_start..dir_end];
+            const name_line = try std.fmt.allocPrint(allocator, "name: {s}\n", .{dir_name});
+            defer allocator.free(name_line);
+            try std.testing.expect(std.mem.indexOf(u8, header, name_line) != null);
+            try std.testing.expect(dir_name.len >= 1 and dir_name.len <= 64);
+            try std.testing.expect(dir_name[0] != '-' and dir_name[dir_name.len - 1] != '-');
+            try std.testing.expect(std.mem.indexOf(u8, dir_name, "--") == null);
+            for (dir_name) |byte| {
+                switch (byte) {
+                    'a'...'z', '0'...'9', '-' => {},
+                    else => return error.TestUnexpectedResult,
+                }
+            }
+
+            // description present, non-empty, within the 1024-char limit.
+            const desc_start = (std.mem.indexOf(u8, header, "description: ") orelse
+                return error.TestUnexpectedResult) + "description: ".len;
+            const desc_end = std.mem.indexOfScalarPos(u8, header, desc_start, '\n') orelse
+                return error.TestUnexpectedResult;
+            try std.testing.expect(desc_end - desc_start >= 1 and desc_end - desc_start <= 1024);
+
+            // Cog-specific requirements: environment note, discovery hiding,
+            // and the version stamp used for asset-drift reporting.
+            try std.testing.expect(std.mem.indexOf(u8, header, "compatibility: Requires the Cog MCP server") != null);
+            try std.testing.expect(std.mem.indexOf(u8, header, "internal: \"true\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, header, cog_version_token) != null);
+            validated += 1;
+        }
+    }
+    // Amp, Goose, Pi, Windsurf, Cursor, Codex, and Copilot each expose five
+    // skills (observe included); anything fewer means a surface regressed.
+    try std.testing.expect(validated >= 7 * 5);
 }

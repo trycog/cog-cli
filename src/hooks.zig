@@ -1546,7 +1546,7 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
 
     if (caps.subagent_support == .workflow_files) {
         const header = agent.agent_file_header orelse return;
-        const instructions = try buildWorkflowSpecialistInstructions(allocator, agent.display_name, .code_query, build_options.agent_body);
+        const instructions = try buildWorkflowSpecialistInstructions(allocator, specialistHostLabel(agent, agent_path), .code_query, build_options.agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, agent_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.code_query == .config) {
@@ -1556,7 +1556,7 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
         try writeMarkdownAgent(allocator, agent_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.code_query == .prompt_only) {
         const header = agent.agent_file_header orelse return;
-        const instructions = try buildPromptOnlySpecialistInstructions(allocator, agent.display_name, .code_query, build_options.agent_body);
+        const instructions = try buildPromptOnlySpecialistInstructions(allocator, specialistHostLabel(agent, agent_path), .code_query, build_options.agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, agent_path, header, instructions);
     } else if (agent.agent_file_header) |header| {
@@ -1582,7 +1582,7 @@ pub fn configureDebugAgentFile(allocator: std.mem.Allocator, agent: agents_mod.A
 
     if (caps.subagent_support == .workflow_files) {
         const header = agent.debug_file_header orelse return;
-        const instructions = try buildWorkflowSpecialistInstructions(allocator, agent.display_name, .debug, build_options.debug_agent_body);
+        const instructions = try buildWorkflowSpecialistInstructions(allocator, specialistHostLabel(agent, debug_path), .debug, build_options.debug_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, debug_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.debug == .config) {
@@ -1592,7 +1592,7 @@ pub fn configureDebugAgentFile(allocator: std.mem.Allocator, agent: agents_mod.A
         try writeMarkdownAgent(allocator, debug_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.debug == .prompt_only) {
         const header = agent.debug_file_header orelse return;
-        const instructions = try buildPromptOnlySpecialistInstructions(allocator, agent.display_name, .debug, build_options.debug_agent_body);
+        const instructions = try buildPromptOnlySpecialistInstructions(allocator, specialistHostLabel(agent, debug_path), .debug, build_options.debug_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, debug_path, header, instructions);
     } else if (agent.debug_file_header) |header| {
@@ -1614,7 +1614,7 @@ pub fn configureMemAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Age
 
     if (caps.subagent_support == .workflow_files) {
         const header = agent.mem_file_header orelse return;
-        const instructions = try buildWorkflowSpecialistInstructions(allocator, agent.display_name, .memory, build_options.mem_agent_body);
+        const instructions = try buildWorkflowSpecialistInstructions(allocator, specialistHostLabel(agent, mem_path), .memory, build_options.mem_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, mem_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.memory == .config) {
@@ -1624,7 +1624,7 @@ pub fn configureMemAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Age
         try writeMarkdownAgent(allocator, mem_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.memory == .prompt_only) {
         const header = agent.mem_file_header orelse return;
-        const instructions = try buildPromptOnlySpecialistInstructions(allocator, agent.display_name, .memory, build_options.mem_agent_body);
+        const instructions = try buildPromptOnlySpecialistInstructions(allocator, specialistHostLabel(agent, mem_path), .memory, build_options.mem_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, mem_path, header, instructions);
     } else if (agent.mem_file_header) |header| {
@@ -1646,7 +1646,7 @@ pub fn configureValidateAgentFile(allocator: std.mem.Allocator, agent: agents_mo
 
     if (caps.subagent_support == .workflow_files) {
         const header = agent.validate_file_header orelse return;
-        const instructions = try buildWorkflowSpecialistInstructions(allocator, agent.display_name, .validate, build_options.validate_agent_body);
+        const instructions = try buildWorkflowSpecialistInstructions(allocator, specialistHostLabel(agent, validate_path), .validate, build_options.validate_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, validate_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.validate == .config) {
@@ -1656,7 +1656,7 @@ pub fn configureValidateAgentFile(allocator: std.mem.Allocator, agent: agents_mo
         try writeMarkdownAgent(allocator, validate_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.validate == .prompt_only) {
         const header = agent.validate_file_header orelse return;
-        const instructions = try buildPromptOnlySpecialistInstructions(allocator, agent.display_name, .validate, build_options.validate_agent_body);
+        const instructions = try buildPromptOnlySpecialistInstructions(allocator, specialistHostLabel(agent, validate_path), .validate, build_options.validate_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, validate_path, header, instructions);
     } else if (agent.validate_file_header) |header| {
@@ -1721,8 +1721,15 @@ fn buildCodexSpecialistInstructions(allocator: std.mem.Allocator, kind: CodexSpe
     return try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ prelude, body });
 }
 
+/// Shared .agents/skills files serve several hosts at once, so their
+/// instructions must not name any single host.
+fn specialistHostLabel(agent: agents_mod.Agent, path: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, path, "skills/") != null) return "this coding agent";
+    return agent.display_name;
+}
+
 fn buildWorkflowSpecialistInstructions(allocator: std.mem.Allocator, agent_name: []const u8, kind: CodexSpecialistKind, body: []const u8) ![]const u8 {
-    const surface = if (std.mem.eql(u8, agent_name, "Cursor")) "project rule files" else "workflow files";
+    const surface = if (std.mem.eql(u8, agent_name, "this coding agent")) "shared skill files" else "workflow files";
     return switch (kind) {
         .code_query => try std.fmt.allocPrint(allocator,
             \\Workflow guidance:
@@ -1876,7 +1883,7 @@ pub fn configureObserveAgentFile(allocator: std.mem.Allocator, agent: agents_mod
 
     if (caps.subagent_support == .workflow_files) {
         const header = agent.observe_file_header orelse return;
-        const instructions = try buildWorkflowSpecialistInstructions(allocator, agent.display_name, .observe, build_options.observe_agent_body);
+        const instructions = try buildWorkflowSpecialistInstructions(allocator, specialistHostLabel(agent, observe_path), .observe, build_options.observe_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, observe_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.observe == .config) {
@@ -1886,7 +1893,7 @@ pub fn configureObserveAgentFile(allocator: std.mem.Allocator, agent: agents_mod
         try writeMarkdownAgent(allocator, observe_path, header, instructions);
     } else if (caps.subagent_support == .dedicated_files and caps.specialists.observe == .prompt_only) {
         const header = agent.observe_file_header orelse return;
-        const instructions = try buildPromptOnlySpecialistInstructions(allocator, agent.display_name, .observe, build_options.observe_agent_body);
+        const instructions = try buildPromptOnlySpecialistInstructions(allocator, specialistHostLabel(agent, observe_path), .observe, build_options.observe_agent_body);
         defer allocator.free(instructions);
         try writeMarkdownAgent(allocator, observe_path, header, instructions);
     } else if (agent.observe_file_header) |header| {
@@ -1901,7 +1908,22 @@ pub fn configureObserveAgentFile(allocator: std.mem.Allocator, agent: agents_mod
 }
 
 pub fn buildMarkdownAgentContent(allocator: std.mem.Allocator, header: []const u8, body: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
+    const joined = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
+    if (std.mem.indexOf(u8, joined, agents_mod.cog_version_token) == null) return joined;
+    defer allocator.free(joined);
+    // Skill frontmatter records the generating binary so doctor can report
+    // asset drift against the running version.
+    return try std.mem.replaceOwned(u8, allocator, joined, agents_mod.cog_version_token, build_options.version);
+}
+
+test "buildMarkdownAgentContent stamps the generating version" {
+    const allocator = std.testing.allocator;
+    const stamped = try buildMarkdownAgentContent(allocator, "---\ncog-version: \"{{COG_VERSION}}\"\n---\n", "body\n");
+    defer allocator.free(stamped);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, "{{COG_VERSION}}") == null);
+    const expected = try std.fmt.allocPrint(allocator, "cog-version: \"{s}\"", .{build_options.version});
+    defer allocator.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, stamped, expected) != null);
 }
 
 pub const opencode_override_content = build_options.opencode_override_plugin;
@@ -3347,12 +3369,12 @@ test "skill-based prompt-only agents get host-specific content" {
             try configureAgentFile(allocator, agents_mod.agents[3]); // windsurf
             const windsurf = (try readCwdFile(allocator, ".windsurf/skills/cog-code-query/SKILL.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(windsurf);
-            try std.testing.expect(std.mem.indexOf(u8, windsurf, "workflow files rather than hard-scoped subagents") != null);
+            try std.testing.expect(std.mem.indexOf(u8, windsurf, "shared skill files rather than hard-scoped subagents") != null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[7]); // goose
             const goose = (try readCwdFile(allocator, ".goose/skills/cog-mem/SKILL.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(goose);
-            try std.testing.expect(std.mem.indexOf(u8, goose, "workflow files rather than hard-scoped subagents") != null);
+            try std.testing.expect(std.mem.indexOf(u8, goose, "shared skill files rather than hard-scoped subagents") != null);
             try std.testing.expect(std.mem.indexOf(u8, goose, "engram IDs") != null);
         }
     }.run);
@@ -3362,15 +3384,18 @@ test "prompt-only dedicated agents get host-specific content" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
             try configureAgentFile(allocator, agents_mod.agents[4]); // cursor
-            const cursor = (try readCwdFile(allocator, ".cursor/rules/cog-code-query.mdc")) orelse return error.TestUnexpectedResult;
+            const cursor = (try readCwdFile(allocator, ".agents/skills/cog-code-query/SKILL.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(cursor);
-            try std.testing.expect(std.mem.indexOf(u8, cursor, "Cursor") != null);
-            try std.testing.expect(std.mem.indexOf(u8, cursor, "project rule") != null);
+            // Shared skill files serve several hosts, so no host name leaks in.
+            try std.testing.expect(std.mem.indexOf(u8, cursor, "Cursor") == null);
+            try std.testing.expect(std.mem.indexOf(u8, cursor, "shared skill files") != null);
+            try std.testing.expect(std.mem.indexOf(u8, cursor, "name: cog-code-query") != null);
 
             try configureMemAgentFile(allocator, agents_mod.agents[2]); // copilot
-            const copilot = (try readCwdFile(allocator, ".github/agents/cog-mem.agent.md")) orelse return error.TestUnexpectedResult;
+            const copilot = (try readCwdFile(allocator, ".agents/skills/cog-mem/SKILL.md")) orelse return error.TestUnexpectedResult;
             defer allocator.free(copilot);
-            try std.testing.expect(std.mem.indexOf(u8, copilot, "GitHub Copilot cannot hard-deny tools per specialist") != null);
+            try std.testing.expect(std.mem.indexOf(u8, copilot, "GitHub Copilot") == null);
+            try std.testing.expect(std.mem.indexOf(u8, copilot, "retrieval-first triage path") != null);
         }
     }.run);
 }

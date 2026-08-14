@@ -102,11 +102,11 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 |-------|------------|--------------------|------------------|--------------------|------------------|-------------------------|
 | Amp | `.amp/settings.json` | `.agents/skills/` | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
 | Claude Code | `.mcp.json` | `.claude/agents/` | Auto-allow | Hard sub-agent allowlist + hooks + project MCP approval | Yes | Hook/config reminders |
-| Cursor | `.cursor/mcp.json` | `.cursor/rules/` | | Soft AGENTS.md + project rules | Yes | Prompt guidance |
+| Cursor | `.cursor/mcp.json` | `.agents/skills/` | | Soft AGENTS.md + shared skills | Yes | Prompt guidance |
 | Gemini CLI | `.gemini/settings.json` | `.gemini/agents/` | Auto-allow | Medium hooks + sub-agent tool scoping | Yes | Hook/config reminders |
-| GitHub Copilot | `.vscode/mcp.json` | `.github/agents/` | | Soft specialist tool scoping | Yes | Prompt guidance |
+| GitHub Copilot | `.vscode/mcp.json` | `.agents/skills/` | | Soft shared skills directory | Yes | Prompt guidance |
 | Goose | Global config | `.goose/skills/` | | Soft skill guidance | Yes | Prompt guidance |
-| OpenAI Codex CLI | `.codex/config.toml` | `[agents.*]` TOML sections | | Soft shared-config specialist guidance | Yes | Prompt guidance |
+| OpenAI Codex CLI | `.codex/config.toml` | `.agents/skills/` | | Soft shared skills directory | Yes | Prompt guidance |
 | OpenCode | `opencode.json` | `.opencode/agents/` | Auto-allow | Medium runtime plugins + sub-agent permissions | Yes | Runtime reminders |
 | Pi | `.pi/mcp.json` | `.pi/skills/` | | Medium extension hooks + skills | Yes | Runtime reminders |
 | Roo Code | `.roo/mcp.json` | `.roomodes` custom modes | | Medium native mode groups | Yes | Prompt guidance |
