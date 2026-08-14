@@ -3097,6 +3097,16 @@ test "remote session changes rebind the active context" {
     old_ctx = undefined;
 }
 
+test "runtimeCallTool rebinds context after first-call remote discovery" {
+    const source = @embedFile("mcp.zig");
+    const remote_branch_start = std.mem.indexOf(u8, source, "        } else {\n            // Ensure remote tools are discovered while holding the mutex") orelse return error.TestUnexpectedResult;
+    const discovery = std.mem.indexOfPos(u8, source, remote_branch_start, "try discoverRemoteTools(runtime);") orelse return error.TestUnexpectedResult;
+    const remote_call = std.mem.indexOfPos(u8, source, discovery, "callRemoteHostedTool(runtime, session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
+    const between_discovery_and_call = source[discovery..remote_call];
+
+    try std.testing.expect(std.mem.indexOf(u8, between_discovery_and_call, "session_ctx = try runtime.ensureSessionContext()") != null);
+}
+
 test "runtimeCallTool keeps runtime mutex held across remote calls and event recording" {
     const source = @embedFile("mcp.zig");
     const remote_branch_start = std.mem.indexOf(u8, source, "        } else {\n            // Ensure remote tools are discovered while holding the mutex") orelse return error.TestUnexpectedResult;
