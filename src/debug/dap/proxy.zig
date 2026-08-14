@@ -83,6 +83,21 @@ const BufferedEvent = struct {
     body: []const u8,
 };
 
+// Adapter event retention limits. Snapshot-like FIFO collections retain the
+// newest entries by dropping the oldest on overflow. Active progress retains
+// existing operations and drops a new progress ID when all slots are occupied.
+const MAX_LOADED_MODULES: usize = 256;
+const MAX_MEMORY_EVENTS: usize = 256;
+const MAX_ACTIVE_PROGRESS: usize = 64;
+const MAX_INVALIDATED_AREAS: usize = 256;
+
+const RetentionCounters = struct {
+    loaded_modules: usize = 0,
+    memory_events: usize = 0,
+    active_progress: usize = 0,
+    invalidated_areas: usize = 0,
+};
+
 /// A child process spawned with setsid() so it cannot access the
 /// controlling terminal.  Replaces std.process.Child for the debug
 /// adapter to prevent SIGTTIN in the parent (Claude CLI) process.
@@ -274,6 +289,9 @@ pub const DapProxy = struct {
     active_progress: std.StringHashMapUnmanaged(ProgressState) = .empty,
     // Invalidated areas from adapter
     invalidated_areas: std.ArrayListUnmanaged(InvalidatedEvent) = .empty,
+    // Explicit retention accounting for adapter-controlled event state.
+    retention_drops: RetentionCounters = .{},
+    retention_deduplications: RetentionCounters = .{},
     // Pending notifications for MCP server to emit
     pending_notifications: std.ArrayListUnmanaged(types.DebugNotification) = .empty,
     dropped_notifications: usize = 0,
@@ -2177,28 +2195,99 @@ pub const DapProxy = struct {
         }
     }
 
+    fn freeMemoryEvent(self: *DapProxy, event: MemoryEvent) void {
+        self.allocator.free(event.memory_reference);
+    }
+
     fn handleMemoryEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
         const mem_ref = if (body_obj.get("memoryReference")) |v| (if (v == .string) v.string else return) else return;
         const offset: i64 = if (body_obj.get("offset")) |v| (if (v == .integer) v.integer else 0) else 0;
         const count: i64 = if (body_obj.get("count")) |v| (if (v == .integer) v.integer else 0) else 0;
-        self.memory_events.append(self.allocator, .{
-            .memory_reference = self.allocator.dupe(u8, mem_ref) catch return,
+
+        for (self.memory_events.items) |event| {
+            if (event.offset == offset and event.count == count and std.mem.eql(u8, event.memory_reference, mem_ref)) {
+                self.retention_deduplications.memory_events += 1;
+                debug_log.log("dap.proxy: deduplicated memory event ref={s} offset={d} count={d}", .{ mem_ref, offset, count });
+                return;
+            }
+        }
+
+        const owned_ref = self.allocator.dupe(u8, mem_ref) catch return;
+        const new_event: MemoryEvent = .{
+            .memory_reference = owned_ref,
             .offset = offset,
             .count = count,
-        }) catch {};
+        };
+
+        if (self.memory_events.items.len == MAX_MEMORY_EVENTS) {
+            const dropped = self.memory_events.orderedRemove(0);
+            self.freeMemoryEvent(dropped);
+            self.retention_drops.memory_events += 1;
+            debug_log.log("dap.proxy: memory event retention full; dropped oldest total={d}", .{self.retention_drops.memory_events});
+        }
+
+        self.memory_events.append(self.allocator, new_event) catch self.freeMemoryEvent(new_event);
+    }
+
+    fn progressPercentage(value: std.json.Value) ?f64 {
+        return switch (value) {
+            .float => |percentage| percentage,
+            .integer => |percentage| @floatFromInt(percentage),
+            else => null,
+        };
+    }
+
+    fn freeProgressState(self: *DapProxy, state: ProgressState) void {
+        self.allocator.free(state.title);
+        self.allocator.free(state.message);
     }
 
     fn handleProgressStart(self: *DapProxy, body_obj: std.json.ObjectMap) void {
         const progress_id = if (body_obj.get("progressId")) |v| (if (v == .string) v.string else return) else return;
         const title = if (body_obj.get("title")) |v| (if (v == .string) v.string else "") else "";
         const message = if (body_obj.get("message")) |v| (if (v == .string) v.string else "") else "";
-        const percentage: ?f64 = if (body_obj.get("percentage")) |v| (if (v == .float) v.float else null) else null;
+        const percentage = if (body_obj.get("percentage")) |v| progressPercentage(v) else null;
+
+        if (self.active_progress.getPtr(progress_id)) |state| {
+            const owned_title = self.allocator.dupe(u8, title) catch return;
+            const owned_message = self.allocator.dupe(u8, message) catch {
+                self.allocator.free(owned_title);
+                return;
+            };
+            self.freeProgressState(state.*);
+            state.* = .{
+                .title = owned_title,
+                .message = owned_message,
+                .percentage = percentage,
+            };
+            self.retention_deduplications.active_progress += 1;
+            debug_log.log("dap.proxy: replaced duplicate progress start id={s}", .{progress_id});
+            return;
+        }
+
+        if (self.active_progress.count() == MAX_ACTIVE_PROGRESS) {
+            self.retention_drops.active_progress += 1;
+            debug_log.log("dap.proxy: progress retention full; dropped incoming id={s} total={d}", .{ progress_id, self.retention_drops.active_progress });
+            return;
+        }
+
         const key = self.allocator.dupe(u8, progress_id) catch return;
+        const owned_title = self.allocator.dupe(u8, title) catch {
+            self.allocator.free(key);
+            return;
+        };
+        const owned_message = self.allocator.dupe(u8, message) catch {
+            self.allocator.free(owned_title);
+            self.allocator.free(key);
+            return;
+        };
         self.active_progress.put(self.allocator, key, .{
-            .title = self.allocator.dupe(u8, title) catch return,
-            .message = self.allocator.dupe(u8, message) catch return,
+            .title = owned_title,
+            .message = owned_message,
             .percentage = percentage,
         }) catch {
+            self.allocator.free(owned_message);
+            self.allocator.free(owned_title);
             self.allocator.free(key);
         };
     }
@@ -2208,12 +2297,13 @@ pub const DapProxy = struct {
         if (self.active_progress.getPtr(progress_id)) |state| {
             if (body_obj.get("message")) |v| {
                 if (v == .string) {
+                    const owned_message = self.allocator.dupe(u8, v.string) catch return;
                     self.allocator.free(state.message);
-                    state.message = self.allocator.dupe(u8, v.string) catch return;
+                    state.message = owned_message;
                 }
             }
             if (body_obj.get("percentage")) |v| {
-                if (v == .float) state.percentage = v.float;
+                if (progressPercentage(v)) |percentage| state.percentage = percentage;
             }
         }
     }
@@ -2221,31 +2311,80 @@ pub const DapProxy = struct {
     fn handleProgressEnd(self: *DapProxy, body_obj: std.json.ObjectMap) void {
         const progress_id = if (body_obj.get("progressId")) |v| (if (v == .string) v.string else return) else return;
         if (self.active_progress.fetchRemove(progress_id)) |kv| {
-            self.allocator.free(kv.value.title);
-            self.allocator.free(kv.value.message);
+            self.freeProgressState(kv.value);
             self.allocator.free(kv.key);
         }
     }
 
-    fn handleInvalidatedEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
-        var areas_list = std.ArrayListUnmanaged([]const u8).empty;
-        if (body_obj.get("areas")) |areas_val| {
-            if (areas_val == .array) {
-                for (areas_val.array.items) |item| {
-                    if (item == .string) {
-                        areas_list.append(self.allocator, self.allocator.dupe(u8, item.string) catch continue) catch {};
-                    }
-                }
-            }
+    fn freeInvalidatedEvent(self: *DapProxy, event: InvalidatedEvent) void {
+        for (event.areas) |area| self.allocator.free(area);
+        self.allocator.free(event.areas);
+    }
+
+    fn invalidatedEventMatchesBody(event: InvalidatedEvent, body_obj: std.json.ObjectMap, stack_frame_id: ?u32) bool {
+        if (event.stack_frame_id != stack_frame_id) return false;
+        const areas_val = body_obj.get("areas") orelse return event.areas.len == 0;
+        if (areas_val != .array) return event.areas.len == 0;
+
+        var area_index: usize = 0;
+        for (areas_val.array.items) |item| {
+            if (item != .string) continue;
+            if (area_index >= event.areas.len or !std.mem.eql(u8, event.areas[area_index], item.string)) return false;
+            area_index += 1;
         }
+        return area_index == event.areas.len;
+    }
+
+    fn handleInvalidatedEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
         const stack_frame_id: ?u32 = if (body_obj.get("stackFrameId")) |v|
             (if (v == .integer) @as(u32, @intCast(v.integer)) else null)
         else
             null;
-        self.invalidated_areas.append(self.allocator, .{
-            .areas = areas_list.toOwnedSlice(self.allocator) catch &.{},
+
+        for (self.invalidated_areas.items) |event| {
+            if (invalidatedEventMatchesBody(event, body_obj, stack_frame_id)) {
+                self.retention_deduplications.invalidated_areas += 1;
+                debug_log.log("dap.proxy: deduplicated invalidated event frame={?d}", .{stack_frame_id});
+                return;
+            }
+        }
+
+        var areas_list = std.ArrayListUnmanaged([]const u8).empty;
+        defer areas_list.deinit(self.allocator);
+        if (body_obj.get("areas")) |areas_val| {
+            if (areas_val == .array) {
+                for (areas_val.array.items) |item| {
+                    if (item != .string) continue;
+                    const owned_area = self.allocator.dupe(u8, item.string) catch {
+                        for (areas_list.items) |area| self.allocator.free(area);
+                        return;
+                    };
+                    areas_list.append(self.allocator, owned_area) catch {
+                        self.allocator.free(owned_area);
+                        for (areas_list.items) |area| self.allocator.free(area);
+                        return;
+                    };
+                }
+            }
+        }
+
+        const owned_areas = areas_list.toOwnedSlice(self.allocator) catch {
+            for (areas_list.items) |area| self.allocator.free(area);
+            return;
+        };
+        const new_event: InvalidatedEvent = .{
+            .areas = owned_areas,
             .stack_frame_id = stack_frame_id,
-        }) catch {};
+        };
+
+        if (self.invalidated_areas.items.len == MAX_INVALIDATED_AREAS) {
+            const dropped = self.invalidated_areas.orderedRemove(0);
+            self.freeInvalidatedEvent(dropped);
+            self.retention_drops.invalidated_areas += 1;
+            debug_log.log("dap.proxy: invalidated retention full; dropped oldest total={d}", .{self.retention_drops.invalidated_areas});
+        }
+
+        self.invalidated_areas.append(self.allocator, new_event) catch self.freeInvalidatedEvent(new_event);
     }
 
     fn buildReverseResponse(allocator: std.mem.Allocator, seq: i64, request_seq: i64, command: []const u8, success: bool, message: ?[]const u8) ![]const u8 {
@@ -2443,19 +2582,44 @@ pub const DapProxy = struct {
     }
 
     fn handleModuleEvent(self: *DapProxy, body_obj: std.json.ObjectMap) void {
-        // Track module load/unload events from the adapter
         const reason = if (body_obj.get("reason")) |r| (if (r == .string) r.string else return) else return;
         const module = body_obj.get("module") orelse return;
         if (module != .object) return;
-
         const name = if (module.object.get("name")) |n| (if (n == .string) n.string else "unknown") else "unknown";
 
-        if (std.mem.eql(u8, reason, "new") or std.mem.eql(u8, reason, "changed")) {
-            // Track loaded module
-            self.loaded_modules.append(self.allocator, .{
-                .name = self.allocator.dupe(u8, name) catch return,
-            }) catch {};
+        var existing_index: ?usize = null;
+        for (self.loaded_modules.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                existing_index = index;
+                break;
+            }
         }
+
+        if (std.mem.eql(u8, reason, "removed")) {
+            if (existing_index) |index| {
+                const removed = self.loaded_modules.orderedRemove(index);
+                self.allocator.free(removed.name);
+                debug_log.log("dap.proxy: removed loaded module name={s}", .{name});
+            }
+            return;
+        }
+        if (!std.mem.eql(u8, reason, "new") and !std.mem.eql(u8, reason, "changed")) return;
+
+        if (existing_index != null) {
+            self.retention_deduplications.loaded_modules += 1;
+            debug_log.log("dap.proxy: deduplicated loaded module name={s}", .{name});
+            return;
+        }
+
+        const owned_name = self.allocator.dupe(u8, name) catch return;
+        const new_entry: LoadedModuleEntry = .{ .name = owned_name };
+        if (self.loaded_modules.items.len == MAX_LOADED_MODULES) {
+            const dropped = self.loaded_modules.orderedRemove(0);
+            self.allocator.free(dropped.name);
+            self.retention_drops.loaded_modules += 1;
+            debug_log.log("dap.proxy: loaded module retention full; dropped oldest total={d}", .{self.retention_drops.loaded_modules});
+        }
+        self.loaded_modules.append(self.allocator, new_entry) catch self.allocator.free(owned_name);
     }
 
     fn proxySetBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, file: []const u8, line: u32, condition: ?[]const u8, hit_condition: ?[]const u8, log_message: ?[]const u8) anyerror!BreakpointInfo {
@@ -4659,4 +4823,78 @@ test "DapProxy terminated event sets initialized to false" {
     // but we can verify the vtable and capabilities still work after state change.
     proxy.initialized = false;
     try std.testing.expect(!proxy.initialized);
+}
+
+fn handleTestEvent(
+    proxy: *DapProxy,
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    comptime handler: fn (*DapProxy, std.json.ObjectMap) void,
+) !void {
+    const parsed = try json.parseFromSlice(json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    handler(proxy, parsed.value.object);
+}
+
+test "DapProxy caps and deduplicates adversarial event queues" {
+    const allocator = std.testing.allocator;
+    var proxy = DapProxy.init(allocator);
+    defer proxy.deinit();
+
+    var json_buf: [256]u8 = undefined;
+
+    for (0..MAX_LOADED_MODULES) |i| {
+        const event = try std.fmt.bufPrint(&json_buf, "{{\"reason\":\"new\",\"module\":{{\"name\":\"module-{d}\"}}}}", .{i});
+        try handleTestEvent(&proxy, allocator, event, DapProxy.handleModuleEvent);
+    }
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"changed\",\"module\":{\"name\":\"module-0\"}}", DapProxy.handleModuleEvent);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"name\":\"module-overflow\"}}", DapProxy.handleModuleEvent);
+    try std.testing.expectEqual(MAX_LOADED_MODULES, proxy.loaded_modules.items.len);
+    try std.testing.expectEqualStrings("module-1", proxy.loaded_modules.items[0].name);
+    try std.testing.expectEqualStrings("module-overflow", proxy.loaded_modules.items[MAX_LOADED_MODULES - 1].name);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.loaded_modules);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.loaded_modules);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"removed\",\"module\":{\"name\":\"module-1\"}}", DapProxy.handleModuleEvent);
+    try std.testing.expectEqual(MAX_LOADED_MODULES - 1, proxy.loaded_modules.items.len);
+
+    for (0..MAX_MEMORY_EVENTS) |i| {
+        const event = try std.fmt.bufPrint(&json_buf, "{{\"memoryReference\":\"memory\",\"offset\":{d},\"count\":1}}", .{i});
+        try handleTestEvent(&proxy, allocator, event, DapProxy.handleMemoryEvent);
+    }
+    try handleTestEvent(&proxy, allocator, "{\"memoryReference\":\"memory\",\"offset\":0,\"count\":1}", DapProxy.handleMemoryEvent);
+    try handleTestEvent(&proxy, allocator, "{\"memoryReference\":\"memory\",\"offset\":9999,\"count\":1}", DapProxy.handleMemoryEvent);
+    try std.testing.expectEqual(MAX_MEMORY_EVENTS, proxy.memory_events.items.len);
+    try std.testing.expectEqual(@as(i64, 1), proxy.memory_events.items[0].offset);
+    try std.testing.expectEqual(@as(i64, 9999), proxy.memory_events.items[MAX_MEMORY_EVENTS - 1].offset);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.memory_events);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.memory_events);
+
+    for (0..MAX_ACTIVE_PROGRESS) |i| {
+        const event = try std.fmt.bufPrint(&json_buf, "{{\"progressId\":\"progress-{d}\",\"title\":\"title-{d}\"}}", .{ i, i });
+        try handleTestEvent(&proxy, allocator, event, DapProxy.handleProgressStart);
+    }
+    try handleTestEvent(&proxy, allocator, "{\"progressId\":\"progress-0\",\"title\":\"replacement\"}", DapProxy.handleProgressStart);
+    try handleTestEvent(&proxy, allocator, "{\"progressId\":\"progress-overflow\",\"title\":\"overflow\"}", DapProxy.handleProgressStart);
+    try std.testing.expectEqual(MAX_ACTIVE_PROGRESS, proxy.active_progress.count());
+    try std.testing.expectEqualStrings("replacement", proxy.active_progress.get("progress-0").?.title);
+    try std.testing.expect(proxy.active_progress.get("progress-overflow") == null);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.active_progress);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.active_progress);
+    try handleTestEvent(&proxy, allocator, "{\"progressId\":\"progress-0\"}", DapProxy.handleProgressEnd);
+    try handleTestEvent(&proxy, allocator, "{\"progressId\":\"progress-overflow\",\"title\":\"overflow\"}", DapProxy.handleProgressStart);
+    try std.testing.expectEqual(MAX_ACTIVE_PROGRESS, proxy.active_progress.count());
+    try std.testing.expect(proxy.active_progress.get("progress-overflow") != null);
+
+    for (0..MAX_INVALIDATED_AREAS) |i| {
+        const event = try std.fmt.bufPrint(&json_buf, "{{\"areas\":[\"variables\"],\"stackFrameId\":{d}}}", .{i});
+        try handleTestEvent(&proxy, allocator, event, DapProxy.handleInvalidatedEvent);
+    }
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":0}", DapProxy.handleInvalidatedEvent);
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":9999}", DapProxy.handleInvalidatedEvent);
+    try std.testing.expectEqual(MAX_INVALIDATED_AREAS, proxy.invalidated_areas.items.len);
+    try std.testing.expectEqual(@as(?u32, 1), proxy.invalidated_areas.items[0].stack_frame_id);
+    try std.testing.expectEqual(@as(?u32, 9999), proxy.invalidated_areas.items[MAX_INVALIDATED_AREAS - 1].stack_frame_id);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.invalidated_areas);
+    try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.invalidated_areas);
 }
