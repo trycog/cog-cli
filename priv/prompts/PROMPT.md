@@ -7,6 +7,9 @@ Code intelligence, persistent memory, and interactive debugging.
 ## Code Intelligence
 
 For any request to explore, analyze, understand, map, or explain code, use `cog_code_explore` or `cog_code_query`.
+<cog:code-query>
+For repository exploration, invoke or apply the installed `cog-code-query` specialist so code-index work stays out of the primary context.
+</cog:code-query>
 Do NOT use Grep, Glob, or shell search commands like `grep`, `rg`, `find`, or `git grep` for code exploration when the Cog index is available.
 
 - `cog_code_explore` — find symbols by name, return full definition bodies, file TOC, and optional architecture summaries. ALWAYS put all symbols into a single `queries` array — never split across multiple calls.
@@ -35,11 +38,12 @@ work is an error. Combine them.
 - Prefer `cog_code_query` over raw file reads for architectural questions.
 - Budget: 2-3 code-intelligence calls before responding.
 
+<cog:debug>
 ## Debugging
 
-**Always delegate debugging to the `cog-debug` sub-agent.** Do NOT call `cog_debug_*` tools directly from the primary agent.
+**Always route runtime debugging through the installed `cog-debug` specialist.** Do NOT call `cog_debug_*` tools directly from the primary agent.
 
-When you need to investigate runtime behavior — wrong output, unexpected state, crashes, or variable inspection — delegate to the `cog-debug` sub-agent with a prompt containing:
+When you need to investigate runtime behavior — wrong output, unexpected state, crashes, or variable inspection — invoke or apply `cog-debug` with context containing:
 - **QUESTION**: what you want to understand about runtime behavior
 - **HYPOTHESIS**: your theory about what's happening
 - **TEST**: the command or binary to run
@@ -53,16 +57,17 @@ Prefer the debugger when:
 
 Prefer static reasoning instead when the issue is clearly a syntax, type, import, config, or other non-runtime problem.
 
-Fast-stack exception: if the language stack recompiles or hot-reloads so quickly that a one-bit edit-run check is cheaper than opening a debug session, a quick edit-run is acceptable. Otherwise, delegate to `cog-debug`.
+Fast-stack exception: if the language stack recompiles or hot-reloads so quickly that a one-bit edit-run check is cheaper than opening a debug session, a quick edit-run is acceptable. Otherwise, use `cog-debug`.
 
-Do NOT fall back to shell debuggers (lldb, gdb, dlv) — the `cog-debug` sub-agent handles all debugging.
+Do NOT fall back to shell debuggers (lldb, gdb, dlv) — the `cog-debug` specialist handles all debugging.
+</cog:debug>
 
 <cog:observe>
 ## Observability
 
-**Always delegate system observability to the `cog-observe` sub-agent.** Do NOT call `cog_observe_*` tools directly from the primary agent.
+**Always route system observability through the installed `cog-observe` specialist.** Do NOT call `cog_observe_*` tools directly from the primary agent.
 
-When you need to investigate system-level behavior — slow syscalls, GPU stalls, network latency, or resource costs — delegate to the `cog-observe` sub-agent with a prompt containing:
+When you need to investigate system-level behavior — slow syscalls, GPU stalls, network latency, or resource costs — invoke or apply `cog-observe` with context containing:
 - **QUESTION**: what system behavior to investigate
 - **HYPOTHESIS**: your theory about the system-level cause
 - **TARGET**: process PID or command to observe
@@ -76,7 +81,7 @@ Prefer the observe sub-agent when:
 
 Prefer the debugger instead when the issue is clearly application logic — wrong values, control flow, or crash state.
 
-Do NOT fall back to shell profiling tools (strace, perf, dtrace, tcpdump) — the `cog-observe` sub-agent handles all system observability.
+Do NOT fall back to shell profiling tools (strace, perf, dtrace, tcpdump) — the `cog-observe` specialist handles all system observability.
 </cog:observe>
 
 <cog:mem>
@@ -84,33 +89,41 @@ Do NOT fall back to shell profiling tools (strace, perf, dtrace, tcpdump) — th
 
 `cog_mem_*` tools are MCP tools — call them directly, never via the Skill tool.
 
+<cog:memory-specialist>
 When you do not already know how to do something and prior knowledge may help,
-delegate to the `cog-mem` sub-agent first. That specialist should attempt
+route retrieval through the installed `cog-mem` specialist first. That specialist should attempt
 memory recall, decide whether memory is sufficient, and only then escalate to
 Cog code exploration if memory is insufficient. Do not launch a separate
-Explore/code-research sub-agent alongside `cog-mem` for the same question.
+Explore/code-research specialist alongside `cog-mem` for the same question.
+</cog:memory-specialist>
 
 Use memory as a deterministic workflow, not an optional hint:
 
-1. When you do not know how to do something, delegate to `cog-mem` first so it
+<cog:memory-specialist>
+1. When you do not know how to do something, route retrieval through `cog-mem` first so it
    can query long-term memory.
 2. If long-term memory does not answer it, let `cog-mem` escalate to code
    exploration.
+</cog:memory-specialist>
 3. If exploration plus reasoning teaches a durable fact, workflow, constraint,
    or design reason, call `cog_mem_learn` with an `items` array.
 4. During regular work, if you figure out a durable fact, call `cog_mem_learn`
    with an `items` array.
+<cog:validate>
 5. Before you finish, if this task created short-term memory or you explored
-   code and learned something durable, delegate to `cog-mem-validate` to
+   code and learned something durable, route validation through `cog-mem-validate` to
    learn and consolidate in one call. Do NOT call `cog_mem_learn`,
    `cog_mem_list_short_term`, `cog_mem_reinforce`, or `cog_mem_flush` directly
-   from the primary agent — always delegate to `cog-mem-validate`.
+   from the primary agent — always use `cog-mem-validate`.
+</cog:validate>
 6. Mention Cog memory in the final response only if you directly used `cog_mem_*`
-   tools or the `cog-mem` sub-agent during this task. Otherwise omit any memory
+   tools or an installed memory specialist during this task. Otherwise omit any memory
    note entirely.
 
 Memory quality guardrails:
-- when prior knowledge may help, do recall before broad code-intel exploration; only lightweight orientation is acceptable first
+<cog:memory-specialist>
+- when prior knowledge may help, use `cog-mem` recall before broad code-intel exploration; only lightweight orientation is acceptable first
+</cog:memory-specialist>
 - store non-obvious, durable knowledge that would save future reasoning
 - do not store generic repo summaries or facts that are obvious from a quick README or file read unless they capture durable workflow or architectural conventions
 - when learning implementation details, prefer storing why plus what so recall preserves the design reason, not just the surface behavior
@@ -127,8 +140,10 @@ Record knowledge as you work - use IF-THEN rules:
 - IF you completed analysis that required reasoning across multiple symbols
   or files, THEN call `cog_mem_learn` with an `items` array immediately,
   before writing response text.
+<cog:memory-specialist>
 - IF you do not know how to do something and prior knowledge may help, THEN
-  delegate to `cog-mem` before broad exploration.
+  route retrieval through `cog-mem` before broad exploration.
+</cog:memory-specialist>
 - IF A relates to B, THEN call `cog_mem_associate` with an `items` array
   using a strong predicate.
 - IF you discovered a sequence A -> B -> C, THEN call `cog_mem_learn` with
@@ -149,7 +164,9 @@ Record knowledge as you work - use IF-THEN rules:
 Avoid `related_to` and `similar_to` — these weaken graph traversal signal.
 Every concept should have at least one association; orphans are nearly invisible during recall.
 
-After completing work, delegate to `cog-mem-validate` to learn and consolidate.
+<cog:validate>
+After completing work, use `cog-mem-validate` to learn and consolidate.
+</cog:validate>
 New memories are short-term (24h decay) unless reinforced.
 Never store secrets, credentials, or PII.
 
@@ -157,12 +174,16 @@ Never store secrets, credentials, or PII.
 
 Before writing your response to the user, verify:
 
-1. IF prior knowledge might have helped and you never delegated to `cog-mem`
+<cog:memory-specialist>
+1. IF prior knowledge might have helped and you never used `cog-mem`
    -> do that first, then continue
+</cog:memory-specialist>
+<cog:validate>
 2. IF you used `cog_code_explore` and learned something durable, OR this task
-   created short-term memory -> delegate to `cog-mem-validate` once to learn
-   and consolidate. One subagent call handles both — do not call memory
+   created short-term memory -> use `cog-mem-validate` once to learn
+   and consolidate. One specialist call handles both — do not call memory
    tools directly.
+</cog:validate>
 3. IF you modified code for a concept that exists in memory -> call
    `cog_mem_refactor` first, then respond
 

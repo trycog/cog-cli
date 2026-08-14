@@ -49,15 +49,99 @@ pub const CapabilityLevel = enum {
     runtime,
 };
 
+pub const SpecialistKind = enum {
+    code_query,
+    debug,
+    memory,
+    validate,
+    observe,
+};
+
+pub const SpecialistCapabilities = struct {
+    code_query: CapabilityLevel = .none,
+    debug: CapabilityLevel = .none,
+    memory: CapabilityLevel = .none,
+    validate: CapabilityLevel = .none,
+    observe: CapabilityLevel = .none,
+
+    pub fn level(self: SpecialistCapabilities, kind: SpecialistKind) CapabilityLevel {
+        return switch (kind) {
+            .code_query => self.code_query,
+            .debug => self.debug,
+            .memory => self.memory,
+            .validate => self.validate,
+            .observe => self.observe,
+        };
+    }
+
+    pub fn supports(self: SpecialistCapabilities, kind: SpecialistKind) bool {
+        return self.level(kind) != .none;
+    }
+
+    pub fn availability(self: SpecialistCapabilities, memory_enabled: bool) SpecialistAvailability {
+        return .{
+            .code_query = self.code_query != .none,
+            .debug = self.debug != .none,
+            .memory = memory_enabled and self.memory != .none,
+            .validate = memory_enabled and self.validate != .none,
+            .observe = self.observe != .none,
+        };
+    }
+};
+
+pub const SpecialistAvailability = struct {
+    code_query: bool = false,
+    debug: bool = false,
+    memory: bool = false,
+    validate: bool = false,
+    observe: bool = false,
+
+    pub fn all() SpecialistAvailability {
+        return .{
+            .code_query = true,
+            .debug = true,
+            .memory = true,
+            .validate = true,
+            .observe = true,
+        };
+    }
+
+    pub fn has(self: SpecialistAvailability, kind: SpecialistKind) bool {
+        return switch (kind) {
+            .code_query => self.code_query,
+            .debug => self.debug,
+            .memory => self.memory,
+            .validate => self.validate,
+            .observe => self.observe,
+        };
+    }
+
+    pub fn set(self: *SpecialistAvailability, kind: SpecialistKind, value: bool) void {
+        switch (kind) {
+            .code_query => self.code_query = value,
+            .debug => self.debug = value,
+            .memory => self.memory = value,
+            .validate => self.validate = value,
+            .observe => self.observe = value,
+        }
+    }
+
+    pub fn intersect(self: *SpecialistAvailability, other: SpecialistAvailability) void {
+        self.code_query = self.code_query and other.code_query;
+        self.debug = self.debug and other.debug;
+        self.memory = self.memory and other.memory;
+        self.validate = self.validate and other.validate;
+        self.observe = self.observe and other.observe;
+    }
+};
+
 pub const AgentCapabilities = struct {
     repo_local_mcp: bool,
     auto_tool_permissions: bool,
     runtime_policy_plugins: bool,
     dedicated_subagent_files: bool,
     subagent_support: SubAgentSupport,
-    code_query_enforcement: CapabilityLevel,
-    debug_enforcement: CapabilityLevel,
-    memory_enforcement: CapabilityLevel,
+    specialists: SpecialistCapabilities,
     context_packaging: bool,
     memory_write_enrichment: CapabilityLevel,
 };
@@ -255,9 +339,13 @@ pub const Agent = struct {
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
                 .subagent_support = .dedicated_files,
-                .code_query_enforcement = .config,
-                .debug_enforcement = .config,
-                .memory_enforcement = .config,
+                .specialists = .{
+                    .code_query = .config,
+                    .debug = .config,
+                    .memory = .config,
+                    .validate = .config,
+                    .observe = .config,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .config,
             };
@@ -270,9 +358,13 @@ pub const Agent = struct {
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
                 .subagent_support = .dedicated_files,
-                .code_query_enforcement = .config,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .specialists = .{
+                    .code_query = .config,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .config,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .config,
             };
@@ -285,9 +377,13 @@ pub const Agent = struct {
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
                 .subagent_support = .dedicated_files,
-                .code_query_enforcement = .prompt_only,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .specialists = .{
+                    .code_query = .prompt_only,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .prompt_only,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .prompt_only,
             };
@@ -299,10 +395,14 @@ pub const Agent = struct {
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
-                .subagent_support = .dedicated_files,
-                .code_query_enforcement = .prompt_only,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .subagent_support = .workflow_files,
+                .specialists = .{
+                    .code_query = .prompt_only,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .prompt_only,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .prompt_only,
             };
@@ -313,11 +413,15 @@ pub const Agent = struct {
                 .repo_local_mcp = true,
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
-                .dedicated_subagent_files = false,
-                .subagent_support = .shared_config,
-                .code_query_enforcement = .prompt_only,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .dedicated_subagent_files = true,
+                .subagent_support = .workflow_files,
+                .specialists = .{
+                    .code_query = .prompt_only,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .prompt_only,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .prompt_only,
             };
@@ -330,9 +434,13 @@ pub const Agent = struct {
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = false,
                 .subagent_support = .shared_config,
-                .code_query_enforcement = .prompt_only,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .specialists = .{
+                    .code_query = .prompt_only,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .prompt_only,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .prompt_only,
             };
@@ -344,10 +452,14 @@ pub const Agent = struct {
                 .auto_tool_permissions = true,
                 .runtime_policy_plugins = true,
                 .dedicated_subagent_files = true,
-                .subagent_support = .dedicated_files,
-                .code_query_enforcement = .runtime,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .runtime,
+                .subagent_support = .workflow_files,
+                .specialists = .{
+                    .code_query = .runtime,
+                    .debug = .prompt_only,
+                    .memory = .runtime,
+                    .validate = .runtime,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .runtime,
             };
@@ -359,10 +471,14 @@ pub const Agent = struct {
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = true,
-                .subagent_support = .dedicated_files,
-                .code_query_enforcement = .prompt_only,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .subagent_support = .workflow_files,
+                .specialists = .{
+                    .code_query = .prompt_only,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .prompt_only,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .prompt_only,
             };
@@ -375,9 +491,13 @@ pub const Agent = struct {
                 .runtime_policy_plugins = false,
                 .dedicated_subagent_files = false,
                 .subagent_support = .shared_config,
-                .code_query_enforcement = .prompt_only,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .prompt_only,
+                .specialists = .{
+                    .code_query = .prompt_only,
+                    .debug = .prompt_only,
+                    .memory = .prompt_only,
+                    .validate = .prompt_only,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .prompt_only,
             };
@@ -390,9 +510,13 @@ pub const Agent = struct {
                 .runtime_policy_plugins = true,
                 .dedicated_subagent_files = true,
                 .subagent_support = .dedicated_files,
-                .code_query_enforcement = .runtime,
-                .debug_enforcement = .runtime,
-                .memory_enforcement = .runtime,
+                .specialists = .{
+                    .code_query = .runtime,
+                    .debug = .runtime,
+                    .memory = .runtime,
+                    .validate = .runtime,
+                    .observe = .runtime,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .runtime,
             };
@@ -404,16 +528,42 @@ pub const Agent = struct {
                 .auto_tool_permissions = false,
                 .runtime_policy_plugins = true,
                 .dedicated_subagent_files = true,
-                .subagent_support = .dedicated_files,
-                .code_query_enforcement = .runtime,
-                .debug_enforcement = .prompt_only,
-                .memory_enforcement = .runtime,
+                .subagent_support = .workflow_files,
+                .specialists = .{
+                    .code_query = .runtime,
+                    .debug = .prompt_only,
+                    .memory = .runtime,
+                    .validate = .runtime,
+                    .observe = .prompt_only,
+                },
                 .context_packaging = true,
                 .memory_write_enrichment = .runtime,
             };
         }
 
         unreachable;
+    }
+
+    pub fn specialistPath(self: *const Agent, kind: SpecialistKind) ?[]const u8 {
+        if (!self.capabilities().specialists.supports(kind)) return null;
+        return switch (kind) {
+            .code_query => self.agent_file_path,
+            .debug => self.debug_file_path,
+            .memory => self.mem_file_path,
+            .validate => self.validate_file_path,
+            .observe => self.observe_file_path,
+        };
+    }
+
+    pub fn specialistHeader(self: *const Agent, kind: SpecialistKind) ?[]const u8 {
+        if (!self.capabilities().specialists.supports(kind)) return null;
+        return switch (kind) {
+            .code_query => self.agent_file_header,
+            .debug => self.debug_file_header,
+            .memory => self.mem_file_header,
+            .validate => self.validate_file_header,
+            .observe => self.observe_file_header,
+        };
     }
 
     pub fn supportsToolPermissions(self: *const Agent) bool {
@@ -423,12 +573,12 @@ pub const Agent = struct {
     pub fn overrideEnforcementLevel(self: *const Agent) OverrideEnforcementLevel {
         const caps = self.capabilities();
         if (caps.runtime_policy_plugins) return .medium;
-        if (caps.code_query_enforcement == .config and
-            caps.debug_enforcement == .config and
-            caps.memory_enforcement == .config) return .hard;
-        if (caps.code_query_enforcement == .config or
-            caps.debug_enforcement == .config or
-            caps.memory_enforcement == .config) return .medium;
+        if (caps.specialists.code_query == .config and
+            caps.specialists.debug == .config and
+            caps.specialists.memory == .config) return .hard;
+        if (caps.specialists.code_query == .config or
+            caps.specialists.debug == .config or
+            caps.specialists.memory == .config) return .medium;
         return .soft;
     }
 
@@ -461,7 +611,10 @@ pub const Agent = struct {
     }
 
     pub fn subAgentsSummary(self: *const Agent) []const u8 {
-        return if (self.agent_file_path != null and self.debug_file_path != null and self.mem_file_path != null) "Yes" else "";
+        inline for (std.meta.tags(SpecialistKind)) |kind| {
+            if (!self.capabilities().specialists.supports(kind) or self.specialistPath(kind) == null) return "";
+        }
+        return "Yes";
     }
 
     pub fn contextPackagingSummary(self: *const Agent) []const u8 {
@@ -520,16 +673,16 @@ pub const Agent = struct {
             return "Medium hooks + sub-agent tool scoping";
         }
 
-        if (caps.code_query_enforcement == .config and
-            caps.debug_enforcement == .config and
-            caps.memory_enforcement == .config)
+        if (caps.specialists.code_query == .config and
+            caps.specialists.debug == .config and
+            caps.specialists.memory == .config)
         {
             return "Hard sub-agent allowlist";
         }
 
-        if (caps.code_query_enforcement == .config or
-            caps.debug_enforcement == .config or
-            caps.memory_enforcement == .config)
+        if (caps.specialists.code_query == .config or
+            caps.specialists.debug == .config or
+            caps.specialists.memory == .config)
         {
             if (std.mem.eql(u8, self.id, "amp")) {
                 return "Medium permission bootstrap + skills + plugin";
@@ -844,7 +997,7 @@ pub const agents = [_]Agent{
         .observe_file_header =
         \\---
         \\name: cog-observe
-        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        \\description: System observability specialist for syscall, GPU, network, and cost investigation
         \\---
         \\
         ,
@@ -856,12 +1009,51 @@ pub const agents = [_]Agent{
         .prompt_target = .agents_md,
         .mcp_path = ".cursor/mcp.json",
         .mcp_format = .json_mcpServers,
-        .agent_file_path = null,
-        .agent_file_header = null,
-        .debug_file_path = null,
-        .debug_file_header = null,
-        .mem_file_path = null,
-        .mem_file_header = null,
+        .agent_file_path = ".cursor/rules/cog-code-query.mdc",
+        .agent_file_header =
+        \\---
+        \\description: Explore code structure using the Cog SCIP index
+        \\globs:
+        \\alwaysApply: false
+        \\---
+        \\
+        ,
+        .debug_file_path = ".cursor/rules/cog-debug.mdc",
+        .debug_file_header =
+        \\---
+        \\description: Debug runtime behavior with Cog debugger tools
+        \\globs:
+        \\alwaysApply: false
+        \\---
+        \\
+        ,
+        .mem_file_path = ".cursor/rules/cog-mem.mdc",
+        .mem_file_header =
+        \\---
+        \\description: Recall and maintain durable project memory with Cog
+        \\globs:
+        \\alwaysApply: false
+        \\---
+        \\
+        ,
+        .validate_file_path = ".cursor/rules/cog-mem-validate.mdc",
+        .validate_file_header =
+        \\---
+        \\description: Validate and consolidate Cog memory after work
+        \\globs:
+        \\alwaysApply: false
+        \\---
+        \\
+        ,
+        .observe_file_path = ".cursor/rules/cog-observe.mdc",
+        .observe_file_header =
+        \\---
+        \\description: Investigate system behavior with Cog observability tools
+        \\globs:
+        \\alwaysApply: false
+        \\---
+        \\
+        ,
     },
     // ── OpenAI Codex CLI ────────────────────────────────────────────
     .{
@@ -876,6 +1068,8 @@ pub const agents = [_]Agent{
         .debug_file_header = null,
         .mem_file_path = ".codex/config.toml",
         .mem_file_header = null,
+        .validate_file_path = ".codex/config.toml",
+        .validate_file_header = null,
         .observe_file_path = ".codex/config.toml",
         .observe_file_header = null,
     },
@@ -922,7 +1116,7 @@ pub const agents = [_]Agent{
         .observe_file_header =
         \\---
         \\name: cog-observe
-        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        \\description: System observability specialist for syscall, GPU, network, and cost investigation
         \\---
         \\
         ,
@@ -970,7 +1164,7 @@ pub const agents = [_]Agent{
         .observe_file_header =
         \\---
         \\name: cog-observe
-        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        \\description: System observability specialist for syscall, GPU, network, and cost investigation
         \\---
         \\
         ,
@@ -988,6 +1182,8 @@ pub const agents = [_]Agent{
         .debug_file_header = null,
         .mem_file_path = ".roomodes",
         .mem_file_header = null,
+        .validate_file_path = ".roomodes",
+        .validate_file_header = null,
         .observe_file_path = ".roomodes",
         .observe_file_header = null,
     },
@@ -1077,13 +1273,16 @@ pub const agents = [_]Agent{
         .observe_file_path = ".opencode/agents/cog-observe.md",
         .observe_file_header =
         \\---
-        \\description: System observability sub-agent for syscall, GPU, network, and cost investigation
+        \\description: System observability specialist for syscall, GPU, network, and cost investigation
         \\mode: subagent
         \\permission:
         \\  read: allow
         \\  glob: deny
         \\  grep: deny
         \\  list: deny
+        \\  bash: allow
+        \\  webfetch: deny
+        \\  task: deny
         \\  cog_*: allow
         \\tools:
         \\  write: false
@@ -1135,7 +1334,7 @@ pub const agents = [_]Agent{
         .observe_file_header =
         \\---
         \\name: cog-observe
-        \\description: System observability sub-agent that investigates syscalls, GPU, network, and cost via cog observe tools
+        \\description: System observability specialist for syscall, GPU, network, and cost investigation
         \\---
         \\
         ,
@@ -1257,15 +1456,15 @@ test "capability model matches mcp strategy" {
 }
 
 test "capability model keeps subagent topology explicit" {
-    try std.testing.expect(agents[3].capabilities().subagent_support == .dedicated_files); // windsurf
-    try std.testing.expect(agents[4].capabilities().subagent_support == .shared_config); // cursor
+    try std.testing.expect(agents[3].capabilities().subagent_support == .workflow_files); // windsurf
+    try std.testing.expect(agents[4].capabilities().subagent_support == .workflow_files); // cursor
     try std.testing.expect(agents[5].capabilities().subagent_support == .shared_config); // codex
-    try std.testing.expect(agents[7].capabilities().subagent_support == .dedicated_files); // goose
+    try std.testing.expect(agents[7].capabilities().subagent_support == .workflow_files); // goose
     try std.testing.expect(agents[8].capabilities().subagent_support == .shared_config); // roo
     try std.testing.expect(agents[9].capabilities().subagent_support == .dedicated_files); // opencode
-    try std.testing.expect(agents[10].capabilities().subagent_support == .dedicated_files); // pi
+    try std.testing.expect(agents[10].capabilities().subagent_support == .workflow_files); // pi
     try std.testing.expectEqualStrings(".windsurf/skills/cog-code-query/SKILL.md", agents[3].agent_file_path.?); // windsurf
-    try std.testing.expect(agents[4].agent_file_path == null); // cursor
+    try std.testing.expectEqualStrings(".cursor/rules/cog-code-query.mdc", agents[4].agent_file_path.?); // cursor
     try std.testing.expectEqualStrings(".agents/skills/cog-code-query/SKILL.md", agents[6].agent_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-debug/SKILL.md", agents[6].debug_file_path.?); // amp
     try std.testing.expectEqualStrings(".agents/skills/cog-mem/SKILL.md", agents[6].mem_file_path.?); // amp
@@ -1303,29 +1502,29 @@ test "tool permission support stays capability-driven" {
 }
 
 test "enforcement level stays capability-driven" {
-    try std.testing.expect(agents[0].capabilities().code_query_enforcement == .config);
-    try std.testing.expect(agents[0].capabilities().debug_enforcement == .config);
-    try std.testing.expect(agents[0].capabilities().memory_enforcement == .config);
+    try std.testing.expect(agents[0].capabilities().specialists.code_query == .config);
+    try std.testing.expect(agents[0].capabilities().specialists.debug == .config);
+    try std.testing.expect(agents[0].capabilities().specialists.memory == .config);
 
-    try std.testing.expect(agents[9].capabilities().code_query_enforcement == .runtime);
-    try std.testing.expect(agents[9].capabilities().debug_enforcement == .runtime);
-    try std.testing.expect(agents[9].capabilities().memory_enforcement == .runtime);
+    try std.testing.expect(agents[9].capabilities().specialists.code_query == .runtime);
+    try std.testing.expect(agents[9].capabilities().specialists.debug == .runtime);
+    try std.testing.expect(agents[9].capabilities().specialists.memory == .runtime);
 
-    try std.testing.expect(agents[2].capabilities().code_query_enforcement == .prompt_only);
-    try std.testing.expect(agents[2].capabilities().debug_enforcement == .prompt_only);
-    try std.testing.expect(agents[2].capabilities().memory_enforcement == .prompt_only);
+    try std.testing.expect(agents[2].capabilities().specialists.code_query == .prompt_only);
+    try std.testing.expect(agents[2].capabilities().specialists.debug == .prompt_only);
+    try std.testing.expect(agents[2].capabilities().specialists.memory == .prompt_only);
 
     try std.testing.expect(agents[0].capabilities().memory_write_enrichment == .config);
     try std.testing.expect(agents[6].capabilities().memory_write_enrichment == .runtime);
     try std.testing.expect(agents[9].capabilities().memory_write_enrichment == .runtime);
     try std.testing.expect(agents[2].capabilities().memory_write_enrichment == .prompt_only);
 
-    try std.testing.expect(agents[6].capabilities().code_query_enforcement == .runtime);
-    try std.testing.expect(agents[6].capabilities().memory_enforcement == .runtime);
+    try std.testing.expect(agents[6].capabilities().specialists.code_query == .runtime);
+    try std.testing.expect(agents[6].capabilities().specialists.memory == .runtime);
 
-    try std.testing.expect(agents[10].capabilities().code_query_enforcement == .runtime);
-    try std.testing.expect(agents[10].capabilities().debug_enforcement == .prompt_only);
-    try std.testing.expect(agents[10].capabilities().memory_enforcement == .runtime);
+    try std.testing.expect(agents[10].capabilities().specialists.code_query == .runtime);
+    try std.testing.expect(agents[10].capabilities().specialists.debug == .prompt_only);
+    try std.testing.expect(agents[10].capabilities().specialists.memory == .runtime);
     try std.testing.expect(agents[10].capabilities().memory_write_enrichment == .runtime);
 
     for (agents) |agent| {
@@ -1379,10 +1578,22 @@ test "opencode debug header stays debugger-focused" {
     try std.testing.expect(std.mem.indexOf(u8, opencode_debug_header, "cog_*: allow") != null);
 }
 
-test "cursor does not claim unsupported specialist files" {
-    try std.testing.expect(agents[4].agent_file_path == null);
-    try std.testing.expect(agents[4].debug_file_path == null);
-    try std.testing.expect(agents[4].mem_file_path == null);
+test "cursor exposes project rule equivalents for every specialist" {
+    try std.testing.expectEqualStrings(".cursor/rules/cog-code-query.mdc", agents[4].agent_file_path.?);
+    try std.testing.expectEqualStrings(".cursor/rules/cog-debug.mdc", agents[4].debug_file_path.?);
+    try std.testing.expectEqualStrings(".cursor/rules/cog-mem.mdc", agents[4].mem_file_path.?);
+    try std.testing.expectEqualStrings(".cursor/rules/cog-mem-validate.mdc", agents[4].validate_file_path.?);
+    try std.testing.expectEqualStrings(".cursor/rules/cog-observe.mdc", agents[4].observe_file_path.?);
+}
+
+test "specialist capabilities derive asset coverage across the full registry" {
+    inline for (std.meta.tags(SpecialistKind)) |kind| {
+        for (agents) |agent| {
+            const supported = agent.capabilities().specialists.supports(kind);
+            try std.testing.expectEqual(supported, agent.specialistPath(kind) != null);
+            try std.testing.expect(supported);
+        }
+    }
 }
 
 test "gemini specialist headers stay capability-aligned" {
@@ -1462,7 +1673,7 @@ test "support summaries stay capability-driven" {
 test "support matrix helpers stay aligned" {
     try std.testing.expectEqualStrings(".mcp.json", agents[0].mcpConfigSummary());
     try std.testing.expectEqualStrings("Global config", agents[3].mcpConfigSummary());
-    try std.testing.expectEqualStrings("", agents[4].subAgentsSummary());
+    try std.testing.expectEqualStrings("Yes", agents[4].subAgentsSummary());
     try std.testing.expectEqualStrings("Yes", agents[9].subAgentsSummary());
     try std.testing.expectEqualStrings("Yes", agents[0].contextPackagingSummary());
     try std.testing.expectEqualStrings("Runtime reminders", agents[6].memoryEnrichmentSummary());
@@ -1495,7 +1706,7 @@ test "observe specialist files preserve all-host parity when enabled" {
     for (agents) |agent| {
         if (agent.observeFilePath(true) != null) supported += 1;
     }
-    try std.testing.expectEqual(@as(usize, 10), supported);
+    try std.testing.expectEqual(agents.len, supported);
 }
 
 test "hosts that advertise specialist files have debug_file_path" {

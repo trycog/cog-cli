@@ -145,15 +145,50 @@ fn printCommandHelp(comptime help_text: []const u8) void {
     printErr(help_text);
 }
 
-/// Process <cog:mem> tags in content.
-/// When keep_content is true (memory mode): removes tag lines, keeps content between them.
-/// When keep_content is false (tools-only mode): removes tag lines AND all content between them.
-/// Collapses consecutive blank lines left by stripping.
-fn processTaggedBlock(allocator: std.mem.Allocator, content: []const u8, open_tag: []const u8, close_tag: []const u8, keep_content: bool) ![]const u8 {
+const PromptContext = struct {
+    memory_enabled: bool,
+    specialists: agents_mod.SpecialistAvailability,
+};
+
+fn promptTagEnabled(tag: []const u8, context: PromptContext) ?bool {
+    if (std.mem.eql(u8, tag, "<cog:mem>")) return context.memory_enabled;
+    if (std.mem.eql(u8, tag, "<cog:code-query>")) return context.specialists.code_query;
+    if (std.mem.eql(u8, tag, "<cog:debug>")) return context.specialists.debug;
+    if (std.mem.eql(u8, tag, "<cog:memory-specialist>")) return context.memory_enabled and context.specialists.memory;
+    if (std.mem.eql(u8, tag, "<cog:validate>")) return context.memory_enabled and context.specialists.validate;
+    if (std.mem.eql(u8, tag, "<cog:observe>")) return context.specialists.observe;
+    return null;
+}
+
+fn isPromptCloseTag(tag: []const u8) bool {
+    return std.mem.eql(u8, tag, "</cog:mem>") or
+        std.mem.eql(u8, tag, "</cog:code-query>") or
+        std.mem.eql(u8, tag, "</cog:debug>") or
+        std.mem.eql(u8, tag, "</cog:memory-specialist>") or
+        std.mem.eql(u8, tag, "</cog:validate>") or
+        std.mem.eql(u8, tag, "</cog:observe>");
+}
+
+/// Render the embedded prompt from memory and installed specialist capabilities.
+fn processPromptTags(allocator: std.mem.Allocator, content: []const u8, context: PromptContext) ![]const u8 {
+    debug_log.log(
+        "commands.processPromptTags: memory={any} code={any} debug={any} mem={any} validate={any} observe={any}",
+        .{
+            context.memory_enabled,
+            context.specialists.code_query,
+            context.specialists.debug,
+            context.specialists.memory,
+            context.specialists.validate,
+            context.specialists.observe,
+        },
+    );
+
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
-    var in_mem_block = false;
+    var include_stack: [8]bool = undefined;
+    var depth: usize = 0;
+    var include = true;
     var prev_blank = false;
     var first_line = true;
     var lines = std.mem.splitSequence(u8, content, "\n");
@@ -161,19 +196,23 @@ fn processTaggedBlock(allocator: std.mem.Allocator, content: []const u8, open_ta
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
 
-        if (std.mem.eql(u8, trimmed, open_tag)) {
-            in_mem_block = true;
+        if (promptTagEnabled(trimmed, context)) |enabled| {
+            if (depth >= include_stack.len) return error.InvalidPromptTags;
+            include_stack[depth] = include;
+            depth += 1;
+            include = include and enabled;
             continue;
         }
 
-        if (std.mem.eql(u8, trimmed, close_tag)) {
-            in_mem_block = false;
+        if (isPromptCloseTag(trimmed)) {
+            if (depth == 0) return error.InvalidPromptTags;
+            depth -= 1;
+            include = include_stack[depth];
             continue;
         }
 
-        if (in_mem_block and !keep_content) continue;
+        if (!include) continue;
 
-        // Collapse consecutive blank lines
         const is_blank = trimmed.len == 0;
         if (is_blank and prev_blank) continue;
         prev_blank = is_blank;
@@ -183,15 +222,88 @@ fn processTaggedBlock(allocator: std.mem.Allocator, content: []const u8, open_ta
         first_line = false;
     }
 
+    if (depth != 0) return error.InvalidPromptTags;
     return try result.toOwnedSlice(allocator);
 }
 
-fn processCogMemTags(allocator: std.mem.Allocator, content: []const u8, keep_content: bool) ![]const u8 {
-    return processTaggedBlock(allocator, content, "<cog:mem>", "</cog:mem>", keep_content);
+fn specialistBody(kind: agents_mod.SpecialistKind) []const u8 {
+    return switch (kind) {
+        .code_query => build_options.agent_body,
+        .debug => build_options.debug_agent_body,
+        .memory => build_options.mem_agent_body,
+        .validate => build_options.validate_agent_body,
+        .observe => build_options.observe_agent_body,
+    };
 }
 
-fn processCogObserveTags(allocator: std.mem.Allocator, content: []const u8, keep_content: bool) ![]const u8 {
-    return processTaggedBlock(allocator, content, "<cog:observe>", "</cog:observe>", keep_content);
+fn installSpecialistAsset(
+    allocator: std.mem.Allocator,
+    agent: agents_mod.Agent,
+    kind: agents_mod.SpecialistKind,
+    accept_all: *bool,
+    written_paths: [][]const u8,
+    written_paths_count: *usize,
+    installed_assets: [][]const u8,
+    installed_assets_count: *usize,
+) !bool {
+    const caps = agent.capabilities();
+    if (!caps.specialists.supports(kind)) {
+        debug_log.log("commands.installSpecialistAsset: unsupported agent={s} kind={s}", .{ agent.id, @tagName(kind) });
+        return false;
+    }
+
+    const path = agent.specialistPath(kind) orelse {
+        debug_log.log("commands.installSpecialistAsset: missing path agent={s} kind={s}", .{ agent.id, @tagName(kind) });
+        return false;
+    };
+    var path_seen = false;
+    for (written_paths[0..written_paths_count.*]) |written| {
+        if (std.mem.eql(u8, written, path)) {
+            path_seen = true;
+            break;
+        }
+    }
+
+    const shared_config = caps.subagent_support == .shared_config;
+    if (path_seen and !shared_config) {
+        debug_log.log("commands.installSpecialistAsset: reusing path={s} agent={s} kind={s}", .{ path, agent.id, @tagName(kind) });
+        return true;
+    }
+
+    if (!shared_config) {
+        const should_write = if (agent.specialistHeader(kind)) |header| blk: {
+            const content = hooks_mod.buildMarkdownAgentContent(allocator, header, specialistBody(kind)) catch break :blk true;
+            defer allocator.free(content);
+            break :blk shouldWriteFile(allocator, path, content, accept_all);
+        } else true;
+
+        if (!should_write) {
+            debug_log.log("commands.installSpecialistAsset: skipped path={s} agent={s} kind={s}", .{ path, agent.id, @tagName(kind) });
+            appendUniquePath(written_paths, written_paths_count, path);
+            printErr("    ");
+            printErr(dim ++ "  skipped " ++ reset);
+            printErr(path);
+            printErr("\n");
+            return false;
+        }
+    }
+
+    hooks_mod.configureSpecialistFile(allocator, agent, kind) catch |err| {
+        debug_log.log("commands.installSpecialistAsset: failed path={s} agent={s} kind={s} error={s}", .{ path, agent.id, @tagName(kind), @errorName(err) });
+        return err;
+    };
+
+    debug_log.log("commands.installSpecialistAsset: installed path={s} agent={s} kind={s}", .{ path, agent.id, @tagName(kind) });
+    appendUniquePath(written_paths, written_paths_count, path);
+    appendUniquePath(installed_assets, installed_assets_count, path);
+    if (!path_seen) {
+        printErr("    ");
+        tui.checkmark();
+        printErr(" ");
+        printErr(path);
+        printErr("\n");
+    }
+    return true;
 }
 
 // ── Brain URL Parser ────────────────────────────────────────────────────
@@ -380,12 +492,6 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const observe_enabled = settings_mod.isObserveEnabled(allocator);
     debug_log.log("commands.init: observe_enabled={any}", .{observe_enabled});
 
-    // Process embedded PROMPT.md
-    const memory_prompt = try processCogMemTags(allocator, build_options.prompt_md, setup_mem);
-    defer allocator.free(memory_prompt);
-    const prompt_content = try processCogObserveTags(allocator, memory_prompt, observe_enabled);
-    defer allocator.free(prompt_content);
-
     // Track overwrite-all consent for existing files
     var accept_all = false;
 
@@ -393,18 +499,16 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var written_mcp: [16][]const u8 = undefined;
     var written_mcp_count: usize = 0;
 
-    // Track which prompt targets have been written (for dedup)
-    var written_prompts: [4]agents_mod.PromptTarget = undefined;
-    var written_prompts_count: usize = 0;
-
-    // Track which agent files have been written (for dedup)
-    var written_agents: [32][]const u8 = undefined;
+    // Track specialist assets and the capabilities that were actually installed.
+    const max_specialist_assets = agents_mod.agents.len * std.meta.fields(agents_mod.SpecialistKind).len;
+    var written_agents: [max_specialist_assets][]const u8 = undefined;
     var written_agents_count: usize = 0;
+    var installed_specialists: [agents_mod.agents.len]agents_mod.SpecialistAvailability = @splat(.{});
 
     var installed_assets: [96][]const u8 = undefined;
     var installed_assets_count: usize = 0;
 
-    for (selected_agent_indices[0..selected_indices.len]) |idx| {
+    for (selected_agent_indices[0..selected_indices.len], 0..) |idx, selected_pos| {
         const agent = agents_mod.agents[idx];
 
         tui.separator();
@@ -412,38 +516,9 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         printErr(agent.display_name);
         printErr("...\n");
 
-        // a. Write system prompt to agent's prompt file (dedup by target)
-        const prompt_target = agent.prompt_target;
-        var prompt_already_written = false;
-        for (written_prompts[0..written_prompts_count]) |wt| {
-            if (wt == prompt_target) {
-                prompt_already_written = true;
-                break;
-            }
-        }
-        if (!prompt_already_written) {
-            const filename = prompt_target.filename();
-            // Ensure parent dir for copilot
-            if (prompt_target == .copilot_instructions) {
-                std.fs.cwd().makeDir(".github") catch |err| switch (err) {
-                    error.PathAlreadyExists => {},
-                    else => {},
-                };
-            }
-            try updateFileWithPrompt(allocator, filename, prompt_content);
-            printErr("    ");
-            tui.checkmark();
-            printErr(" ");
-            printErr(filename);
-            printErr("\n");
-            appendUniquePath(&installed_assets, &installed_assets_count, filename);
-            if (written_prompts_count < 4) {
-                written_prompts[written_prompts_count] = prompt_target;
-                written_prompts_count += 1;
-            }
-        }
+        // a. Configure MCP server (dedup by path). Prompts are rendered after
+        // specialist installation so they only mandate assets that were installed.
 
-        // b. Configure MCP server (dedup by path)
         if (agent.mcp_path) |mcp_path| {
             var mcp_already_written = false;
             for (written_mcp[0..written_mcp_count]) |wc| {
@@ -503,229 +578,75 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         var runtime_policy_configured = false;
         try runHostConfigStep("runtime policy config", hooks_mod.configureRuntimePolicy(allocator, agent), &runtime_policy_configured);
 
-        // d. Deploy agent file (dedup by path)
-        if (agent.agent_file_path) |agent_path| {
-            var agent_already_written = false;
-            for (written_agents[0..written_agents_count]) |wa| {
-                if (std.mem.eql(u8, wa, agent_path)) {
-                    agent_already_written = true;
-                    break;
-                }
-            }
-            if (!agent_already_written) {
-                const should_write = if (agent.agent_file_header) |header| blk: {
-                    const content = hooks_mod.buildMarkdownAgentContent(allocator, header, build_options.agent_body) catch break :blk true;
-                    defer allocator.free(content);
-                    break :blk shouldWriteFile(allocator, agent_path, content, &accept_all);
-                } else true; // codex/roo: upsert, always write
-                if (should_write) {
-                    try hooks_mod.configureAgentFile(allocator, agent);
-                    printErr("    ");
-                    tui.checkmark();
-                    printErr(" ");
-                    printErr(agent_path);
-                    printErr("\n");
-                    appendUniquePath(&installed_assets, &installed_assets_count, agent_path);
-                } else {
-                    printErr("    ");
-                    printErr(dim ++ "  skipped " ++ reset);
-                    printErr(agent_path);
-                    printErr("\n");
-                }
-                if (written_agents_count < 32) {
-                    written_agents[written_agents_count] = agent_path;
-                    written_agents_count += 1;
-                }
+        // d. Install every specialist supported by this host. Memory specialists
+        // are only installed when memory was configured during this init run.
+        inline for (std.meta.tags(agents_mod.SpecialistKind)) |kind| {
+            if (!setup_mem and (kind == .memory or kind == .validate)) continue;
+            if (!observe_enabled and kind == .observe) continue;
+            const installed = try installSpecialistAsset(
+                allocator,
+                agent,
+                kind,
+                &accept_all,
+                &written_agents,
+                &written_agents_count,
+                &installed_assets,
+                &installed_assets_count,
+            );
+            installed_specialists[selected_pos].set(kind, installed);
+        }
+    }
+
+    // A shared prompt target must be safe for every selected host that reads it.
+    // Intersect actual installation results so one failed or skipped specialist
+    // cannot leave a mandate behind for that host.
+    var prompt_targets: [4]agents_mod.PromptTarget = undefined;
+    var prompt_specialists: [4]agents_mod.SpecialistAvailability = undefined;
+    var prompt_target_count: usize = 0;
+    for (selected_agent_indices[0..selected_indices.len], 0..) |idx, selected_pos| {
+        const target = agents_mod.agents[idx].prompt_target;
+        var target_pos: ?usize = null;
+        for (prompt_targets[0..prompt_target_count], 0..) |existing, pos| {
+            if (existing == target) {
+                target_pos = pos;
+                break;
             }
         }
 
-        // e. Deploy debug agent file
-        // For agents sharing a path (codex, roo), the writers are additive
-        // so we always call configureDebugAgentFile even if the path was seen.
-        if (agent.debug_file_path) |debug_path| {
-            const shares_path = if (agent.agent_file_path) |ap|
-                std.mem.eql(u8, ap, debug_path)
-            else
-                false;
+        if (target_pos) |pos| {
+            prompt_specialists[pos].intersect(installed_specialists[selected_pos]);
+        } else {
+            prompt_targets[prompt_target_count] = target;
+            prompt_specialists[prompt_target_count] = installed_specialists[selected_pos];
+            prompt_target_count += 1;
+        }
+    }
 
-            if (shares_path) {
-                // Codex/Roo: same file, writers append — always write
-                try hooks_mod.configureDebugAgentFile(allocator, agent);
-            } else {
-                var debug_already_written = false;
-                for (written_agents[0..written_agents_count]) |wa| {
-                    if (std.mem.eql(u8, wa, debug_path)) {
-                        debug_already_written = true;
-                        break;
-                    }
-                }
-                if (!debug_already_written) {
-                    const should_write = if (agent.debug_file_header) |header| blk: {
-                        const content = hooks_mod.buildMarkdownAgentContent(allocator, header, build_options.debug_agent_body) catch break :blk true;
-                        defer allocator.free(content);
-                        break :blk shouldWriteFile(allocator, debug_path, content, &accept_all);
-                    } else true;
-                    if (should_write) {
-                        try hooks_mod.configureDebugAgentFile(allocator, agent);
-                        printErr("    ");
-                        tui.checkmark();
-                        printErr(" ");
-                        printErr(debug_path);
-                        printErr("\n");
-                        appendUniquePath(&installed_assets, &installed_assets_count, debug_path);
-                    } else {
-                        printErr("    ");
-                        printErr(dim ++ "  skipped " ++ reset);
-                        printErr(debug_path);
-                        printErr("\n");
-                    }
-                    if (written_agents_count < 32) {
-                        written_agents[written_agents_count] = debug_path;
-                        written_agents_count += 1;
-                    }
-                }
-            }
+    for (prompt_targets[0..prompt_target_count], prompt_specialists[0..prompt_target_count]) |target, specialists| {
+        const filename = target.filename();
+        debug_log.log(
+            "commands.init: rendering prompt target={s} code={any} debug={any} mem={any} validate={any} observe={any}",
+            .{ filename, specialists.code_query, specialists.debug, specialists.memory, specialists.validate, specialists.observe },
+        );
+        if (target == .copilot_instructions) {
+            std.fs.cwd().makeDir(".github") catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
         }
 
-        // f. Deploy memory agent file (only when memory is configured)
-        if (setup_mem) {
-            if (agent.mem_file_path) |mem_path| {
-                const shares_path = if (agent.agent_file_path) |ap|
-                    std.mem.eql(u8, ap, mem_path)
-                else
-                    false;
-
-                if (shares_path) {
-                    // Codex/Roo: same file, writers append — always write
-                    try hooks_mod.configureMemAgentFile(allocator, agent);
-                } else {
-                    var mem_already_written = false;
-                    for (written_agents[0..written_agents_count]) |wa| {
-                        if (std.mem.eql(u8, wa, mem_path)) {
-                            mem_already_written = true;
-                            break;
-                        }
-                    }
-                    if (!mem_already_written) {
-                        const should_write = if (agent.mem_file_header) |header| blk: {
-                            const content = hooks_mod.buildMarkdownAgentContent(allocator, header, build_options.mem_agent_body) catch break :blk true;
-                            defer allocator.free(content);
-                            break :blk shouldWriteFile(allocator, mem_path, content, &accept_all);
-                        } else true;
-                        if (should_write) {
-                            try hooks_mod.configureMemAgentFile(allocator, agent);
-                            printErr("    ");
-                            tui.checkmark();
-                            printErr(" ");
-                            printErr(mem_path);
-                            printErr("\n");
-                            appendUniquePath(&installed_assets, &installed_assets_count, mem_path);
-                        } else {
-                            printErr("    ");
-                            printErr(dim ++ "  skipped " ++ reset);
-                            printErr(mem_path);
-                            printErr("\n");
-                        }
-                        if (written_agents_count < 32) {
-                            written_agents[written_agents_count] = mem_path;
-                            written_agents_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // g. Deploy validate agent file (only when memory is configured)
-        if (setup_mem) {
-            if (agent.validate_file_path) |validate_path| {
-                const shares_path = if (agent.agent_file_path) |ap|
-                    std.mem.eql(u8, ap, validate_path)
-                else
-                    false;
-
-                if (shares_path) {
-                    try hooks_mod.configureValidateAgentFile(allocator, agent);
-                } else {
-                    var validate_already_written = false;
-                    for (written_agents[0..written_agents_count]) |wa| {
-                        if (std.mem.eql(u8, wa, validate_path)) {
-                            validate_already_written = true;
-                            break;
-                        }
-                    }
-                    if (!validate_already_written) {
-                        const should_write = if (agent.validate_file_header) |header| blk: {
-                            const content = hooks_mod.buildMarkdownAgentContent(allocator, header, build_options.validate_agent_body) catch break :blk true;
-                            defer allocator.free(content);
-                            break :blk shouldWriteFile(allocator, validate_path, content, &accept_all);
-                        } else true;
-                        if (should_write) {
-                            try hooks_mod.configureValidateAgentFile(allocator, agent);
-                            printErr("    ");
-                            tui.checkmark();
-                            printErr(" ");
-                            printErr(validate_path);
-                            printErr("\n");
-                            appendUniquePath(&installed_assets, &installed_assets_count, validate_path);
-                        } else {
-                            printErr("    ");
-                            printErr(dim ++ "  skipped " ++ reset);
-                            printErr(validate_path);
-                            printErr("\n");
-                        }
-                        if (written_agents_count < 32) {
-                            written_agents[written_agents_count] = validate_path;
-                            written_agents_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // h. Deploy observe agent file only when the feature is enabled.
-        if (agent.observeFilePath(observe_enabled)) |observe_path| {
-            const shares_path = if (agent.agent_file_path) |ap|
-                std.mem.eql(u8, ap, observe_path)
-            else
-                false;
-
-            if (shares_path) {
-                try hooks_mod.configureObserveAgentFile(allocator, agent);
-            } else {
-                var observe_already_written = false;
-                for (written_agents[0..written_agents_count]) |wa| {
-                    if (std.mem.eql(u8, wa, observe_path)) {
-                        observe_already_written = true;
-                        break;
-                    }
-                }
-                if (!observe_already_written) {
-                    const should_write = if (agent.observeFileHeader(observe_enabled)) |header| blk: {
-                        const content = hooks_mod.buildMarkdownAgentContent(allocator, header, build_options.observe_agent_body) catch break :blk true;
-                        defer allocator.free(content);
-                        break :blk shouldWriteFile(allocator, observe_path, content, &accept_all);
-                    } else true;
-                    if (should_write) {
-                        try hooks_mod.configureObserveAgentFile(allocator, agent);
-                        printErr("    ");
-                        tui.checkmark();
-                        printErr(" ");
-                        printErr(observe_path);
-                        printErr("\n");
-                        appendUniquePath(&installed_assets, &installed_assets_count, observe_path);
-                    } else {
-                        printErr("    ");
-                        printErr(dim ++ "  skipped " ++ reset);
-                        printErr(observe_path);
-                        printErr("\n");
-                    }
-                    if (written_agents_count < 32) {
-                        written_agents[written_agents_count] = observe_path;
-                        written_agents_count += 1;
-                    }
-                }
-            }
-        }
+        const prompt_content = try processPromptTags(allocator, build_options.prompt_md, .{
+            .memory_enabled = setup_mem,
+            .specialists = specialists,
+        });
+        defer allocator.free(prompt_content);
+        try updateFileWithPrompt(allocator, filename, prompt_content);
+        printErr("    ");
+        tui.checkmark();
+        printErr(" ");
+        printErr(filename);
+        printErr("\n");
+        appendUniquePath(&installed_assets, &installed_assets_count, filename);
     }
 
     try writeClientContextManifest(
@@ -2392,6 +2313,7 @@ fn writeCwdFile(filename: []const u8, content: []const u8) !void {
 }
 
 fn updateFileWithPrompt(allocator: std.mem.Allocator, filename: []const u8, prompt_content: []const u8) !void {
+    debug_log.log("commands.updateFileWithPrompt: path={s} prompt_bytes={d}", .{ filename, prompt_content.len });
     const open_tag = "<cog>";
     const close_tag = "</cog>";
     const trimmed_prompt = std.mem.trimRight(u8, prompt_content, &std.ascii.whitespace);
@@ -2405,16 +2327,19 @@ fn updateFileWithPrompt(allocator: std.mem.Allocator, filename: []const u8, prom
                 const search_start = open_pos + open_tag.len;
                 if (std.mem.indexOfPos(u8, content, search_start, close_tag)) |close_pos| {
                     // Replace content between <cog> and </cog>
+                    debug_log.log("commands.updateFileWithPrompt: replacing managed block path={s}", .{filename});
                     const before = content[0 .. open_pos + open_tag.len];
                     const after = content[close_pos..];
                     break :blk try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}", .{ before, trimmed_prompt, after });
                 }
             }
             // No valid tags found, append at end
+            debug_log.log("commands.updateFileWithPrompt: appending managed block path={s}", .{filename});
             const trimmed_existing = std.mem.trimRight(u8, content, &std.ascii.whitespace);
             break :blk try std.fmt.allocPrint(allocator, "{s}\n\n{s}\n{s}\n{s}\n", .{ trimmed_existing, open_tag, trimmed_prompt, close_tag });
         } else {
             // New file
+            debug_log.log("commands.updateFileWithPrompt: creating managed block path={s}", .{filename});
             break :blk try std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n", .{ open_tag, trimmed_prompt, close_tag });
         }
     };
@@ -2748,31 +2673,99 @@ test "prompt markdown includes stronger memory gate guidance" {
     try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "Budget: 2-3 code-intelligence calls before responding.") != null);
 }
 
-test "processCogMemTags preserves memory gate in memory mode" {
+test "processPromptTags preserves mandates only for installed specialists" {
     const allocator = std.testing.allocator;
-    const processed = try processCogMemTags(allocator, build_options.prompt_md, true);
+    const processed = try processPromptTags(allocator, build_options.prompt_md, .{
+        .memory_enabled = true,
+        .specialists = .{
+            .code_query = true,
+            .debug = true,
+            .memory = true,
+            .validate = true,
+            .observe = true,
+        },
+    });
     defer allocator.free(processed);
 
     try std.testing.expect(std.mem.indexOf(u8, processed, "## BEFORE Responding - Memory Gate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, processed, "delegate to `cog-mem-validate`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-debug`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem-validate`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-observe`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "<cog:") == null);
 }
 
-test "processCogMemTags strips memory gate in tools-only mode" {
+test "processPromptTags omits unavailable specialist mandates" {
     const allocator = std.testing.allocator;
-    const processed = try processCogMemTags(allocator, build_options.prompt_md, false);
+    const processed = try processPromptTags(allocator, build_options.prompt_md, .{
+        .memory_enabled = true,
+        .specialists = .{ .code_query = true },
+    });
+    defer allocator.free(processed);
+
+    try std.testing.expect(std.mem.indexOf(u8, processed, "## Memory") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-debug`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem-validate`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-observe`") == null);
+}
+
+test "processPromptTags strips memory content when memory is disabled" {
+    const allocator = std.testing.allocator;
+    const processed = try processPromptTags(allocator, build_options.prompt_md, .{
+        .memory_enabled = false,
+        .specialists = .{
+            .code_query = true,
+            .debug = true,
+            .memory = true,
+            .validate = true,
+            .observe = true,
+        },
+    });
     defer allocator.free(processed);
 
     try std.testing.expect(std.mem.indexOf(u8, processed, "## BEFORE Responding - Memory Gate") == null);
     try std.testing.expect(std.mem.indexOf(u8, processed, "cog_mem_learn") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem-validate`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-debug`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-observe`") != null);
+}
+
+test "prompt specialist intersection is safe for shared targets" {
+    var shared = agents_mod.SpecialistAvailability.all();
+    shared.intersect(.{
+        .code_query = true,
+        .debug = true,
+        .memory = true,
+        .validate = true,
+        .observe = true,
+    });
+    shared.intersect(.{
+        .code_query = true,
+        .debug = false,
+        .memory = true,
+        .validate = false,
+        .observe = true,
+    });
+
+    try std.testing.expect(shared.code_query);
+    try std.testing.expect(!shared.debug);
+    try std.testing.expect(shared.memory);
+    try std.testing.expect(!shared.validate);
+    try std.testing.expect(shared.observe);
 }
 
 test "Cog gitignore production contract remains stable" {
     try std.testing.expectEqualStrings("*.db\n*.scip\n*.log\n", COG_GITIGNORE_CONTENT);
 }
 
-test "processCogObserveTags preserves observe guidance when enabled" {
+test "processPromptTags preserves observe guidance when available" {
     const allocator = std.testing.allocator;
-    const processed = try processCogObserveTags(allocator, build_options.prompt_md, true);
+    const processed = try processPromptTags(allocator, build_options.prompt_md, .{
+        .memory_enabled = true,
+        .specialists = agents_mod.SpecialistAvailability.all(),
+    });
     defer allocator.free(processed);
 
     try std.testing.expect(std.mem.indexOf(u8, processed, "## Observability") != null);
@@ -2780,9 +2773,14 @@ test "processCogObserveTags preserves observe guidance when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, processed, "<cog:observe>") == null);
 }
 
-test "processCogObserveTags strips observe guidance when disabled" {
+test "processPromptTags strips observe guidance when unavailable" {
     const allocator = std.testing.allocator;
-    const processed = try processCogObserveTags(allocator, build_options.prompt_md, false);
+    var specialists = agents_mod.SpecialistAvailability.all();
+    specialists.observe = false;
+    const processed = try processPromptTags(allocator, build_options.prompt_md, .{
+        .memory_enabled = true,
+        .specialists = specialists,
+    });
     defer allocator.free(processed);
 
     try std.testing.expect(std.mem.indexOf(u8, processed, "## Observability") == null);
