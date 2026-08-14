@@ -1667,19 +1667,21 @@ fn toolBulkRecall(mem_db: *MemoryDb, arguments: ?json.Value) ![]const u8 {
         const fq = fts_query.?;
         defer allocator.free(fq);
 
-        // FTS5 bm25 values are negative with better matches more negative. Multiplying
-        // by a bounded positive memory weight boosts reinforced results without letting
-        // corrupted weights dominate; term and ID keep equal scores deterministic.
-        debug_log.log("memory: recall ranking query={s} limit={d} formula=bm25*clamp(weight,0.1,10.0)", .{ q.string, limit });
+        // FTS5 bm25 values are negative with better matches more negative. Rank
+        // term hits in a strict first tier, then let bounded memory weight reorder
+        // comparable hits within a tier. This keeps reinforcement useful without
+        // allowing a high-weight body-only hit to eclipse a direct term match.
+        debug_log.log("memory: recall ranking query={s} limit={d} formula=term-tier,bm25*clamp(weight,0.1,10.0)", .{ q.string, limit });
         var stmt = mem_db.db.prepare(
             \\SELECT e.id, e.term, e.definition, e.memory_term,
+            \\       CASE WHEN length(highlight(engrams_fts, 0, '<', '>')) > length(e.term) THEN 0 ELSE 1 END AS match_tier,
             \\       bm25(engrams_fts, 10.0, 1.0) * MIN(MAX(e.weight, 0.1), 10.0) AS combined_rank
             \\FROM engrams_fts
             \\JOIN engrams e ON e.rowid = engrams_fts.rowid
             \\WHERE e.brain_id = ? AND engrams_fts MATCH ?
             \\  AND e.deprecated_at IS NULL
             \\  AND (e.expires_at IS NULL OR datetime(e.expires_at) > datetime('now'))
-            \\ORDER BY combined_rank ASC, LOWER(e.term), e.id
+            \\ORDER BY match_tier ASC, combined_rank ASC, LOWER(e.term), e.id
             \\LIMIT ?
         ) catch |err| {
             debug_log.log("memory: recall ranking prepare failed: {s}", .{@errorName(err)});
@@ -2463,7 +2465,7 @@ test "recall limit defaults, clamps, and handles extreme floats" {
     try std.testing.expectEqual(@as(i64, 1), recallLimit(minimum_args.value));
 }
 
-test "recall combined rank lets memory weight reorder comparable matches" {
+test "recall ranks term matches ahead of body-only matches before memory weight" {
     var db = try Db.open(":memory:");
     defer db.close();
     try memory_schema.ensureSchema(&db);
@@ -2484,7 +2486,7 @@ test "recall combined rank lets memory weight reorder comparable matches" {
     const beta_pos = std.mem.indexOf(u8, result, "Ranked beta").?;
     const reference_pos = std.mem.indexOf(u8, result, "Ranking reference").?;
     try std.testing.expect(alpha_pos < beta_pos);
-    try std.testing.expect(reference_pos < beta_pos);
+    try std.testing.expect(beta_pos < reference_pos);
 }
 
 test "recall strengthens only results emitted before output cap" {
