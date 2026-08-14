@@ -2711,6 +2711,46 @@ test "prompt markdown includes stronger memory gate guidance" {
     try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "Budget: 2-3 code-intelligence calls before responding.") != null);
 }
 
+test "every host prompt carries the identical Cog-first policy and raw-text exceptions" {
+    const allocator = std.testing.allocator;
+    for (agents_mod.agents) |agent| {
+        const specialists = agent.capabilities().specialists;
+        // The policy must hold with and without memory configured, so no
+        // host or init combination can render a looser fallback policy.
+        inline for ([_]bool{ true, false }) |memory_enabled| {
+            const rendered = try processPromptTags(allocator, build_options.prompt_md, .{
+                .memory_enabled = memory_enabled,
+                .specialists = specialists.availability(memory_enabled),
+            });
+            defer allocator.free(rendered);
+
+            try std.testing.expect(std.mem.indexOf(u8, rendered, agents_mod.cog_first_exploration_policy) != null);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, agents_mod.prompt_raw_text_fallback_policy) != null);
+        }
+    }
+}
+
+test "hosts never render prompt mandates for uninstallable specialists" {
+    const allocator = std.testing.allocator;
+    for (agents_mod.agents) |agent| {
+        const specialists = agent.capabilities().specialists;
+        inline for ([_]bool{ true, false }) |memory_enabled| {
+            const availability = specialists.availability(memory_enabled);
+            const rendered = try processPromptTags(allocator, build_options.prompt_md, .{
+                .memory_enabled = memory_enabled,
+                .specialists = availability,
+            });
+            defer allocator.free(rendered);
+
+            try std.testing.expectEqual(availability.debug, std.mem.indexOf(u8, rendered, "`cog-debug`") != null);
+            try std.testing.expectEqual(availability.observe, std.mem.indexOf(u8, rendered, "`cog-observe`") != null);
+            try std.testing.expectEqual(availability.memory, std.mem.indexOf(u8, rendered, "`cog-mem`") != null);
+            try std.testing.expectEqual(availability.validate, std.mem.indexOf(u8, rendered, "`cog-mem-validate`") != null);
+            try std.testing.expectEqual(availability.code_query, std.mem.indexOf(u8, rendered, "`cog-code-query`") != null);
+        }
+    }
+}
+
 test "processPromptTags preserves mandates only for installed specialists" {
     const allocator = std.testing.allocator;
     const processed = try processPromptTags(allocator, build_options.prompt_md, .{

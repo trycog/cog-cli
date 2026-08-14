@@ -306,6 +306,26 @@ const copilot_memory_tools =
     \\  - read
 ;
 
+// ── Shared Cog-first policy (single source for every host surface) ──────
+
+/// The only narrow exceptions under which a host may fall back from Cog code
+/// intelligence to raw text search. Every instruction surface quotes these
+/// exceptions verbatim so no host drifts to a looser or stricter policy.
+pub const raw_text_fallback_exceptions =
+    "the Cog index is unavailable, incomplete for the target code, or the task is about raw string literals, log messages, or other non-symbol text patterns";
+
+/// The Cog-first exploration mandate as rendered in every host prompt.
+pub const cog_first_exploration_policy =
+    "Do NOT use Grep, Glob, or shell search commands like `grep`, `rg`, `find`, or `git grep` for code exploration when the Cog index is available.";
+
+/// The raw-text fallback policy as rendered in every host prompt.
+pub const prompt_raw_text_fallback_policy =
+    "Only fall back to Grep, Glob, or shell search commands when " ++ raw_text_fallback_exceptions ++ ".";
+
+/// The raw-text fallback policy as rendered in specialist instructions.
+pub const specialist_raw_text_fallback_policy =
+    "Only fall back to raw file search when " ++ raw_text_fallback_exceptions ++ ".";
+
 pub const Agent = struct {
     id: []const u8,
     display_name: []const u8,

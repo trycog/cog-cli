@@ -1566,9 +1566,13 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
         defer allocator.free(instructions);
         try writeTomlAgent(allocator, agent_path, "cog-code-query", "Explore code structure using the Cog SCIP index", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
-        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", "You are a code index exploration agent. Use cog_code_explore for symbol discovery and file structure, then use cog_code_query refs only when you need call sites. Read source only after the index tells you where to look. Do not use filename guessing or raw file search unless the Cog index is unavailable. Return concise summaries with file paths and line numbers.");
+        try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", roo_code_query_role);
     }
 }
+
+/// Roo stores specialists as shared-config custom modes; its code-query role
+/// must quote the same raw-text fallback policy as every other host surface.
+const roo_code_query_role = "You are a code index exploration agent. Use cog_code_explore for symbol discovery and file structure, then use cog_code_query refs only when you need call sites. Read source only after the index tells you where to look. Do not use filename guessing or raw file search for code exploration. " ++ agents_mod.specialist_raw_text_fallback_policy ++ " Return concise summaries with file paths and line numbers.";
 
 pub fn configureDebugAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent) !void {
     debug_log.log("hooks.configureDebugAgentFile: agent={s}", .{agent.id});
@@ -1676,14 +1680,12 @@ const CodexSpecialistKind = enum {
 
 fn buildCodexSpecialistInstructions(allocator: std.mem.Allocator, kind: CodexSpecialistKind, body: []const u8) ![]const u8 {
     const prelude = switch (kind) {
-        .code_query =>
-        \\Host guidance:
-        \\- Treat this specialist as read-only.
-        \\- Use Cog code intelligence before any raw file search.
-        \\- Do not use shell search commands like grep, rg, find, or git grep from this specialist.
-        \\- Do not edit files or run commands from this specialist.
-        \\
-        ,
+        .code_query => "Host guidance:\n" ++
+            "- Treat this specialist as read-only.\n" ++
+            "- Use Cog code intelligence before any raw file search.\n" ++
+            "- " ++ agents_mod.specialist_raw_text_fallback_policy ++ "\n" ++
+            "- Do not use shell search commands like grep, rg, find, or git grep from this specialist.\n" ++
+            "- Do not edit files or run commands from this specialist.\n",
         .debug =>
         \\Host guidance:
         \\- Prefer debugger evidence over speculative fixes.
@@ -1726,12 +1728,12 @@ fn buildWorkflowSpecialistInstructions(allocator: std.mem.Allocator, agent_name:
             \\Workflow guidance:
             \\- This host uses {s} rather than hard-scoped subagents.
             \\- Treat this workflow as a read-oriented research specialist inside {s}.
-            \\- Start with Cog code intelligence and only fall back to raw file search if the Cog index is unavailable.
+            \\- Start with Cog code intelligence. {s}
             \\- Do not use shell search commands like grep, rg, find, or git grep when Cog code intelligence can answer the question.
             \\- Return concrete paths, symbols, and next actions for the main agent.
             \\
             \\{s}
-        , .{ surface, agent_name, body }),
+        , .{ surface, agent_name, agents_mod.specialist_raw_text_fallback_policy, body }),
         .debug => try std.fmt.allocPrint(allocator,
             \\Workflow guidance:
             \\- This host uses {s} rather than hard-scoped subagents.
@@ -1777,11 +1779,12 @@ fn buildPromptOnlySpecialistInstructions(allocator: std.mem.Allocator, agent_nam
             \\Host guidance:
             \\- {s} cannot hard-deny tools per specialist, so treat this as a read-oriented code research role.
             \\- Use Cog code intelligence before any raw file search.
+            \\- {s}
             \\- Do not use shell search commands like grep, rg, find, or git grep from this specialist.
             \\- Do not edit files or run shell commands from this specialist.
             \\
             \\{s}
-        , .{ agent_name, body }),
+        , .{ agent_name, agents_mod.specialist_raw_text_fallback_policy, body }),
         .debug => try std.fmt.allocPrint(allocator,
             \\Host guidance:
             \\- {s} cannot hard-deny tools per specialist, so keep this role focused on debugger-backed investigation.
@@ -1824,10 +1827,11 @@ fn buildConfigScopedSpecialistInstructions(allocator: std.mem.Allocator, agent_n
             \\- {s} provides config-level tool scoping for this specialist.
             \\- Stay inside the allowed read and Cog code-intel tools.
             \\- Use Cog code intelligence before any raw file search.
+            \\- {s}
             \\- Do not use shell search commands like grep, rg, find, or git grep for code exploration.
             \\
             \\{s}
-        , .{ agent_name, body }),
+        , .{ agent_name, agents_mod.specialist_raw_text_fallback_policy, body }),
         .debug => try std.fmt.allocPrint(allocator,
             \\Host guidance:
             \\- {s} provides partial config-level scoping for this specialist.
@@ -3463,6 +3467,36 @@ test "specialist installers cover every capability in the registry" {
             }
         }
     }.run);
+}
+
+test "raw-text fallback policy is single-sourced across every host surface" {
+    // The shared prompt every host reads carries the canonical policy verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, agents_mod.cog_first_exploration_policy) != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, agents_mod.prompt_raw_text_fallback_policy) != null);
+
+    // The shared code-query specialist body repeats the same narrow exceptions.
+    try std.testing.expect(std.mem.indexOf(u8, build_options.agent_body, agents_mod.raw_text_fallback_exceptions) != null);
+
+    // Every specialist instruction builder repeats the same narrow exceptions,
+    // so no host class receives a looser raw-text fallback policy.
+    const workflow = try buildWorkflowSpecialistInstructions(std.testing.allocator, "Windsurf", .code_query, build_options.agent_body);
+    defer std.testing.allocator.free(workflow);
+    try std.testing.expect(std.mem.indexOf(u8, workflow, agents_mod.raw_text_fallback_exceptions) != null);
+
+    const prompt_only = try buildPromptOnlySpecialistInstructions(std.testing.allocator, "Cursor", .code_query, build_options.agent_body);
+    defer std.testing.allocator.free(prompt_only);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_only, agents_mod.raw_text_fallback_exceptions) != null);
+
+    const config_scoped = try buildConfigScopedSpecialistInstructions(std.testing.allocator, "Claude Code", .code_query, build_options.agent_body);
+    defer std.testing.allocator.free(config_scoped);
+    try std.testing.expect(std.mem.indexOf(u8, config_scoped, agents_mod.raw_text_fallback_exceptions) != null);
+
+    const codex = try buildCodexSpecialistInstructions(std.testing.allocator, .code_query, build_options.agent_body);
+    defer std.testing.allocator.free(codex);
+    try std.testing.expect(std.mem.indexOf(u8, codex, agents_mod.raw_text_fallback_exceptions) != null);
+
+    // Roo's shared-config custom mode carries the same exceptions.
+    try std.testing.expect(std.mem.indexOf(u8, roo_code_query_role, agents_mod.raw_text_fallback_exceptions) != null);
 }
 
 test "writeRooAgent creates .roomodes" {
