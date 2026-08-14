@@ -79,7 +79,10 @@ pub const DaemonServer = struct {
 
         // Create and bind the Unix domain socket
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        errdefer posix.close(sock);
+        // Once ownership transfers to self.socket_fd, deinit closes it; the
+        // errdefer must stand down or late startup errors close it twice.
+        var sock_owned = true;
+        errdefer if (sock_owned) posix.close(sock);
 
         const sock_path = try paths.getDaemonSocketPath(self.allocator);
         paths.validateUnixSocketPath(sock_path) catch |err| {
@@ -116,6 +119,7 @@ pub const DaemonServer = struct {
         try posix.listen(sock, 8);
 
         self.socket_fd = sock;
+        sock_owned = false;
 
         // PID publication is required because clients refuse to signal an
         // unverified or stale process identity.

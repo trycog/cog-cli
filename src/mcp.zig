@@ -614,10 +614,20 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
             shutdown_requested.store(true, .release);
             break;
         }
-        try appendFramingInput(allocator, &input_buf, &framing_state, read_buf[0..n]);
+        // A framing failure must not unwind past the handler drain below:
+        // in-flight handler threads still reference stack-owned runtime state.
+        appendFramingInput(allocator, &input_buf, &framing_state, read_buf[0..n]) catch |err| {
+            debug_log_mod.log("mcp.framing: input buffering failed: {s}; beginning shutdown", .{@errorName(err)});
+            shutdown_requested.store(true, .release);
+            break;
+        };
 
         while (!shutdown_requested.load(.acquire)) {
-            const framed = try nextMessageFromBuffer(allocator, &input_buf, &framing_state) orelse break;
+            const framed = (nextMessageFromBuffer(allocator, &input_buf, &framing_state) catch |err| {
+                debug_log_mod.log("mcp.framing: message extraction failed: {s}; beginning shutdown", .{@errorName(err)});
+                shutdown_requested.store(true, .release);
+                break;
+            }) orelse break;
             switch (framed) {
                 .oversized_complete, .oversized_partial => {
                     debug_log_mod.log("mcp.framing: rejecting oversized message with null id", .{});

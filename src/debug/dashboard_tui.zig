@@ -367,9 +367,14 @@ pub const DashboardTui = struct {
         paths.logLegacyDebugPaths();
 
         const path = try paths.getDashboardSocketPath(self.allocator);
-        errdefer self.allocator.free(path);
+        // Once ownership transfers to self.socket_path, deinit frees it; the
+        // errdefer must stand down or later startup errors free it twice and
+        // deinit touches a dangling slice.
+        var path_owned = true;
+        errdefer if (path_owned) self.allocator.free(path);
         try paths.validateUnixSocketPath(path);
         self.socket_path = path;
+        path_owned = false;
 
         // Serialize the whole takeover — probe, unlink, bind — against every
         // other same-user starter, and hold the lock until teardown finishes.
@@ -388,7 +393,8 @@ pub const DashboardTui = struct {
 
         // Create listener socket
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
-        errdefer posix.close(sock);
+        var sock_owned = true;
+        errdefer if (sock_owned) posix.close(sock);
 
         var addr: std.posix.sockaddr.un = .{ .path = undefined };
         @memset(&addr.path, 0);
@@ -405,6 +411,7 @@ pub const DashboardTui = struct {
         if (@import("builtin").os.tag != .windows) try std.posix.fchmodat(std.posix.AT.FDCWD, path, 0o600, 0);
         try posix.listen(sock, 5);
         self.listener = sock;
+        sock_owned = false;
 
         // The signal handler may unlink this path only after this process has
         // successfully bound and begun listening on the socket.
