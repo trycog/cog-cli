@@ -18,8 +18,9 @@ pub fn main() !void {
 
     const lock_path = args[1];
     debug_log.log("grammar_lock: opening directory {s}", .{lock_path});
-    var lock_dir = try std.fs.cwd().openDir(lock_path, .{});
-    defer lock_dir.close();
+    // The lock descriptor must outlive main (see below), so it is never
+    // closed here; process exit reclaims it.
+    const lock_dir = try std.fs.cwd().openDir(lock_path, .{});
     const lock_file = std.fs.File{ .handle = lock_dir.fd };
     // The protected process group inherits this descriptor. If the wrapper is
     // hard-killed, the kernel lock therefore remains held until every child
@@ -38,6 +39,7 @@ pub fn main() !void {
     // Do not explicitly unlock: closing the wrapper descriptor must not release
     // the inherited open-file-description lock while a child is still alive.
     debug_log.log("grammar_lock: acquired directory {s}", .{lock_path});
+    trace("grammar-lock: lock acquired\n", .{});
 
     installSignalForwarders();
 
@@ -59,6 +61,7 @@ pub fn main() !void {
     }
 
     debug_log.log("grammar_lock: spawned payload pid={d}", .{pid});
+    trace("grammar-lock: spawned pid={d}\n", .{pid});
     child_pgid.store(@intCast(pid), .release);
     const queued_signal = pending_signal.swap(0, .acq_rel);
     if (queued_signal > 0) posix.kill(-pid, @intCast(queued_signal)) catch {};
@@ -68,14 +71,21 @@ pub fn main() !void {
     pending_signal.store(0, .release);
 
     const status = wait_result.status;
+    trace("grammar-lock: payload finished status={d}\n", .{status});
     if (posix.W.IFEXITED(status)) {
-        const code = posix.W.EXITSTATUS(status);
-        if (code != 0) std.process.exit(code);
+        std.process.exit(posix.W.EXITSTATUS(status));
     } else if (posix.W.IFSIGNALED(status)) {
         std.process.exit(@intCast(128 + @as(u8, @intCast(posix.W.TERMSIG(status)))));
     } else {
         std.process.exit(1);
     }
+}
+
+/// Stderr checkpoints for diagnosing wrapper behavior on CI runners; inert
+/// unless COG_GRAMMAR_LOCK_TRACE is set.
+fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (posix.getenv("COG_GRAMMAR_LOCK_TRACE") == null) return;
+    std.debug.print(fmt, args);
 }
 
 fn installSignalForwarders() void {

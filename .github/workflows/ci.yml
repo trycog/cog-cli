@@ -54,6 +54,8 @@ jobs:
 
       - name: Download grammars
         run: zig build setup
+        env:
+          COG_GRAMMAR_LOCK_TRACE: 1
 
       - name: Run tests
         run: zig build test
