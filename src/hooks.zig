@@ -3346,6 +3346,17 @@ test "specialist installers cover every capability in the registry" {
                         try configureSpecialistFile(allocator, agent, kind);
                         const path = agent.specialistPath(kind) orelse return error.TestUnexpectedResult;
                         try std.testing.expect(fileExistsInCwd(path));
+
+                        const marker = switch (kind) {
+                            .code_query => "You are a code index exploration agent.",
+                            .debug => "You are a debugging agent.",
+                            .memory => "You are a memory sub-agent",
+                            .validate => "You are a post-task memory validation sub-agent.",
+                            .observe => "You are a system observability agent.",
+                        };
+                        const content = readCwdFile(allocator, path) orelse return error.TestUnexpectedResult;
+                        defer allocator.free(content);
+                        try std.testing.expect(std.mem.indexOf(u8, content, marker) != null);
                     }
                 }
             }
