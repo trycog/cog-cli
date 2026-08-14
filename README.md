@@ -260,18 +260,25 @@ If you'd rather not use `cog init`, you can set things up by hand.
 
 For local memory:
 ```json
-{"memory": {"brain": "file:.cog/brain.db"}}
+{
+  "memory": {
+    "brain": "file:.cog/brain.db"
+  }
+}
 ```
 
 For hosted memory:
 ```json
-{"memory": {"brain": "https://trycog.ai/username/brain"}}
+{
+  "memory": {
+    "brain": "https://trycog.ai/username/brain"
+  }
+}
 ```
 
-Cog sends `COG_API_KEY` automatically only to the exact official origin `https://trycog.ai:443`. A self-hosted HTTPS origin must be approved explicitly in the global `~/.config/cog/approved-origins.json` store; an exact approved origin is allowed, while an unapproved origin is rejected before network I/O. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding.
+Cog sends `COG_API_KEY` only to the exact official `https://trycog.ai:443` origin or to an exact non-official HTTPS origin already present in the global `~/.config/cog/approved-origins.json` store. Authenticated request callsites enforce this check before network I/O; unapproved self-hosted destinations fail with `error.CredentialDestinationNotApproved`. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding. The approval API exists in code, but no public credential-approval CLI command is currently exposed.
 
-On Windows, global approved-origin reads and writes return `error.UnsupportedPlatform` because Zig 0.15 does not expose reparse-point-resistant file access needed for credential authorization state. URL parsing remains available; approval fails closed.
-
+On Windows, global approved-origin reads and writes return `error.UnsupportedPlatform` because Zig 0.15 does not expose reparse-point-resistant file access needed for credential authorization state. URL parsing remains available; non-official credential destinations therefore fail closed.
 
 **2.** For hosted memory, set your API key:
 
@@ -426,7 +433,7 @@ Validates your Cog installation: config resolution, memory backend connectivity,
 
 ## Development
 
-The release workflow grants repository contents write access plus GitHub `id-token: write` and `attestations: write` only to the release job that creates draft assets and build provenance. Validation, CI, and build jobs retain read-only repository permissions.
+The release workflow grants repository contents write access plus GitHub `id-token: write`, `attestations: write`, and `artifact-metadata: write` only to the release job that creates draft assets and build provenance. Validation, CI, and build jobs retain read-only repository permissions.
 
 ```sh
 zig build test                     # Run tests

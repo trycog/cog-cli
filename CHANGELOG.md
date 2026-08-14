@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - CLI help, README, and extension authoring guidance now match the current command surface, MCP tool names, debugger architecture, and explicit extension build trust model.
 - MCP tool advertisement and dispatch now share exact capability gates for debug tiers, observe opt-in, local memory, and dynamically discovered hosted memory tools.
-- Credential-origin documentation now reflects the current global approval-store boundary, including fail-closed Windows behavior and the fact that request callsites are not yet wired to consume approvals.
+- Credential-origin documentation now reflects enforced pre-request destination checks, the global approval-store boundary, unavailable public approval CLI, and fail-closed Windows behavior.
 
 ### Removed
 
