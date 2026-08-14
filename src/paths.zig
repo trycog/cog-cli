@@ -164,6 +164,30 @@ pub fn getDiagnosticLogPath(allocator: std.mem.Allocator) ![]const u8 {
     return getRuntimePath(allocator, "cog.log");
 }
 
+const LegacyDebugPathKind = enum { daemon_socket, daemon_pid, dashboard_socket };
+
+fn formatLegacyDebugPath(buffer: *[128]u8, kind: LegacyDebugPathKind, uid: std.posix.uid_t) ![]const u8 {
+    return switch (kind) {
+        .daemon_socket => std.fmt.bufPrint(buffer, "/tmp/cog-debug-{d}.sock", .{uid}),
+        .daemon_pid => std.fmt.bufPrint(buffer, "/tmp/cog-debug-{d}.pid", .{uid}),
+        .dashboard_socket => std.fmt.bufPrint(buffer, "/tmp/cog-debug-dashboard-{d}.sock", .{uid}),
+    };
+}
+
+/// Emit a one-release diagnostic for retired shared runtime paths. Cog never
+/// opens, trusts, signals through, or removes these nodes.
+pub fn logLegacyDebugPaths() void {
+    if (builtin.os.tag == .windows) return;
+
+    const kinds = [_]LegacyDebugPathKind{ .daemon_socket, .daemon_pid, .dashboard_socket };
+    var buffers: [kinds.len][128]u8 = undefined;
+    for (kinds, 0..) |kind, index| {
+        const path = formatLegacyDebugPath(&buffers[index], kind, std.posix.geteuid()) catch continue;
+        _ = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch continue;
+        debug_log.log("legacy debug runtime path detected and ignored: {s}; remove it manually after confirming no older Cog process uses it", .{path});
+    }
+}
+
 /// Resolve the DAP diagnostic log path. Caller owns the returned path.
 pub fn getDapLogPath(allocator: std.mem.Allocator) ![]const u8 {
     return getRuntimePath(allocator, "dap.log");
@@ -178,6 +202,37 @@ pub fn validateUnixSocketPath(path: []const u8) !void {
         return error.PathTooLong;
     }
     debug_log.log("validateUnixSocketPath: accepted {d}-byte path", .{path.len});
+}
+
+/// Remove a stale runtime socket only after proving it is an owned socket node.
+/// Runtime directories are private, so the validated node cannot be replaced by
+/// another user between this check and unlink.
+pub fn removeOwnedSocketIfPresent(path: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        return;
+    }
+
+    const stat = std.posix.fstatat(std.posix.AT.FDCWD, path, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    const kind = stat.mode & std.posix.S.IFMT;
+    if (kind == std.posix.S.IFLNK) {
+        debug_log.log("removeOwnedSocketIfPresent: rejected symlink {s}", .{path});
+        return error.RuntimePathSymlink;
+    }
+    if (kind != std.posix.S.IFSOCK) {
+        debug_log.log("removeOwnedSocketIfPresent: rejected non-socket {s}", .{path});
+        return error.RuntimePathNotSocket;
+    }
+    try validateRuntimeDirectoryOwner(path, stat.uid, std.posix.geteuid());
+
+    debug_log.log("removeOwnedSocketIfPresent: removing owned stale socket {s}", .{path});
+    try std.fs.deleteFileAbsolute(path);
 }
 
 fn ensurePrivateProjectTempDir(path: []const u8) !void {
@@ -520,6 +575,13 @@ test "getRuntimePath accepts only basenames" {
     try std.testing.expectError(error.InvalidRuntimeBasename, getRuntimePath(std.testing.allocator, "nested/daemon.sock"));
 }
 
+test "legacy debug diagnostics identify the retired shared paths" {
+    var buffer: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("/tmp/cog-debug-42.sock", try formatLegacyDebugPath(&buffer, .daemon_socket, 42));
+    try std.testing.expectEqualStrings("/tmp/cog-debug-42.pid", try formatLegacyDebugPath(&buffer, .daemon_pid, 42));
+    try std.testing.expectEqualStrings("/tmp/cog-debug-dashboard-42.sock", try formatLegacyDebugPath(&buffer, .dashboard_socket, 42));
+}
+
 test "named runtime paths are allocator-owned private paths" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -572,6 +634,51 @@ test "unix socket path validation reserves NUL terminator" {
 
     try std.testing.expectError(error.PathTooLong, validateUnixSocketPath(exact_capacity));
     try validateUnixSocketPath(fits);
+}
+
+test "removeOwnedSocketIfPresent rejects regular files and symlinks" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "regular", .data = "do not remove\n" });
+    try tmp.dir.symLink("regular", "link", .{});
+
+    const regular = try tmp.dir.realpathAlloc(allocator, "regular");
+    defer allocator.free(regular);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const link = try std.fs.path.join(allocator, &.{ root, "link" });
+    defer allocator.free(link);
+
+    try std.testing.expectError(error.RuntimePathNotSocket, removeOwnedSocketIfPresent(regular));
+    try std.testing.expectError(error.RuntimePathSymlink, removeOwnedSocketIfPresent(link));
+    try tmp.dir.access("regular", .{});
+    try tmp.dir.access("link", .{});
+}
+
+test "removeOwnedSocketIfPresent removes an owned Unix socket" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const socket_path = try std.fs.path.join(allocator, &.{ root, "owned.sock" });
+    defer allocator.free(socket_path);
+    try validateUnixSocketPath(socket_path);
+
+    const socket = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(socket);
+    var address: std.posix.sockaddr.un = .{ .path = undefined };
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..socket_path.len], socket_path);
+    try std.posix.bind(socket, @ptrCast(&address), @sizeOf(std.posix.sockaddr.un));
+
+    try removeOwnedSocketIfPresent(socket_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(socket_path, .{}));
 }
 
 fn allocatorFilledPath(allocator: std.mem.Allocator, len: usize) ![]u8 {

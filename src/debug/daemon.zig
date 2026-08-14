@@ -59,6 +59,9 @@ pub const DaemonServer = struct {
     }
 
     pub fn run(self: *DaemonServer) !void {
+        // Report retired shared paths without trusting or removing them.
+        paths.logLegacyDebugPaths();
+
         // Set up signal handler for clean shutdown
         setupSignalHandler();
 
@@ -73,12 +76,9 @@ pub const DaemonServer = struct {
         defer self.allocator.free(sock_path);
         try paths.validateUnixSocketPath(sock_path);
 
-        // Remove stale socket if it exists
-        debug_log.log("DaemonServer.run: removing stale socket {s}", .{sock_path});
-        std.fs.deleteFileAbsolute(sock_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => debug_log.log("DaemonServer.run: failed to remove stale socket {s}: {s}", .{ sock_path, @errorName(err) }),
-        };
+        // Remove only an owned socket node. Never unlink a regular file or
+        // symlink that happens to occupy the runtime pathname.
+        try paths.removeOwnedSocketIfPresent(sock_path);
 
         var addr: posix.sockaddr.un = .{ .path = undefined };
         @memset(&addr.path, 0);

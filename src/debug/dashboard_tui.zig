@@ -350,6 +350,9 @@ pub const DashboardTui = struct {
     }
 
     pub fn run(self: *DashboardTui) !void {
+        // Report retired shared paths without trusting or removing them.
+        paths.logLegacyDebugPaths();
+
         const path = try paths.getDashboardSocketPath(self.allocator);
         errdefer self.allocator.free(path);
         try paths.validateUnixSocketPath(path);
@@ -360,12 +363,9 @@ pub const DashboardTui = struct {
         @memcpy(g_socket_path[0..path.len], path);
         g_socket_path_len = path.len;
 
-        // Remove stale socket if it exists
-        debug_log.log("DashboardTui.run: removing stale socket {s}", .{path});
-        std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => debug_log.log("DashboardTui.run: failed to remove stale socket {s}: {s}", .{ path, @errorName(err) }),
-        };
+        // Remove only an owned socket node. Never unlink a regular file or
+        // symlink that happens to occupy the runtime pathname.
+        try paths.removeOwnedSocketIfPresent(path);
 
         // Create listener socket
         const sock = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
