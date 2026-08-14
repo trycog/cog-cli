@@ -36,6 +36,12 @@ const HardwareWatchpoint = struct {
     access_type: u3 = 0, // WCR access bits (1=load, 2=store, 3=both)
 };
 
+fn supportsNativeDataBreakpoints(os_tag: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) bool {
+    // The Mach backend implements ARM64 hardware debug registers. Linux ptrace
+    // deliberately returns NotSupported until NT_ARM_HW_WATCH support is added.
+    return os_tag == .macos and arch == .aarch64;
+}
+
 pub const DwarfEngine = struct {
     process: ProcessControl = .{},
     allocator: std.mem.Allocator,
@@ -4105,13 +4111,19 @@ pub const DwarfEngine = struct {
     fn engineCapabilities(ctx: *anyopaque) types.DebugCapabilities {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
         const read_only = self.core_dump != null;
-        debug_log.log("dwarf.engine: capabilities read_only={}", .{read_only});
+        const supports_data_breakpoints = !read_only and supportsNativeDataBreakpoints(builtin.os.tag, builtin.cpu.arch);
+        debug_log.log("dwarf.engine: capabilities read_only={} data_breakpoints={} os={s} arch={s}", .{
+            read_only,
+            supports_data_breakpoints,
+            @tagName(builtin.os.tag),
+            @tagName(builtin.cpu.arch),
+        });
         return .{
             .supports_conditional_breakpoints = !read_only,
             .supports_hit_conditional_breakpoints = !read_only,
             .supports_log_points = !read_only,
             .supports_function_breakpoints = !read_only,
-            .supports_data_breakpoints = !read_only and builtin.cpu.arch == .aarch64,
+            .supports_data_breakpoints = supports_data_breakpoints,
             .supports_step_back = false,
             .supports_restart_frame = false,
             .supports_goto_targets = false,
@@ -4460,7 +4472,10 @@ pub const DwarfEngine = struct {
 
     fn engineDataBreakpointInfo(ctx: *anyopaque, allocator: std.mem.Allocator, name: []const u8, frame_id: ?u32) anyerror!types.DataBreakpointInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        if (builtin.cpu.arch != .aarch64) return error.NotSupported;
+        if (!supportsNativeDataBreakpoints(builtin.os.tag, builtin.cpu.arch)) {
+            debug_log.log("dwarf.engine: native data breakpoint unavailable os={s} arch={s}", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
+            return error.NotSupported;
+        }
 
         const regs = try self.process.readRegisters();
 
@@ -4552,7 +4567,10 @@ pub const DwarfEngine = struct {
 
     fn engineSetDataBreakpoint(ctx: *anyopaque, allocator: std.mem.Allocator, data_id: []const u8, access_type: types.DataBreakpointAccessType) anyerror!types.BreakpointInfo {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        if (builtin.cpu.arch != .aarch64) return error.NotSupported;
+        if (!supportsNativeDataBreakpoints(builtin.os.tag, builtin.cpu.arch)) {
+            debug_log.log("dwarf.engine: native data breakpoint unavailable os={s} arch={s}", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) });
+            return error.NotSupported;
+        }
 
         // Parse data_id format: "0xADDRESS:SIZE"
         const colon_pos = std.mem.indexOf(u8, data_id, ":") orelse return error.InvalidDataId;
@@ -5297,6 +5315,13 @@ test "DwarfEngine implements ActiveDriver interface" {
 
     const driver = engine.activeDriver();
     try std.testing.expectEqual(ActiveDriver.DriverType.native, driver.driver_type);
+}
+
+test "native data breakpoints are advertised only for macOS AArch64" {
+    try std.testing.expect(supportsNativeDataBreakpoints(.macos, .aarch64));
+    try std.testing.expect(!supportsNativeDataBreakpoints(.linux, .aarch64));
+    try std.testing.expect(!supportsNativeDataBreakpoints(.macos, .x86_64));
+    try std.testing.expect(!supportsNativeDataBreakpoints(.linux, .x86_64));
 }
 
 test "DwarfEngine launches fixture binary" {
