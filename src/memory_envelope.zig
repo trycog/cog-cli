@@ -203,23 +203,36 @@ pub fn isExplicitUnsupportedEnhancedResponse(allocator: std.mem.Allocator, body:
 }
 
 fn isUnsupportedEnhancedMessage(message: []const u8) bool {
-    const markers = [_][]const u8{
+    const unsupported_tool_markers = [_][]const u8{
         "unknown tool",
         "unsupported tool",
         "tool not found",
         "method not found",
+    };
+    for (unsupported_tool_markers) |marker| {
+        if (std.ascii.indexOfIgnoreCase(message, marker) != null) return true;
+    }
+
+    const schema_markers = [_][]const u8{
         "schema validation",
         "invalid schema",
         "input schema",
         "unexpected field",
         "unrecognized field",
         "additional properties",
-        "semantic_payload",
-        "provenance",
-        "context_hints",
     };
-    for (markers) |marker| {
-        if (std.ascii.indexOfIgnoreCase(message, marker) != null) return true;
+    var mentions_schema_failure = false;
+    for (schema_markers) |marker| {
+        if (std.ascii.indexOfIgnoreCase(message, marker) != null) {
+            mentions_schema_failure = true;
+            break;
+        }
+    }
+    if (!mentions_schema_failure) return false;
+
+    const enhanced_fields = [_][]const u8{ "semantic_payload", "provenance", "context_hints" };
+    for (enhanced_fields) |field| {
+        if (std.ascii.indexOfIgnoreCase(message, field) != null) return true;
     }
     return false;
 }
@@ -320,6 +333,10 @@ test "ambiguous enhanced failures are not retryable" {
     try std.testing.expect(!isExplicitUnsupportedEnhancedResponse(
         std.testing.allocator,
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"upstream unavailable\"}}",
+    ));
+    try std.testing.expect(!isExplicitUnsupportedEnhancedResponse(
+        std.testing.allocator,
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"failed while persisting provenance\"}}",
     ));
     try std.testing.expect(!isExplicitUnsupportedEnhancedResponse(
         std.testing.allocator,
