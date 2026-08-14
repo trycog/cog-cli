@@ -189,14 +189,25 @@ fn replaceDirectoryTransactionalWithHook(
         if (had_live) try restoreDirectoryBackup(parent, backup_name, live_name);
         return promotion_err;
     };
-    try syncDirectory(parent);
+
+    // The staged tree is live from this point on. Reporting a sync or
+    // backup-cleanup problem as an error would tell the caller the
+    // replacement failed while the new directory is already serving, so
+    // cleanup issues are logged and the backup is retained instead.
+    syncDirectory(parent) catch |err| {
+        debug_log.log("fs_util.replaceDirectoryTransactional: promoted {s} but parent sync failed: {s}", .{ live_name, @errorName(err) });
+        return;
+    };
 
     if (had_live) {
         parent.deleteTree(backup_name) catch |err| {
             debug_log.log("fs_util.replaceDirectoryTransactional: retained backup {s}: {s}", .{ backup_name, @errorName(err) });
-            return err;
+            return;
         };
-        try syncDirectory(parent);
+        syncDirectory(parent) catch |err| {
+            debug_log.log("fs_util.replaceDirectoryTransactional: backup removal sync failed for {s}: {s}", .{ live_name, @errorName(err) });
+            return;
+        };
     }
     debug_log.log("fs_util.replaceDirectoryTransactional: replaced {s}", .{live_name});
 }
@@ -485,6 +496,61 @@ test "replaceDirectoryTransactional restores live after post-backup failure" {
     const staged_version = try tmp.dir.readFileAlloc(allocator, "staged/version", 1024);
     defer allocator.free(staged_version);
     try std.testing.expectEqualStrings("new\n", staged_version);
+}
+
+test "replaceDirectoryTransactional succeeds when backup cleanup fails after promotion" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("live");
+    try tmp.dir.makeDir("staged");
+    try tmp.dir.writeFile(.{ .sub_path = "live/version", .data = "old\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "staged/version", .data = "new\n" });
+
+    // Strip all permissions from the backup so deleteTree fails after the
+    // promotion has already made the staged tree live.
+    const Sabotage = struct {
+        var parent: ?std.fs.Dir = null;
+        fn lockBackup() anyerror!void {
+            var iterator = parent.?.iterate();
+            while (try iterator.next()) |entry| {
+                if (std.mem.startsWith(u8, entry.name, ".live.backup-")) {
+                    var backup = try parent.?.openDir(entry.name, .{});
+                    defer backup.close();
+                    try backup.chmod(0o000);
+                }
+            }
+        }
+    };
+    Sabotage.parent = tmp.dir;
+    defer Sabotage.parent = null;
+    defer {
+        // Restore permissions so tmp cleanup can delete the retained backup.
+        var iterator = tmp.dir.iterate();
+        while (iterator.next() catch null) |entry| {
+            if (std.mem.startsWith(u8, entry.name, ".live.backup-")) {
+                std.posix.fchmodat(tmp.dir.fd, entry.name, 0o700, 0) catch {};
+            }
+        }
+    }
+
+    try replaceDirectoryTransactionalWithHook(tmp.dir, allocator, "live", "staged", Sabotage.lockBackup);
+
+    // The new tree is live and the operation reports success; the backup is
+    // retained for diagnostics rather than failing the completed replacement.
+    const live_version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(live_version);
+    try std.testing.expectEqualStrings("new\n", live_version);
+
+    var found_backup = false;
+    var iterator = tmp.dir.iterate();
+    while (try iterator.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, ".live.backup-")) found_backup = true;
+    }
+    try std.testing.expect(found_backup);
 }
 
 test "replaceDirectoryTransactional restores live when promotion itself fails" {
