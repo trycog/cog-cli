@@ -227,6 +227,12 @@ pub const DwarfEngine = struct {
         return self.address_translation.runtimeToDwarf(address);
     }
 
+    /// Whether a runtime PC lands inside a DWARF-space [low, high) range.
+    fn pcWithinDwarfRange(self: *const DwarfEngine, runtime_pc: u64, low: u64, high: u64) bool {
+        const dwarf_pc = self.runtimeToDwarf(runtime_pc);
+        return dwarf_pc >= low and dwarf_pc < high;
+    }
+
     fn dwarfToRuntime(self: *const DwarfEngine, address: u64) u64 {
         return self.address_translation.dwarfToRuntime(address);
     }
@@ -875,8 +881,11 @@ pub const DwarfEngine = struct {
                             const post_file = if (post_line_info) |info| info.file_index else 0;
 
                             // PRIMARY CHECK: Is PC within the original function?
+                            // The function range is DWARF-space, so the runtime
+                            // PC must be translated or any nonzero PIE/ASLR bias
+                            // turns step-over into step-out.
                             const in_original_func = if (func_low != 0 and func_high != 0)
-                                (post_regs.pc >= func_low and post_regs.pc < func_high)
+                                self.pcWithinDwarfRange(post_regs.pc, func_low, func_high)
                             else
                                 true;
 
@@ -897,7 +906,8 @@ pub const DwarfEngine = struct {
                                     }
                                 } else {
                                     // Same line or inlined code from different file — re-set BPs and continue
-                                    for (bp_targets[0..bp_count]) |target_addr| {
+                                    for (bp_targets[0..bp_count]) |dwarf_target| {
+                                        const target_addr = self.dwarfToRuntime(dwarf_target);
                                         const re_id = self.bp_manager.setTemporary(target_addr) catch continue;
                                         self.bp_manager.writeBreakpoint(re_id, &self.process) catch continue;
                                     }
@@ -911,16 +921,19 @@ pub const DwarfEngine = struct {
                                 }
                             }
 
-                            // We left the original function. Check if it's a runtime trampoline.
+                            // We left the original function. Check if it's a runtime
+                            // trampoline. The function table holds DWARF addresses,
+                            // so look up the translated PC.
                             const post_func_name = if (self.functions.len > 0)
-                                unwind.findFunctionForPC(self.functions, post_regs.pc)
+                                unwind.findFunctionForPC(self.functions, self.runtimeToDwarf(post_regs.pc))
                             else
                                 "";
                             if (isRuntimeTrampoline(post_func_name)) {
                                 // In morestack/gogo/etc — re-set all BPs and continue.
                                 // After stack growth completes, execution will return to
                                 // our function (or its callee), hitting one of our BPs.
-                                for (bp_targets[0..bp_count]) |target_addr| {
+                                for (bp_targets[0..bp_count]) |dwarf_target| {
+                                    const target_addr = self.dwarfToRuntime(dwarf_target);
                                     const re_id = self.bp_manager.setTemporary(target_addr) catch continue;
                                     self.bp_manager.writeBreakpoint(re_id, &self.process) catch continue;
                                 }
@@ -5138,6 +5151,19 @@ test "sectionData refuses raw fallback when decompression fails" {
     // Compressed bytes must never reach DWARF parsers as if they were the
     // section contents; a failed decompression means the section is absent.
     try std.testing.expect(engine.sectionData(view, fixture.sections.debug_info) == null);
+}
+
+test "step-over frame check translates the runtime PC under PIE bias" {
+    var engine = DwarfEngine.init(std.testing.allocator);
+    defer engine.deinit();
+    engine.address_translation.load_bias = 0x300000;
+
+    // Runtime 0x701100 is DWARF 0x401100 — inside the original function.
+    try std.testing.expect(engine.pcWithinDwarfRange(0x701100, 0x401000, 0x402000));
+    // A raw runtime comparison would also have accepted this out-of-function
+    // address, turning step-over into step-out.
+    try std.testing.expect(!engine.pcWithinDwarfRange(0x401100, 0x401000, 0x402000));
+    try std.testing.expect(!engine.pcWithinDwarfRange(0x702000, 0x401000, 0x402000));
 }
 
 test "DwarfEngine rejects core runtime bases that overflow the load bias" {
