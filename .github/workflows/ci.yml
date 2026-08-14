@@ -25,6 +25,7 @@ jobs:
   test:
     needs: fmt
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest       # x86_64 Linux

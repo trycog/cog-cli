@@ -27,6 +27,7 @@ jobs:
   ci:
     needs: validate
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest       # x86_64 Linux
