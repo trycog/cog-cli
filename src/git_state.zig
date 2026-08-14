@@ -95,6 +95,135 @@ pub fn syncStamp(allocator: std.mem.Allocator, project_root: []const u8) ?SyncSt
     };
 }
 
+/// Resolve the commit hash HEAD points at without spawning git: detached
+/// HEAD carries the hash directly; a symbolic ref is read from the loose ref
+/// file, falling back to packed-refs. Linked worktrees resolve refs through
+/// their commondir. Null when the state cannot be resolved from files.
+pub fn resolveHeadCommit(allocator: std.mem.Allocator, project_root: []const u8) ?[]const u8 {
+    const git_dir = resolveGitDir(allocator, project_root) orelse return null;
+    defer allocator.free(git_dir);
+
+    const head_path = std.fs.path.join(allocator, &.{ git_dir, "HEAD" }) catch return null;
+    defer allocator.free(head_path);
+    const head_content = std.fs.cwd().readFileAlloc(allocator, head_path, max_git_file_bytes) catch return null;
+    defer allocator.free(head_content);
+    const trimmed = std.mem.trim(u8, head_content, " \t\r\n");
+
+    const ref_prefix = "ref:";
+    if (!std.mem.startsWith(u8, trimmed, ref_prefix)) {
+        if (!isCommitHash(trimmed)) return null;
+        return allocator.dupe(u8, trimmed) catch null;
+    }
+    const ref_name = std.mem.trim(u8, trimmed[ref_prefix.len..], " \t\r\n");
+    if (ref_name.len == 0 or std.mem.indexOf(u8, ref_name, "..") != null) return null;
+
+    if (resolveRefIn(allocator, git_dir, ref_name)) |hash| return hash;
+
+    // Linked worktrees keep refs in the main repository's git directory.
+    const commondir_path = std.fs.path.join(allocator, &.{ git_dir, "commondir" }) catch return null;
+    defer allocator.free(commondir_path);
+    const commondir_content = std.fs.cwd().readFileAlloc(allocator, commondir_path, max_git_file_bytes) catch return null;
+    defer allocator.free(commondir_content);
+    const common_rel = std.mem.trim(u8, commondir_content, " \t\r\n");
+    if (common_rel.len == 0) return null;
+    const common_dir = if (std.fs.path.isAbsolute(common_rel))
+        allocator.dupe(u8, common_rel) catch return null
+    else
+        std.fs.path.join(allocator, &.{ git_dir, common_rel }) catch return null;
+    defer allocator.free(common_dir);
+    return resolveRefIn(allocator, common_dir, ref_name);
+}
+
+fn resolveRefIn(allocator: std.mem.Allocator, git_dir: []const u8, ref_name: []const u8) ?[]const u8 {
+    const ref_path = std.fs.path.join(allocator, &.{ git_dir, ref_name }) catch return null;
+    defer allocator.free(ref_path);
+    if (std.fs.cwd().readFileAlloc(allocator, ref_path, max_git_file_bytes)) |ref_content| {
+        defer allocator.free(ref_content);
+        const hash = std.mem.trim(u8, ref_content, " \t\r\n");
+        if (isCommitHash(hash)) return allocator.dupe(u8, hash) catch null;
+    } else |_| {}
+
+    const packed_path = std.fs.path.join(allocator, &.{ git_dir, "packed-refs" }) catch return null;
+    defer allocator.free(packed_path);
+    const packed_content = std.fs.cwd().readFileAlloc(allocator, packed_path, max_git_file_bytes) catch return null;
+    defer allocator.free(packed_content);
+
+    var lines = std.mem.splitScalar(u8, packed_content, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const hash = line[0..space];
+        const name = std.mem.trim(u8, line[space + 1 ..], " \t\r");
+        if (std.mem.eql(u8, name, ref_name) and isCommitHash(hash)) {
+            return allocator.dupe(u8, hash) catch null;
+        }
+    }
+    return null;
+}
+
+fn isCommitHash(candidate: []const u8) bool {
+    if (candidate.len < 40 or candidate.len > 64) return false;
+    for (candidate) |byte| {
+        switch (byte) {
+            '0'...'9', 'a'...'f' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+test "resolveHeadCommit reads loose refs, packed refs, and detached heads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const loose_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const packed_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    try tmp.dir.makePath(".git/refs/heads");
+    try tmp.dir.writeFile(.{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/main\n" });
+    try tmp.dir.writeFile(.{ .sub_path = ".git/refs/heads/main", .data = loose_hash ++ "\n" });
+
+    const loose = resolveHeadCommit(allocator, root) orelse return error.TestUnexpectedResult;
+    defer allocator.free(loose);
+    try std.testing.expectEqualStrings(loose_hash, loose);
+
+    // Packed-only ref: the loose file is gone after git pack-refs.
+    try tmp.dir.deleteFile(".git/refs/heads/main");
+    try tmp.dir.writeFile(.{ .sub_path = ".git/packed-refs", .data = "# pack-refs with: peeled fully-peeled sorted \n" ++ packed_hash ++ " refs/heads/main\n" });
+    const from_packed = resolveHeadCommit(allocator, root) orelse return error.TestUnexpectedResult;
+    defer allocator.free(from_packed);
+    try std.testing.expectEqualStrings(packed_hash, from_packed);
+
+    // Detached HEAD carries the hash directly.
+    try tmp.dir.writeFile(.{ .sub_path = ".git/HEAD", .data = loose_hash ++ "\n" });
+    const detached = resolveHeadCommit(allocator, root) orelse return error.TestUnexpectedResult;
+    defer allocator.free(detached);
+    try std.testing.expectEqualStrings(loose_hash, detached);
+}
+
+test "resolveHeadCommit follows worktree commondirs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const wt_hash = "cccccccccccccccccccccccccccccccccccccccc";
+
+    try tmp.dir.makePath("repo/.git/refs/heads");
+    try tmp.dir.makePath("repo/.git/worktrees/wt");
+    try tmp.dir.makePath("wt");
+    try tmp.dir.writeFile(.{ .sub_path = "repo/.git/refs/heads/feature", .data = wt_hash ++ "\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "repo/.git/worktrees/wt/HEAD", .data = "ref: refs/heads/feature\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "repo/.git/worktrees/wt/commondir", .data = "../..\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "wt/.git", .data = "gitdir: ../repo/.git/worktrees/wt\n" });
+
+    const worktree_root = try tmp.dir.realpathAlloc(allocator, "wt");
+    defer allocator.free(worktree_root);
+    const resolved = resolveHeadCommit(allocator, worktree_root) orelse return error.TestUnexpectedResult;
+    defer allocator.free(resolved);
+    try std.testing.expectEqualStrings(wt_hash, resolved);
+}
+
 test "syncStamp reads a repository directory and tracks ref changes" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
