@@ -153,6 +153,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_fetch_source_tests = b.addRunArtifact(fetch_source_tests);
+
+    const live_mcp_client_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/live_mcp_client.zig"),
+            .target = target,
+        }),
+    });
+    const run_live_mcp_client_tests = b.addRunArtifact(live_mcp_client_tests);
+    const live_mcp_client_test_step = b.step("test-live-mcp-client", "Test live MCP client contracts");
+    live_mcp_client_test_step.dependOn(&run_live_mcp_client_tests.step);
+
     const fetch_source_test_exe = b.addExecutable(.{
         .name = "fetch-source-test-helper",
         .root_module = b.createModule(.{
@@ -176,6 +187,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_verify_source_tests.step);
     test_step.dependOn(&run_grammar_lock_tests.step);
     test_step.dependOn(&run_fetch_source_tests.step);
+    test_step.dependOn(&run_live_mcp_client_tests.step);
     test_step.dependOn(&grammar_setup_tests.step);
 
     // Benchmark
@@ -231,6 +243,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     addCurl(b, integ_exe.root_module, target, optimize);
+    live_mcp_client_test_step.dependOn(&bench_exe.step);
+    live_mcp_client_test_step.dependOn(&integ_exe.step);
     const integ_run = b.addRunArtifact(integ_exe);
     integ_run.step.dependOn(b.getInstallStep());
     const integ_step = b.step("test-integration", "Run integration tests");

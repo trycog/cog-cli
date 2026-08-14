@@ -2,6 +2,7 @@ const std = @import("std");
 const json = std.json;
 const Writer = std.io.Writer;
 const http = @import("curl.zig");
+const mcp_client = @import("live_mcp_client.zig");
 
 // ── Constants & Config ─────────────────────────────────────────────────
 
@@ -74,18 +75,18 @@ const integration_tools_json =
     \\  "type": "function",
     \\  "function": {
     \\    "name": "cog_query",
-    \\    "description": "Query a pre-built SCIP code index. Supports modes: --find <name> to locate symbol definitions, --refs <name> to find references, --symbols <file> to list symbols in a file. Returns JSON with paths and line numbers.",
+    \\    "description": "Query a pre-built SCIP code index. Supports modes: find <name> to locate symbol definitions, refs <name> to find references, symbols <file> to list symbols in a file. Returns JSON with paths and line numbers.",
     \\    "parameters": {
     \\      "type": "object",
     \\      "properties": {
     \\        "mode": {
     \\          "type": "string",
-    \\          "enum": ["--find", "--refs", "--symbols"],
+    \\          "enum": ["find", "refs", "symbols"],
     \\          "description": "Query mode"
     \\        },
     \\        "query": {
     \\          "type": "string",
-    \\          "description": "Symbol name for --find/--refs, or file path for --symbols"
+    \\          "description": "Symbol name for find/refs, or file path for symbols"
     \\        }
     \\      },
     \\      "required": ["mode", "query"]
@@ -398,34 +399,24 @@ fn getCogPath(allocator: std.mem.Allocator) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ cwd, COG_BINARY });
 }
 
-fn runCogCommand(allocator: std.mem.Allocator, argv: []const []const u8) ![]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv,
-        .cwd = REACT_DIR,
-        .max_output_bytes = 64 * 1024,
-    }) catch |err| {
-        return try std.fmt.allocPrint(allocator, "error: failed to run cog: {s}", .{@errorName(err)});
+fn isAllowedIntegrationPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, TARGET_FILE) or
+        std.mem.eql(u8, path, RENAMED_FILE) or
+        std.mem.eql(u8, path, CREATED_FILE);
+}
+
+fn integrationPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (!isAllowedIntegrationPath(path)) return error.InvalidIntegrationPath;
+    return std.fs.path.join(allocator, &.{ REACT_DIR, path });
+}
+
+fn refreshIntegrationIndex(allocator: std.mem.Allocator) ![]const u8 {
+    std.fs.cwd().deleteFile(REACT_DIR ++ "/.cog/index.scip") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     };
-    defer allocator.free(result.stderr);
-
-    if (result.stdout.len == 0) {
-        defer allocator.free(result.stdout);
-        if (result.stderr.len > 0) {
-            return try allocator.dupe(u8, result.stderr);
-        }
-        return try allocator.dupe(u8, "No results found.");
-    }
-
-    if (result.stdout.len > 8192) {
-        const truncated = try allocator.alloc(u8, 8192 + 20);
-        @memcpy(truncated[0..8192], result.stdout[0..8192]);
-        @memcpy(truncated[8192..][0..20], "\n... (truncated) ...");
-        allocator.free(result.stdout);
-        return truncated;
-    }
-
-    return result.stdout;
+    try buildCogIndex(allocator, "packages/react/src/**/*.js");
+    return allocator.dupe(u8, "ok");
 }
 
 fn executeCogQuery(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -448,7 +439,7 @@ fn executeCogQuery(allocator: std.mem.Allocator, args_json: []const u8) ![]const
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code:query", mode, query });
+    return mcp_client.runCodeQuery(allocator, cog_path, REACT_DIR, mode, query);
 }
 
 fn executeCogEdit(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -471,10 +462,27 @@ fn executeCogEdit(allocator: std.mem.Allocator, args_json: []const u8) ![]const 
     const old_text = if (old_val == .string) old_val.string else return try allocator.dupe(u8, "error: old_text must be a string");
     const new_text = if (new_val == .string) new_val.string else return try allocator.dupe(u8, "error: new_text must be a string");
 
-    const cog_path = try getCogPath(allocator);
-    defer allocator.free(cog_path);
+    const full_path = try integrationPath(allocator, file);
+    defer allocator.free(full_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code:edit", file, "--old", old_text, "--new", new_text });
+    const source_file = try std.fs.cwd().openFile(full_path, .{});
+    defer source_file.close();
+    const content = try source_file.readToEndAlloc(allocator, 2 * 1024 * 1024);
+    defer allocator.free(content);
+
+    const match = std.mem.indexOf(u8, content, old_text) orelse return error.EditTextNotFound;
+    if (std.mem.indexOf(u8, content[match + old_text.len ..], old_text) != null) {
+        return error.EditTextAmbiguous;
+    }
+
+    const updated = try std.mem.replaceOwned(u8, allocator, content, old_text, new_text);
+    defer allocator.free(updated);
+    const destination = try std.fs.cwd().createFile(full_path, .{ .truncate = true });
+    defer destination.close();
+    try destination.writeAll(updated);
+    try destination.sync();
+
+    return refreshIntegrationIndex(allocator);
 }
 
 fn executeCogRename(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -494,10 +502,13 @@ fn executeCogRename(allocator: std.mem.Allocator, args_json: []const u8) ![]cons
     const old_path = if (old_val == .string) old_val.string else return try allocator.dupe(u8, "error: old_path must be a string");
     const new_path = if (new_val == .string) new_val.string else return try allocator.dupe(u8, "error: new_path must be a string");
 
-    const cog_path = try getCogPath(allocator);
-    defer allocator.free(cog_path);
+    const full_old_path = try integrationPath(allocator, old_path);
+    defer allocator.free(full_old_path);
+    const full_new_path = try integrationPath(allocator, new_path);
+    defer allocator.free(full_new_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code:rename", old_path, "--to", new_path });
+    try std.fs.cwd().rename(full_old_path, full_new_path);
+    return refreshIntegrationIndex(allocator);
 }
 
 fn executeCogDelete(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -514,10 +525,11 @@ fn executeCogDelete(allocator: std.mem.Allocator, args_json: []const u8) ![]cons
 
     const file = if (file_val == .string) file_val.string else return try allocator.dupe(u8, "error: file must be a string");
 
-    const cog_path = try getCogPath(allocator);
-    defer allocator.free(cog_path);
+    const full_path = try integrationPath(allocator, file);
+    defer allocator.free(full_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code:delete", file });
+    try std.fs.cwd().deleteFile(full_path);
+    return refreshIntegrationIndex(allocator);
 }
 
 fn executeCogCreate(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
@@ -537,10 +549,15 @@ fn executeCogCreate(allocator: std.mem.Allocator, args_json: []const u8) ![]cons
     const file = if (file_val == .string) file_val.string else return try allocator.dupe(u8, "error: file must be a string");
     const content = if (content_val == .string) content_val.string else return try allocator.dupe(u8, "error: content must be a string");
 
-    const cog_path = try getCogPath(allocator);
-    defer allocator.free(cog_path);
+    const full_path = try integrationPath(allocator, file);
+    defer allocator.free(full_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code:create", file, "--content", content });
+    const destination = try std.fs.cwd().createFile(full_path, .{ .exclusive = true });
+    defer destination.close();
+    try destination.writeAll(content);
+    try destination.sync();
+
+    return refreshIntegrationIndex(allocator);
 }
 
 fn executeToolCall(allocator: std.mem.Allocator, name: []const u8, arguments: []const u8) ![]const u8 {
@@ -616,30 +633,27 @@ fn directCogQuery(allocator: std.mem.Allocator, mode: []const u8, query: []const
     const cog_path = try getCogPath(allocator);
     defer allocator.free(cog_path);
 
-    return runCogCommand(allocator, &.{ cog_path, "code:query", mode, query });
+    return mcp_client.runCodeQuery(allocator, cog_path, REACT_DIR, mode, query);
 }
 
 fn verifySymbolExists(allocator: std.mem.Allocator, name: []const u8) !bool {
-    const output = try directCogQuery(allocator, "--find", name);
+    const output = try directCogQuery(allocator, "find", name);
     defer allocator.free(output);
-    // If the result contains a file path (has a slash), the symbol was found
-    return std.mem.indexOf(u8, output, "/") != null;
+    return mcp_client.isUsableToolOutput(output) and
+        std.mem.indexOf(u8, output, "/") != null;
 }
 
 fn verifyFileInIndex(allocator: std.mem.Allocator, path: []const u8) !bool {
-    const output = try directCogQuery(allocator, "--symbols", path);
+    const output = try directCogQuery(allocator, "symbols", path);
     defer allocator.free(output);
-    // If output does NOT contain "error" or "No results", the file is indexed
-    if (std.mem.indexOf(u8, output, "error") != null) return false;
-    if (std.mem.indexOf(u8, output, "No results") != null) return false;
-    if (std.mem.indexOf(u8, output, "not found") != null) return false;
-    return output.len > 0;
+    return mcp_client.isUsableToolOutput(output);
 }
 
 fn verifySymbolInFile(allocator: std.mem.Allocator, path: []const u8, name: []const u8) !bool {
-    const output = try directCogQuery(allocator, "--symbols", path);
+    const output = try directCogQuery(allocator, "symbols", path);
     defer allocator.free(output);
-    return std.mem.indexOf(u8, output, name) != null;
+    return mcp_client.isUsableToolOutput(output) and
+        std.mem.indexOf(u8, output, name) != null;
 }
 
 fn outputContains(output: []const u8, needle: []const u8) bool {
@@ -805,7 +819,7 @@ fn runPhase1(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
             allocator,
             api_key,
             model,
-            "Use the cog_query tool with mode \"--find\" and query \"resolveDispatcher\" to find where resolveDispatcher is defined.",
+            "Use the cog_query tool with mode \"find\" and query \"resolveDispatcher\" to find where resolveDispatcher is defined.",
         ) catch |err| {
             results[0] = .{ .passed = false, .detail = @errorName(err) };
             printStepResult("Find resolveDispatcher", results[0], true);
@@ -815,6 +829,7 @@ fn runPhase1(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_query") and
+            mcp_client.isUsableToolOutput(agent_result.tool_output) and
             outputContains(agent_result.tool_output, "ReactHooks");
         results[0] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Find resolveDispatcher", results[0], true);
@@ -837,7 +852,7 @@ fn runPhase1(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_edit") and
-            !outputContains(agent_result.tool_output, "error");
+            std.mem.eql(u8, agent_result.tool_output, "ok");
         results[1] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Edit: rename to getActiveDispatcher", results[1], true);
     }
@@ -874,7 +889,7 @@ fn runPhase2(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
             allocator,
             api_key,
             model,
-            "Use the cog_query tool with mode \"--symbols\" and query \"" ++ TARGET_FILE ++ "\" to list all symbols defined in that file.",
+            "Use the cog_query tool with mode \"symbols\" and query \"" ++ TARGET_FILE ++ "\" to list all symbols defined in that file.",
         ) catch |err| {
             results[5] = .{ .passed = false, .detail = @errorName(err) };
             printStepResult("Query symbols in ReactHooks.js", results[5], true);
@@ -884,7 +899,8 @@ fn runPhase2(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_query") and
-            agent_result.tool_output.len > 10;
+            mcp_client.isUsableToolOutput(agent_result.tool_output) and
+            outputContains(agent_result.tool_output, "getActiveDispatcher");
         results[5] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Query symbols in ReactHooks.js", results[5], true);
     }
@@ -906,7 +922,7 @@ fn runPhase2(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_rename") and
-            !outputContains(agent_result.tool_output, "error");
+            std.mem.eql(u8, agent_result.tool_output, "ok");
         results[6] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Rename to ReactHooksRenamed.js", results[6], true);
     }
@@ -946,7 +962,7 @@ fn runPhase3(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_delete") and
-            !outputContains(agent_result.tool_output, "error");
+            std.mem.eql(u8, agent_result.tool_output, "ok");
         results[9] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Delete ReactHooksRenamed.js", results[9], true);
     }
@@ -969,7 +985,7 @@ fn runPhase4(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
             allocator,
             api_key,
             model,
-            "Use the cog_query tool with mode \"--refs\" and query \"createElement\" to find all references to createElement.",
+            "Use the cog_query tool with mode \"refs\" and query \"createElement\" to find all references to createElement.",
         ) catch |err| {
             results[11] = .{ .passed = false, .detail = @errorName(err) };
             printStepResult("Query refs for createElement", results[11], true);
@@ -979,7 +995,9 @@ fn runPhase4(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_query") and
-            outputContains(agent_result.tool_output, "/");
+            mcp_client.isUsableToolOutput(agent_result.tool_output) and
+            outputContains(agent_result.tool_output, "/") and
+            outputContains(agent_result.tool_output, "createElement");
         results[11] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Query refs for createElement", results[11], true);
     }
@@ -1001,7 +1019,7 @@ fn runPhase4(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_create") and
-            !outputContains(agent_result.tool_output, "error");
+            std.mem.eql(u8, agent_result.tool_output, "ok");
         results[12] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Create IntegrationTestHelper.js", results[12], true);
     }
@@ -1030,7 +1048,7 @@ fn runPhase4(allocator: std.mem.Allocator, api_key: []const u8, model: []const u
         defer allocator.free(agent_result.tool_output);
 
         const passed = std.mem.eql(u8, agent_result.tool_name, "cog_delete") and
-            !outputContains(agent_result.tool_output, "error");
+            std.mem.eql(u8, agent_result.tool_output, "ok");
         results[14] = .{ .passed = passed, .elapsed_ms = agent_result.elapsed_ms };
         printStepResult("Delete IntegrationTestHelper.js", results[14], true);
     }

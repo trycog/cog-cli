@@ -2,6 +2,7 @@ const std = @import("std");
 const json = std.json;
 const Writer = std.io.Writer;
 const http = @import("curl.zig");
+const mcp_client = @import("live_mcp_client.zig");
 
 // ── Constants & Config ─────────────────────────────────────────────────
 
@@ -24,7 +25,7 @@ const reset = "\x1B[0m";
 const TestCase = struct {
     name: []const u8,
     question: []const u8,
-    cog_mode: []const u8, // e.g. "--find", "--refs", "--symbols"
+    cog_mode: []const u8, // e.g. "find", "refs", "symbols"
 };
 
 const Metrics = struct {
@@ -46,27 +47,27 @@ const test_cases = [_]TestCase{
     .{
         .name = "Find createElement definition",
         .question = "Where is the function createElement defined? Give the file path and line number.",
-        .cog_mode = "--find",
+        .cog_mode = "find",
     },
     .{
         .name = "Find useState references",
         .question = "What files reference useState? List the file paths.",
-        .cog_mode = "--refs",
+        .cog_mode = "refs",
     },
     .{
         .name = "List ReactFiberWorkLoop symbols",
         .question = "What symbols are defined in packages/react-reconciler/src/ReactFiberWorkLoop.js?",
-        .cog_mode = "--symbols",
+        .cog_mode = "symbols",
     },
     .{
         .name = "Find Component class",
         .question = "Where is the Component class defined? Give the file path and line number.",
-        .cog_mode = "--find",
+        .cog_mode = "find",
     },
     .{
         .name = "Exports from ReactClient.js",
         .question = "What functions are exported from packages/react/src/ReactClient.js?",
-        .cog_mode = "--symbols",
+        .cog_mode = "symbols",
     },
 };
 
@@ -77,18 +78,18 @@ const cog_tools_json =
     \\  "type": "function",
     \\  "function": {
     \\    "name": "cog_query",
-    \\    "description": "Query a pre-built SCIP code index. Supports modes: --find <name> to locate symbol definitions, --refs <name> to find references, --symbols <file> to list symbols in a file. Returns JSON with paths and line numbers.",
+    \\    "description": "Query a pre-built SCIP code index. Supports modes: find <name> to locate symbol definitions, refs <name> to find references, symbols <file> to list symbols in a file. Returns JSON with paths and line numbers.",
     \\    "parameters": {
     \\      "type": "object",
     \\      "properties": {
     \\        "mode": {
     \\          "type": "string",
-    \\          "enum": ["--find", "--refs", "--symbols"],
+    \\          "enum": ["find", "refs", "symbols"],
     \\          "description": "Query mode"
     \\        },
     \\        "query": {
     \\          "type": "string",
-    \\          "description": "Symbol name for --find/--refs, or file path for --symbols"
+    \\          "description": "Symbol name for find/refs, or file path for symbols"
     \\        }
     \\      },
     \\      "required": ["mode", "query"]
@@ -443,7 +444,6 @@ fn executeCogQuery(allocator: std.mem.Allocator, args_json: []const u8) ![]const
     const mode = if (mode_val == .string) mode_val.string else return try allocator.dupe(u8, "error: mode must be a string");
     const query = if (query_val == .string) query_val.string else return try allocator.dupe(u8, "error: query must be a string");
 
-    // Shell out to cog binary (need absolute path since cwd will be the React dir)
     const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch {
         return try allocator.dupe(u8, "error: cannot resolve cwd");
     };
@@ -454,34 +454,7 @@ fn executeCogQuery(allocator: std.mem.Allocator, args_json: []const u8) ![]const
     };
     defer allocator.free(cog_path);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ cog_path, "code:query", mode, query },
-        .cwd = REACT_DIR,
-        .max_output_bytes = 64 * 1024,
-    }) catch |err| {
-        return try std.fmt.allocPrint(allocator, "error: failed to run cog: {s}", .{@errorName(err)});
-    };
-    defer allocator.free(result.stderr);
-
-    if (result.stdout.len == 0) {
-        defer allocator.free(result.stdout);
-        if (result.stderr.len > 0) {
-            return try allocator.dupe(u8, result.stderr);
-        }
-        return try allocator.dupe(u8, "No results found.");
-    }
-
-    // Truncate if too large
-    if (result.stdout.len > 8192) {
-        const truncated = try allocator.alloc(u8, 8192 + 20);
-        @memcpy(truncated[0..8192], result.stdout[0..8192]);
-        @memcpy(truncated[8192..][0..20], "\n... (truncated) ...");
-        allocator.free(result.stdout);
-        return truncated;
-    }
-
-    return result.stdout;
+    return mcp_client.runCodeQuery(allocator, cog_path, REACT_DIR, mode, query);
 }
 
 fn executeGrep(allocator: std.mem.Allocator, args_json: []const u8) ![]const u8 {
