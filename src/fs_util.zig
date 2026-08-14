@@ -134,6 +134,16 @@ pub fn replaceDirectoryTransactional(
     live_name: []const u8,
     staged_name: []const u8,
 ) !void {
+    return replaceDirectoryTransactionalWithHook(parent, allocator, live_name, staged_name, null);
+}
+
+fn replaceDirectoryTransactionalWithHook(
+    parent: std.fs.Dir,
+    allocator: std.mem.Allocator,
+    live_name: []const u8,
+    staged_name: []const u8,
+    after_backup: ?*const fn () anyerror!void,
+) !void {
     if (!isBasename(live_name) or !isBasename(staged_name) or std.mem.eql(u8, live_name, staged_name)) {
         return error.InvalidDirectoryName;
     }
@@ -165,16 +175,18 @@ pub fn replaceDirectoryTransactional(
         else => return err,
     };
 
+    if (after_backup) |hook| {
+        hook() catch |hook_err| {
+            debug_log.log("fs_util.replaceDirectoryTransactional: injected post-backup failure for {s}: {s}", .{ live_name, @errorName(hook_err) });
+            if (had_live) try restoreDirectoryBackup(parent, backup_name, live_name);
+            return hook_err;
+        };
+    }
+
     debug_log.log("fs_util.replaceDirectoryTransactional: promoting {s} to {s}", .{ staged_name, live_name });
     parent.rename(staged_name, live_name) catch |promotion_err| {
         debug_log.log("fs_util.replaceDirectoryTransactional: promotion failed for {s}: {s}", .{ live_name, @errorName(promotion_err) });
-        if (had_live) {
-            parent.rename(backup_name, live_name) catch |rollback_err| {
-                debug_log.log("fs_util.replaceDirectoryTransactional: rollback failed for {s}: {s}", .{ live_name, @errorName(rollback_err) });
-                return error.DirectoryRollbackFailed;
-            };
-            try syncDirectory(parent);
-        }
+        if (had_live) try restoreDirectoryBackup(parent, backup_name, live_name);
         return promotion_err;
     };
     try syncDirectory(parent);
@@ -187,6 +199,14 @@ pub fn replaceDirectoryTransactional(
         try syncDirectory(parent);
     }
     debug_log.log("fs_util.replaceDirectoryTransactional: replaced {s}", .{live_name});
+}
+
+fn restoreDirectoryBackup(parent: std.fs.Dir, backup_name: []const u8, live_name: []const u8) !void {
+    parent.rename(backup_name, live_name) catch |rollback_err| {
+        debug_log.log("fs_util.replaceDirectoryTransactional: rollback failed for {s}: {s}", .{ live_name, @errorName(rollback_err) });
+        return error.DirectoryRollbackFailed;
+    };
+    try syncDirectory(parent);
 }
 
 fn isBasename(name: []const u8) bool {
@@ -437,4 +457,32 @@ test "replaceDirectoryTransactional installs when live is absent" {
     const version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
     defer allocator.free(version);
     try std.testing.expectEqualStrings("new\n", version);
+}
+
+test "replaceDirectoryTransactional restores live after post-backup failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("live");
+    try tmp.dir.makeDir("staged");
+    try tmp.dir.writeFile(.{ .sub_path = "live/version", .data = "old\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "staged/version", .data = "new\n" });
+
+    const fail_after_backup = struct {
+        fn run() anyerror!void {
+            return error.InjectedPromotionFailure;
+        }
+    }.run;
+    try std.testing.expectError(
+        error.InjectedPromotionFailure,
+        replaceDirectoryTransactionalWithHook(tmp.dir, allocator, "live", "staged", fail_after_backup),
+    );
+
+    const live_version = try tmp.dir.readFileAlloc(allocator, "live/version", 1024);
+    defer allocator.free(live_version);
+    try std.testing.expectEqualStrings("old\n", live_version);
+    const staged_version = try tmp.dir.readFileAlloc(allocator, "staged/version", 1024);
+    defer allocator.free(staged_version);
+    try std.testing.expectEqualStrings("new\n", staged_version);
 }
