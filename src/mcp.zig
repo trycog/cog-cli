@@ -2231,7 +2231,7 @@ fn processWatcherEvents(
     const result = if (overflow)
         spawnResyncWorker(allocator)
     else
-        spawnReindexWorker(allocator, paths_buf.items);
+        reindexBatchInChunks(allocator, paths_buf.items);
 
     for (paths_buf.items) |file_path| allocator.free(file_path);
     paths_buf.clearRetainingCapacity();
@@ -2251,6 +2251,47 @@ const ReindexWorkerResult = enum {
     unchanged,
     failed,
 };
+
+fn mergeReindexResults(a: ReindexWorkerResult, b: ReindexWorkerResult) ReindexWorkerResult {
+    if (a == .failed or b == .failed) return .failed;
+    if (a == .changed or b == .changed) return .changed;
+    return .unchanged;
+}
+
+/// Run a watcher batch through as many bounded worker calls as it needs.
+///
+/// A batch can exceed the worker's path count or argument byte limits — a
+/// branch switch or a moved directory produces thousands of paths at once.
+/// Handing the whole batch to one worker call made the worker reject it and
+/// the batch was then freed, so those edits never reached the index. Splitting
+/// preserves every path, and a path no argument list can carry escalates to a
+/// full resync rather than being dropped.
+fn reindexBatchInChunks(allocator: std.mem.Allocator, file_paths: []const []const u8) ReindexWorkerResult {
+    if (file_paths.len == 0) return .unchanged;
+
+    var offset: usize = 0;
+    var aggregate: ReindexWorkerResult = .unchanged;
+    while (offset < file_paths.len) {
+        const remaining = file_paths[offset..];
+        const chunk_len = code_intel.nextWatcherReindexChunk(remaining);
+        if (chunk_len == 0) {
+            debug_log_mod.log(
+                "watcher batch: path at index {d} cannot be passed as a worker argument; escalating to full resync",
+                .{offset},
+            );
+            return spawnResyncWorker(allocator);
+        }
+
+        debug_log_mod.log("watcher batch: worker chunk offset={d} paths={d} of {d}", .{
+            offset,
+            chunk_len,
+            file_paths.len,
+        });
+        aggregate = mergeReindexResults(aggregate, spawnReindexWorker(allocator, remaining[0..chunk_len]));
+        offset += chunk_len;
+    }
+    return aggregate;
+}
 
 fn reindexWorkerResult(term: std.process.Child.Term) ReindexWorkerResult {
     return switch (term) {
@@ -2653,6 +2694,36 @@ test "IndexGeneration detects identity size and mtime changes" {
     try std.testing.expect(!base.eql(.{ .inode = 2, .size = 10, .mtime = 100 }));
     try std.testing.expect(!base.eql(.{ .inode = 1, .size = 11, .mtime = 100 }));
     try std.testing.expect(!base.eql(.{ .inode = 1, .size = 10, .mtime = 101 }));
+}
+
+test "watcher batches split into worker calls that never drop a path" {
+    const batch = [_][]const u8{"src/main.zig"} ** (code_intel.MAX_WATCHER_REINDEX_FILES * 2 + 3);
+
+    var offset: usize = 0;
+    var calls: usize = 0;
+    while (offset < batch.len) {
+        const chunk_len = code_intel.nextWatcherReindexChunk(batch[offset..]);
+        try std.testing.expect(chunk_len > 0);
+        try std.testing.expect(chunk_len <= code_intel.MAX_WATCHER_REINDEX_FILES);
+        try code_intel.validateWatcherReindexArgs(batch[offset .. offset + chunk_len]);
+        offset += chunk_len;
+        calls += 1;
+    }
+
+    try std.testing.expectEqual(batch.len, offset);
+    try std.testing.expectEqual(@as(usize, 3), calls);
+}
+
+test "mergeReindexResults keeps the strongest outcome of a split batch" {
+    try std.testing.expectEqual(ReindexWorkerResult.unchanged, mergeReindexResults(.unchanged, .unchanged));
+    try std.testing.expectEqual(ReindexWorkerResult.changed, mergeReindexResults(.unchanged, .changed));
+    try std.testing.expectEqual(ReindexWorkerResult.changed, mergeReindexResults(.changed, .unchanged));
+    try std.testing.expectEqual(ReindexWorkerResult.failed, mergeReindexResults(.changed, .failed));
+    try std.testing.expectEqual(ReindexWorkerResult.failed, mergeReindexResults(.failed, .unchanged));
+}
+
+test "reindexBatchInChunks reports nothing to do for an empty batch" {
+    try std.testing.expectEqual(ReindexWorkerResult.unchanged, reindexBatchInChunks(std.testing.allocator, &.{}));
 }
 
 test "reindexWorkerResult maps documented exit statuses" {

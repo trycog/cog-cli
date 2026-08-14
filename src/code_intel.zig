@@ -141,6 +141,27 @@ pub fn validateWatcherReindexArgs(file_paths: []const []const u8) !void {
     }
 }
 
+/// How many leading paths of `file_paths` fit in one reindex worker call.
+///
+/// Returns 0 when the first path can never be passed as a worker argument, so
+/// callers escalate to a full resync instead of discarding the batch: a watcher
+/// batch that outgrows the argument limits still describes real index changes.
+pub fn nextWatcherReindexChunk(file_paths: []const []const u8) usize {
+    var count: usize = 0;
+    var total_bytes: usize = 0;
+    for (file_paths) |file_path| {
+        if (count == MAX_WATCHER_REINDEX_FILES) break;
+        if (file_path.len == 0 or file_path.len > std.fs.max_path_bytes) break;
+        if (std.mem.indexOfScalar(u8, file_path, 0) != null) break;
+
+        const next_bytes = std.math.add(usize, total_bytes, file_path.len) catch break;
+        if (next_bytes > MAX_WATCHER_REINDEX_ARG_BYTES) break;
+        total_bytes = next_bytes;
+        count += 1;
+    }
+    return count;
+}
+
 fn deduplicateFilePaths(allocator: std.mem.Allocator, file_paths: []const []const u8) ![]const []const u8 {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
@@ -202,6 +223,45 @@ test "validateWatcherReindexArgs rejects excessive argument bytes" {
     const path_count = MAX_WATCHER_REINDEX_ARG_BYTES / path.len + 1;
     const paths_list = [_][]const u8{&path} ** path_count;
     try std.testing.expectError(error.ArgumentsTooLong, validateWatcherReindexArgs(&paths_list));
+}
+
+test "nextWatcherReindexChunk fills a worker call up to the file limit" {
+    const paths_list = [_][]const u8{"src/main.zig"} ** (MAX_WATCHER_REINDEX_FILES + 40);
+    const chunk = nextWatcherReindexChunk(&paths_list);
+    try std.testing.expectEqual(MAX_WATCHER_REINDEX_FILES, chunk);
+    try validateWatcherReindexArgs(paths_list[0..chunk]);
+}
+
+test "nextWatcherReindexChunk stops at the argument byte budget" {
+    const path = [_]u8{'a'} ** 1024;
+    const paths_list = [_][]const u8{&path} ** 200;
+    const chunk = nextWatcherReindexChunk(&paths_list);
+    try std.testing.expectEqual(MAX_WATCHER_REINDEX_ARG_BYTES / path.len, chunk);
+    try validateWatcherReindexArgs(paths_list[0..chunk]);
+}
+
+test "nextWatcherReindexChunk reports paths no worker call can carry" {
+    const long_path = [_]u8{'a'} ** (std.fs.max_path_bytes + 1);
+    try std.testing.expectEqual(@as(usize, 0), nextWatcherReindexChunk(&.{&long_path}));
+    try std.testing.expectEqual(@as(usize, 0), nextWatcherReindexChunk(&.{""}));
+    try std.testing.expectEqual(@as(usize, 0), nextWatcherReindexChunk(&.{"src/main\x00.zig"}));
+    try std.testing.expectEqual(@as(usize, 0), nextWatcherReindexChunk(&.{}));
+}
+
+test "nextWatcherReindexChunk covers an oversized batch without dropping paths" {
+    const paths_list = [_][]const u8{"src/main.zig"} ** (MAX_WATCHER_REINDEX_FILES * 3 + 7);
+
+    var covered: usize = 0;
+    var calls: usize = 0;
+    while (covered < paths_list.len) {
+        const chunk = nextWatcherReindexChunk(paths_list[covered..]);
+        try std.testing.expect(chunk > 0);
+        try validateWatcherReindexArgs(paths_list[covered .. covered + chunk]);
+        covered += chunk;
+        calls += 1;
+    }
+    try std.testing.expectEqual(paths_list.len, covered);
+    try std.testing.expectEqual(@as(usize, 4), calls);
 }
 
 test "deduplicateFilePaths keeps first occurrence" {
