@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const json = std.json;
 const Stringify = json.Stringify;
 const Writer = std.io.Writer;
@@ -8,6 +9,8 @@ const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 const debug_log = @import("../../debug_log.zig");
 const paths = @import("../../paths.zig");
+
+extern "c" fn getpgrp() std.posix.pid_t;
 
 // Debug logging to file (stderr not visible when running as MCP subprocess)
 var dap_log_file: ?std.fs.File = null;
@@ -108,6 +111,8 @@ const DetachedProcess = struct {
     stderr: ?std.fs.File = null,
 
     fn closePipes(self: *DetachedProcess) void {
+        if (self.stdin == null and self.stdout == null and self.stderr == null) return;
+        debug_log.log("dap.proxy: closing adapter pipes pid={d}", .{self.id});
         if (self.stdin) |file| file.close();
         if (self.stdout) |file| file.close();
         if (self.stderr) |file| file.close();
@@ -116,45 +121,48 @@ const DetachedProcess = struct {
         self.stderr = null;
     }
 
-    fn terminateAndReap(self: *DetachedProcess) void {
-        self.closePipes();
-        if (self.id == 0) return;
-
-        debug_log.log("dap.proxy: terminating adapter pid={d}", .{self.id});
-        std.posix.kill(self.id, std.posix.SIG.TERM) catch |err| switch (err) {
-            error.ProcessNotFound => {},
-            else => debug_log.log("dap.proxy: SIGTERM failed pid={d} error={s}", .{ self.id, @errorName(err) }),
-        };
-
-        var reaped = false;
-        for (0..20) |_| {
-            const result = std.posix.waitpid(self.id, 1);
-            if (result.pid != 0) {
-                reaped = true;
-                break;
-            }
-            std.posix.nanosleep(0, 5_000_000);
-        }
-        if (!reaped) {
-            std.posix.kill(self.id, std.posix.SIG.KILL) catch |err| switch (err) {
-                error.ProcessNotFound => {},
-                else => debug_log.log("dap.proxy: SIGKILL failed pid={d} error={s}", .{ self.id, @errorName(err) }),
-            };
-            for (0..20) |_| {
-                const result = std.posix.waitpid(self.id, 1);
-                if (result.pid != 0) {
-                    reaped = true;
-                    break;
-                }
-                std.posix.nanosleep(0, 5_000_000);
-            }
-        }
-        if (!reaped) {
-            debug_log.log("dap.proxy: adapter cleanup deadline expired pid={d}", .{self.id});
+    fn signalProcessGroup(pid: std.posix.pid_t, signal: u8) void {
+        const own_group = getpgrp();
+        if (pid <= 0 or pid == own_group) {
+            debug_log.log("dap.proxy: refusing unsafe adapter group signal pid={d} own_group={d} signal={d}", .{ pid, own_group, signal });
             return;
         }
-        debug_log.log("dap.proxy: adapter cleanup complete pid={d} reaped=true", .{self.id});
+
+        std.posix.kill(-pid, signal) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => debug_log.log("dap.proxy: adapter group signal failed pgid={d} signal={d} error={s}", .{ pid, signal, @errorName(err) }),
+        };
+    }
+
+    fn terminateAndReap(self: *DetachedProcess) void {
+        self.closePipes();
+        const pid = self.id;
+        if (pid <= 0) return;
         self.id = 0;
+
+        debug_log.log("dap.proxy: terminating adapter process group pgid={d}", .{pid});
+        signalProcessGroup(pid, std.posix.SIG.TERM);
+
+        var reaped = false;
+        for (0..20) |attempt| {
+            if (!reaped) {
+                const result = std.posix.waitpid(pid, 1); // WNOHANG
+                if (result.pid != 0) {
+                    reaped = true;
+                    debug_log.log("dap.proxy: reaped adapter leader after SIGTERM pid={d} status={d}", .{ pid, result.status });
+                }
+            }
+            if (attempt + 1 < 20) std.posix.nanosleep(0, 5_000_000);
+        }
+
+        // The session leader may exit before descendants. Always signal the
+        // process group after the grace period so TERM-ignoring descendants
+        // cannot outlive the DAP session.
+        signalProcessGroup(pid, std.posix.SIG.KILL);
+        if (!reaped) {
+            const result = std.posix.waitpid(pid, 0);
+            debug_log.log("dap.proxy: reaped adapter leader after SIGKILL pid={d} status={d}", .{ pid, result.status });
+        }
     }
 };
 
@@ -164,6 +172,7 @@ const DetachedProcess = struct {
 /// process group — which would send SIGTTIN to the parent.
 fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !DetachedProcess {
     const posix = std.posix;
+    debug_log.log("dap.proxy: spawning detached adapter command={s} argc={d}", .{ argv[0], argv.len });
 
     // Create pipes with CLOEXEC — they auto-close after exec in the child.
     const stdin_pipe = try posix.pipe2(.{ .CLOEXEC = true });
@@ -195,8 +204,9 @@ fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !Detach
     if (pid == 0) {
         // ── Child ──
         // Create a new session — fully detaches from the controlling
-        // terminal so the adapter cannot call tcsetpgrp().
-        _ = std.c.setsid();
+        // terminal so the adapter cannot call tcsetpgrp(). The child PID is
+        // then also the process-group ID used by terminateAndReap.
+        if (std.c.setsid() < 0) posix.exit(1);
 
         // Wire up pipes to stdin/stdout/stderr (dup2 clears CLOEXEC on
         // the target fd, so 0/1/2 survive exec).
@@ -221,6 +231,7 @@ fn spawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) !Detach
     posix.close(stdin_pipe[0]);
     posix.close(stdout_pipe[1]);
     posix.close(stderr_pipe[1]);
+    debug_log.log("dap.proxy: detached adapter spawned pid={d} pgid={d}", .{ pid, pid });
 
     return .{
         .id = pid,
@@ -651,8 +662,8 @@ pub const DapProxy = struct {
     /// Kill the adapter process(es) and close connections.
     /// Idempotent: sets transport to .none after cleanup so repeated calls are safe.
     fn transportKill(self: *DapProxy) void {
-        // Close the parent stream from child session swap (if any)
         if (self.parent_stream) |s| {
+            debug_log.log("dap.proxy: closing parent DAP stream", .{});
             s.close();
             self.parent_stream = null;
         }
@@ -660,6 +671,7 @@ pub const DapProxy = struct {
             .none => {},
             .stdio => |*t| t.process.terminateAndReap(),
             .tcp => |*t| {
+                debug_log.log("dap.proxy: closing adapter TCP stream pid={d}", .{t.server_process.id});
                 t.stream.close();
                 t.server_process.terminateAndReap();
             },
@@ -1563,7 +1575,8 @@ pub const DapProxy = struct {
         // 1. Spawn the adapter process
         dapLog("[DAP launch] Spawning adapter process (TCP)...", .{});
         var server_child = try spawnDetached(allocator, argv);
-        errdefer server_child.terminateAndReap();
+        var owns_server_child = true;
+        errdefer if (owns_server_child) server_child.terminateAndReap();
 
         // 2. Read stdout to get the listening port
         const port_prefix = cfg.port_stdout_prefix orelse return error.PortParseFailed;
@@ -1599,6 +1612,7 @@ pub const DapProxy = struct {
         const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return error.ConnectionFailed;
 
         self.transport = .{ .tcp = .{ .stream = stream, .server_process = server_child } };
+        owns_server_child = false;
         self.initialized = false;
 
         // 4. DAP initialize handshake
@@ -4035,7 +4049,8 @@ pub const DapProxy = struct {
                     dapLog("[DAP restart] Failed to spawn adapter: {any}", .{err});
                     return err;
                 };
-                errdefer child.terminateAndReap();
+                var owns_child = true;
+                errdefer if (owns_child) child.terminateAndReap();
                 const server_stdout = child.stdout orelse return error.NotInitialized;
                 var port_buf: [256]u8 = undefined;
                 var port_len: usize = 0;
@@ -4060,6 +4075,7 @@ pub const DapProxy = struct {
                 self.adapter_tcp_port = port;
                 const stream = std.net.tcpConnectToHost(allocator, "127.0.0.1", port) catch return error.ConnectionFailed;
                 self.transport = .{ .tcp = .{ .stream = stream, .server_process = child } };
+                owns_child = false;
             } else {
                 const child = spawnDetached(allocator, adapter_argv) catch |err| {
                     dapLog("[DAP restart] Failed to spawn adapter: {any}", .{err});
@@ -4897,4 +4913,62 @@ test "DapProxy caps and deduplicates adversarial event queues" {
     try std.testing.expectEqual(@as(?u32, 9999), proxy.invalidated_areas.items[MAX_INVALIDATED_AREAS - 1].stack_frame_id);
     try std.testing.expectEqual(@as(usize, 1), proxy.retention_drops.invalidated_areas);
     try std.testing.expectEqual(@as(usize, 1), proxy.retention_deduplications.invalidated_areas);
+}
+
+fn readTestPid(file: std.fs.File) !std.posix.pid_t {
+    var buf: [32]u8 = undefined;
+    var len: usize = 0;
+
+    while (len < buf.len) {
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = file.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&poll_fds, 2_000) == 0) return error.Timeout;
+        const n = try file.read(buf[len .. len + 1]);
+        if (n == 0) return error.EndOfStream;
+        if (buf[len] == '\n') {
+            return std.fmt.parseInt(std.posix.pid_t, buf[0..len], 10);
+        }
+        len += 1;
+    }
+    return error.LineTooLong;
+}
+
+fn expectTestProcessGone(pid: std.posix.pid_t) !void {
+    for (0..100) |_| {
+        std.posix.kill(pid, 0) catch |err| switch (err) {
+            error.ProcessNotFound => return,
+            else => {},
+        };
+        std.posix.nanosleep(0, 10_000_000);
+    }
+    return error.ProcessStillRunning;
+}
+
+test "DetachedProcess terminateAndReap kills process group descendants" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const script =
+        \\trap '' TERM
+        \\/bin/sh -c 'trap "" TERM; while :; do /bin/sleep 30; done' &
+        \\child=$!
+        \\printf '%s\n' "$child"
+        \\wait "$child"
+    ;
+    var process = try spawnDetached(std.testing.allocator, &.{ "/bin/sh", "-c", script });
+    defer process.terminateAndReap();
+
+    const leader_pid = process.id;
+    const descendant_pid = try readTestPid(process.stdout.?);
+    try std.testing.expect(leader_pid != getpgrp());
+    try std.testing.expect(descendant_pid != leader_pid);
+
+    process.terminateAndReap();
+
+    try std.testing.expectEqual(@as(std.posix.pid_t, 0), process.id);
+    var status: c_int = 0;
+    try std.testing.expectEqual(@as(std.posix.pid_t, -1), std.c.waitpid(leader_pid, &status, 1));
+    try expectTestProcessGone(descendant_pid);
 }
