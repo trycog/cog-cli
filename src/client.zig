@@ -2,6 +2,7 @@ const std = @import("std");
 const json = std.json;
 const Writer = std.io.Writer;
 const curl = @import("curl.zig");
+const credential_boundary = @import("credential_boundary.zig");
 const debug_log = @import("debug_log.zig");
 
 pub const ClientError = error{
@@ -15,6 +16,46 @@ pub const McpResponse = struct {
     body: []const u8,
     session_id: ?[]const u8,
 };
+
+const CredentialDecision = enum {
+    official,
+    approved_self_hosted,
+};
+
+fn authorizeCredentialDestinationWithApprovalCheck(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    context: *anyopaque,
+    is_approved: *const fn (*anyopaque, std.mem.Allocator, []const u8) anyerror!bool,
+) !CredentialDecision {
+    var origin = try credential_boundary.parseRequestOrigin(allocator, url);
+    defer origin.deinit(allocator);
+
+    if (origin.is_official) {
+        debug_log.log("credential boundary: official destination allowed", .{});
+        return .official;
+    }
+    if (try is_approved(context, allocator, origin.serialized)) {
+        debug_log.log("credential boundary: globally approved self-hosted destination allowed", .{});
+        return .approved_self_hosted;
+    }
+
+    debug_log.log("credential boundary: unapproved self-hosted destination denied", .{});
+    return error.CredentialDestinationNotApproved;
+}
+
+fn checkGlobalApproval(_: *anyopaque, allocator: std.mem.Allocator, origin: []const u8) anyerror!bool {
+    return credential_boundary.isApproved(allocator, origin);
+}
+
+fn authorizeCredentialDestination(allocator: std.mem.Allocator, url: []const u8) !CredentialDecision {
+    var context: u8 = 0;
+    return authorizeCredentialDestinationWithApprovalCheck(allocator, url, &context, checkGlobalApproval);
+}
+
+fn beforeCredentialRequest(allocator: std.mem.Allocator, url: []const u8) !void {
+    _ = try authorizeCredentialDestination(allocator, url);
+}
 
 pub fn mcpCallTool(
     allocator: std.mem.Allocator,
@@ -59,6 +100,7 @@ pub fn mcpCall(
     session_id: ?[]const u8,
     body: []const u8,
 ) !McpResponse {
+    try beforeCredentialRequest(allocator, endpoint);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -184,6 +226,7 @@ fn mcpCallQuiet(
     session_id: ?[]const u8,
     body: []const u8,
 ) !McpResponse {
+    try beforeCredentialRequest(allocator, endpoint);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -248,6 +291,7 @@ pub fn post(
     body: []const u8,
 ) ![]const u8 {
     // Build auth header
+    try beforeCredentialRequest(allocator, url);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -306,6 +350,7 @@ pub fn postRaw(
     api_key: []const u8,
     body: []const u8,
 ) !RawResponse {
+    try beforeCredentialRequest(allocator, url);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -339,6 +384,7 @@ pub fn httpGetPublic(allocator: std.mem.Allocator, url: []const u8) ![]const u8 
 
 pub fn httpGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8) ![]const u8 {
     debug_log.log("httpGet: {s}", .{url});
+    try beforeCredentialRequest(allocator, url);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -481,6 +527,7 @@ pub const ApiResponse = struct {
 /// Authenticated GET request that returns status code and body without printing errors.
 pub fn apiGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8) !ApiResponse {
     debug_log.log("apiGet: {s}", .{url});
+    try beforeCredentialRequest(allocator, url);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -502,6 +549,7 @@ pub fn apiGet(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8
 /// Authenticated POST request that returns status code and body without printing errors.
 pub fn apiPost(allocator: std.mem.Allocator, url: []const u8, api_key: []const u8, body: []const u8) !ApiResponse {
     debug_log.log("apiPost: {s} ({d} bytes)", .{ url, body.len });
+    try beforeCredentialRequest(allocator, url);
     const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
     defer allocator.free(auth_header);
 
@@ -527,6 +575,65 @@ fn printErr(msg: []const u8) void {
     var w = std.fs.File.stderr().writer(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
+}
+
+const TestApprovalContext = struct {
+    approved_origin: ?[]const u8,
+    requests: usize = 0,
+};
+
+fn testApproval(context: *anyopaque, _: std.mem.Allocator, origin: []const u8) anyerror!bool {
+    const state: *TestApprovalContext = @ptrCast(@alignCast(context));
+    const approved_origin = state.approved_origin orelse return false;
+    return std.mem.eql(u8, approved_origin, origin);
+}
+
+fn countTestRequest(context: *anyopaque, _: []const u8) void {
+    const state: *TestApprovalContext = @ptrCast(@alignCast(context));
+    state.requests += 1;
+}
+
+fn authorizeAndObserveTestRequest(state: *TestApprovalContext, url: []const u8) !CredentialDecision {
+    const decision = try authorizeCredentialDestinationWithApprovalCheck(
+        std.testing.allocator,
+        url,
+        state,
+        testApproval,
+    );
+    countTestRequest(state, url);
+    return decision;
+}
+
+test "credential request boundary rejects unapproved self-host before network I/O" {
+    var state = TestApprovalContext{ .approved_origin = null };
+    try std.testing.expectError(
+        error.CredentialDestinationNotApproved,
+        authorizeAndObserveTestRequest(&state, "https://memory.example/api/v1/owner/brain/mcp"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), state.requests);
+}
+
+test "credential request boundary allows approved and exact official destinations" {
+    var approved = TestApprovalContext{ .approved_origin = "https://memory.example:8443" };
+    try std.testing.expectEqual(
+        CredentialDecision.approved_self_hosted,
+        try authorizeAndObserveTestRequest(&approved, "https://MEMORY.example:8443/api/v1/verify"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), approved.requests);
+
+    var official = TestApprovalContext{ .approved_origin = null };
+    try std.testing.expectEqual(
+        CredentialDecision.official,
+        try authorizeAndObserveTestRequest(&official, "https://trycog.ai:443/api/v1/owner/brain/mcp"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), official.requests);
+
+    var noncanonical_official = TestApprovalContext{ .approved_origin = null };
+    try std.testing.expectError(
+        error.CredentialDestinationNotApproved,
+        authorizeAndObserveTestRequest(&noncanonical_official, "https://trycog.ai:444/api/v1/owner/brain/mcp"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), noncanonical_official.requests);
 }
 
 test "parseResponse success with data envelope" {
