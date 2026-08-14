@@ -1095,6 +1095,31 @@ fn writeSettingsCodeConfig(
                     try s.write(entry.value_ptr.*);
                 }
 
+                // Approving a new external root is additive: an earlier approval
+                // of a different root stays in force, so a later scan can never
+                // silently revoke access the user already granted.
+                var merged_roots: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer merged_roots.deinit(allocator);
+                if (external_roots.len > 0) {
+                    if (parsed_val.value.object.get("code")) |code| {
+                        if (code == .object) {
+                            if (code.object.get("external_roots")) |existing_roots| {
+                                if (existing_roots == .array) {
+                                    for (existing_roots.array.items) |entry| {
+                                        if (entry != .string) continue;
+                                        try appendUniqueRoot(allocator, &merged_roots, entry.string);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (external_roots) |root| try appendUniqueRoot(allocator, &merged_roots, root);
+                    debug_log.log(
+                        "writeSettingsCodeConfig: merged external roots existing+new={d}",
+                        .{merged_roots.items.len},
+                    );
+                }
+
                 // Deep merge code, preserving non-index keys
                 try s.objectField("code");
                 try s.beginObject();
@@ -1112,7 +1137,7 @@ fn writeSettingsCodeConfig(
                 }
 
                 if (replace_index) try writeStringArrayField(&s, "index", patterns);
-                if (external_roots.len > 0) try writeStringArrayField(&s, "external_roots", external_roots);
+                if (external_roots.len > 0) try writeStringArrayField(&s, "external_roots", merged_roots.items);
                 try s.endObject(); // code
             } else {
                 try writeFreshCodeConfig(&s, patterns, external_roots, replace_index);
@@ -1136,6 +1161,18 @@ fn writeSettingsCodeConfig(
     defer allocator.free(with_newline);
 
     try writeCwdFile(".cog/settings.json", with_newline);
+}
+
+fn appendUniqueRoot(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged([]const u8),
+    root: []const u8,
+) !void {
+    if (root.len == 0) return;
+    for (roots.items) |existing| {
+        if (std.mem.eql(u8, existing, root)) return;
+    }
+    try roots.append(allocator, root);
 }
 
 fn writeFreshCodeConfig(
@@ -2927,6 +2964,71 @@ test "approve-host rejects ambiguous and non-HTTPS destinations" {
         );
         try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
     }
+}
+
+test "approving an external root merges with previously approved roots" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try std.fs.cwd().makeDir(".cog");
+
+            try writeSettingsCodeConfig(allocator, &.{}, &.{"/srv/alpha"}, false);
+            try writeSettingsCodeConfig(allocator, &.{}, &.{"/srv/beta"}, false);
+            // Re-approving a known root must not duplicate it.
+            try writeSettingsCodeConfig(allocator, &.{}, &.{"/srv/alpha"}, false);
+
+            const body = try std.fs.cwd().readFileAlloc(allocator, ".cog/settings.json", 64 * 1024);
+            defer allocator.free(body);
+
+            try std.testing.expectEqualStrings(
+                \\{
+                \\  "code": {
+                \\    "external_roots": [
+                \\      "/srv/alpha",
+                \\      "/srv/beta"
+                \\    ]
+                \\  }
+                \\}
+                \\
+            , body);
+        }
+    }.run);
+}
+
+test "approving an external root preserves unrelated settings" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try std.fs.cwd().makeDir(".cog");
+            try std.fs.cwd().writeFile(.{
+                .sub_path = ".cog/settings.json",
+                .data =
+                \\{
+                \\  "memory": { "brain": "file:.cog/brain.db" },
+                \\  "code": {
+                \\    "index": ["**/*.zig"],
+                \\    "external_roots": ["/srv/alpha"]
+                \\  }
+                \\}
+                \\
+                ,
+            });
+
+            try writeSettingsCodeConfig(allocator, &.{}, &.{"/srv/beta"}, false);
+
+            const body = try std.fs.cwd().readFileAlloc(allocator, ".cog/settings.json", 64 * 1024);
+            defer allocator.free(body);
+
+            const parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
+            defer parsed.deinit();
+
+            const code = parsed.value.object.get("code").?.object;
+            try std.testing.expectEqualStrings("**/*.zig", code.get("index").?.array.items[0].string);
+            const roots = code.get("external_roots").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), roots.len);
+            try std.testing.expectEqualStrings("/srv/alpha", roots[0].string);
+            try std.testing.expectEqualStrings("/srv/beta", roots[1].string);
+            try std.testing.expect(parsed.value.object.get("memory") != null);
+        }
+    }.run);
 }
 
 test "doctor requires an origin argument for approve-host" {
