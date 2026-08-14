@@ -733,28 +733,40 @@ fn fseventsCallback(
         const abs_path = std.mem.span(event_paths[i]);
         if (self.matcher.ignoresPhysicalPath(abs_path)) continue;
 
+        const structural = CF.kFSEventStreamEventFlagItemCreated |
+            CF.kFSEventStreamEventFlagItemRemoved |
+            CF.kFSEventStreamEventFlagItemRenamed;
+        const is_directory = flags & CF.kFSEventStreamEventFlagItemIsDir != 0;
+
         // A symlink appearing or disappearing changes which logical names a
         // physical path answers to — same rule the inotify backend applies.
-        if (flags & CF.kFSEventStreamEventFlagItemIsSymlink != 0) {
-            noteStructuralChange(self, abs_path, false);
-        }
+        const impact = if (flags & structural != 0)
+            noteStructuralChange(self, abs_path, is_directory)
+        else
+            AliasImpact.none;
 
         // FSEvents reports a moved directory as one event and never enumerates
         // what it carried, so the subtree is reconciled explicitly rather than
         // left half-indexed.
-        if (flags & CF.kFSEventStreamEventFlagItemIsDir != 0) {
-            const structural = CF.kFSEventStreamEventFlagItemCreated |
-                CF.kFSEventStreamEventFlagItemRemoved |
-                CF.kFSEventStreamEventFlagItemRenamed;
+        if (is_directory or flags & CF.kFSEventStreamEventFlagItemIsSymlink != 0) {
             if (flags & structural == 0) continue;
-            if (directoryExists(abs_path)) {
-                debug_log.log("watcher.macos: directory appeared path={s}; indexing subtree", .{abs_path});
-                emitPhysicalSubtree(self, abs_path);
-            } else {
-                debug_log.log("watcher.macos: directory vanished path={s}; requesting resync", .{abs_path});
-                self.matcher.invalidateAliases();
-                _ = emitOverflow(self);
+            if (is_directory or linkTargetsDirectory(abs_path)) {
+                if (directoryExists(abs_path)) {
+                    debug_log.log("watcher.macos: directory appeared path={s}; indexing subtree", .{abs_path});
+                    emitPhysicalSubtree(self, abs_path);
+                } else {
+                    debug_log.log("watcher.macos: directory vanished path={s}; requesting resync", .{abs_path});
+                    self.matcher.invalidateAliases();
+                    _ = emitOverflow(self);
+                }
+                continue;
             }
+            if (impact == .retired and !isSymbolicLink(abs_path)) {
+                debug_log.log("watcher.macos: alias link removed path={s}; requesting resync", .{abs_path});
+                _ = emitOverflow(self);
+                continue;
+            }
+            emitPhysicalPath(self, abs_path);
             continue;
         }
 
@@ -858,10 +870,10 @@ fn watcherThreadLinux(self: *Watcher) void {
                 // inotify reports nothing about the contents a directory already
                 // had when it was moved in, so the subtree is walked explicitly:
                 // watch it, then index every file it brought with it.
+                _ = noteStructuralChange(self, abs_path, true);
                 debug_log.log("watcher.linux: directory appeared path={s}; watching and indexing subtree", .{abs_path});
                 addWatchSubtree(self, inotify_fd, watch_mask, abs_path, &registry);
                 emitPhysicalSubtree(self, abs_path);
-                noteStructuralChange(self, abs_path, true);
                 continue;
             }
 
@@ -869,19 +881,38 @@ fn watcherThreadLinux(self: *Watcher) void {
                 // The descendants are already gone, so they cannot be
                 // enumerated. Retire their watches and reconcile the index
                 // through a full resync rather than leaving stale entries.
+                _ = noteStructuralChange(self, abs_path, true);
                 const retired = registry.removeSubtree(abs_path, inotify_fd);
                 debug_log.log(
                     "watcher.linux: directory vanished path={s}; retired {d} watches, requesting resync",
                     .{ abs_path, retired },
                 );
-                noteStructuralChange(self, abs_path, true);
                 _ = emitOverflow(self);
                 continue;
             }
 
             if (is_directory) continue;
 
-            if (appeared or vanished) noteStructuralChange(self, abs_path, false);
+            const impact = if (appeared or vanished)
+                noteStructuralChange(self, abs_path, false)
+            else
+                AliasImpact.none;
+
+            if (appeared and linkTargetsDirectory(abs_path)) {
+                debug_log.log("watcher.linux: directory link appeared path={s}; indexing linked subtree", .{abs_path});
+                addWatchSubtree(self, inotify_fd, watch_mask, abs_path, &registry);
+                emitPhysicalSubtree(self, abs_path);
+                continue;
+            }
+
+            if (vanished and impact == .retired) {
+                // Everything the link contributed is gone with it and cannot be
+                // enumerated from the deleted path.
+                debug_log.log("watcher.linux: alias link removed path={s}; requesting resync", .{abs_path});
+                _ = emitOverflow(self);
+                continue;
+            }
+
             emitPhysicalPath(self, abs_path);
         }
     }
@@ -962,19 +993,40 @@ fn emitPhysicalSubtree(self: *Watcher, dir_path: []const u8) void {
     for (logical_paths.items) |logical_path| _ = emitWatcherRecord(self, logical_path);
 }
 
+const AliasImpact = enum {
+    /// Nothing that can produce a second logical name changed.
+    none,
+    /// A link appeared that the alias table does not know about yet.
+    discovered,
+    /// A link or target the alias table already depended on changed, so logical
+    /// paths derived from it may no longer describe anything.
+    retired,
+};
+
 /// Refresh the alias table when a change could have altered which logical names
 /// a physical path answers to. Ordinary files and directories are already
 /// covered by the prefix of an existing alias, so only links and the endpoints
 /// of known aliases matter here.
-fn noteStructuralChange(self: *Watcher, physical_path: []const u8, is_directory: bool) void {
-    const reason: []const u8 = blk: {
-        if (self.matcher.isKnownAliasLink(physical_path)) break :blk "alias link changed";
-        if (self.matcher.isKnownAliasTarget(physical_path)) break :blk "alias target changed";
-        if (!is_directory and isSymbolicLink(physical_path)) break :blk "symlink appeared";
-        return;
-    };
-    debug_log.log("Watcher.aliases: {s} at {s}; refreshing logical aliases", .{ reason, physical_path });
+fn noteStructuralChange(self: *Watcher, physical_path: []const u8, is_directory: bool) AliasImpact {
+    const known = self.matcher.isKnownAliasLink(physical_path) or
+        self.matcher.isKnownAliasTarget(physical_path);
+    if (!known and (is_directory or !isSymbolicLink(physical_path))) return .none;
+
     self.matcher.invalidateAliases();
+    if (known) {
+        debug_log.log("Watcher.aliases: known alias endpoint changed at {s}", .{physical_path});
+        return .retired;
+    }
+    debug_log.log("Watcher.aliases: new link at {s}", .{physical_path});
+    return .discovered;
+}
+
+/// True when the path is a symlink that resolves to a directory. Such a link
+/// introduces a whole logical subtree at once, so the files underneath it have
+/// to be indexed even though the link itself is a single event.
+fn linkTargetsDirectory(physical_path: []const u8) bool {
+    if (!isSymbolicLink(physical_path)) return false;
+    return directoryExists(physical_path);
 }
 
 fn isSymbolicLink(physical_path: []const u8) bool {
@@ -1157,6 +1209,36 @@ fn collectSubtreeForTest(
     var active = std.AutoHashMap(path_matcher.DirectoryIdentity, void).init(allocator);
     defer active.deinit();
     try walkWatchedSubtree(allocator, matcher, dir_path, 0, &active, .{ .logical_out = out });
+}
+
+test "link classification separates directory links from file links" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+    try project.dir.symLink("src/main.zig", "entry.zig", .{});
+    try project.dir.symLink("src/missing.zig", "dangling.zig", .{});
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    const dir_link = try std.fs.path.join(allocator, &.{ project_root, "src-link" });
+    defer allocator.free(dir_link);
+    const file_link = try std.fs.path.join(allocator, &.{ project_root, "entry.zig" });
+    defer allocator.free(file_link);
+    const dangling = try std.fs.path.join(allocator, &.{ project_root, "dangling.zig" });
+    defer allocator.free(dangling);
+    const plain_dir = try std.fs.path.join(allocator, &.{ project_root, "src" });
+    defer allocator.free(plain_dir);
+
+    try std.testing.expect(linkTargetsDirectory(dir_link));
+    try std.testing.expect(!linkTargetsDirectory(file_link));
+    try std.testing.expect(!linkTargetsDirectory(dangling));
+    try std.testing.expect(!linkTargetsDirectory(plain_dir));
+    try std.testing.expect(isSymbolicLink(dangling));
+    try std.testing.expect(!isSymbolicLink(plain_dir));
 }
 
 test "watched subtree collection applies the shared exclusion policy" {
