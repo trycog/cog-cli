@@ -397,12 +397,293 @@ const RelationshipInfo = struct {
 
 const RelationshipList = std.ArrayListUnmanaged(RelationshipInfo);
 
+const RelationshipDedupKey = struct {
+    owner: []const u8,
+    symbol: []const u8,
+    kind: []const u8,
+};
+
+const RelationshipDedupContext = struct {
+    pub fn hash(_: @This(), key: RelationshipDedupKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(key.owner);
+        hasher.update("\x00");
+        hasher.update(key.symbol);
+        hasher.update("\x00");
+        hasher.update(key.kind);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), left: RelationshipDedupKey, right: RelationshipDedupKey) bool {
+        return std.mem.eql(u8, left.owner, right.owner) and
+            std.mem.eql(u8, left.symbol, right.symbol) and
+            std.mem.eql(u8, left.kind, right.kind);
+    }
+};
+
+const RelationshipDedupSet = std.HashMapUnmanaged(
+    RelationshipDedupKey,
+    void,
+    RelationshipDedupContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 const FileImport = struct {
     label: []const u8,
     symbol: []const u8,
 };
 
 const FileImportList = std.ArrayListUnmanaged(FileImport);
+
+const ImportDedupKey = struct {
+    document_path: []const u8,
+    label: []const u8,
+    symbol: []const u8,
+};
+
+const ImportDedupContext = struct {
+    pub fn hash(_: @This(), key: ImportDedupKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(key.document_path);
+        hasher.update("\x00");
+        hasher.update(key.label);
+        hasher.update("\x00");
+        hasher.update(key.symbol);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), left: ImportDedupKey, right: ImportDedupKey) bool {
+        return std.mem.eql(u8, left.document_path, right.document_path) and
+            std.mem.eql(u8, left.label, right.label) and
+            std.mem.eql(u8, left.symbol, right.symbol);
+    }
+};
+
+const ImportDedupSet = std.HashMapUnmanaged(
+    ImportDedupKey,
+    void,
+    ImportDedupContext,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn appendDeduplicatedRelationship(
+    allocator: std.mem.Allocator,
+    seen: *RelationshipDedupSet,
+    owner: []const u8,
+    list: *RelationshipList,
+    relationship: RelationshipInfo,
+) !void {
+    const entry = try seen.getOrPut(allocator, .{
+        .owner = owner,
+        .symbol = relationship.symbol,
+        .kind = relationship.kind,
+    });
+    if (entry.found_existing) return;
+    try list.append(allocator, relationship);
+}
+
+fn appendDeduplicatedImport(
+    allocator: std.mem.Allocator,
+    seen: *ImportDedupSet,
+    document_path: []const u8,
+    list: *FileImportList,
+    item: FileImport,
+) !void {
+    const entry = try seen.getOrPut(allocator, .{
+        .document_path = document_path,
+        .label = item.label,
+        .symbol = item.symbol,
+    });
+    if (entry.found_existing) return;
+    try list.append(allocator, item);
+}
+
+const RangeEndpoint = struct {
+    line: i32,
+    char: i32,
+};
+
+const EnclosingRangeEntry = struct {
+    symbol: []const u8,
+    range: scip.Range,
+    document_order: usize,
+};
+
+const EnclosingRangeIndex = struct {
+    entries: []EnclosingRangeEntry,
+    max_end_tree: []RangeEndpoint,
+    leaf_count: usize,
+
+    fn init(allocator: std.mem.Allocator, source_entries: []const EnclosingRangeEntry) !EnclosingRangeIndex {
+        const entries = try allocator.dupe(EnclosingRangeEntry, source_entries);
+        return initOwned(allocator, entries);
+    }
+
+    fn initForDocument(
+        allocator: std.mem.Allocator,
+        document: scip.Document,
+        definitions: *const std.StringHashMapUnmanaged(DefInfo),
+    ) !EnclosingRangeIndex {
+        var entry_count: usize = 0;
+        for (document.symbols) |symbol| {
+            if (symbol.symbol.len == 0) continue;
+            if ((definitions.get(symbol.symbol) orelse continue).enclosing_range != null) entry_count += 1;
+        }
+
+        const entries = try allocator.alloc(EnclosingRangeEntry, entry_count);
+        var entry_index: usize = 0;
+        for (document.symbols, 0..) |symbol, document_order| {
+            if (symbol.symbol.len == 0) continue;
+            const range = (definitions.get(symbol.symbol) orelse continue).enclosing_range orelse continue;
+            entries[entry_index] = .{
+                .symbol = symbol.symbol,
+                .range = range,
+                .document_order = document_order,
+            };
+            entry_index += 1;
+        }
+        return initOwned(allocator, entries);
+    }
+
+    fn initOwned(allocator: std.mem.Allocator, entries: []EnclosingRangeEntry) !EnclosingRangeIndex {
+        errdefer allocator.free(entries);
+        if (entries.len == 0) {
+            return .{
+                .entries = entries,
+                .max_end_tree = &.{},
+                .leaf_count = 0,
+            };
+        }
+
+        std.mem.sortUnstable(EnclosingRangeEntry, entries, {}, lessThan);
+
+        var leaf_count: usize = 1;
+        while (leaf_count < entries.len) {
+            leaf_count = std.math.mul(usize, leaf_count, 2) catch return error.OutOfMemory;
+        }
+        const tree_len = std.math.mul(usize, leaf_count, 2) catch return error.OutOfMemory;
+        const max_end_tree = try allocator.alloc(RangeEndpoint, tree_len);
+        errdefer allocator.free(max_end_tree);
+        @memset(max_end_tree, minimumEndpoint());
+
+        for (entries, 0..) |entry, index| {
+            max_end_tree[leaf_count + index] = rangeEnd(entry.range);
+        }
+        var node = leaf_count;
+        while (node > 1) {
+            node -= 1;
+            max_end_tree[node] = laterEndpoint(max_end_tree[node * 2], max_end_tree[node * 2 + 1]);
+        }
+
+        return .{
+            .entries = entries,
+            .max_end_tree = max_end_tree,
+            .leaf_count = leaf_count,
+        };
+    }
+
+    fn deinit(self: *EnclosingRangeIndex, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+        if (self.max_end_tree.len > 0) allocator.free(self.max_end_tree);
+        self.* = undefined;
+    }
+
+    fn findInnermost(self: *const EnclosingRangeIndex, line: i32, char: i32) ?[]const u8 {
+        return self.findInnermostInternal(line, char, null);
+    }
+
+    fn findInnermostCounted(self: *const EnclosingRangeIndex, line: i32, char: i32, probes: *usize) ?[]const u8 {
+        return self.findInnermostInternal(line, char, probes);
+    }
+
+    fn findInnermostInternal(
+        self: *const EnclosingRangeIndex,
+        line: i32,
+        char: i32,
+        probes: ?*usize,
+    ) ?[]const u8 {
+        if (self.entries.len == 0) return null;
+        const point: RangeEndpoint = .{ .line = line, .char = char };
+        const limit = self.upperBoundStart(point, probes);
+        if (limit == 0) return null;
+        const entry_index = self.findRightmostCovering(1, 0, self.leaf_count, limit, point, probes) orelse return null;
+        return self.entries[entry_index].symbol;
+    }
+
+    fn upperBoundStart(self: *const EnclosingRangeIndex, point: RangeEndpoint, probes: ?*usize) usize {
+        var low: usize = 0;
+        var high: usize = self.entries.len;
+        while (low < high) {
+            countProbe(probes);
+            const middle = low + (high - low) / 2;
+            if (endpointAtOrBefore(rangeStart(self.entries[middle].range), point)) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        return low;
+    }
+
+    fn findRightmostCovering(
+        self: *const EnclosingRangeIndex,
+        node: usize,
+        start: usize,
+        end: usize,
+        limit: usize,
+        point: RangeEndpoint,
+        probes: ?*usize,
+    ) ?usize {
+        countProbe(probes);
+        if (start >= limit or endpointBefore(self.max_end_tree[node], point)) return null;
+        if (end - start == 1) return if (start < self.entries.len) start else null;
+
+        const middle = start + (end - start) / 2;
+        if (self.findRightmostCovering(node * 2 + 1, middle, end, limit, point, probes)) |index| return index;
+        return self.findRightmostCovering(node * 2, start, middle, limit, point, probes);
+    }
+
+    fn lessThan(_: void, left: EnclosingRangeEntry, right: EnclosingRangeEntry) bool {
+        const left_start = rangeStart(left.range);
+        const right_start = rangeStart(right.range);
+        if (endpointBefore(left_start, right_start)) return true;
+        if (endpointBefore(right_start, left_start)) return false;
+
+        const left_end = rangeEnd(left.range);
+        const right_end = rangeEnd(right.range);
+        if (endpointBefore(right_end, left_end)) return true;
+        if (endpointBefore(left_end, right_end)) return false;
+        return left.document_order < right.document_order;
+    }
+
+    fn countProbe(probes: ?*usize) void {
+        if (probes) |count| count.* += 1;
+    }
+
+    fn minimumEndpoint() RangeEndpoint {
+        return .{ .line = std.math.minInt(i32), .char = std.math.minInt(i32) };
+    }
+
+    fn rangeStart(range: scip.Range) RangeEndpoint {
+        return .{ .line = range.start_line, .char = range.start_char };
+    }
+
+    fn rangeEnd(range: scip.Range) RangeEndpoint {
+        return .{ .line = range.end_line, .char = range.end_char };
+    }
+
+    fn endpointBefore(left: RangeEndpoint, right: RangeEndpoint) bool {
+        return left.line < right.line or (left.line == right.line and left.char < right.char);
+    }
+
+    fn endpointAtOrBefore(left: RangeEndpoint, right: RangeEndpoint) bool {
+        return !endpointBefore(right, left);
+    }
+
+    fn laterEndpoint(left: RangeEndpoint, right: RangeEndpoint) RangeEndpoint {
+        return if (endpointBefore(left, right)) right else left;
+    }
+};
 
 const FileStat = struct {
     path: []const u8,
@@ -451,6 +732,19 @@ pub const CodeIndex = struct {
         var symbol_to_calls: std.StringHashMapUnmanaged(RelationshipList) = .empty;
         var symbol_to_callers: std.StringHashMapUnmanaged(RelationshipList) = .empty;
 
+        var children_seen: RelationshipDedupSet = .empty;
+        defer children_seen.deinit(allocator);
+        var relationships_seen: RelationshipDedupSet = .empty;
+        defer relationships_seen.deinit(allocator);
+        var reverse_relationships_seen: RelationshipDedupSet = .empty;
+        defer reverse_relationships_seen.deinit(allocator);
+        var imports_seen: ImportDedupSet = .empty;
+        defer imports_seen.deinit(allocator);
+        var calls_seen: RelationshipDedupSet = .empty;
+        defer calls_seen.deinit(allocator);
+        var callers_seen: RelationshipDedupSet = .empty;
+        defer callers_seen.deinit(allocator);
+
         debug_log.log("CodeIndex.build: pass1 documents={d}", .{index.documents.len});
 
         // Pass 1: register every document and definition before resolving any
@@ -498,11 +792,24 @@ pub const CodeIndex = struct {
             }
         }
 
-        debug_log.log("CodeIndex.build: pass2 definitions={d}", .{symbol_to_defs.count()});
+        const enclosing_range_indexes = try allocator.alloc(EnclosingRangeIndex, index.documents.len);
+        var initialized_range_indexes: usize = 0;
+        defer {
+            for (enclosing_range_indexes[0..initialized_range_indexes]) |*range_index| range_index.deinit(allocator);
+            allocator.free(enclosing_range_indexes);
+        }
+        var enclosing_range_entries: usize = 0;
+        for (index.documents, 0..) |doc, doc_idx| {
+            enclosing_range_indexes[doc_idx] = try EnclosingRangeIndex.initForDocument(allocator, doc, &symbol_to_defs);
+            initialized_range_indexes += 1;
+            enclosing_range_entries += enclosing_range_indexes[doc_idx].entries.len;
+        }
+
+        debug_log.log("CodeIndex.build: pass2 definitions={d} enclosing_ranges={d}", .{ symbol_to_defs.count(), enclosing_range_entries });
 
         // Pass 2: build containment, declared relationships, references,
         // imports, and call edges against the complete definition table.
-        for (index.documents) |doc| {
+        for (index.documents, 0..) |doc, doc_idx| {
             for (doc.symbols) |sym| {
                 if (sym.symbol.len == 0) continue;
 
@@ -510,7 +817,7 @@ pub const CodeIndex = struct {
                     try symbol_to_parent.put(allocator, sym.symbol, sym.enclosing_symbol);
                     const children_entry = try parent_to_children.getOrPut(allocator, sym.enclosing_symbol);
                     if (!children_entry.found_existing) children_entry.value_ptr.* = .empty;
-                    try appendUniqueRelationship(allocator, children_entry.value_ptr, .{
+                    try appendDeduplicatedRelationship(allocator, &children_seen, sym.enclosing_symbol, children_entry.value_ptr, .{
                         .symbol = sym.symbol,
                         .kind = "contains",
                     });
@@ -522,7 +829,7 @@ pub const CodeIndex = struct {
 
                 for (sym.relationships) |rel| {
                     const rel_kind = scip.relationshipKind(rel);
-                    try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
+                    try appendDeduplicatedRelationship(allocator, &relationships_seen, sym.symbol, outgoing_entry.value_ptr, .{
                         .symbol = rel.symbol,
                         .kind = rel_kind,
                     });
@@ -534,14 +841,17 @@ pub const CodeIndex = struct {
                         rel_kind,
                         &symbol_to_defs,
                         &path_to_doc_idx,
+                        &imports_seen,
                         &file_to_imports,
+                        &calls_seen,
+                        &callers_seen,
                         &symbol_to_calls,
                         &symbol_to_callers,
                     );
 
                     const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
                     if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
-                    try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{
+                    try appendDeduplicatedRelationship(allocator, &reverse_relationships_seen, rel.symbol, reverse_entry.value_ptr, .{
                         .symbol = sym.symbol,
                         .kind = rel_kind,
                     });
@@ -561,15 +871,23 @@ pub const CodeIndex = struct {
                 if ((occ.symbol_roles & scip.SymbolRole.Import) != 0) {
                     const imports_entry = try file_to_imports.getOrPut(allocator, doc.relative_path);
                     if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
-                    try appendUniqueImport(allocator, imports_entry.value_ptr, .{
+                    try appendDeduplicatedImport(allocator, &imports_seen, doc.relative_path, imports_entry.value_ptr, .{
                         .label = resolveImportLabel(displayLabelForSymbol(occ.symbol, &symbol_to_defs), &path_to_doc_idx),
                         .symbol = occ.symbol,
                     });
                 } else if (std.mem.startsWith(u8, occ.symbol, "cog/call/")) {
                     const call_name = occ.symbol["cog/call/".len..];
-                    const caller_symbol = findEnclosingSymbolForOccurrence(doc, occ, &symbol_to_defs) orelse continue;
+                    const caller_symbol = enclosing_range_indexes[doc_idx].findInnermost(occ.range.start_line, occ.range.start_char) orelse continue;
                     const callee_symbol = resolveCallTarget(call_name, doc.relative_path, &symbol_to_defs) orelse continue;
-                    try addCallEdge(allocator, caller_symbol, callee_symbol, &symbol_to_calls, &symbol_to_callers);
+                    try addCallEdge(
+                        allocator,
+                        caller_symbol,
+                        callee_symbol,
+                        &calls_seen,
+                        &callers_seen,
+                        &symbol_to_calls,
+                        &symbol_to_callers,
+                    );
                 }
             }
         }
@@ -580,17 +898,25 @@ pub const CodeIndex = struct {
             if (!outgoing_entry.found_existing) outgoing_entry.value_ptr.* = .empty;
             for (sym.relationships) |rel| {
                 const rel_kind = scip.relationshipKind(rel);
-                try appendUniqueRelationship(allocator, outgoing_entry.value_ptr, .{
+                try appendDeduplicatedRelationship(allocator, &relationships_seen, sym.symbol, outgoing_entry.value_ptr, .{
                     .symbol = rel.symbol,
                     .kind = rel_kind,
                 });
                 if (std.mem.eql(u8, rel_kind, "calls")) {
-                    try addCallEdge(allocator, sym.symbol, rel.symbol, &symbol_to_calls, &symbol_to_callers);
+                    try addCallEdge(
+                        allocator,
+                        sym.symbol,
+                        rel.symbol,
+                        &calls_seen,
+                        &callers_seen,
+                        &symbol_to_calls,
+                        &symbol_to_callers,
+                    );
                 }
 
                 const reverse_entry = try symbol_to_reverse_relationships.getOrPut(allocator, rel.symbol);
                 if (!reverse_entry.found_existing) reverse_entry.value_ptr.* = .empty;
-                try appendUniqueRelationship(allocator, reverse_entry.value_ptr, .{
+                try appendDeduplicatedRelationship(allocator, &reverse_relationships_seen, rel.symbol, reverse_entry.value_ptr, .{
                     .symbol = sym.symbol,
                     .kind = rel_kind,
                 });
@@ -598,6 +924,14 @@ pub const CodeIndex = struct {
         }
 
         debug_log.log("CodeIndex.build: defs={d} refs={d} imports={d} calls={d}", .{ symbol_to_defs.count(), symbol_to_refs.count(), file_to_imports.count(), symbol_to_calls.count() });
+        debug_log.log("CodeIndex.build: dedup children={d} relationships={d} reverse={d} imports={d} calls={d} callers={d}", .{
+            children_seen.count(),
+            relationships_seen.count(),
+            reverse_relationships_seen.count(),
+            imports_seen.count(),
+            calls_seen.count(),
+            callers_seen.count(),
+        });
 
         return .{
             .index = index,
@@ -662,41 +996,25 @@ pub const CodeIndex = struct {
         if (self.backing_data) |data| allocator.free(data);
     }
 
-    fn appendUniqueRelationship(allocator: std.mem.Allocator, list: *RelationshipList, rel: RelationshipInfo) !void {
-        for (list.items) |existing| {
-            if (std.mem.eql(u8, existing.symbol, rel.symbol) and std.mem.eql(u8, existing.kind, rel.kind)) {
-                return;
-            }
-        }
-        try list.append(allocator, rel);
-    }
-
-    fn appendUniqueImport(allocator: std.mem.Allocator, list: *FileImportList, item: FileImport) !void {
-        for (list.items) |existing| {
-            if (std.mem.eql(u8, existing.label, item.label) and std.mem.eql(u8, existing.symbol, item.symbol)) {
-                return;
-            }
-        }
-        try list.append(allocator, item);
-    }
-
     fn addCallEdge(
         allocator: std.mem.Allocator,
         caller_symbol: []const u8,
         callee_symbol: []const u8,
+        calls_seen: *RelationshipDedupSet,
+        callers_seen: *RelationshipDedupSet,
         symbol_to_calls: *std.StringHashMapUnmanaged(RelationshipList),
         symbol_to_callers: *std.StringHashMapUnmanaged(RelationshipList),
     ) !void {
         const calls_entry = try symbol_to_calls.getOrPut(allocator, caller_symbol);
         if (!calls_entry.found_existing) calls_entry.value_ptr.* = .empty;
-        try appendUniqueRelationship(allocator, calls_entry.value_ptr, .{
+        try appendDeduplicatedRelationship(allocator, calls_seen, caller_symbol, calls_entry.value_ptr, .{
             .symbol = callee_symbol,
             .kind = "calls",
         });
 
         const callers_entry = try symbol_to_callers.getOrPut(allocator, callee_symbol);
         if (!callers_entry.found_existing) callers_entry.value_ptr.* = .empty;
-        try appendUniqueRelationship(allocator, callers_entry.value_ptr, .{
+        try appendDeduplicatedRelationship(allocator, callers_seen, callee_symbol, callers_entry.value_ptr, .{
             .symbol = caller_symbol,
             .kind = "callers",
         });
@@ -710,16 +1028,27 @@ pub const CodeIndex = struct {
         kind: []const u8,
         defs: *const std.StringHashMapUnmanaged(DefInfo),
         indexed_paths: *const std.StringHashMapUnmanaged(usize),
+        imports_seen: *ImportDedupSet,
         file_to_imports: *std.StringHashMapUnmanaged(FileImportList),
+        calls_seen: *RelationshipDedupSet,
+        callers_seen: *RelationshipDedupSet,
         symbol_to_calls: *std.StringHashMapUnmanaged(RelationshipList),
         symbol_to_callers: *std.StringHashMapUnmanaged(RelationshipList),
     ) !void {
         if (std.mem.eql(u8, kind, "calls")) {
-            try addCallEdge(allocator, source_symbol, target_symbol, symbol_to_calls, symbol_to_callers);
+            try addCallEdge(
+                allocator,
+                source_symbol,
+                target_symbol,
+                calls_seen,
+                callers_seen,
+                symbol_to_calls,
+                symbol_to_callers,
+            );
         } else if (std.mem.eql(u8, kind, "imports")) {
             const imports_entry = try file_to_imports.getOrPut(allocator, document_path);
             if (!imports_entry.found_existing) imports_entry.value_ptr.* = .empty;
-            try appendUniqueImport(allocator, imports_entry.value_ptr, .{
+            try appendDeduplicatedImport(allocator, imports_seen, document_path, imports_entry.value_ptr, .{
                 .label = resolveImportLabel(displayLabelForSymbol(target_symbol, defs), indexed_paths),
                 .symbol = target_symbol,
             });
@@ -767,38 +1096,6 @@ pub const CodeIndex = struct {
             if (def.display_name.len > 0) return def.display_name;
         }
         return scip.extractSymbolName(symbol);
-    }
-
-    fn findEnclosingSymbolForOccurrence(
-        self_doc: scip.Document,
-        occ: scip.Occurrence,
-        defs: *const std.StringHashMapUnmanaged(DefInfo),
-    ) ?[]const u8 {
-        var best_symbol: ?[]const u8 = null;
-        var best_range: ?scip.Range = null;
-
-        for (self_doc.symbols) |sym| {
-            if (sym.symbol.len == 0) continue;
-            const range = (defs.get(sym.symbol) orelse continue).enclosing_range orelse continue;
-            if (!rangeContainsPoint(range, occ.range.start_line, occ.range.start_char)) continue;
-            if (best_range == null or rangeContainsRange(best_range.?, range)) {
-                best_symbol = sym.symbol;
-                best_range = range;
-            }
-        }
-        return best_symbol;
-    }
-
-    fn rangeContainsPoint(range: scip.Range, line: i32, char: i32) bool {
-        if (line < range.start_line or line > range.end_line) return false;
-        if (line == range.start_line and char < range.start_char) return false;
-        if (line == range.end_line and char > range.end_char) return false;
-        return true;
-    }
-
-    fn rangeContainsRange(outer: scip.Range, inner: scip.Range) bool {
-        return rangeContainsPoint(outer, inner.start_line, inner.start_char) and
-            rangeContainsPoint(outer, inner.end_line, inner.end_char);
     }
 
     fn resolveCallTarget(call_name: []const u8, caller_path: []const u8, defs: *const std.StringHashMapUnmanaged(DefInfo)) ?[]const u8 {
@@ -5393,6 +5690,115 @@ test "countPathSeparators" {
     try std.testing.expectEqual(@as(usize, 1), CodeIndex.countPathSeparators("src/main.go"));
     try std.testing.expectEqual(@as(usize, 2), CodeIndex.countPathSeparators("src/pkg/main.go"));
     try std.testing.expectEqual(@as(usize, 3), CodeIndex.countPathSeparators("a/b/c/d.go"));
+}
+
+test "EnclosingRangeIndex finds innermost definitions with bounded lookup" {
+    const allocator = std.testing.allocator;
+    const entry_count: usize = 1_025;
+    const target_index: usize = 800;
+    const target_line: i32 = @intCast(target_index * 2);
+
+    var entries: [entry_count]EnclosingRangeEntry = undefined;
+    entries[0] = .{
+        .symbol = "outer",
+        .range = .{ .start_line = 0, .start_char = 0, .end_line = 3_000, .end_char = 0 },
+        .document_order = 0,
+    };
+    for (1..entry_count) |i| {
+        const start_line: i32 = @intCast(i * 2);
+        entries[i] = .{
+            .symbol = if (i == target_index) "target" else "sibling",
+            .range = .{ .start_line = start_line, .start_char = 0, .end_line = start_line + 1, .end_char = 0 },
+            .document_order = i,
+        };
+    }
+
+    var range_index = try EnclosingRangeIndex.init(allocator, &entries);
+    defer range_index.deinit(allocator);
+
+    var probes: usize = 0;
+    const target = range_index.findInnermostCounted(target_line, 0, &probes) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("target", target);
+    try std.testing.expect(probes <= 64);
+
+    probes = 0;
+    const gap = range_index.findInnermostCounted(target_line + 1, 1, &probes) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("outer", gap);
+    try std.testing.expect(probes <= 64);
+}
+
+test "EnclosingRangeIndex preserves innermost tie behavior" {
+    const allocator = std.testing.allocator;
+    const entries = [_]EnclosingRangeEntry{
+        .{ .symbol = "outer", .range = .{ .start_line = 0, .start_char = 0, .end_line = 100, .end_char = 0 }, .document_order = 0 },
+        .{ .symbol = "same-start-outer", .range = .{ .start_line = 10, .start_char = 0, .end_line = 20, .end_char = 0 }, .document_order = 1 },
+        .{ .symbol = "same-start-inner", .range = .{ .start_line = 10, .start_char = 0, .end_line = 15, .end_char = 0 }, .document_order = 2 },
+        .{ .symbol = "same-range-later", .range = .{ .start_line = 10, .start_char = 0, .end_line = 15, .end_char = 0 }, .document_order = 3 },
+    };
+
+    var range_index = try EnclosingRangeIndex.init(allocator, &entries);
+    defer range_index.deinit(allocator);
+
+    const found = range_index.findInnermost(12, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("same-range-later", found);
+}
+
+test "set-based relationship and import dedup preserves first-seen order" {
+    const allocator = std.testing.allocator;
+
+    var relationship_seen: RelationshipDedupSet = .empty;
+    defer relationship_seen.deinit(allocator);
+    var relationships: RelationshipList = .empty;
+    defer relationships.deinit(allocator);
+
+    const relationship_inputs = [_]RelationshipInfo{
+        .{ .symbol = "alpha", .kind = "calls" },
+        .{ .symbol = "beta", .kind = "implements" },
+        .{ .symbol = "alpha", .kind = "calls" },
+        .{ .symbol = "gamma", .kind = "calls" },
+    };
+    for (0..4_096) |i| {
+        try appendDeduplicatedRelationship(
+            allocator,
+            &relationship_seen,
+            "owner",
+            &relationships,
+            relationship_inputs[i % relationship_inputs.len],
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), relationships.items.len);
+    try std.testing.expectEqual(@as(usize, 3), relationship_seen.count());
+    try std.testing.expectEqualStrings("alpha", relationships.items[0].symbol);
+    try std.testing.expectEqualStrings("beta", relationships.items[1].symbol);
+    try std.testing.expectEqualStrings("gamma", relationships.items[2].symbol);
+
+    var import_seen: ImportDedupSet = .empty;
+    defer import_seen.deinit(allocator);
+    var imports: FileImportList = .empty;
+    defer imports.deinit(allocator);
+
+    const import_inputs = [_]FileImport{
+        .{ .label = "src/a.zig", .symbol = "cog/import/src/a.zig" },
+        .{ .label = "src/b.zig", .symbol = "cog/import/src/b.zig" },
+        .{ .label = "src/a.zig", .symbol = "cog/import/src/a.zig" },
+        .{ .label = "src/c.zig", .symbol = "cog/import/src/c.zig" },
+    };
+    for (0..4_096) |i| {
+        try appendDeduplicatedImport(
+            allocator,
+            &import_seen,
+            "src/main.zig",
+            &imports,
+            import_inputs[i % import_inputs.len],
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), imports.items.len);
+    try std.testing.expectEqual(@as(usize, 3), import_seen.count());
+    try std.testing.expectEqualStrings("src/a.zig", imports.items[0].label);
+    try std.testing.expectEqualStrings("src/b.zig", imports.items[1].label);
+    try std.testing.expectEqualStrings("src/c.zig", imports.items[2].label);
 }
 
 test "sortMatchesByScore" {
