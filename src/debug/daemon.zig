@@ -19,6 +19,8 @@ pub const DaemonServer = struct {
     allocator: std.mem.Allocator,
     server: DebugServer,
     socket_fd: ?posix.socket_t = null,
+    socket_path: ?[]const u8 = null,
+    pid_path: ?[]const u8 = null,
     last_activity: i64 = 0,
     session_idle_timeout_ms: i64 = DEFAULT_SESSION_IDLE_TIMEOUT_MS,
 
@@ -33,29 +35,28 @@ pub const DaemonServer = struct {
 
     pub fn deinit(self: *DaemonServer) void {
         if (self.socket_fd) |fd| {
+            debug_log.log("DaemonServer.deinit: closing listener fd={d}", .{fd});
             posix.close(fd);
             self.socket_fd = null;
         }
-        self.deleteRuntimeFile(paths.getDaemonSocketPath, "socket");
-        self.deleteRuntimeFile(paths.getDaemonPidPath, "PID file");
+        if (self.socket_path) |path| {
+            debug_log.log("DaemonServer.deinit: removing owned socket {s}", .{path});
+            paths.removeOwnedSocketIfPresent(path) catch |err| {
+                debug_log.log("DaemonServer.deinit: preserving unsafe socket path {s}: {s}", .{ path, @errorName(err) });
+            };
+            self.allocator.free(path);
+            self.socket_path = null;
+        }
+        if (self.pid_path) |path| {
+            debug_log.log("DaemonServer.deinit: removing published PID file {s}", .{path});
+            std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => debug_log.log("DaemonServer.deinit: failed to remove PID file {s}: {s}", .{ path, @errorName(err) }),
+            };
+            self.allocator.free(path);
+            self.pid_path = null;
+        }
         self.server.deinit();
-    }
-
-    fn deleteRuntimeFile(
-        self: *DaemonServer,
-        comptime path_fn: fn (std.mem.Allocator) anyerror![]const u8,
-        description: []const u8,
-    ) void {
-        const path = path_fn(self.allocator) catch |err| {
-            debug_log.log("DaemonServer.deinit: failed to resolve {s}: {s}", .{ description, @errorName(err) });
-            return;
-        };
-        defer self.allocator.free(path);
-        debug_log.log("DaemonServer.deinit: removing {s} {s}", .{ description, path });
-        std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => debug_log.log("DaemonServer.deinit: failed to remove {s}: {s}", .{ path, @errorName(err) }),
-        };
     }
 
     pub fn run(self: *DaemonServer) !void {
@@ -73,12 +74,20 @@ pub const DaemonServer = struct {
         errdefer posix.close(sock);
 
         const sock_path = try paths.getDaemonSocketPath(self.allocator);
-        defer self.allocator.free(sock_path);
-        try paths.validateUnixSocketPath(sock_path);
+        paths.validateUnixSocketPath(sock_path) catch |err| {
+            self.allocator.free(sock_path);
+            return err;
+        };
 
         // Remove only an owned socket node. Never unlink a regular file or
         // symlink that happens to occupy the runtime pathname.
-        try paths.removeOwnedSocketIfPresent(sock_path);
+        paths.removeOwnedSocketIfPresent(sock_path) catch |err| {
+            debug_log.log("DaemonServer.run: preserving unsafe socket path {s}: {s}", .{ sock_path, @errorName(err) });
+            self.allocator.free(sock_path);
+            return err;
+        };
+        std.debug.assert(self.socket_path == null);
+        self.socket_path = sock_path;
 
         var addr: posix.sockaddr.un = .{ .path = undefined };
         @memset(&addr.path, 0);
@@ -314,7 +323,7 @@ pub const DaemonServer = struct {
 
     fn writePidFile(self: *DaemonServer) !void {
         const pid_path = try paths.getDaemonPidPath(self.allocator);
-        defer self.allocator.free(pid_path);
+        errdefer self.allocator.free(pid_path);
 
         const c_fns = struct {
             extern fn getpid() posix.pid_t;
@@ -322,8 +331,32 @@ pub const DaemonServer = struct {
 
         debug_log.log("DaemonServer.writePidFile: securely creating {s}", .{pid_path});
         try ipc_identity.writePidFile(pid_path, c_fns.getpid());
+        std.debug.assert(self.pid_path == null);
+        self.pid_path = pid_path;
     }
 };
+
+test "daemon teardown preserves unsafe socket and removes published PID file" {
+    if (@import("builtin").os.tag == .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "daemon.sock", .data = "not a socket" });
+    try tmp.dir.writeFile(.{ .sub_path = "daemon.pid", .data = "123\n" });
+
+    const socket_path = try tmp.dir.realpathAlloc(std.testing.allocator, "daemon.sock");
+    defer std.testing.allocator.free(socket_path);
+    const pid_path = try tmp.dir.realpathAlloc(std.testing.allocator, "daemon.pid");
+    defer std.testing.allocator.free(pid_path);
+
+    var daemon = DaemonServer.init(std.testing.allocator, null);
+    daemon.socket_path = try std.testing.allocator.dupe(u8, socket_path);
+    daemon.pid_path = try std.testing.allocator.dupe(u8, pid_path);
+    daemon.deinit();
+
+    try tmp.dir.access("daemon.sock", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("daemon.pid", .{}));
+}
 
 test "reaping a session queues dashboard end until delivery" {
     var daemon = DaemonServer.init(std.testing.allocator, 1);
