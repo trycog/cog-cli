@@ -21,6 +21,13 @@ const EXPECTED_INDEX_SHA256 = [_]u8{
 };
 const REINDEX_BATCH_SIZE: usize = 8;
 const QUERY_COUNT: usize = 4;
+const EXPECTED_VARIANT_INDEX_BYTES: usize = 25_870;
+const EXPECTED_VARIANT_INDEX_SHA256 = [_]u8{
+    0xc3, 0x38, 0xc4, 0x57, 0x45, 0xad, 0x82, 0xf3,
+    0x44, 0xcd, 0x57, 0x66, 0x85, 0xfc, 0xb6, 0x27,
+    0x84, 0x19, 0xb5, 0x1c, 0xbc, 0x13, 0xab, 0xd1,
+    0x3c, 0x58, 0x11, 0x59, 0x29, 0xee, 0x86, 0x42,
+};
 
 const Snapshot = struct {
     encoded_bytes: usize,
@@ -43,39 +50,64 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
+fn writeModuleSource(allocator: std.mem.Allocator, i: usize, variant: bool) !void {
+    const rel_path = try std.fmt.allocPrint(allocator, "pkg_{d:0>2}/module_{d:0>2}.go", .{ i / 8, i });
+    defer allocator.free(rel_path);
+    if (std.fs.path.dirname(rel_path)) |parent| try std.fs.cwd().makePath(parent);
+
+    // The variant adds one deterministic definition per file so a reindex of
+    // modified sources must visibly change the encoded index.
+    const suffix = if (variant)
+        try std.fmt.allocPrint(allocator,
+            \\
+            \\func changed{d:0>2}() int {{
+            \\    return {d}
+            \\}}
+            \\
+        , .{ i, i })
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(suffix);
+
+    const source = try std.fmt.allocPrint(allocator,
+        \\package pkg{d:0>2}
+        \\
+        \\type Type{d:0>2} struct {{
+        \\    Value int
+        \\}}
+        \\
+        \\func (item Type{d:0>2}) Compute() int {{
+        \\    return helper{d:0>2}(item.Value)
+        \\}}
+        \\
+        \\func helper{d:0>2}(value int) int {{
+        \\    return value + {d}
+        \\}}
+        \\
+        \\func entry{d:0>2}() int {{
+        \\    item := Type{d:0>2}{{Value: {d}}}
+        \\    return item.Compute()
+        \\}}
+        \\{s}
+    , .{ i / 8, i, i, i, i, i + 1, i, i, i + 1, suffix });
+    defer allocator.free(source);
+
+    const file = try std.fs.cwd().createFile(rel_path, .{});
+    defer file.close();
+    try file.writeAll(source);
+}
+
 fn writeSyntheticCorpus(allocator: std.mem.Allocator) !void {
     debug_log.log("bench_indexing: write corpus files={d}", .{SOURCE_FILE_COUNT});
     for (0..SOURCE_FILE_COUNT) |i| {
-        const rel_path = try std.fmt.allocPrint(allocator, "pkg_{d:0>2}/module_{d:0>2}.go", .{ i / 8, i });
-        defer allocator.free(rel_path);
-        if (std.fs.path.dirname(rel_path)) |parent| try std.fs.cwd().makePath(parent);
+        try writeModuleSource(allocator, i, false);
+    }
+}
 
-        const source = try std.fmt.allocPrint(allocator,
-            \\package pkg{d:0>2}
-            \\
-            \\type Type{d:0>2} struct {{
-            \\    Value int
-            \\}}
-            \\
-            \\func (item Type{d:0>2}) Compute() int {{
-            \\    return helper{d:0>2}(item.Value)
-            \\}}
-            \\
-            \\func helper{d:0>2}(value int) int {{
-            \\    return value + {d}
-            \\}}
-            \\
-            \\func entry{d:0>2}() int {{
-            \\    item := Type{d:0>2}{{Value: {d}}}
-            \\    return item.Compute()
-            \\}}
-            \\
-        , .{ i / 8, i, i, i, i, i + 1, i, i, i + 1 });
-        defer allocator.free(source);
-
-        const file = try std.fs.cwd().createFile(rel_path, .{});
-        defer file.close();
-        try file.writeAll(source);
+fn writeBatchSources(allocator: std.mem.Allocator, variant: bool) !void {
+    debug_log.log("bench_indexing: write batch sources variant={}", .{variant});
+    for (0..REINDEX_BATCH_SIZE) |i| {
+        try writeModuleSource(allocator, i, variant);
     }
 }
 
@@ -104,20 +136,48 @@ fn snapshotIndex(allocator: std.mem.Allocator, index_path: []const u8) !Snapshot
     };
 }
 
+const ExpectedSnapshot = struct {
+    documents: usize,
+    symbols: usize,
+    occurrences: usize,
+    encoded_bytes: usize,
+    hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
+const EXPECTED_BASE_SNAPSHOT: ExpectedSnapshot = .{
+    .documents = EXPECTED_DOCUMENTS,
+    .symbols = EXPECTED_SYMBOLS,
+    .occurrences = EXPECTED_OCCURRENCES,
+    .encoded_bytes = EXPECTED_INDEX_BYTES,
+    .hash = EXPECTED_INDEX_SHA256,
+};
+
+const EXPECTED_VARIANT_SNAPSHOT: ExpectedSnapshot = .{
+    .documents = EXPECTED_DOCUMENTS,
+    .symbols = EXPECTED_SYMBOLS + REINDEX_BATCH_SIZE,
+    .occurrences = EXPECTED_OCCURRENCES + REINDEX_BATCH_SIZE,
+    .encoded_bytes = EXPECTED_VARIANT_INDEX_BYTES,
+    .hash = EXPECTED_VARIANT_INDEX_SHA256,
+};
+
 fn expectSnapshot(snapshot: Snapshot) void {
-    if (snapshot.documents != EXPECTED_DOCUMENTS) {
-        fail("indexing benchmark expected {d} documents, found {d}\n", .{ EXPECTED_DOCUMENTS, snapshot.documents });
+    expectSnapshotMatches(snapshot, EXPECTED_BASE_SNAPSHOT);
+}
+
+fn expectSnapshotMatches(snapshot: Snapshot, expected: ExpectedSnapshot) void {
+    if (snapshot.documents != expected.documents) {
+        fail("indexing benchmark expected {d} documents, found {d}\n", .{ expected.documents, snapshot.documents });
     }
-    if (snapshot.symbols != EXPECTED_SYMBOLS) {
-        fail("indexing benchmark expected {d} symbols, found {d}\n", .{ EXPECTED_SYMBOLS, snapshot.symbols });
+    if (snapshot.symbols != expected.symbols) {
+        fail("indexing benchmark expected {d} symbols, found {d}\n", .{ expected.symbols, snapshot.symbols });
     }
-    if (snapshot.occurrences != EXPECTED_OCCURRENCES) {
-        fail("indexing benchmark expected {d} occurrences, found {d}\n", .{ EXPECTED_OCCURRENCES, snapshot.occurrences });
+    if (snapshot.occurrences != expected.occurrences) {
+        fail("indexing benchmark expected {d} occurrences, found {d}\n", .{ expected.occurrences, snapshot.occurrences });
     }
-    if (snapshot.encoded_bytes != EXPECTED_INDEX_BYTES) {
-        fail("indexing benchmark expected {d} encoded bytes, found {d}\n", .{ EXPECTED_INDEX_BYTES, snapshot.encoded_bytes });
+    if (snapshot.encoded_bytes != expected.encoded_bytes) {
+        fail("indexing benchmark expected {d} encoded bytes, found {d}\n", .{ expected.encoded_bytes, snapshot.encoded_bytes });
     }
-    if (!std.mem.eql(u8, &snapshot.hash, &EXPECTED_INDEX_SHA256)) {
+    if (!std.mem.eql(u8, &snapshot.hash, &expected.hash)) {
         fail("indexing benchmark index hash changed: {x}\n", .{snapshot.hash});
     }
 }
@@ -144,12 +204,22 @@ fn runReindexBatch(allocator: std.mem.Allocator, index_path: []const u8) !u64 {
         initialized_paths += 1;
     }
 
+    // Reindex modified sources so a subset or no-op reindex is detectable:
+    // the timed batch must move the index to the exact variant snapshot, and
+    // the restore batch must bring back the exact base snapshot.
+    try writeBatchSources(allocator, true);
     debug_log.log("bench_indexing: reindex transaction start files={d}", .{batch_paths.len});
     var timer = try std.time.Timer.start();
     if (!code_intel.reindexFiles(allocator, &batch_paths)) {
         fail("indexing benchmark failed to reindex {d}-file batch\n", .{batch_paths.len});
     }
     const elapsed = timer.read();
+    expectSnapshotMatches(try snapshotIndex(allocator, index_path), EXPECTED_VARIANT_SNAPSHOT);
+
+    try writeBatchSources(allocator, false);
+    if (!code_intel.reindexFiles(allocator, &batch_paths)) {
+        fail("indexing benchmark failed to restore {d}-file batch\n", .{batch_paths.len});
+    }
     expectSnapshot(try snapshotIndex(allocator, index_path));
     debug_log.log("bench_indexing: reindex transaction done files={d}", .{batch_paths.len});
     return elapsed;
