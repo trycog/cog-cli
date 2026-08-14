@@ -2444,23 +2444,53 @@ fn appendConfiguredReindexPaths(
     }
 }
 
+/// Owns the string storage that indexed documents borrow from.
+///
+/// A `scip.Document` owns its `occurrences` and `symbols` arrays but only
+/// *borrows* every string inside them — symbol ids, display names and, for
+/// external indexers, the relative path — from a backing buffer produced by
+/// the indexer: tree-sitter's `result.string_data`, or an external indexer's
+/// decoded `result.backing_data`. Documents merged into the master index
+/// therefore outlive the batch that produced them, so these buffers must stay
+/// alive until the index has been *encoded*, not merely until the batch ends.
+///
+/// Ownership lives with the caller of `applyReindexBatch` for exactly that
+/// reason: the caller encodes via `saveIndex` and only then releases the
+/// store. Freeing the buffers inside the batch is a use-after-free in
+/// `scip_encode`.
+const IndexBackingStore = struct {
+    buffers: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    /// Take ownership of `buffer`. Returns false when the buffer could not be
+    /// retained, in which case it has already been freed and the caller must
+    /// drop any document borrowing from it.
+    fn take(self: *IndexBackingStore, allocator: std.mem.Allocator, buffer: []const u8) bool {
+        self.buffers.append(allocator, buffer) catch {
+            debug_log.log("IndexBackingStore: retain failed bytes={d}", .{buffer.len});
+            allocator.free(buffer);
+            return false;
+        };
+        return true;
+    }
+
+    fn deinit(self: *IndexBackingStore, allocator: std.mem.Allocator) void {
+        debug_log.log("IndexBackingStore: releasing buffers={d}", .{self.buffers.items.len});
+        for (self.buffers.items) |buffer| allocator.free(buffer);
+        self.buffers.deinit(allocator);
+    }
+};
+
+/// Merge a batch of re-indexed files into `master_index`.
+///
+/// String storage for every merged document is handed to `store`, which the
+/// caller must keep alive until after the index is encoded.
 fn applyReindexBatch(
     allocator: std.mem.Allocator,
     master_index: *scip.Index,
     file_paths: []const ReindexPath,
+    store: *IndexBackingStore,
 ) bool {
     var changed = false;
-    var backing_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (backing_buffers.items) |buf| allocator.free(buf);
-        backing_buffers.deinit(allocator);
-    }
-
-    var string_buffers: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (string_buffers.items) |buf| allocator.free(buf);
-        string_buffers.deinit(allocator);
-    }
 
     var external_symbol_list: std.ArrayListUnmanaged(scip.SymbolInformation) = .empty;
     defer {
@@ -2552,10 +2582,7 @@ fn applyReindexBatch(
                     changed = true;
                     continue;
                 };
-                string_buffers.append(allocator, result.string_data) catch {
-                    allocator.free(result.string_data);
-                    continue;
-                };
+                if (!store.take(allocator, result.string_data)) continue;
                 mergeDocument(allocator, master_index, result.doc);
                 changed = true;
             },
@@ -2597,12 +2624,11 @@ fn applyReindexBatch(
             debug_log.log("reindexFiles: external batch failed command={s} error={s}", .{ scip_config.command, @errorName(err) });
             continue;
         };
-        backing_buffers.append(allocator, result.backing_data.?) catch {
+        if (!store.take(allocator, result.backing_data.?)) {
             var failed_index = result.index;
             scip.freeIndex(allocator, &failed_index);
-            allocator.free(result.backing_data.?);
             continue;
-        };
+        }
         remapExternalDocumentPaths(ext_mappings[ext_idx].items, result.index.documents);
         for (result.index.documents) |doc| mergeDocument(allocator, master_index, doc);
         allocator.free(result.index.documents);
@@ -2631,6 +2657,12 @@ pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8
 
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
     defer allocator.free(index_path);
+
+    // Declared before the index so its deinit runs last: merged documents
+    // borrow their strings from this store and must not outlive it.
+    var backing_store: IndexBackingStore = .{};
+    defer backing_store.deinit(allocator);
+
     debug_log.log("reindexFiles: loading index path={s}", .{index_path});
     const loaded = loadExistingIndex(allocator, index_path);
     var master_index = loaded.index;
@@ -2645,7 +2677,7 @@ pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8
             .physical_path = file_path,
         };
     }
-    if (!applyReindexBatch(allocator, &master_index, batch)) return false;
+    if (!applyReindexBatch(allocator, &master_index, batch, &backing_store)) return false;
     debug_log.log("reindexFiles: encoding documents={d}", .{master_index.documents.len});
     return saveIndex(allocator, master_index, index_path);
 }
@@ -2681,6 +2713,12 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     defer releaseIndexLock(lock_fd);
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return false;
     defer allocator.free(index_path);
+
+    // Declared before the index so its deinit runs last: merged documents
+    // borrow their strings from this store and must not outlive it.
+    var backing_store: IndexBackingStore = .{};
+    defer backing_store.deinit(allocator);
+
     const loaded = loadExistingIndex(allocator, index_path);
     var master_index = loaded.index;
     defer scip.freeIndex(allocator, &master_index);
@@ -2690,7 +2728,7 @@ pub fn reindexConfiguredFiles(allocator: std.mem.Allocator) bool {
     defer batch.deinit(allocator);
     appendConfiguredReindexPaths(allocator, matched_files.items, master_index.documents, &batch) catch return false;
     debug_log.log("reindexConfiguredFiles: reconciliation current={d} batch={d}", .{ matched_files.items.len, batch.items.len });
-    if (!applyReindexBatch(allocator, &master_index, batch.items)) return false;
+    if (!applyReindexBatch(allocator, &master_index, batch.items, &backing_store)) return false;
     return saveIndex(allocator, master_index, index_path);
 }
 
@@ -4746,6 +4784,128 @@ test "collectConfiguredFiles uses PathMatcher logical paths and external roots" 
     try std.testing.expect(saw_project_alias);
     try std.testing.expect(saw_external_alias);
     try std.testing.expect(saw_direct_external);
+}
+
+/// Test allocator that poisons freed memory with 0xAA and retains the pages
+/// until `deinit`, so a use-after-free surfaces as deterministic garbage bytes
+/// instead of an unmapped-page segfault. Retained blocks are released to the
+/// child allocator on `deinit`, so `std.testing.allocator` still sees a
+/// balanced alloc/free ledger and can report genuine leaks.
+const PoisonRetainingAllocator = struct {
+    child: std.mem.Allocator,
+    retained: std.ArrayListUnmanaged(Block) = .empty,
+
+    const Block = struct {
+        ptr: [*]u8,
+        len: usize,
+        alignment: std.mem.Alignment,
+    };
+
+    fn allocator(self: *PoisonRetainingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = poisonAlloc,
+                .resize = poisonResize,
+                .remap = poisonRemap,
+                .free = poisonFree,
+            },
+        };
+    }
+
+    fn deinit(self: *PoisonRetainingAllocator) void {
+        for (self.retained.items) |block| {
+            self.child.rawFree(block.ptr[0..block.len], block.alignment, @returnAddress());
+        }
+        self.retained.deinit(self.child);
+    }
+
+    fn poisonAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonRetainingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn poisonResize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn poisonRemap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn poisonFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, _: usize) void {
+        const self: *PoisonRetainingAllocator = @ptrCast(@alignCast(ctx));
+        @memset(memory, 0xAA);
+        self.retained.append(self.child, .{
+            .ptr = memory.ptr,
+            .len = memory.len,
+            .alignment = alignment,
+        }) catch @panic("poison allocator failed to retain freed block");
+    }
+};
+
+fn expectUnpoisoned(text: []const u8) !void {
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, 0xAA) == null);
+}
+
+test "reindexFiles keeps indexed string storage alive through index encoding" {
+    var poison: PoisonRetainingAllocator = .{ .child = std.testing.allocator };
+    defer poison.deinit();
+    const allocator = poison.allocator();
+
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    try project.dir.makePath(".cog");
+    try project.dir.writeFile(.{
+        .sub_path = "widget.go",
+        .data =
+        \\package sample
+        \\
+        \\type Widget struct {
+        \\    Value int
+        \\}
+        \\
+        \\func (item Widget) Compute() int {
+        \\    return item.Value
+        \\}
+        \\
+        ,
+    });
+
+    const original = try std.fs.cwd().realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(original);
+    const tmp_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{project.sub_path});
+    defer std.testing.allocator.free(tmp_root);
+    try std.posix.chdir(tmp_root);
+    defer std.posix.chdir(original) catch {};
+
+    try std.testing.expect(reindexFiles(allocator, &.{"widget.go"}));
+
+    const encoded = try std.fs.cwd().readFileAlloc(std.testing.allocator, ".cog/index.scip", 16 * 1024 * 1024);
+    defer std.testing.allocator.free(encoded);
+    var index = try scip.decode(std.testing.allocator, encoded);
+    defer scip.freeIndex(std.testing.allocator, &index);
+
+    try std.testing.expectEqual(@as(usize, 1), index.documents.len);
+    const doc = index.documents[0];
+    try std.testing.expectEqualStrings("widget.go", doc.relative_path);
+    try std.testing.expect(doc.symbols.len > 0);
+
+    // Symbol ids ("local N") and display names are both slices into the
+    // tree-sitter string buffer, so a freed buffer shows up as poison here.
+    var saw_widget = false;
+    var saw_compute = false;
+    for (doc.symbols) |symbol| {
+        try expectUnpoisoned(symbol.symbol);
+        try expectUnpoisoned(symbol.display_name);
+        if (std.mem.eql(u8, symbol.display_name, "Widget")) saw_widget = true;
+        if (std.mem.eql(u8, symbol.display_name, "Compute")) saw_compute = true;
+    }
+    for (doc.occurrences) |occurrence| {
+        try expectUnpoisoned(occurrence.symbol);
+    }
+    try std.testing.expect(saw_widget);
+    try std.testing.expect(saw_compute);
 }
 
 test "pathIsTest" {
