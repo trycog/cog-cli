@@ -8,7 +8,6 @@ const debug_log = if (builtin.os.tag == .windows) struct {
         _ = args;
     }
 } else @import("debug_log.zig");
-const paths = if (builtin.os.tag == .windows) struct {} else @import("paths.zig");
 
 const posix = std.posix;
 const default_https_port: u16 = 443;
@@ -285,6 +284,69 @@ const Store = struct {
     }
 };
 
+/// Test-only redirection of the trusted home. It is deliberately private to this
+/// file and unreachable from the environment: no repository checkout, wrapper
+/// script, or project `.env` can move the credential-approval store.
+var test_trusted_home: ?[]const u8 = null;
+
+fn setTestTrustedHome(path: ?[]const u8) void {
+    if (!builtin.is_test) @compileError("setTestTrustedHome is test-only");
+    test_trusted_home = path;
+}
+
+/// Resolve the home directory of the account this process runs as, reading the
+/// system account database instead of `HOME`. `HOME` is process state that a
+/// repository, a task runner, or a project `.env` can set, so honoring it would
+/// let untrusted project state redirect or forge global credential approvals.
+/// Resolution failure is fatal for approval I/O: the boundary fails closed
+/// rather than falling back to an attacker-influenced location.
+fn trustedHomeDir(buffer: []u8) ![]const u8 {
+    if (builtin.os.tag == .windows) return error.UnsupportedPlatform;
+    if (builtin.is_test) {
+        if (test_trusted_home) |path| {
+            if (path.len == 0 or path.len > buffer.len) return error.TrustedHomeUnavailable;
+            @memcpy(buffer[0..path.len], path);
+            return buffer[0..path.len];
+        }
+    }
+
+    var entry: std.c.passwd = undefined;
+    var result: ?*std.c.passwd = null;
+    var scratch: [4096]u8 = undefined;
+    if (std.c.getpwuid_r(posix.geteuid(), &entry, &scratch, scratch.len, &result) != 0) {
+        debug_log.log("credential_boundary.trustedHomeDir: account lookup failed", .{});
+        return error.TrustedHomeUnavailable;
+    }
+    const record = result orelse {
+        debug_log.log("credential_boundary.trustedHomeDir: no account record for effective uid", .{});
+        return error.TrustedHomeUnavailable;
+    };
+    const home_z = record.dir orelse {
+        debug_log.log("credential_boundary.trustedHomeDir: account record has no home directory", .{});
+        return error.TrustedHomeUnavailable;
+    };
+
+    const home = std.mem.sliceTo(home_z, 0);
+    if (home.len == 0 or !std.fs.path.isAbsolute(home) or home.len > buffer.len) {
+        debug_log.log("credential_boundary.trustedHomeDir: rejecting unusable trusted home", .{});
+        return error.TrustedHomeUnavailable;
+    }
+    @memcpy(buffer[0..home.len], home);
+    debug_log.log("credential_boundary.trustedHomeDir: resolved trusted home from the account database", .{});
+    return buffer[0..home.len];
+}
+
+/// Build `<trusted home>/.config/cog` without consulting `HOME` or `XDG_*`.
+fn trustedConfigDirPath(buffer: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home = try trustedHomeDir(&home_buffer);
+    const suffix = "/.config/cog";
+    if (home.len + suffix.len > buffer.len) return error.TrustedHomeUnavailable;
+    @memcpy(buffer[0..home.len], home);
+    @memcpy(buffer[home.len..][0..suffix.len], suffix);
+    return buffer[0 .. home.len + suffix.len];
+}
+
 /// Return whether an exact canonical origin is present in the global store.
 /// Windows returns `error.UnsupportedPlatform` because Zig 0.15 cannot provide
 /// reparse-point-resistant file access for this security state.
@@ -297,8 +359,8 @@ pub fn isApproved(allocator: std.mem.Allocator, input: []const u8) !bool {
 }
 
 fn isApprovedGlobal(allocator: std.mem.Allocator, canonical_origin: []const u8) !bool {
-    const config_dir_path = try paths.getGlobalConfigDir(allocator);
-    defer allocator.free(config_dir_path);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_dir_path = try trustedConfigDirPath(&path_buffer);
     debug_log.log("credential_boundary.isApproved: resolving global approved-origin store", .{});
 
     var config_dir = openValidatedConfigDir(config_dir_path, false) catch |err| switch (err) {
@@ -323,8 +385,8 @@ pub fn approve(allocator: std.mem.Allocator, input: []const u8) !bool {
 }
 
 fn approveGlobal(allocator: std.mem.Allocator, canonical_origin: []const u8) !bool {
-    const config_dir_path = try paths.getGlobalConfigDir(allocator);
-    defer allocator.free(config_dir_path);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_dir_path = try trustedConfigDirPath(&path_buffer);
     debug_log.log("credential_boundary.approve: ensuring global approved-origin directory", .{});
     var config_dir = try openValidatedConfigDir(config_dir_path, true);
     defer config_dir.close();
@@ -1161,9 +1223,8 @@ test "global approval validates input before missing filesystem state" {
     defer tmp.cleanup();
     const home = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(home);
-    var env = try TestEnv.capture(allocator, "HOME");
-    defer env.restore();
-    try setEnv("HOME", home);
+    setTestTrustedHome(home);
+    defer setTestTrustedHome(null);
 
     try std.testing.expectError(error.HttpsRequired, isApproved(allocator, "http://example.com"));
     try std.testing.expectError(error.QueryNotAllowed, isApproved(allocator, "https://example.com?credential=secret"));
@@ -1178,14 +1239,75 @@ test "global approved origin store rejects a config directory symlink" {
     defer tmp.cleanup();
     const home = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(home);
-    var env = try TestEnv.capture(allocator, "HOME");
-    defer env.restore();
-    try setEnv("HOME", home);
+    setTestTrustedHome(home);
+    defer setTestTrustedHome(null);
 
     try tmp.dir.makePath(".config/outside");
     try tmp.dir.symLink("outside", ".config/cog", .{ .is_directory = true });
     try std.testing.expectError(error.UnreadableStore, approve(allocator, "https://example.com"));
     try std.testing.expectError(error.UnreadableStore, isApproved(allocator, "https://example.com"));
+}
+
+test "global approvals resolve the trusted home instead of HOME" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var trusted = std.testing.tmpDir(.{ .iterate = true });
+    defer trusted.cleanup();
+    var hostile = std.testing.tmpDir(.{ .iterate = true });
+    defer hostile.cleanup();
+
+    const trusted_home = try trusted.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(trusted_home);
+    const hostile_home = try hostile.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(hostile_home);
+
+    // A repository, a wrapper script, or a project `.env` can set HOME. Plant a
+    // well-formed store there so the only thing separating it from a real
+    // approval is where the boundary decides to look.
+    try hostile.dir.makePath(".config/cog");
+    var forged = try hostile.dir.createFile(".config/cog/" ++ store_file_name, .{ .mode = 0o600 });
+    try forged.writeAll(
+        \\{
+        \\  "version": 1,
+        \\  "origins": ["https://attacker.example:443"]
+        \\}
+        \\
+    );
+    forged.close();
+    var forged_dir = try hostile.dir.openDir(".config/cog", .{ .iterate = true });
+    try forged_dir.chmod(0o700);
+    forged_dir.close();
+
+    setTestTrustedHome(trusted_home);
+    defer setTestTrustedHome(null);
+    var env = try TestEnv.capture(allocator, "HOME");
+    defer env.restore();
+    try setEnv("HOME", hostile_home);
+
+    try std.testing.expect(!try isApproved(allocator, "https://attacker.example"));
+
+    // Writes must land in the trusted home, never in the HOME-derived location.
+    try std.testing.expect(try approve(allocator, "https://global.example"));
+    try trusted.dir.access(".config/cog/" ++ store_file_name, .{});
+    const hostile_body = try hostile.dir.readFileAlloc(allocator, ".config/cog/" ++ store_file_name, max_store_bytes);
+    defer allocator.free(hostile_body);
+    try std.testing.expect(std.mem.indexOf(u8, hostile_body, "global.example") == null);
+    try std.testing.expect(try isApproved(allocator, "https://global.example:443"));
+}
+
+test "global approvals fail closed when the trusted home is unusable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    setTestTrustedHome("relative/home");
+    defer setTestTrustedHome(null);
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const config_path = try trustedConfigDirPath(&path_buffer);
+    try std.testing.expectError(error.InvalidConfigPath, openValidatedConfigDir(config_path, false));
+    try std.testing.expectError(error.InvalidConfigPath, isApproved(allocator, "https://example.com"));
+    try std.testing.expectError(error.InvalidConfigPath, approve(allocator, "https://example.com"));
 }
 
 test "validated global config directory supports chmod and durability sync" {
@@ -1239,9 +1361,8 @@ test "global approved origin store ignores repository-local configuration" {
     defer tmp.cleanup();
     const home = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(home);
-    var env = try TestEnv.capture(allocator, "HOME");
-    defer env.restore();
-    try setEnv("HOME", home);
+    setTestTrustedHome(home);
+    defer setTestTrustedHome(null);
 
     try tmp.dir.makePath("project/.cog");
     try tmp.dir.writeFile(.{
@@ -1253,6 +1374,19 @@ test "global approved origin store ignores repository-local configuration" {
         \\}
         \\
         ,
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "project/.cog/settings.json",
+        .data =
+        \\{
+        \\  "credentials": { "approvedOrigins": ["https://repo.example:443"] }
+        \\}
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "project/.env",
+        .data = "COG_APPROVED_ORIGINS=https://repo.example:443\nHOME=/tmp/attacker\n",
     });
 
     try std.testing.expect(!try isApproved(allocator, "https://repo.example"));
