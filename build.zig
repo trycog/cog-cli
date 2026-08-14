@@ -2,6 +2,7 @@ const std = @import("std");
 const zon = @import("build.zig.zon");
 
 const version = zon.version;
+const BENCH_INDEXING_CWD = "/private/tmp/cog-indexing-benchmark";
 
 const tree_sitter_version = "v0.25.4";
 
@@ -155,6 +156,29 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run query benchmark");
     bench_step.dependOn(&bench_run.step);
     if (b.args) |args| bench_run.addArgs(args);
+
+    // Deterministic offline indexing benchmark and fuzz-smoke CI gate.
+    const indexing_bench_exe = b.addExecutable(.{
+        .name = "bench-indexing",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_indexing.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "cog", .module = mod }},
+        }),
+    });
+    const indexing_bench_run = b.addSystemCommand(&.{ "sh", "-c", "exec \"$1\"", "bench-indexing" });
+    indexing_bench_run.addFileArg(indexing_bench_exe.getEmittedBin());
+    indexing_bench_run.setCwd(.{ .cwd_relative = BENCH_INDEXING_CWD });
+    indexing_bench_run.setEnvironmentVariable("COG_INDEX_BENCH_ROOT", BENCH_INDEXING_CWD);
+    indexing_bench_run.setEnvironmentVariable("PWD", BENCH_INDEXING_CWD);
+    indexing_bench_run.step.dependOn(&check_grammars.step);
+    const indexing_bench_step = b.step("bench-indexing", "Run deterministic offline indexing benchmark");
+    indexing_bench_step.dependOn(&indexing_bench_run.step);
+
+    const indexing_gate_step = b.step("test-indexing-benchmark", "Run deterministic indexing benchmark and SCIP fuzz smoke");
+    indexing_gate_step.dependOn(&indexing_bench_run.step);
+    indexing_gate_step.dependOn(&run_mod_tests.step);
 
     // Integration test
     const integ_exe = b.addExecutable(.{
