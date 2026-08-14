@@ -11,6 +11,7 @@ const debug_server_mod = @import("debug/server.zig");
 const debug_mod = @import("debug.zig");
 const observe_server_mod = @import("observe/server.zig");
 const watcher_mod = @import("watcher.zig");
+const git_state = @import("git_state.zig");
 const paths = @import("paths.zig");
 const debug_log_mod = @import("debug_log.zig");
 const memory_mod = @import("memory.zig");
@@ -252,6 +253,9 @@ const Runtime = struct {
     observe_server: ?ObserveServer,
     code_cache: ?code_intel.CodeIndex = null,
     code_cache_generation: ?IndexGeneration = null,
+    // True while a reconcile worker runs; code tools disclose possible
+    // staleness instead of answering with silent confidence.
+    index_sync_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
     session_contexts: std.StringHashMapUnmanaged(session_context_mod.SessionContext) = .empty,
@@ -558,6 +562,12 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     }
     var watcher_overflow = false;
 
+    // Reconcile whatever changed while no server was running before trusting
+    // the on-disk index; the flag keeps code tools honest meanwhile.
+    var index_sync: IndexSyncState = .{};
+    defer index_sync.deinit(allocator);
+    index_sync.spawn(&runtime, "startup", std.time.nanoTimestamp());
+
     while (!shutdown_requested.load(.acquire)) {
         if (builtin.os.tag != .windows) {
             var fds: [2]posix.pollfd = undefined;
@@ -584,6 +594,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
                 watcher_batch.reset();
                 watcher_overflow = false;
             }
+            index_sync.tick(&runtime, now_ns);
             if (poll_result == 0) continue;
 
             if (fds[0].revents & posix.POLL.ERR != 0) {
@@ -1684,14 +1695,14 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             return err;
         };
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-        return result;
+        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire), result);
     } else if (std.mem.eql(u8, tool_name, "code_explore")) {
         const result = callCodeExplore(runtime, arguments) catch |err| {
             debug_log_mod.log("runtimeCallTool: code_explore failed: {s}", .{@errorName(err)});
             return err;
         };
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-        return result;
+        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire), result);
     }
 
     // Observe tools — delegate to ObserveServer (has its own mutex).
@@ -2356,6 +2367,135 @@ fn reindexInProcessAfterSpawnFailure(allocator: std.mem.Allocator, file_paths: [
     }
     return if (changed) .changed else .unchanged;
 }
+
+pub const index_sync_warning =
+    "WARNING: the code index is being reconciled with the working tree; " ++
+    "results may be stale. Re-run shortly, or verify critical answers with direct file reads.\n\n";
+
+/// Disclose possible staleness while a reconcile is in flight instead of
+/// answering with silent confidence. Takes ownership of `result`.
+fn withSyncWarning(allocator: std.mem.Allocator, pending: bool, result: []const u8) ![]const u8 {
+    if (!pending) return result;
+    const warned = std.fmt.allocPrint(allocator, "{s}{s}", .{ index_sync_warning, result }) catch return result;
+    allocator.free(result);
+    return warned;
+}
+
+test "code tool results disclose an in-flight reconcile" {
+    const allocator = std.testing.allocator;
+
+    const untouched = try allocator.dupe(u8, "Matches for `foo`");
+    const clean = try withSyncWarning(allocator, false, untouched);
+    defer allocator.free(clean);
+    try std.testing.expectEqualStrings("Matches for `foo`", clean);
+
+    const stale = try allocator.dupe(u8, "Matches for `foo`");
+    const warned = try withSyncWarning(allocator, true, stale);
+    defer allocator.free(warned);
+    try std.testing.expect(std.mem.startsWith(u8, warned, "WARNING: the code index is being reconciled"));
+    try std.testing.expect(std.mem.endsWith(u8, warned, "Matches for `foo`"));
+}
+
+const git_sentinel_interval_ns: i128 = 2 * std.time.ns_per_s;
+const unwatched_sync_interval_ns: i128 = 120 * std.time.ns_per_s;
+
+/// Drives index reconciliation from the serve loop: once at startup, when
+/// the git sentinel reports a checkout/pull/merge, and periodically when no
+/// file watcher is available. The reconcile itself runs in a re-executed
+/// worker process; visibility of its result comes from the per-query index
+/// generation check, so completion only has to clear the pending flag.
+const IndexSyncState = struct {
+    child: ?std.process.Child = null,
+    project_root: ?[]const u8 = null,
+    git_stamp: ?git_state.SyncStamp = null,
+    last_git_check_ns: i128 = 0,
+    last_trigger_ns: i128 = 0,
+
+    fn tick(self: *IndexSyncState, runtime: *Runtime, now_ns: i128) void {
+        if (builtin.os.tag == .windows) return;
+        self.reap(runtime);
+
+        if (now_ns - self.last_git_check_ns >= git_sentinel_interval_ns) {
+            self.last_git_check_ns = now_ns;
+            self.checkGitSentinel(runtime, now_ns);
+        }
+        if (runtime.watcher == null and now_ns - self.last_trigger_ns >= unwatched_sync_interval_ns) {
+            self.spawn(runtime, "unwatched periodic", now_ns);
+        }
+    }
+
+    fn spawn(self: *IndexSyncState, runtime: *Runtime, reason: []const u8, now_ns: i128) void {
+        if (builtin.os.tag == .windows) return;
+        self.last_trigger_ns = now_ns;
+        if (self.child != null) return;
+        if (runtime.indexGeneration() == null) {
+            debug_log_mod.log("index sync: no index to reconcile ({s})", .{reason});
+            return;
+        }
+
+        const allocator = runtime.allocator;
+        const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
+            debug_log_mod.log("index sync: self executable lookup failed error={s}", .{@errorName(err)});
+            return;
+        };
+        defer allocator.free(exe_path);
+        const argv = [_][]const u8{ exe_path, code_intel.SYNC_WORKER_COMMAND };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch |err| {
+            debug_log_mod.log("index sync: worker spawn failed error={s}", .{@errorName(err)});
+            return;
+        };
+        debug_log_mod.log("index sync: reconcile worker spawned reason={s}", .{reason});
+        runtime.index_sync_pending.store(true, .release);
+        self.child = child;
+    }
+
+    /// Non-blocking reap so the serve loop never stalls behind a reconcile.
+    fn reap(self: *IndexSyncState, runtime: *Runtime) void {
+        const child = self.child orelse return;
+        const wait_result = std.posix.waitpid(child.id, std.posix.W.NOHANG);
+        if (wait_result.pid == 0) return;
+
+        self.child = null;
+        runtime.index_sync_pending.store(false, .release);
+        if (std.posix.W.IFEXITED(wait_result.status)) {
+            debug_log_mod.log("index sync: worker exited code={d}", .{std.posix.W.EXITSTATUS(wait_result.status)});
+        } else {
+            debug_log_mod.log("index sync: worker terminated abnormally", .{});
+        }
+    }
+
+    fn checkGitSentinel(self: *IndexSyncState, runtime: *Runtime, now_ns: i128) void {
+        const allocator = runtime.allocator;
+        if (self.project_root == null) {
+            const cog_dir = paths.findCogDir(allocator) catch return;
+            defer allocator.free(cog_dir);
+            const root = std.fs.path.dirname(cog_dir) orelse return;
+            self.project_root = allocator.dupe(u8, root) catch return;
+        }
+
+        const stamp = git_state.syncStamp(allocator, self.project_root.?) orelse return;
+        const previous = self.git_stamp orelse {
+            self.git_stamp = stamp;
+            return;
+        };
+        if (previous.eql(stamp)) return;
+
+        debug_log_mod.log("index sync: git state changed; reconciling", .{});
+        self.git_stamp = stamp;
+        self.spawn(runtime, "git state change", now_ns);
+    }
+
+    fn deinit(self: *IndexSyncState, allocator: std.mem.Allocator) void {
+        // An in-flight worker is deliberately left to finish: it completes
+        // the repair on its own and is reparented at process exit.
+        if (self.project_root) |root| allocator.free(root);
+        self.project_root = null;
+    }
+};
 
 fn spawnResyncWorker(allocator: std.mem.Allocator) ReindexWorkerResult {
     const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
