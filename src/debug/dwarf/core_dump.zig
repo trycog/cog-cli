@@ -15,12 +15,28 @@ pub const CoreDump = struct {
     segments: []const Segment, // PT_LOAD / LC_SEGMENT_64 entries
     registers: RegisterState, // from NT_PRSTATUS / LC_THREAD
     allocator: std.mem.Allocator,
+    format: Format = .unknown,
+    file_mappings: []FileMapping = &.{},
+
+    pub const Format = enum {
+        unknown,
+        elf,
+        macho,
+    };
 
     pub const Segment = struct {
         vaddr: u64,
         file_offset: u64,
         file_size: u64,
         mem_size: u64,
+    };
+
+    /// Validated ELF NT_FILE mapping. The pathname aliases the owned core bytes.
+    pub const FileMapping = struct {
+        start: u64,
+        end: u64,
+        file_offset: u64,
+        pathname: []const u8,
     };
 
     pub fn load(allocator: std.mem.Allocator, core_path: []const u8) !CoreDump {
@@ -81,8 +97,56 @@ pub const CoreDump = struct {
         return self.registers;
     }
 
+    /// Derive the ELF image runtime base from consistent NT_FILE mappings.
+    pub fn executableRuntimeBase(self: *const CoreDump, executable_path: []const u8) !u64 {
+        if (self.format != .elf) return error.NotSupported;
+
+        var runtime_base: ?u64 = null;
+        var matched: usize = 0;
+        for (self.file_mappings) |mapping| {
+            if (!mappingMatchesExecutable(mapping.pathname, executable_path)) continue;
+            if (mapping.end <= mapping.start or mapping.file_offset > mapping.start) {
+                debug_log.log("dwarf.core_dump: invalid executable mapping path={s} start=0x{x} end=0x{x} file_offset=0x{x}", .{
+                    mapping.pathname,
+                    mapping.start,
+                    mapping.end,
+                    mapping.file_offset,
+                });
+                return error.InvalidExecutableMapping;
+            }
+
+            const candidate = mapping.start - mapping.file_offset;
+            if (runtime_base) |base| {
+                if (candidate != base) {
+                    debug_log.log("dwarf.core_dump: inconsistent executable mappings path={s} first_base=0x{x} candidate=0x{x}", .{ executable_path, base, candidate });
+                    return error.InvalidExecutableMapping;
+                }
+            } else {
+                runtime_base = candidate;
+            }
+            matched += 1;
+        }
+
+        const base = runtime_base orelse {
+            debug_log.log("dwarf.core_dump: no NT_FILE mapping for executable {s}", .{executable_path});
+            return error.ExecutableMappingNotFound;
+        };
+        debug_log.log("dwarf.core_dump: derived executable runtime base path={s} base=0x{x} mappings={d}", .{ executable_path, base, matched });
+        return base;
+    }
+
+    fn mappingMatchesExecutable(mapping_path: []const u8, executable_path: []const u8) bool {
+        const deleted_suffix = " (deleted)";
+        const clean_mapping = if (std.mem.endsWith(u8, mapping_path, deleted_suffix))
+            mapping_path[0 .. mapping_path.len - deleted_suffix.len]
+        else
+            mapping_path;
+        return std.mem.eql(u8, clean_mapping, executable_path);
+    }
+
     pub fn deinit(self: *CoreDump) void {
         if (self.segments.len > 0) self.allocator.free(self.segments);
+        if (self.file_mappings.len > 0) self.allocator.free(self.file_mappings);
         self.allocator.free(self.data);
     }
 
@@ -109,6 +173,7 @@ pub const CoreDump = struct {
     const PT_LOAD: u32 = 1;
     const PT_NOTE: u32 = 4;
     const NT_PRSTATUS: u32 = 1;
+    const NT_FILE: u32 = 0x46494c45;
     const EM_X86_64: u16 = 62;
     const EM_AARCH64: u16 = 183;
 
@@ -141,6 +206,8 @@ pub const CoreDump = struct {
 
         var segments = std.ArrayListUnmanaged(Segment){};
         errdefer segments.deinit(allocator);
+        var file_mappings = std.ArrayListUnmanaged(FileMapping){};
+        errdefer file_mappings.deinit(allocator);
         var registers = RegisterState{};
         var found_regs = false;
 
@@ -161,11 +228,14 @@ pub const CoreDump = struct {
                     .file_size = phdr.p_filesz,
                     .mem_size = phdr.p_memsz,
                 });
-            } else if (phdr.p_type == PT_NOTE and !found_regs) {
-                if (try parseElfNotes(data, phdr.p_offset, phdr.p_filesz, target_arch)) |regs| {
-                    registers = regs;
-                    found_regs = true;
+            } else if (phdr.p_type == PT_NOTE) {
+                if (!found_regs) {
+                    if (try parseElfNotes(data, phdr.p_offset, phdr.p_filesz, target_arch)) |regs| {
+                        registers = regs;
+                        found_regs = true;
+                    }
                 }
+                try parseElfFileMappings(data, phdr.p_offset, phdr.p_filesz, allocator, &file_mappings);
             }
         }
 
@@ -175,12 +245,16 @@ pub const CoreDump = struct {
         }
 
         const owned_segments = try segments.toOwnedSlice(allocator);
-        debug_log.log("dwarf.core_dump: loaded ELF core segments={d}", .{owned_segments.len});
+        errdefer allocator.free(owned_segments);
+        const owned_mappings = try file_mappings.toOwnedSlice(allocator);
+        debug_log.log("dwarf.core_dump: loaded ELF core segments={d} file_mappings={d}", .{ owned_segments.len, owned_mappings.len });
         return .{
             .data = data,
             .segments = owned_segments,
             .registers = registers,
             .allocator = allocator,
+            .format = .elf,
+            .file_mappings = owned_mappings,
         };
     }
 
@@ -219,6 +293,89 @@ pub const CoreDump = struct {
         }
 
         return null;
+    }
+
+    fn parseElfFileMappings(
+        data: []const u8,
+        note_offset: u64,
+        note_size: u64,
+        allocator: std.mem.Allocator,
+        mappings: *std.ArrayListUnmanaged(FileMapping),
+    ) !void {
+        const end = std.math.add(u64, note_offset, note_size) catch return error.InvalidCoreFile;
+        if (end > data.len) return error.InvalidCoreFile;
+
+        var offset = note_offset;
+        while (offset < end) {
+            const header_end = std.math.add(u64, offset, @sizeOf(Elf64Nhdr)) catch return error.InvalidCoreFile;
+            if (header_end > end) return error.InvalidCoreFile;
+
+            const nhdr = std.mem.bytesAsValue(Elf64Nhdr, data[offset..][0..@sizeOf(Elf64Nhdr)]);
+            offset = header_end;
+
+            const name_aligned = std.mem.alignForward(u64, nhdr.n_namesz, 4);
+            const name_end = std.math.add(u64, offset, nhdr.n_namesz) catch return error.InvalidCoreFile;
+            const desc_start = std.math.add(u64, offset, name_aligned) catch return error.InvalidCoreFile;
+            const desc_end = std.math.add(u64, desc_start, nhdr.n_descsz) catch return error.InvalidCoreFile;
+            const desc_aligned = std.mem.alignForward(u64, nhdr.n_descsz, 4);
+            const next_offset = std.math.add(u64, desc_start, desc_aligned) catch return error.InvalidCoreFile;
+            if (name_end > end or desc_end > end or next_offset > end) return error.InvalidCoreFile;
+
+            const name = data[offset..name_end];
+            const is_core_owner = name.len == 5 and std.mem.eql(u8, name, "CORE\x00");
+            if (nhdr.n_type == NT_FILE and is_core_owner) {
+                try parseElfFileMappingDesc(data[desc_start..desc_end], allocator, mappings);
+            }
+
+            offset = next_offset;
+        }
+    }
+
+    fn parseElfFileMappingDesc(
+        desc: []const u8,
+        allocator: std.mem.Allocator,
+        mappings: *std.ArrayListUnmanaged(FileMapping),
+    ) !void {
+        const word_size = @sizeOf(u64);
+        const header_size = 2 * word_size;
+        const entry_size = 3 * word_size;
+        if (desc.len < header_size) return error.InvalidCoreFile;
+
+        const count_u64 = std.mem.readInt(u64, desc[0..8], .little);
+        const page_size = std.mem.readInt(u64, desc[8..16], .little);
+        if (page_size == 0 or (page_size & (page_size - 1)) != 0) return error.InvalidCoreFile;
+        if (count_u64 > std.math.maxInt(usize)) return error.InvalidCoreFile;
+        const count: usize = @intCast(count_u64);
+        const table_size = std.math.mul(usize, count, entry_size) catch return error.InvalidCoreFile;
+        const paths_start = std.math.add(usize, header_size, table_size) catch return error.InvalidCoreFile;
+        if (paths_start > desc.len) return error.InvalidCoreFile;
+
+        var path_offset = paths_start;
+        for (0..count) |index| {
+            const nul_relative = std.mem.indexOfScalar(u8, desc[path_offset..], 0) orelse return error.InvalidCoreFile;
+            if (nul_relative == 0) return error.InvalidCoreFile;
+            const path_end = path_offset + nul_relative;
+
+            const entry_offset = header_size + index * entry_size;
+            const start = std.mem.readInt(u64, desc[entry_offset..][0..8], .little);
+            const mapping_end = std.mem.readInt(u64, desc[entry_offset + 8 ..][0..8], .little);
+            const file_page_offset = std.mem.readInt(u64, desc[entry_offset + 16 ..][0..8], .little);
+            const file_offset = std.math.mul(u64, file_page_offset, page_size) catch return error.InvalidCoreFile;
+            if (mapping_end <= start or start % page_size != 0 or mapping_end % page_size != 0) return error.InvalidCoreFile;
+
+            try mappings.append(allocator, .{
+                .start = start,
+                .end = mapping_end,
+                .file_offset = file_offset,
+                .pathname = desc[path_offset..path_end],
+            });
+            path_offset = path_end + 1;
+        }
+
+        for (desc[path_offset..]) |byte| {
+            if (byte != 0) return error.InvalidCoreFile;
+        }
+        debug_log.log("dwarf.core_dump: parsed ELF NT_FILE mappings={d} page_size={d}", .{ count, page_size });
     }
 
     fn parseElfPrstatus(desc: []const u8, target_arch: std.Target.Cpu.Arch) !RegisterState {
@@ -356,6 +513,7 @@ pub const CoreDump = struct {
             .segments = try segments.toOwnedSlice(allocator),
             .registers = registers,
             .allocator = allocator,
+            .format = .macho,
         };
     }
 
@@ -781,5 +939,59 @@ test "ELF notes reject unsupported register architecture" {
     try std.testing.expectError(
         error.UnsupportedArchitecture,
         CoreDump.parseElfNotes(&note, 0, 356, .riscv64),
+    );
+}
+
+test "ELF NT_FILE mappings derive validated PIE runtime base" {
+    const allocator = std.testing.allocator;
+    const path = "/tmp/pie";
+    const desc_size = 16 + 2 * 24 + 2 * (path.len + 1);
+    var note: [104]u8 = [_]u8{0} ** 104;
+    writeTestNoteHeader(&note, 5, desc_size, CoreDump.NT_FILE);
+    @memcpy(note[12..17], "CORE\x00");
+
+    const desc_start = 20;
+    writeTestU64(&note, desc_start, 2);
+    writeTestU64(&note, desc_start + 8, 0x1000);
+    writeTestU64(&note, desc_start + 16, 0x5555_5000);
+    writeTestU64(&note, desc_start + 24, 0x5555_6000);
+    writeTestU64(&note, desc_start + 32, 0);
+    writeTestU64(&note, desc_start + 40, 0x5555_6000);
+    writeTestU64(&note, desc_start + 48, 0x5555_8000);
+    writeTestU64(&note, desc_start + 56, 1);
+    @memcpy(note[desc_start + 64 ..][0..path.len], path);
+    @memcpy(note[desc_start + 64 + path.len + 1 ..][0..path.len], path);
+
+    var mappings = std.ArrayListUnmanaged(CoreDump.FileMapping).empty;
+    defer mappings.deinit(allocator);
+    try CoreDump.parseElfFileMappings(&note, 0, note.len, allocator, &mappings);
+
+    var core = CoreDump{
+        .data = &note,
+        .segments = &.{},
+        .registers = .{},
+        .allocator = allocator,
+        .format = .elf,
+        .file_mappings = mappings.items,
+    };
+    try std.testing.expectEqual(@as(u64, 0x5555_5000), try core.executableRuntimeBase(path));
+
+    mappings.items[1].start = 0x5555_7000;
+    try std.testing.expectError(error.InvalidExecutableMapping, core.executableRuntimeBase(path));
+}
+
+test "ELF NT_FILE mappings reject invalid page size" {
+    const allocator = std.testing.allocator;
+    var note: [64]u8 = [_]u8{0} ** 64;
+    writeTestNoteHeader(&note, 5, 40, CoreDump.NT_FILE);
+    @memcpy(note[12..17], "CORE\x00");
+    writeTestU64(&note, 20, 1);
+    writeTestU64(&note, 28, 3);
+
+    var mappings = std.ArrayListUnmanaged(CoreDump.FileMapping).empty;
+    defer mappings.deinit(allocator);
+    try std.testing.expectError(
+        error.InvalidCoreFile,
+        CoreDump.parseElfFileMappings(&note, 0, note.len, allocator, &mappings),
     );
 }

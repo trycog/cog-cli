@@ -11,6 +11,7 @@ pub const dwarf_process = @import("debug/dwarf/process.zig");
 pub const dwarf_engine = @import("debug/dwarf/engine.zig");
 pub const dwarf_binary_macho = @import("debug/dwarf/binary_macho.zig");
 pub const dwarf_binary_elf = @import("debug/dwarf/binary_elf.zig");
+pub const dwarf_core_dump = @import("debug/dwarf/core_dump.zig");
 pub const dwarf_parser = @import("debug/dwarf/parser.zig");
 pub const dwarf_breakpoints = @import("debug/dwarf/breakpoints.zig");
 pub const dwarf_unwind = @import("debug/dwarf/unwind.zig");
@@ -300,6 +301,7 @@ test {
     _ = dwarf_engine;
     _ = dwarf_binary_macho;
     _ = dwarf_binary_elf;
+    _ = dwarf_core_dump;
     _ = dwarf_parser;
     _ = dwarf_breakpoints;
     _ = dwarf_unwind;
