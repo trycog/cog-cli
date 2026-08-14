@@ -403,17 +403,19 @@ test "concurrent schema migration is idempotent" {
 
     const first = try std.posix.fork();
     if (first == 0) Migrator.run(path.ptr, ready_pipe[1], start_pipe[0]);
-    errdefer {
+    var first_pending = true;
+    errdefer if (first_pending) {
         std.posix.kill(first, std.posix.SIG.KILL) catch {};
         _ = std.posix.waitpid(first, 0);
-    }
+    };
 
     const second = try std.posix.fork();
     if (second == 0) Migrator.run(path.ptr, ready_pipe[1], start_pipe[0]);
-    errdefer {
+    var second_pending = true;
+    errdefer if (second_pending) {
         std.posix.kill(second, std.posix.SIG.KILL) catch {};
         _ = std.posix.waitpid(second, 0);
-    }
+    };
 
     var ready: [2]u8 = undefined;
     var ready_count: usize = 0;
@@ -423,7 +425,9 @@ test "concurrent schema migration is idempotent" {
     try std.testing.expectEqual(@as(usize, 2), try std.posix.write(start_pipe[1], "gg"));
 
     const first_result = std.posix.waitpid(first, 0);
+    first_pending = false;
     const second_result = std.posix.waitpid(second, 0);
+    second_pending = false;
     try std.testing.expect(std.posix.W.IFEXITED(first_result.status));
     try std.testing.expectEqual(@as(u8, 0), std.posix.W.EXITSTATUS(first_result.status));
     try std.testing.expect(std.posix.W.IFEXITED(second_result.status));
