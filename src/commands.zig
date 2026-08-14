@@ -236,6 +236,14 @@ fn specialistBody(kind: agents_mod.SpecialistKind) []const u8 {
     };
 }
 
+fn specialistEnabledForInit(kind: agents_mod.SpecialistKind, memory_enabled: bool, observe_enabled: bool) bool {
+    return switch (kind) {
+        .code_query, .debug => true,
+        .memory, .validate => memory_enabled,
+        .observe => observe_enabled,
+    };
+}
+
 fn installSpecialistAsset(
     allocator: std.mem.Allocator,
     agent: agents_mod.Agent,
@@ -581,19 +589,19 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // d. Install every specialist supported by this host. Memory specialists
         // are only installed when memory was configured during this init run.
         inline for (std.meta.tags(agents_mod.SpecialistKind)) |kind| {
-            if (!setup_mem and (kind == .memory or kind == .validate)) continue;
-            if (!observe_enabled and kind == .observe) continue;
-            const installed = try installSpecialistAsset(
-                allocator,
-                agent,
-                kind,
-                &accept_all,
-                &written_agents,
-                &written_agents_count,
-                &installed_assets,
-                &installed_assets_count,
-            );
-            installed_specialists[selected_pos].set(kind, installed);
+            if (specialistEnabledForInit(kind, setup_mem, observe_enabled)) {
+                const installed = try installSpecialistAsset(
+                    allocator,
+                    agent,
+                    kind,
+                    &accept_all,
+                    &written_agents,
+                    &written_agents_count,
+                    &installed_assets,
+                    &installed_assets_count,
+                );
+                installed_specialists[selected_pos].set(kind, installed);
+            }
         }
     }
 
@@ -2730,6 +2738,17 @@ test "processPromptTags strips memory content when memory is disabled" {
     try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-mem-validate`") == null);
     try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-debug`") != null);
     try std.testing.expect(std.mem.indexOf(u8, processed, "`cog-observe`") != null);
+}
+
+test "specialist init gates memory and observe independently" {
+    try std.testing.expect(specialistEnabledForInit(.code_query, false, false));
+    try std.testing.expect(specialistEnabledForInit(.debug, false, false));
+    try std.testing.expect(!specialistEnabledForInit(.memory, false, true));
+    try std.testing.expect(!specialistEnabledForInit(.validate, false, true));
+    try std.testing.expect(specialistEnabledForInit(.memory, true, false));
+    try std.testing.expect(specialistEnabledForInit(.validate, true, false));
+    try std.testing.expect(!specialistEnabledForInit(.observe, true, false));
+    try std.testing.expect(specialistEnabledForInit(.observe, false, true));
 }
 
 test "prompt specialist intersection is safe for shared targets" {
