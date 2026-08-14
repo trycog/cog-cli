@@ -379,15 +379,20 @@ Results go into `.cog/index.scip`. A built-in file watcher automatically keeps t
 
 ### Staying in sync
 
-The watcher only sees changes while `cog mcp` is running, so every index write also records a provenance manifest (`.cog/index-manifest.json`) with the size and mtime of each indexed file. A reconcile pass compares that manifest against the working tree and repairs exactly what drifted — modified and new files are reindexed, deleted files are dropped, and the pass escalates to a full rebuild when most of the tree changed or no manifest exists. When nothing drifted, the pass is a stat scan that never opens the index.
+The watcher only sees changes while `cog mcp` is running, so every index write also records a provenance manifest (`.cog/index-manifest.json`): the size, mtime, and content hash of each indexed file, the configured pattern set, and the git HEAD it was built at. A reconcile pass compares that manifest against the working tree and repairs exactly what drifted — modified and new files are reindexed, deleted files are dropped, and the pass escalates to a full rebuild when most of the tree changed or no manifest exists. When nothing drifted, the pass is a stat scan that never opens the index, and stat-level churn with identical bytes (switching a branch away and back) refreshes the manifest instead of reindexing anything. Because the pattern set is recorded, reconciliation also works for projects indexed with explicit `cog code:index` patterns and no `code.index` settings entry.
 
 Reconciliation runs automatically:
 
-- at MCP startup, covering everything that changed while no server was running;
+- at MCP startup, covering everything that changed while no server was running (the first startup after upgrading Cog performs one full rebuild to establish the manifest);
 - when the git sentinel (`.git/HEAD`, the active ref, and `.git/index` mtimes) reports a checkout, pull, merge, or rebase — linked worktrees included;
+- when watcher event queues overflow under mass changes;
 - periodically, when file watching is unavailable on the host.
 
-While a reconcile is in flight, `code_query` and `code_explore` results begin with an explicit staleness warning so agents verify critical answers with direct file reads instead of trusting a converging index. `cog doctor` reports drift counts, and `cog code:sync` runs the same reconcile on demand — useful in scripts and git hooks.
+For large projects (10k+ indexed files) in a git checkout, reconciliation asks git for the changed-path set — a diff against the recorded HEAD plus status with untracked files — instead of walking the whole tree. Files git ignores are invisible to that shortcut and external roots live outside the repository, so either condition falls back to the full stat walk, as does any git failure.
+
+While any reindex is in flight — a reconcile worker or a watcher batch — `code_query` and `code_explore` results begin with an explicit staleness warning so agents verify critical answers with direct file reads instead of trusting a converging index. `cog doctor` reports drift counts, and `cog code:sync` runs the same reconcile on demand — useful in scripts and git hooks.
+
+On Windows, automatic synchronization (file watching, startup reconcile, and the git sentinel) is unavailable; keep the index current with `cog code:sync` or `cog code:index`.
 
 Scan, bootstrap, reconciliation, and watcher paths share the same symlink-aware boundary policy. Symlinks that resolve inside the project are followed while preserving their logical alias; targets outside the project are excluded unless their root is explicitly listed under `code.external_roots`. Project-scan recommendations for external roots require interactive approval before `cog init` persists them.
 
