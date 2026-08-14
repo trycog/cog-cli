@@ -15,6 +15,7 @@ const extensions = @import("extensions.zig");
 const tree_sitter_indexer = @import("tree_sitter_indexer.zig");
 const debug_log = @import("debug_log.zig");
 const path_matcher = @import("path_matcher.zig");
+const index_manifest = @import("index_manifest.zig");
 
 // Advisory file locking via flock(2). Auto-released on close/process exit.
 extern "c" fn flock(fd: c_int, operation: c_int) c_int;
@@ -2038,6 +2039,7 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         printErr("error: failed to write index file\n");
         return error.Explained;
     }
+    writeManifestForIndex(allocator, index_path, master_index.documents);
 
     // Add external symbols to total count
     total_symbols += master_index.external_symbols.len;
@@ -3305,7 +3307,42 @@ fn saveIndex(allocator: std.mem.Allocator, index: scip.Index, index_path: []cons
     const encoded = scip_encode.encodeIndex(allocator, index) catch return false;
     defer allocator.free(encoded);
 
-    return writeEncodedIndexAtomically(allocator, index_path, encoded);
+    if (!writeEncodedIndexAtomically(allocator, index_path, encoded)) return false;
+    writeManifestForIndex(allocator, index_path, index.documents);
+    return true;
+}
+
+/// Refresh the provenance manifest after a successful index write. Manifest
+/// problems are logged, never propagated: a missing manifest only means the
+/// next reconcile falls back to a full resync.
+fn writeManifestForIndex(allocator: std.mem.Allocator, index_path: []const u8, documents: []const scip.Document) void {
+    const cog_dir_path = std.fs.path.dirname(index_path) orelse return;
+    const project_root = std.fs.path.dirname(cog_dir_path) orelse return;
+
+    var root_dir = std.fs.openDirAbsolute(project_root, .{}) catch |err| {
+        debug_log.log("writeManifestForIndex: cannot open project root {s}: {s}", .{ project_root, @errorName(err) });
+        return;
+    };
+    defer root_dir.close();
+
+    var entries: std.ArrayListUnmanaged(index_manifest.Entry) = .empty;
+    defer entries.deinit(allocator);
+    for (documents) |doc| {
+        if (!isManagedDocumentPath(doc.relative_path)) continue;
+        if (index_manifest.statFile(root_dir, doc.relative_path)) |entry| {
+            entries.append(allocator, entry) catch |err| {
+                debug_log.log("writeManifestForIndex: entry collection failed: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+    }
+
+    var cog_dir = std.fs.openDirAbsolute(cog_dir_path, .{}) catch |err| {
+        debug_log.log("writeManifestForIndex: cannot open {s}: {s}", .{ cog_dir_path, @errorName(err) });
+        return;
+    };
+    defer cog_dir.close();
+    _ = index_manifest.write(allocator, cog_dir, entries.items);
 }
 
 fn writeEncodedIndexAtomically(allocator: std.mem.Allocator, index_path: []const u8, encoded: []const u8) bool {
@@ -5033,6 +5070,7 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
     defer allocator.free(encoded);
 
     if (!writeEncodedIndexAtomically(allocator, index_path, encoded)) return error.WriteFailed;
+    writeManifestForIndex(allocator, index_path, master_index.documents);
 
     total_symbols += master_index.external_symbols.len;
 
@@ -5735,6 +5773,36 @@ test "EnclosingRangeIndex preserves innermost tie behavior" {
 
     const found = range_index.findInnermost(12, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("same-range-later", found);
+}
+
+test "index writes refresh the provenance manifest for managed documents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.writeFile(.{ .sub_path = "tracked.zig", .data = "const tracked = 1;\n" });
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const index_path = try std.fs.path.join(allocator, &.{ root, ".cog", "index.scip" });
+    defer allocator.free(index_path);
+
+    var documents = [_]scip.Document{
+        .{ .language = "zig", .relative_path = "tracked.zig", .occurrences = &.{}, .symbols = &.{} },
+        // Deleted files and external aliases must not appear in the manifest.
+        .{ .language = "zig", .relative_path = "deleted.zig", .occurrences = &.{}, .symbols = &.{} },
+        .{ .language = "zig", .relative_path = "@external/lib/dep.zig", .occurrences = &.{}, .symbols = &.{} },
+    };
+    writeManifestForIndex(allocator, index_path, &documents);
+
+    var cog_dir = try tmp.dir.openDir(".cog", .{});
+    defer cog_dir.close();
+    var loaded = index_manifest.load(allocator, cog_dir) orelse return error.TestUnexpectedResult;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.entries.len);
+    try std.testing.expectEqualStrings("tracked.zig", loaded.value.entries[0].path);
+    try std.testing.expectEqual(@as(u64, 19), loaded.value.entries[0].size);
 }
 
 test "set-based relationship and import dedup preserves first-seen order" {
