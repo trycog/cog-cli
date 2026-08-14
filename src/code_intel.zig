@@ -6255,12 +6255,13 @@ test "isSymbolInFile" {
 // ── readDefinitionBody tests ─────────────────────────────────────────────
 
 fn testReadBodyFromContent(allocator: std.mem.Allocator, content: []const u8, def_line: i32, def_end_line: i32, fallback_context: usize) !ReadBodyResult {
-    const tmp_path = "/tmp/cog_test_body.zig";
-    const file = try std.fs.createFileAbsolute(tmp_path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "body.zig", .data = content });
 
-    return readDefinitionBody(allocator, "/tmp", "cog_test_body.zig", def_line, def_end_line, fallback_context);
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    return readDefinitionBody(allocator, root, "body.zig", def_line, def_end_line, fallback_context);
 }
 
 fn withTempCwd(comptime body: fn (std.mem.Allocator) anyerror!void) !void {
@@ -6475,13 +6476,8 @@ test "readDefinitionBody: truncation at MAX_BODY_LINES" {
     }
     try content_buf.appendSlice(allocator, "}\n");
 
-    const tmp_path = "/tmp/cog_test_body.zig";
-    const file = try std.fs.createFileAbsolute(tmp_path, .{});
-    defer file.close();
-    try file.writeAll(content_buf.items);
-
     // def_end_line=201 (past MAX_BODY_LINES)
-    const result = try readDefinitionBody(allocator, "/tmp", "cog_test_body.zig", 0, 201, 15);
+    const result = try testReadBodyFromContent(allocator, content_buf.items, 0, 201, 15);
     defer allocator.free(result.snippet);
 
     try std.testing.expect(result.truncated);

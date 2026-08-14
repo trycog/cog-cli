@@ -55,3 +55,11 @@ test "MCP source never restores the shared raw payload log" {
     const forbidden_path = "/tmp/" ++ "cog-mcp.log";
     try std.testing.expect(std.mem.indexOf(u8, source, forbidden_path) == null);
 }
+
+test "code intelligence tests use isolated temporary files" {
+    const source = try std.fs.cwd().readFileAlloc(std.testing.allocator, "src/code_intel.zig", 8 * 1024 * 1024);
+    defer std.testing.allocator.free(source);
+
+    const forbidden_path = "/tmp/" ++ "cog_test_body.zig";
+    try std.testing.expect(std.mem.indexOf(u8, source, forbidden_path) == null);
+}
