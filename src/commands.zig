@@ -443,6 +443,11 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     };
 
                     printErr("\n");
+                    if (!try authorizeInitMemoryHost(allocator, effective_host)) {
+                        debug_log.log("commands.init: hosted memory origin approval declined; aborting before credential access", .{});
+                        printErr("  Aborted; no credentials were sent.\n");
+                        return;
+                    }
                     try initBrain(allocator, effective_host, existing_brain_parts);
                 }
             },
@@ -1869,6 +1874,31 @@ fn approveCredentialHost(allocator: std.mem.Allocator, input: []const u8) !Crede
     });
 }
 
+fn authorizeInitMemoryHostWith(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    context: *anyopaque,
+    seams: CredentialApprovalSeams,
+) !bool {
+    const origin = try std.fmt.allocPrint(allocator, "https://{s}", .{host});
+    defer allocator.free(origin);
+
+    debug_log.log("commands.init: checking hosted memory credential origin {s}", .{origin});
+    const outcome = try approveCredentialHostWith(allocator, origin, context, seams);
+    debug_log.log("commands.init: hosted memory credential origin outcome={s}", .{@tagName(outcome)});
+    return outcome != .declined;
+}
+
+fn authorizeInitMemoryHost(allocator: std.mem.Allocator, host: []const u8) !bool {
+    var context: u8 = 0;
+    return authorizeInitMemoryHostWith(allocator, host, &context, .{
+        .is_interactive = approvalIsInteractive,
+        .confirm = approvalConfirm,
+        .is_approved = approvalIsApproved,
+        .approve = approvalApprove,
+    });
+}
+
 pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
         printCommandHelp(help.doctor);
@@ -2945,6 +2975,33 @@ test "diagnostics append when stderr is redirected to a file" {
             "         rejected: HttpsRequired\n",
         body,
     );
+}
+
+test "init explicitly approves a self-hosted memory origin before use" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{};
+
+    try std.testing.expect(try authorizeInitMemoryHostWith(
+        allocator,
+        "MEMORY.example:8443",
+        &probe,
+        ApprovalProbe.seams(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.approve_calls);
+    try std.testing.expectEqualStrings("https://memory.example:8443", probe.approvedOrigin());
+}
+
+test "init fails closed for an unapproved self-hosted memory origin without a terminal" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{ .interactive = false };
+
+    try std.testing.expectError(
+        error.Explained,
+        authorizeInitMemoryHostWith(allocator, "memory.example", &probe, ApprovalProbe.seams()),
+    );
+    try std.testing.expectEqual(@as(usize, 0), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
 }
 
 test "approve-host stores the canonical origin only after an explicit confirmation" {

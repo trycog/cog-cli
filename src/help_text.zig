@@ -9,7 +9,7 @@ const reset = "\x1B[0m";
 // ── Setup ───────────────────────────────────────────────────────────────
 
 pub const init =
-    bold ++ "  cog init" ++ reset ++ "\n" ++ "\n" ++ "  Interactive setup for the current directory. Optionally configures\n" ++ "  memory, then sets up system prompts, MCP server, and hooks\n" ++ "  for your selected AI coding agents.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog init " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--host" ++ reset ++ " HOST             " ++ dim ++ "Server hostname (default: trycog.ai)" ++ reset ++ "\n" ++ "\n";
+    bold ++ "  cog init" ++ reset ++ "\n" ++ "\n" ++ "  Interactive setup for the current directory. Optionally configures\n" ++ "  memory, then sets up system prompts, MCP server, and hooks\n" ++ "  for your selected AI coding agents.\n" ++ "\n" ++ cyan ++ bold ++ "  Usage" ++ reset ++ "\n" ++ "    cog init " ++ dim ++ "[options]" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--host" ++ reset ++ " HOST             " ++ dim ++ "Server hostname (default: trycog.ai)" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Credential approval" ++ reset ++ "\n" ++ "    Selecting a self-hosted memory origin requires explicit interactive approval\n" ++ "    before Cog reads COG_API_KEY or makes an authenticated request. Approval is\n" ++ "    saved in the global approved-origin store for later runs.\n" ++ "    " ++ dim ++ "Non-interactive setup cannot add an approval and fails closed." ++ reset ++ "\n" ++ "\n";
 
 pub const mcp =
     bold ++ "  cog mcp" ++ reset ++ " — MCP server over stdio\n" ++ "\n" ++ bold ++ "  Usage: " ++ reset ++ "cog mcp [options]\n" ++ "\n" ++ dim ++ "  Starts a local Model Context Protocol server on stdio.\n" ++ dim ++ "  This command is intended to be launched by MCP clients.\n" ++ "\n" ++ cyan ++ bold ++ "  Transport" ++ reset ++ "\n" ++ "    Messages are newline-delimited JSON objects.\n" ++ "    The maximum inbound frame size is " ++ bold ++ "4 MiB (4,194,304 bytes)" ++ reset ++ ";\n" ++ "    oversized frames are rejected as invalid requests.\n" ++ "\n" ++ cyan ++ bold ++ "  Options" ++ reset ++ "\n" ++ "    " ++ bold ++ "--help, -h" ++ reset ++ "            " ++ dim ++ "Show this help message\n" ++ reset ++ "    " ++ bold ++ "--debug-tools=TIER" ++ reset ++ "    " ++ dim ++ "Limit exposed debug tools (core, extended, all)\n" ++ "                              core: 7 essential tools (launch, breakpoint, run, inspect, stacktrace, stop, sessions)\n" ++ "                              extended: core + threads, attach, set_variable, watchpoint, exception_info, restart\n" ++ "                              all: all 36 debug tools (default)" ++ reset ++ "\n" ++ "\n";
@@ -96,4 +96,11 @@ test "MCP help publishes the inbound transport frame contract" {
     const std = @import("std");
     try std.testing.expect(std.mem.indexOf(u8, mcp, "4 MiB (4,194,304 bytes)") != null);
     try std.testing.expect(std.mem.indexOf(u8, mcp, "oversized frames are rejected") != null);
+}
+
+test "init help publishes self-hosted memory approval policy" {
+    const std = @import("std");
+    try std.testing.expect(std.mem.indexOf(u8, init, "self-hosted memory origin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, init, "interactive approval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, init, "Non-interactive setup cannot add an approval") != null);
 }

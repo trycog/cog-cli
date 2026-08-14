@@ -289,13 +289,15 @@ For hosted memory:
 
 Cog sends `COG_API_KEY` only to the exact official `https://trycog.ai:443` origin or to an exact non-official HTTPS origin already present in the global `~/.config/cog/approved-origins.json` store. Authenticated request callsites enforce this check before network I/O; unapproved self-hosted destinations fail with `error.CredentialDestinationNotApproved`. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding.
 
-To approve a self-hosted destination, run:
+When you select a self-hosted memory origin during interactive `cog init`, Cog shows the exact canonical HTTPS origin and asks for approval before it reads `COG_API_KEY` or makes an authenticated request. A confirmation is persisted through the same global approved-origin policy and store used by `cog doctor`. Non-interactive setup cannot create an approval and fails closed.
+
+You can also approve a self-hosted destination explicitly before setup:
 
 ```sh
 cog doctor --approve-host https://memory.example:8443
 ```
 
-The command takes one exact HTTPS origin (scheme, host, and optional port — no path, query, fragment, or userinfo), canonicalizes it, requires an interactive terminal, and asks you to confirm before anything is written. Approvals are stored only in the global store, at mode `0600` under a directory restricted to `0700`. Nothing in a repository — `.cog/settings.json`, a project `.env`, or a process-supplied `HOME` — can add an approval or move the store: the store location is resolved from the account database entry for the user Cog runs as, and every component of that path is opened without following symlinks. If the trusted home cannot be resolved, approval reads and writes fail closed.
+Both approval paths take one exact HTTPS origin (scheme, host, and optional port — no path, query, fragment, or userinfo), canonicalize it, require an interactive terminal, and ask you to confirm before anything is written. Approvals are stored only in the global store, at mode `0600` under a directory restricted to `0700`. Nothing in a repository — `.cog/settings.json`, a project `.env`, or a process-supplied `HOME` — can add an approval or move the store: the store location is resolved from the account database entry for the user Cog runs as, and every component of that path is opened without following symlinks. If the trusted home cannot be resolved, approval reads and writes fail closed.
 
 On Windows, global approved-origin reads and writes return `error.UnsupportedPlatform` because Zig 0.15 does not expose reparse-point-resistant file access needed for credential authorization state. URL parsing remains available; non-official credential destinations therefore fail closed.
 
