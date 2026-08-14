@@ -387,7 +387,7 @@ MCP debug sessions and drivers run inside the `cog mcp` process. A separate opti
 
 ### Key capabilities
 
-- **Launch or attach** to processes with full breakpoint support (line, function, exception, conditional, data watchpoints)
+- **Launch or attach** to processes with line, function, exception, and conditional breakpoints; data watchpoints are exposed only when the selected driver and platform implement them
 - **Text-first debug results** — most `debug_*` tools now return readable summaries instead of JSON blobs embedded in MCP text output
 - **Step-over-inspect** — step repeatedly while evaluating expressions in a single call, reducing round trips
 - **Module launch mode** — debug by module name (e.g. `python -m pytest`) in addition to script path
