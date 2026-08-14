@@ -62,6 +62,16 @@ pub fn findOrCreateCogDir(allocator: std.mem.Allocator) ![]const u8 {
         else => return error.NoCogDir,
     };
 
+    // A pre-existing `.cog` may be a committed symlink; refuse to write
+    // bootstrap state through it or to trust a foreign-owned directory.
+    {
+        const cwd_path = std.fs.cwd().realpathAlloc(allocator, ".") catch return error.NoCogDir;
+        defer allocator.free(cwd_path);
+        const cog_path = try std.fs.path.join(allocator, &.{ cwd_path, ".cog" });
+        defer allocator.free(cog_path);
+        try validateOwnedCogDir(cog_path);
+    }
+
     // Create pretty settings.json if it doesn't exist. Existing settings are
     // never replaced by this bootstrap path.
     var cog_dir = std.fs.cwd().openDir(".cog", .{}) catch return error.NoCogDir;
@@ -519,6 +529,27 @@ test "getProjectTempDir creates a private directory under .cog" {
     defer dir.close();
     const stat = try std.posix.fstat(dir.fd);
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o700), stat.mode & 0o777);
+}
+
+test "findOrCreateCogDir rejects a symlinked .cog directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    // Bootstrap must not write settings.json through a committed symlink.
+    try tmp.dir.makeDir("outside");
+    try tmp.dir.symLink("outside", ".cog", .{ .is_directory = true });
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expectError(error.CogDirSymlink, findOrCreateCogDir(allocator));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("outside/settings.json", .{}));
 }
 
 test "getProjectTempDir rejects a symlinked .cog directory" {
