@@ -4213,9 +4213,14 @@ pub const DwarfEngine = struct {
         errdefer mods.deinit(allocator);
 
         if (self.program_path) |path| {
-            const has_debug = self.binary != null and self.binary.?.sections.debug_info != null;
+            const has_macho_debug = self.binary != null and self.binary.?.sections.debug_info != null;
+            const has_elf_debug = self.elf_binary != null and self.elf_binary.?.sections.debug_info != null;
             const has_dsym = self.dsym_binary != null;
-            const sym_status: []const u8 = if (has_dsym) "dSYM loaded" else if (has_debug) "debug info loaded" else "no debug info";
+            const sym_status: []const u8 = if (has_dsym) "dSYM loaded" else if (has_macho_debug or has_elf_debug) "debug info loaded" else "no debug info";
+            debug_log.log("dwarf.engine: module format={s}, symbols={s}", .{
+                if (self.elf_binary != null) "ELF" else "Mach-O",
+                sym_status,
+            });
 
             try mods.append(allocator, .{
                 .id = try allocator.dupe(u8, "main"),
@@ -4237,29 +4242,12 @@ pub const DwarfEngine = struct {
         var sources = std.ArrayListUnmanaged(types.LoadedSource).empty;
         errdefer sources.deinit(allocator);
 
-        // Return source files from parsed debug line info
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_line != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_line != null) break :blk bin;
-            }
-            return try sources.toOwnedSlice(allocator);
-        };
-
-        const line_data = debug_binary.getSectionData(debug_binary.sections.debug_line orelse return try sources.toOwnedSlice(allocator)) orelse return try sources.toOwnedSlice(allocator);
-        const line_str_data = if (debug_binary.sections.debug_line_str) |s| debug_binary.getSectionData(s) else null;
-
-        const result = parser.parseLineProgramWithFilesEx(line_data, allocator, line_str_data) catch return try sources.toOwnedSlice(allocator);
-        defer allocator.free(result.line_entries);
-        defer allocator.free(result.file_entries);
-
-        // Deduplicate file entries
+        // Both the Mach-O and ELF loaders normalize DWARF file entries into this cache.
+        // Using it here preserves compressed-section handling and avoids reparsing line data.
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer seen.deinit(allocator);
 
-        for (result.file_entries) |fe| {
+        for (self.file_entries) |fe| {
             if (fe.name.len == 0) continue;
             const gop = try seen.getOrPut(allocator, fe.name);
             if (gop.found_existing) continue;
@@ -5254,6 +5242,69 @@ test "DwarfEngine setBreakpoint without debug info returns unverified" {
     var driver = engine.activeDriver();
     const bp = try driver.setBreakpoint(std.testing.allocator, "test.c", 10, null);
     try std.testing.expect(!bp.verified);
+}
+
+test "DwarfEngine reports ELF module and loaded sources" {
+    const allocator = std.testing.allocator;
+    const fixture_path = "test/fixtures/simple.elf.o";
+
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+
+    engine.program_path = try allocator.dupe(u8, fixture_path);
+
+    var elf = try binary_elf.ElfBinary.loadFile(allocator, fixture_path);
+    var elf_owned = true;
+    defer if (elf_owned) elf.deinit(allocator);
+    const line_section = elf.sections.debug_line orelse return error.TestUnexpectedResult;
+    const line_data = elf.getSectionData(line_section) orelse return error.TestUnexpectedResult;
+    const line_str_data = if (elf.sections.debug_line_str) |section| elf.getSectionData(section) else null;
+    const line_result = try parser.parseLineProgramWithFilesEx(line_data, allocator, line_str_data);
+    engine.line_entries = line_result.line_entries;
+    engine.file_entries = line_result.file_entries;
+    engine.allocated_paths = line_result.allocated_paths;
+    engine.elf_binary = elf;
+    elf_owned = false;
+
+    try std.testing.expect(engine.file_entries.len > 0);
+
+    var driver = engine.activeDriver();
+    const capabilities = driver.capabilities();
+    try std.testing.expect(capabilities.supports_modules);
+    try std.testing.expect(capabilities.supports_loaded_sources);
+
+    const modules = try driver.modules(allocator);
+    defer {
+        for (modules) |module| {
+            allocator.free(module.id);
+            allocator.free(module.name);
+            allocator.free(module.path);
+            allocator.free(module.symbol_status);
+        }
+        allocator.free(modules);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), modules.len);
+    try std.testing.expectEqualStrings("simple.elf.o", modules[0].name);
+    try std.testing.expectEqualStrings("debug info loaded", modules[0].symbol_status);
+
+    const sources = try driver.loadedSources(allocator);
+    defer {
+        for (sources) |source| {
+            allocator.free(source.name);
+            allocator.free(source.path);
+        }
+        allocator.free(sources);
+    }
+
+    var found_simple_source = false;
+    for (sources) |source| {
+        if (std.mem.eql(u8, source.name, "simple.c")) {
+            found_simple_source = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_simple_source);
 }
 
 test "DwarfEngine stores inlined subroutine info" {
