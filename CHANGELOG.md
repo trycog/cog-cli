@@ -50,12 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Observe stop, status, event-count, persistence, and finalization failures now propagate instead of reporting false success; healthy persisted sessions remain available when another database is corrupt.
 - Host setup now rejects malformed, oversized, unreadable, or unsafe existing configuration instead of treating it as absent, and generated specialist prompts never require an asset that was skipped or unsupported.
 - Project and global settings, bootstrap checkpoints, agent usage state, host assets, index files, and extension directories now use atomic persistence with rollback and restrictive permissions.
+- A failed `debug_load_core` no longer leaks the native engine and its partially loaded state, and MCP shutdown can no longer hang on a stuck macOS file-watcher thread: the join is bounded and an unresponsive thread is abandoned for process exit to reclaim.
+- Extension replacement no longer reports a failed install after the new version is already live: post-promotion sync or backup-cleanup problems are logged and the backup retained instead of failing the completed replacement.
+- The README agent support matrix is rendered from the capability registry and validated at build time, and every host receives the identical single-sourced Cog-first exploration policy with the same narrow raw-text exceptions.
 
 ### Security
 
 - `COG_API_KEY` is sent automatically only to exact `https://trycog.ai:443`; every other credential destination must be an explicitly approved HTTPS origin, authenticated redirects remain disabled, and Windows approval persistence fails closed when safe path traversal is unavailable.
 - Debug sockets, PID files, entitlements, DAP diagnostics, and temporary outputs now live in verified user-owned private runtime paths with restrictive modes, symlink rejection, peer/process identity checks, safe stale-socket teardown, and no Cog-owned shared `/tmp` state; retired shared debug paths are detected but never trusted or removed.
 - Stale-socket cleanup now probes for a live listener first and preserves an actively served endpoint, and daemon teardown removes only nodes it proved it owns while unsafe pre-existing paths are preserved.
+- Socket takeover is serialized through an exclusive owner lock held from startup through teardown, closing the same-user race where two starters could both judge a socket stale and one unlinked the other's freshly bound endpoint.
+- Hostile core dumps can no longer crash the debugger: NT_FILE runtime bases whose load bias overflows the supported range are rejected as invalid executable mappings, and failed section decompression treats the section as absent instead of feeding compressed bytes to the DWARF parsers.
 - The project `.cog` directory is validated as a trust boundary before temporary paths under it are handed to external indexers: a symlinked or foreign-owned `.cog` is rejected and group/world write bits are cleared.
 - MCP shutdown now stops handler intake, drains in-flight handlers, and only then deinitializes the full runtime, so no worker can observe freed runtime state during teardown.
 - MCP frames, handler concurrency, observe queries, DAP queues, HTTP responses, redirects, downloads, subprocess lifetimes, and SQLite contention now have explicit bounds and failure behavior.
