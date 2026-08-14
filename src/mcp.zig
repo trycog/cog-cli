@@ -662,24 +662,37 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
         }
     }
 
-    const handlers_drained = drainHandlerThreads(&handler_threads, &handler_threads_drained);
-    if (!handlers_drained) {
+    if (!deinitRuntimeAfterHandlerDrain(&handler_threads, &handler_threads_drained, &runtime)) {
         // Stack-owned runtime state must remain alive while hung workers may still
         // reference it. Skip all stack unwinding and let process exit reclaim it.
         debug_log_mod.log("mcp.serve: handler shutdown deadline reached; exiting without runtime teardown", .{});
         std.process.exit(0);
     }
 
-    // Clean up debug sessions before exiting — kills adapter process groups
-    // to prevent orphaned debugpy/launcher/debuggee processes.
-    runtime.debug_server.deinit();
-
-    // Force-exit the process. On macOS the file-watcher thread can get
-    // stuck in CFRunLoop's mach_msg2_trap, making thread-join hang
-    // indefinitely and leaving an orphaned process.  Since the MCP server
-    // holds no resources that need flushing beyond what the OS reclaims on
-    // exit, an immediate _exit is the safest shutdown path.
+    // Force-exit after the full Runtime teardown. On macOS the file-watcher
+    // thread can get stuck in CFRunLoop's mach_msg2_trap, making a final
+    // process-level thread join hang indefinitely and leave an orphan.
     std.process.exit(0);
+}
+
+fn deinitRuntimeAfterHandlerDrain(handler_threads: *HandlerThreads, drained: *bool, runtime: anytype) bool {
+    return deinitRuntimeAfterHandlerDrainWithin(handler_threads, drained, runtime, handler_shutdown_grace_ns);
+}
+
+fn deinitRuntimeAfterHandlerDrainWithin(
+    handler_threads: *HandlerThreads,
+    drained: *bool,
+    runtime: anytype,
+    timeout_ns: u64,
+) bool {
+    debug_log_mod.log("mcp.serve: shutdown requested; stopping handler intake before runtime teardown", .{});
+    handler_threads.stopAccepting();
+    if (!drainHandlerThreadsWithin(handler_threads, drained, timeout_ns)) return false;
+
+    debug_log_mod.log("mcp.serve: deinitializing full runtime after handler drain", .{});
+    runtime.deinit();
+    debug_log_mod.log("mcp.serve: full runtime deinitialized", .{});
+    return true;
 }
 
 fn drainHandlerThreads(handler_threads: *HandlerThreads, drained: *bool) bool {
@@ -2645,6 +2658,113 @@ test "handler drain guard reports deadline without exiting test process" {
     handlers.cancel(reserved_slot);
     try std.testing.expect(drainHandlerThreadsWithin(&handlers, &drained, 10 * std.time.ns_per_ms));
     try std.testing.expect(drained);
+}
+
+test "MCP shutdown drains handlers before deinitializing the full runtime" {
+    const RuntimeProbe = struct {
+        debug_alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        observe_alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        owned_state_alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        deinit_called: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn deinit(self: *@This()) void {
+            self.debug_alive.store(false, .release);
+            self.observe_alive.store(false, .release);
+            self.owned_state_alive.store(false, .release);
+            self.deinit_called.store(true, .release);
+        }
+    };
+
+    var handlers = HandlerThreads.init(1);
+    const slot_index = handlers.begin().?;
+    var runtime: RuntimeProbe = .{};
+    var allow_finish = std.atomic.Value(bool).init(false);
+    var saw_full_runtime_alive = std.atomic.Value(bool).init(false);
+
+    const Handler = struct {
+        fn run(
+            handler_threads: *HandlerThreads,
+            slot: usize,
+            probe: *RuntimeProbe,
+            finish: *std.atomic.Value(bool),
+            saw_alive: *std.atomic.Value(bool),
+        ) void {
+            while (!finish.load(.acquire)) std.Thread.yield() catch {};
+            saw_alive.store(
+                probe.debug_alive.load(.acquire) and
+                    probe.observe_alive.load(.acquire) and
+                    probe.owned_state_alive.load(.acquire),
+                .release,
+            );
+            handler_threads.finish(slot);
+        }
+    };
+    handlers.track(slot_index, try std.Thread.spawn(.{}, Handler.run, .{
+        &handlers,
+        slot_index,
+        &runtime,
+        &allow_finish,
+        &saw_full_runtime_alive,
+    }));
+
+    var drained = false;
+    var shutdown_finished = std.atomic.Value(bool).init(false);
+    var shutdown_succeeded = std.atomic.Value(bool).init(false);
+    const Shutdown = struct {
+        fn run(
+            handler_threads: *HandlerThreads,
+            handlers_drained: *bool,
+            probe: *RuntimeProbe,
+            finished: *std.atomic.Value(bool),
+            succeeded: *std.atomic.Value(bool),
+        ) void {
+            succeeded.store(
+                deinitRuntimeAfterHandlerDrainWithin(handler_threads, handlers_drained, probe, 250 * std.time.ns_per_ms),
+                .release,
+            );
+            finished.store(true, .release);
+        }
+    };
+    const shutdown_thread = try std.Thread.spawn(.{}, Shutdown.run, .{
+        &handlers,
+        &drained,
+        &runtime,
+        &shutdown_finished,
+        &shutdown_succeeded,
+    });
+    defer {
+        allow_finish.store(true, .release);
+        shutdown_thread.join();
+    }
+
+    var timer = try std.time.Timer.start();
+    while (true) {
+        handlers.mutex.lock();
+        const accepting = handlers.accepting;
+        handlers.mutex.unlock();
+        if (!accepting) break;
+        if (timer.read() >= 250 * std.time.ns_per_ms) return error.TestTimeout;
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expect(runtime.debug_alive.load(.acquire));
+    try std.testing.expect(runtime.observe_alive.load(.acquire));
+    try std.testing.expect(runtime.owned_state_alive.load(.acquire));
+    try std.testing.expect(!shutdown_finished.load(.acquire));
+
+    allow_finish.store(true, .release);
+    timer.reset();
+    while (!shutdown_finished.load(.acquire)) {
+        if (timer.read() >= 250 * std.time.ns_per_ms) return error.TestTimeout;
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expect(shutdown_succeeded.load(.acquire));
+    try std.testing.expect(saw_full_runtime_alive.load(.acquire));
+    try std.testing.expect(runtime.deinit_called.load(.acquire));
+    try std.testing.expect(!runtime.debug_alive.load(.acquire));
+    try std.testing.expect(!runtime.observe_alive.load(.acquire));
+    try std.testing.expect(!runtime.owned_state_alive.load(.acquire));
 }
 
 test "dispatch write failures propagate to request handler" {
