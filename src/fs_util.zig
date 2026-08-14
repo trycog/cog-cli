@@ -21,12 +21,15 @@ pub fn writeFileAtomicMode(
 ) !void {
     const basename = std.fs.path.basename(sub_path);
     const parent_path = std.fs.path.dirname(sub_path);
+    // The parent handle is fsynced after the rename. Opening without `.iterate`
+    // yields a Linux `O_PATH` descriptor, which accepts `openat`/`renameat` but
+    // rejects `fsync` with `EBADF`, so the commit could never be made durable.
     var parent = if (parent_path) |path|
-        try dir.openDir(path, .{})
+        try dir.openDir(path, .{ .iterate = true })
     else if (builtin.os.tag == .windows)
         dir
     else
-        try dir.openDir(".", .{});
+        try dir.openDir(".", .{ .iterate = true });
     defer if (parent_path != null or builtin.os.tag != .windows) parent.close();
 
     const mode = existingFileMode(parent, basename) catch |err| switch (err) {
@@ -58,12 +61,38 @@ fn existingFileMode(parent: std.fs.Dir, basename: []const u8) !std.fs.File.Mode 
     return stat.mode;
 }
 
+/// `std.posix.fsync` treats `EBADF` as `unreachable`, which aborts the process
+/// when handed a path-only descriptor. Map the syscall errno directly so an
+/// unsyncable directory surfaces as a recoverable error instead of a panic.
+///
+/// Callers may hand in a Linux `O_PATH` handle (any `openDir` without
+/// `.iterate`). Such a descriptor rejects `fsync`, so retry once through
+/// `openat(fd, ".")`, which resolves via the descriptor itself and therefore
+/// cannot be redirected by a concurrent pathname swap.
 fn syncDirectory(dir: std.fs.Dir) !void {
     if (builtin.os.tag == .windows) return;
-    std.posix.fsync(dir.fd) catch |err| {
-        debug_log.log("fs_util.syncDirectory: failed to sync directory: {s}", .{@errorName(err)});
-        return err;
+    if (fsyncDescriptor(dir.fd)) return;
+
+    var syncable = dir.openDir(".", .{ .iterate = true }) catch |err| {
+        debug_log.log("fs_util.syncDirectory: no syncable directory handle: {s}", .{@errorName(err)});
+        return error.DirectorySyncFailed;
     };
+    defer syncable.close();
+    if (fsyncDescriptor(syncable.fd)) return;
+    return error.DirectorySyncFailed;
+}
+
+fn fsyncDescriptor(fd: std.posix.fd_t) bool {
+    while (true) {
+        switch (std.posix.errno(std.posix.system.fsync(fd))) {
+            .SUCCESS => return true,
+            .INTR => continue,
+            else => |err| {
+                debug_log.log("fs_util.syncDirectory: fsync failed: {s}", .{@tagName(err)});
+                return false;
+            },
+        }
+    }
 }
 
 /// Create a uniquely named, mode-restricted file in `dir`. The caller owns the
@@ -197,6 +226,25 @@ test "writeFileAtomic syncs files written through cwd" {
     const contents = try std.fs.cwd().readFileAlloc(allocator, "settings.json", 1024);
     defer allocator.free(contents);
     try std.testing.expectEqualStrings("{\"ok\":true}\n", contents);
+}
+
+test "writeFileAtomic opens fsync-capable parent handles" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("nested");
+
+    // Linux `O_PATH` directory handles accept `openat` and `renameat` but reject
+    // `fsync` with `EBADF`, so a durable atomic replace must open its parent with
+    // a real directory descriptor for both direct and nested destinations.
+    try writeFileAtomic(tmp.dir, allocator, "settings.json", "{}\n");
+    try writeFileAtomic(tmp.dir, allocator, "nested/settings.json", "{}\n");
+
+    var parent = try tmp.dir.openDir("nested", .{ .iterate = true });
+    defer parent.close();
+    try std.posix.fsync(parent.fd);
 }
 
 test "writeFileAtomic replaces complete contents" {
