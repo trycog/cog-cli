@@ -149,12 +149,7 @@ pub fn ensureSchema(db: *Db) !void {
         debug_log.log("memory_schema: schema created at version {d}", .{current_schema_version});
     }
 
-    try db.exec("BEGIN IMMEDIATE");
-    errdefer db.exec("ROLLBACK") catch {};
-    try ensureLifecycleColumns(db);
-    try db.exec("DROP TRIGGER IF EXISTS engrams_au");
-    try db.exec(triggers_ddl);
-    try commitSchemaMigration(db, Db.exec);
+    try retrySchemaMigration(db, runSchemaMigration);
 
     // Cleanup expired short-term memories
     db.exec(cleanup_short_term) catch |err| {
@@ -164,21 +159,46 @@ pub fn ensureSchema(db: *Db) !void {
     debug_log.log("memory_schema: ready", .{});
 }
 
-fn commitSchemaMigration(db: *Db, commit: anytype) sqlite.Error!void {
-    const max_attempts = 3;
+const schema_migration_max_attempts: usize = 3;
+const schema_migration_backoff_ms: u64 = 10;
+
+fn retrySchemaMigration(db: *Db, migrate: anytype) sqlite.Error!void {
     var attempt: usize = 1;
     while (true) : (attempt += 1) {
-        commit(db, "COMMIT") catch |err| switch (err) {
+        migrate(db) catch |err| switch (err) {
             error.SqliteBusy => {
-                if (attempt >= max_attempts) return err;
-                debug_log.log("memory_schema: commit busy; retrying attempt={d}", .{attempt + 1});
-                std.Thread.yield() catch {};
+                if (attempt >= schema_migration_max_attempts) {
+                    debug_log.log("memory_schema: migration busy; retries exhausted attempts={d}", .{attempt});
+                    return err;
+                }
+                const backoff_ms = schema_migration_backoff_ms * attempt;
+                debug_log.log("memory_schema: migration busy; restarting transaction attempt={d} backoff_ms={d}", .{ attempt + 1, backoff_ms });
+                std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
                 continue;
             },
             else => return err,
         };
         return;
     }
+}
+
+fn runSchemaMigration(db: *Db) sqlite.Error!void {
+    debug_log.log("memory_schema: beginning migration transaction", .{});
+    try db.exec("BEGIN IMMEDIATE");
+    var transaction_open = true;
+    errdefer if (transaction_open) {
+        debug_log.log("memory_schema: rolling back migration transaction", .{});
+        db.exec("ROLLBACK") catch |rollback_err| {
+            debug_log.log("memory_schema: migration rollback failed: {s}", .{@errorName(rollback_err)});
+        };
+    };
+
+    try ensureLifecycleColumns(db);
+    try db.exec("DROP TRIGGER IF EXISTS engrams_au");
+    try db.exec(triggers_ddl);
+    try db.exec("COMMIT");
+    transaction_open = false;
+    debug_log.log("memory_schema: migration transaction committed", .{});
 }
 
 fn ensureLifecycleColumns(db: *Db) !void {
