@@ -212,7 +212,15 @@ pub const DwarfEngine = struct {
 
     fn sectionData(self: *DwarfEngine, binary: binary_common.Binary, section: ?binary_common.SectionInfo) ?[]const u8 {
         const info = section orelse return null;
-        return (binary.getSectionDataAlloc(self.allocator, info) catch null) orelse binary.getSectionData(info);
+        // A failed getSectionDataAlloc means a compressed section could not be
+        // decompressed; the raw bytes are not the section contents and must
+        // never reach the DWARF parsers.
+        const allocated = binary.getSectionDataAlloc(self.allocator, info) catch |err| {
+            debug_log.log("dwarf.engine: section load failed: {s}; treating section as absent", .{@errorName(err)});
+            return null;
+        };
+        if (allocated) |data| return data;
+        return binary.getSectionData(info);
     }
 
     fn runtimeToDwarf(self: *const DwarfEngine, address: u64) u64 {
@@ -352,6 +360,17 @@ pub const DwarfEngine = struct {
                 return canonical_err;
             };
         };
+
+        // NT_FILE only requires page alignment, so a hostile core can carry a
+        // base whose bias does not fit i64; loadBias would trap on @intCast.
+        const bias_wide = @as(i128, runtime_base) - @as(i128, binary.preferred_base);
+        if (bias_wide > std.math.maxInt(i64) or bias_wide < std.math.minInt(i64)) {
+            debug_log.log(
+                "dwarf.engine: rejecting out-of-range core load bias runtime_base=0x{x} preferred_base=0x{x}",
+                .{ runtime_base, binary.preferred_base },
+            );
+            return error.InvalidExecutableMapping;
+        }
 
         self.address_translation.load_bias = binary.loadBias(runtime_base);
         debug_log.log(
@@ -5087,6 +5106,70 @@ test "DwarfEngine applies ELF core PIE translation from validated mappings" {
     try engine.resolveCoreAddressTranslation("/tmp/pie");
     try std.testing.expectEqual(@as(i64, 0x300000), engine.address_translation.load_bias);
     try std.testing.expectEqual(@as(u64, 0x701234), engine.dwarfToRuntime(0x401234));
+}
+
+test "sectionData refuses raw fallback when decompression fails" {
+    const Fixture = struct {
+        sections: binary_common.DebugSections = .{
+            .debug_info = .{ .offset = 0, .size = 4, .compression = .zdebug },
+        },
+
+        fn read(_: *anyopaque, _: binary_common.SectionInfo) ?[]const u8 {
+            return "ZLIB";
+        }
+
+        fn readAlloc(_: *anyopaque, _: std.mem.Allocator, _: binary_common.SectionInfo) anyerror!?[]const u8 {
+            return error.DecompressFailed;
+        }
+    };
+    var fixture: Fixture = .{};
+    const view = binary_common.Binary.init(
+        .elf,
+        @ptrCast(&fixture),
+        &fixture.sections,
+        0,
+        Fixture.read,
+        Fixture.readAlloc,
+    );
+
+    var engine = DwarfEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    // Compressed bytes must never reach DWARF parsers as if they were the
+    // section contents; a failed decompression means the section is absent.
+    try std.testing.expect(engine.sectionData(view, fixture.sections.debug_info) == null);
+}
+
+test "DwarfEngine rejects core runtime bases that overflow the load bias" {
+    const allocator = std.testing.allocator;
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+
+    const path = try allocator.dupe(u8, "/tmp/pie");
+    const mappings = try allocator.alloc(core_dump_mod.CoreDump.FileMapping, 1);
+    mappings[0] = .{
+        .start = 0xffff_ffff_ffff_e000,
+        .end = 0xffff_ffff_ffff_f000,
+        .file_offset = 0,
+        .pathname = path,
+    };
+    engine.core_dump = .{
+        .data = path,
+        .segments = &.{},
+        .registers = .{},
+        .allocator = allocator,
+        .format = .elf,
+        .file_mappings = mappings,
+    };
+    engine.binary = .{ .elf = .{
+        .data = &.{},
+        .owned = false,
+        .sections = .{},
+        .preferred_base = 0x400000,
+    } };
+
+    try std.testing.expectError(error.InvalidExecutableMapping, engine.resolveCoreAddressTranslation("/tmp/pie"));
+    try std.testing.expectEqual(@as(i64, 0), engine.address_translation.load_bias);
 }
 
 test "DwarfEngine gates ELF core translation without NT_FILE mappings" {
