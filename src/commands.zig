@@ -514,8 +514,13 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     var written_mcp_count: usize = 0;
 
     // Track specialist assets and the capabilities that were actually installed.
-    const max_specialist_assets = agents_mod.agents.len * std.meta.fields(agents_mod.SpecialistKind).len;
+    const max_specialist_assets = agents_mod.agents.len * (std.meta.fields(agents_mod.SpecialistKind).len + agents_mod.workflow_skills.len);
     var written_agents: [max_specialist_assets][]const u8 = undefined;
+    var owned_workflow_paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (owned_workflow_paths.items) |owned| allocator.free(owned);
+        owned_workflow_paths.deinit(allocator);
+    }
     var written_agents_count: usize = 0;
     var installed_specialists: [agents_mod.agents.len]agents_mod.SpecialistAvailability = @splat(.{});
 
@@ -611,9 +616,51 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
 
         // e. Workflow skills carry the procedures the kernel prompt points
-        // at; every host has a skills directory for them.
-        var workflow_skills_configured = false;
-        try runHostConfigStep("workflow skills", hooks_mod.configureWorkflowSkills(allocator, agent, setup_mem), &workflow_skills_configured);
+        // at. Hosts sharing a skills directory install each skill once, and
+        // overwriting a user-modified skill asks first, like specialists.
+        for (agents_mod.workflow_skills) |skill| {
+            if (skill.requires_memory and !setup_mem) continue;
+            const skill_path = try hooks_mod.workflowSkillPath(allocator, agent, skill);
+            var keep_path = false;
+            defer if (!keep_path) allocator.free(skill_path);
+
+            var path_seen = false;
+            for (written_agents[0..written_agents_count]) |written| {
+                if (std.mem.eql(u8, written, skill_path)) {
+                    path_seen = true;
+                    break;
+                }
+            }
+            if (path_seen) continue;
+
+            const content = try hooks_mod.buildMarkdownAgentContent(allocator, skill.header, hooks_mod.workflowSkillBody(skill));
+            defer allocator.free(content);
+            const retain = struct {
+                fn keep(list: *std.ArrayListUnmanaged([]u8), alloc: std.mem.Allocator, buffer: [][]const u8, count: *usize, path: []u8) void {
+                    list.append(alloc, path) catch {};
+                    appendUniquePath(buffer, count, path);
+                }
+            }.keep;
+            if (!shouldWriteFile(allocator, skill_path, content, &accept_all)) {
+                debug_log.log("commands.init: skipped workflow skill path={s}", .{skill_path});
+                printErr("    ");
+                printErr(dim ++ "  skipped " ++ reset);
+                printErr(skill_path);
+                printErr("\n");
+                keep_path = true;
+                retain(&owned_workflow_paths, allocator, &written_agents, &written_agents_count, skill_path);
+                continue;
+            }
+            var workflow_skill_configured = false;
+            try runHostConfigStep("workflow skill", hooks_mod.configureWorkflowSkill(allocator, agent, skill), &workflow_skill_configured);
+            keep_path = true;
+            retain(&owned_workflow_paths, allocator, &written_agents, &written_agents_count, skill_path);
+            printErr("    ");
+            tui.checkmark();
+            printErr(" ");
+            printErr(skill_path);
+            printErr("\n");
+        }
     }
 
     // A shared prompt target must be safe for every selected host that reads it.

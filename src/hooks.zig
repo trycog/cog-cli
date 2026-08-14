@@ -1883,21 +1883,28 @@ fn writeRuntimePolicyAsset(path: []const u8, content: []const u8) !void {
     try writeCwdFile(path, content);
 }
 
-/// Install the always-on workflow skills the kernel prompt points at.
-/// Bodies carry the detailed procedures that used to live in the prompt;
-/// hosts sharing a skills directory simply overwrite identical content.
-pub fn configureWorkflowSkills(allocator: std.mem.Allocator, agent: agents_mod.Agent, memory_enabled: bool) !void {
-    debug_log.log("hooks.configureWorkflowSkills: agent={s} memory={any}", .{ agent.id, memory_enabled });
-    for (agents_mod.workflow_skills) |skill| {
-        if (skill.requires_memory and !memory_enabled) continue;
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}/SKILL.md", .{ agent.skills_dir, skill.name });
-        defer allocator.free(path);
-        const body = if (std.mem.eql(u8, skill.name, "cog-explore"))
-            build_options.explore_skill_body
-        else
-            build_options.remember_skill_body;
-        try writeMarkdownAgent(allocator, path, skill.header, body);
-    }
+/// Project-relative path a workflow skill installs to for a host. Caller
+/// owns the returned copy.
+pub fn workflowSkillPath(allocator: std.mem.Allocator, agent: agents_mod.Agent, skill: agents_mod.WorkflowSkill) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}/SKILL.md", .{ agent.skills_dir, skill.name });
+}
+
+pub fn workflowSkillBody(skill: agents_mod.WorkflowSkill) []const u8 {
+    return if (std.mem.eql(u8, skill.name, "cog-explore"))
+        build_options.explore_skill_body
+    else
+        build_options.remember_skill_body;
+}
+
+/// Install one workflow skill for a host. The kernel prompt points at these
+/// skills; bodies carry the detailed procedures that used to live in the
+/// prompt. Consent for overwriting user-modified files lives with the init
+/// caller, matching the specialist flow.
+pub fn configureWorkflowSkill(allocator: std.mem.Allocator, agent: agents_mod.Agent, skill: agents_mod.WorkflowSkill) !void {
+    debug_log.log("hooks.configureWorkflowSkill: agent={s} skill={s}", .{ agent.id, skill.name });
+    const path = try workflowSkillPath(allocator, agent, skill);
+    defer allocator.free(path);
+    try writeMarkdownAgent(allocator, path, skill.header, workflowSkillBody(skill));
 }
 
 fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8, body: []const u8) !void {
@@ -3449,6 +3456,69 @@ test "writeRooAgent assigns mode-specific groups" {
             try std.testing.expectEqual(@as(usize, 3), observe_groups.array.items.len);
             try std.testing.expectEqualStrings("command", observe_groups.array.items[1].string);
             try std.testing.expect(std.mem.indexOf(u8, observe_mode.object.get("customInstructions").?.string, "system observability") != null);
+        }
+    }.run);
+}
+
+test "public workflow skills mirror the embedded bodies" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { path: []const u8, body: []const u8, name: []const u8 }{
+        .{ .path = "skills/cog-explore/SKILL.md", .body = build_options.explore_skill_body, .name = "cog-explore" },
+        .{ .path = "skills/cog-remember/SKILL.md", .body = build_options.remember_skill_body, .name = "cog-remember" },
+    };
+    for (cases) |case| {
+        const source = std.fs.cwd().readFileAlloc(allocator, case.path, 256 * 1024) catch
+            return error.TestUnexpectedResult;
+        defer allocator.free(source);
+        // Public copies must never drift from what cog init installs, and
+        // must stay discoverable — never marked internal.
+        try std.testing.expect(std.mem.endsWith(u8, source, case.body));
+        const name_line = try std.fmt.allocPrint(allocator, "name: {s}\n", .{case.name});
+        defer allocator.free(name_line);
+        try std.testing.expect(std.mem.indexOf(u8, source, name_line) != null);
+        try std.testing.expect(std.mem.indexOf(u8, source, "internal:") == null);
+    }
+}
+
+test "skill and specialist bodies respect the spec size guidance" {
+    const bodies = [_][]const u8{
+        build_options.explore_skill_body,
+        build_options.remember_skill_body,
+        build_options.agent_body,
+        build_options.debug_agent_body,
+        build_options.mem_agent_body,
+        build_options.validate_agent_body,
+        build_options.observe_agent_body,
+    };
+    for (bodies) |body| {
+        const line_count = std.mem.count(u8, body, "\n");
+        try std.testing.expect(line_count < 500);
+    }
+}
+
+test "configureWorkflowSkill writes stamped spec-compliant files" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const claude = agents_mod.agents[0];
+            for (agents_mod.workflow_skills) |skill| {
+                try configureWorkflowSkill(allocator, claude, skill);
+            }
+
+            const explore = (try readCwdFile(allocator, ".claude/skills/cog-explore/SKILL.md")) orelse
+                return error.TestUnexpectedResult;
+            defer allocator.free(explore);
+            try std.testing.expect(std.mem.indexOf(u8, explore, "name: cog-explore") != null);
+            try std.testing.expect(std.mem.indexOf(u8, explore, "Budget: 2-3 code-intelligence calls") != null);
+            // The version token must be substituted, never written literally.
+            try std.testing.expect(std.mem.indexOf(u8, explore, agents_mod.cog_version_token) == null);
+            const stamp = try std.fmt.allocPrint(allocator, "cog-version: \"{s}\"", .{build_options.version});
+            defer allocator.free(stamp);
+            try std.testing.expect(std.mem.indexOf(u8, explore, stamp) != null);
+
+            const remember = (try readCwdFile(allocator, ".claude/skills/cog-remember/SKILL.md")) orelse
+                return error.TestUnexpectedResult;
+            defer allocator.free(remember);
+            try std.testing.expect(std.mem.indexOf(u8, remember, "IF-THEN rules") != null);
         }
     }.run);
 }

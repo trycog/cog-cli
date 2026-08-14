@@ -347,6 +347,20 @@ fn runScratchInit(gpa: std.mem.Allocator, scratch_base: []const u8, cog_path: []
     }
     const expected = expected_buf[0..expected_count];
 
+    // Workflow skills install into the host's skills directory; the scratch
+    // run configures local memory, so both skills must exist and be stamped.
+    for (agents_mod.workflow_skills) |skill| {
+        const skill_path = std.fmt.allocPrint(arena, "{s}/{s}/SKILL.md", .{ agent.skills_dir, skill.name }) catch unreachable;
+        const skill_content = project_dir.readFileAlloc(arena, skill_path, 4 * 1024 * 1024) catch {
+            fail("init[{s}]: workflow skill {s} is missing\n", .{ agent.id, skill_path });
+        };
+        const name_line = std.fmt.allocPrint(arena, "name: {s}", .{skill.name}) catch unreachable;
+        expectContains(agent.id, skill_path, skill_content, name_line);
+        if (std.mem.indexOf(u8, skill_content, "{{COG_VERSION}}") != null) {
+            fail("init[{s}]: workflow skill {s} carries an unstamped version token\n", .{ agent.id, skill_path });
+        }
+    }
+
     // The prompt target keeps user content and gains the managed block.
     const prompt_content = project_dir.readFileAlloc(arena, prompt_file, 4 * 1024 * 1024) catch {
         fail("init[{s}]: prompt file {s} is missing\n", .{ agent.id, prompt_file });
