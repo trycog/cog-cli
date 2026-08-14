@@ -26,15 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CLI help, README, extension authoring guidance, and the agent support matrix now match the registered command surface, tool names, observe gating, debugger architecture, credential boundary, and extension trust model.
 - MCP tool advertisement and dispatch now share exact capability gates for debug tiers, observe opt-in, local memory, and dynamically discovered hosted-memory tools.
 - Standard input, output, and error handling now uses streaming writers so redirected output is appended correctly instead of depending on seekable files.
+- CLI state-isolation and MCP startup-privacy regressions now run as part of the default unit and CI gate.
 
 ### Removed
 
 - Stale CLI help and unreferenced compatibility helpers for removed code file-operation commands and `debug:send`.
+- The unused hybrid stack-merging module, which had no production caller.
 - Raw MCP traffic logging that could persist request payloads outside Cog's normal debug-log boundary.
 
 ### Fixed
 
-- Local memory now honors association weights and recall limits, ranks full-text matches deterministically, preserves intra-batch associations transactionally, retries complete schema migrations under contention, and filters expired or deprecated memories from recall.
+- Local memory now honors association weights and recall limits, ranks direct term matches ahead of body-only matches before applying bounded memory weight, preserves intra-batch associations transactionally, records lifecycle metadata as schema version 2, retries complete migrations under contention, and filters expired or deprecated memories from recall.
 - Code intelligence now resolves cross-document calls and imports independent of document order, attaches nested calls to the innermost definition, preserves same-name symbol kinds, and captures broader Java, JavaScript, C, and C++ relationships.
 - Incremental reindexing now keeps merged SCIP storage alive through encoding, maps external-indexer output onto every logical alias, preserves dependency documents, and splits oversized watcher batches instead of dropping paths.
 - MCP framing and handler shutdown are bounded, malformed or oversized messages resynchronize safely, remote tools retain required runtime synchronization, and unknown prefixed tool names no longer reach broader family dispatchers.
@@ -47,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - `COG_API_KEY` is sent automatically only to exact `https://trycog.ai:443`; every other credential destination must be an explicitly approved HTTPS origin, authenticated redirects remain disabled, and Windows approval persistence fails closed when safe path traversal is unavailable.
-- Debug sockets, PID files, entitlements, DAP diagnostics, and temporary outputs now live in verified user-owned private runtime paths with restrictive modes, symlink rejection, peer/process identity checks, and no Cog-owned shared `/tmp` state.
+- Debug sockets, PID files, entitlements, DAP diagnostics, and temporary outputs now live in verified user-owned private runtime paths with restrictive modes, symlink rejection, peer/process identity checks, safe stale-socket teardown, and no Cog-owned shared `/tmp` state; retired shared debug paths are detected but never trusted or removed.
 - MCP frames, handler concurrency, observe queries, DAP queues, HTTP responses, redirects, downloads, subprocess lifetimes, and SQLite contention now have explicit bounds and failure behavior.
 - Built-in grammar sources are pinned to immutable revisions with verified hashes, external index output uses private pre-created files, and archive extraction rejects traversal, links, and ambiguous release assets.
 
