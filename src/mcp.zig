@@ -35,6 +35,29 @@ const RemoteTool = struct {
     input_schema: []const u8, // raw JSON string
 };
 
+const StaticToolDef = struct {
+    name: []const u8,
+    description: []const u8,
+    input_schema: []const u8,
+};
+
+const code_tool_definitions = [_]StaticToolDef{
+    .{
+        .name = "code_query",
+        .description = "Targeted code index query tool. ALWAYS use the 'queries' array to batch multiple queries into a single call — do NOT make sequential code_query calls when they can be combined. Modes: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', 'overview'. Flat parameters (mode, name, file, etc.) are only for genuinely single queries.",
+        .input_schema =
+        \\{"type":"object","properties":{"queries":{"type":"array","description":"REQUIRED for multiple queries. Each entry specifies its own mode, name, file, kind, direction, and scope. Always combine sequential code_query calls into one batched call using this array.","items":{"type":"object","properties":{"mode":{"type":"string","description":"Query mode: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'"},"name":{"type":"string","description":"Symbol name (supports glob: '*', '?', '|')"},"file":{"type":"string","description":"File path for file-scoped queries"},"kind":{"type":"string","description":"Filter by symbol kind"},"direction":{"type":"string","description":"'incoming', 'outgoing', or 'both'"},"scope":{"type":"string","description":"Overview scope: 'symbol', 'file', or 'repo'"}},"required":["mode"]}},"mode":{"type":"string","description":"Query mode (single-query only — use 'queries' array for multiple): 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'"},"name":{"type":"string","description":"Symbol name (supports glob: '*', '?', '|')"},"file":{"type":"string","description":"File path for file-scoped queries"},"kind":{"type":"string","description":"Filter by symbol kind"},"direction":{"type":"string","description":"'incoming', 'outgoing', or 'both'"},"scope":{"type":"string","description":"Overview scope: 'symbol', 'file', or 'repo'"}}}
+        ,
+    },
+    .{
+        .name = "code_explore",
+        .description = "Primary code exploration tool. ALWAYS put all candidate symbols into the 'queries' array in a single call — do NOT make sequential code_explore calls when they can be combined. Returns readable plain-text summaries with definition bodies, per-file outlines, and optional architecture sections such as imports, containment, and overview data.",
+        .input_schema =
+        \\{"type":"object","properties":{"queries":{"type":"array","description":"REQUIRED. All symbol lookups MUST go into this single array. Do not split symbols across multiple code_explore calls.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"},"include_relationships":{"type":"boolean","description":"Include symbol-level relationship summaries such as containment and imports when available"},"include_architecture":{"type":"boolean","description":"Include architecture-oriented summaries. Recommended for repository overview tasks."},"overview_scope":{"type":"string","description":"Architecture summary scope: 'symbol', 'file', or 'repo'"}},"required":["queries"]}
+        ,
+    },
+};
+
 const ToolTier = debug_server_mod.ToolTier;
 
 const MAX_HANDLER_CONCURRENCY: usize = 8;
@@ -1252,6 +1275,7 @@ fn handleToolsCall(runtime: *Runtime, reply: *ReplyOnce, params: ?json.Value) !v
             error.NotConfigured => "Memory not configured. Proceed without memory for now. The user can run 'cog init' to enable it.",
             error.IndexUnavailable => "Code index unavailable. Run 'cog code:index' in a terminal to build it, or use Read and Glob for file-based exploration.",
             error.ObserveDisabled => settings_mod.OBSERVE_DISABLED_MESSAGE,
+            error.ToolUnavailable => "Unknown or unavailable tool. Refresh tools/list and call only an advertised capability.",
             error.Explained => "Operation failed. Try once more or use an alternative approach.",
             else => "Internal error. Try the operation once more. If it fails again, use an alternative approach.",
         };
@@ -1513,32 +1537,24 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     // guides the agent to only use 5 direct memory tools; everything else
     // is accessed through sub-agents (code, debug, memory).
 
-    try writeToolDefWithSchemaJson(allocator, s, "code_query", "Targeted code index query tool. ALWAYS use the 'queries' array to batch multiple queries into a single call — do NOT make sequential code_query calls when they can be combined. Modes: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', 'overview'. Flat parameters (mode, name, file, etc.) are only for genuinely single queries.",
-        \\{"type":"object","properties":{"queries":{"type":"array","description":"REQUIRED for multiple queries. Each entry specifies its own mode, name, file, kind, direction, and scope. Always combine sequential code_query calls into one batched call using this array.","items":{"type":"object","properties":{"mode":{"type":"string","description":"Query mode: 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'"},"name":{"type":"string","description":"Symbol name (supports glob: '*', '?', '|')"},"file":{"type":"string","description":"File path for file-scoped queries"},"kind":{"type":"string","description":"Filter by symbol kind"},"direction":{"type":"string","description":"'incoming', 'outgoing', or 'both'"},"scope":{"type":"string","description":"Overview scope: 'symbol', 'file', or 'repo'"}},"required":["mode"]}},"mode":{"type":"string","description":"Query mode (single-query only — use 'queries' array for multiple): 'find', 'refs', 'symbols', 'imports', 'contains', 'calls', 'callers', or 'overview'"},"name":{"type":"string","description":"Symbol name (supports glob: '*', '?', '|')"},"file":{"type":"string","description":"File path for file-scoped queries"},"kind":{"type":"string","description":"Filter by symbol kind"},"direction":{"type":"string","description":"'incoming', 'outgoing', or 'both'"},"scope":{"type":"string","description":"Overview scope: 'symbol', 'file', or 'repo'"}}}
-    );
+    for (code_tool_definitions) |tool| {
+        try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+    }
 
-    try writeToolDefWithSchemaJson(allocator, s, "code_explore", "Primary code exploration tool. ALWAYS put all candidate symbols into the 'queries' array in a single call — do NOT make sequential code_explore calls when they can be combined. Returns readable plain-text summaries with definition bodies, per-file outlines, and optional architecture sections such as imports, containment, and overview data.",
-        \\{"type":"object","properties":{"queries":{"type":"array","description":"REQUIRED. All symbol lookups MUST go into this single array. Do not split symbols across multiple code_explore calls.","items":{"type":"object","properties":{"name":{"type":"string","description":"Symbol name (supports glob: '*init*', 'get*')"},"kind":{"type":"string","description":"Filter by symbol kind (function, struct, method, variable, etc.)"}},"required":["name"]}},"context_lines":{"type":"number","description":"Fallback context lines for simple definitions without braces (default: 15)"},"include_relationships":{"type":"boolean","description":"Include symbol-level relationship summaries such as containment and imports when available"},"include_architecture":{"type":"boolean","description":"Include architecture-oriented summaries. Recommended for repository overview tasks."},"overview_scope":{"type":"string","description":"Architecture summary scope: 'symbol', 'file', or 'repo'"}},"required":["queries"]}
-    );
-
-    // Memory tools: local definitions or remote discovery
-    if (runtime.hasMemory()) {
-        if (runtime.isLocalBrain()) {
-            // Emit hardcoded local tool definitions
-            for (memory_mod.tool_definitions) |tool| {
+    // Memory tools: local definitions or dynamically discovered hosted capabilities.
+    if (runtime.isLocalBrain()) {
+        for (memory_mod.tool_definitions) |tool| {
+            try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
+        }
+    } else if (runtime.brain_type == .remote) {
+        if (runtime.remote_tools == null) {
+            discoverRemoteTools(runtime) catch |err| {
+                debug_log_mod.log("Remote tool discovery failed: {s}", .{@errorName(err)});
+            };
+        }
+        if (runtime.remote_tools) |tools| {
+            for (tools) |tool| {
                 try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
-            }
-        } else {
-            // Lazily discover remote memory tools on first tools/list
-            if (runtime.remote_tools == null) {
-                discoverRemoteTools(runtime) catch |err| {
-                    debug_log_mod.log("Remote tool discovery failed: {s}", .{@errorName(err)});
-                };
-            }
-            if (runtime.remote_tools) |tools| {
-                for (tools) |tool| {
-                    try writeToolDefWithSchemaJson(allocator, s, tool.name, tool.description, tool.input_schema);
-                }
             }
         }
     }
@@ -1562,6 +1578,43 @@ fn writeToolCatalog(runtime: *Runtime, allocator: std.mem.Allocator, s: *Stringi
     }
 }
 
+fn findToolByName(comptime definitions: anytype, tool_name: []const u8) ?@TypeOf(definitions[0]) {
+    for (definitions) |tool| {
+        if (std.mem.eql(u8, tool.name, tool_name)) return tool;
+    }
+    return null;
+}
+
+fn findRemoteTool(runtime: *const Runtime, tool_name: []const u8) ?*const RemoteTool {
+    const tools = runtime.remote_tools orelse return null;
+    for (tools) |*tool| {
+        if (std.mem.eql(u8, tool.name, tool_name)) return tool;
+    }
+    return null;
+}
+
+fn isDebugToolAvailable(runtime: *const Runtime, tool_name: []const u8) bool {
+    const tool = findToolByName(debug_server_mod.tool_definitions, tool_name) orelse return false;
+    return tool.tier.isWithin(runtime.debug_tool_tier);
+}
+
+fn isObserveToolName(tool_name: []const u8) bool {
+    return findToolByName(observe_server_mod.tool_definitions, tool_name) != null;
+}
+
+fn isObserveToolAvailable(runtime: *const Runtime, tool_name: []const u8) bool {
+    return runtime.observe_enabled and runtime.observe_server != null and isObserveToolName(tool_name);
+}
+
+fn isRuntimeToolAvailable(runtime: *const Runtime, tool_name: []const u8) bool {
+    if (findToolByName(code_tool_definitions, tool_name) != null) return true;
+    if (isDebugToolAvailable(runtime, tool_name)) return true;
+    if (isObserveToolAvailable(runtime, tool_name)) return true;
+    if (runtime.isLocalBrain()) return memory_mod.isLocalToolName(tool_name);
+    if (runtime.brain_type == .remote) return findRemoteTool(runtime, tool_name) != null;
+    return false;
+}
+
 fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {
     // All non-debug tool paths access shared Runtime state.
     debug_log_mod.log("runtimeCallTool: acquiring mutex for {s}", .{tool_name});
@@ -1572,10 +1625,23 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
         debug_log_mod.log("runtimeCallTool: mutex released for {s}", .{tool_name});
     }
 
+    if (runtime.brain_type == .remote and std.mem.startsWith(u8, tool_name, "mem_") and runtime.remote_tools == null) {
+        debug_log_mod.log("runtimeCallTool: discovering hosted memory tools before eligibility check", .{});
+        try discoverRemoteTools(runtime);
+    }
+    if (isObserveToolName(tool_name) and (!runtime.observe_enabled or runtime.observe_server == null)) {
+        debug_log_mod.log("runtimeCallTool: rejecting disabled observe tool {s}", .{tool_name});
+        return error.ObserveDisabled;
+    }
+    if (!isRuntimeToolAvailable(runtime, tool_name)) {
+        debug_log_mod.log("runtimeCallTool: rejecting unavailable tool {s}", .{tool_name});
+        return error.ToolUnavailable;
+    }
+
     var session_ctx = try runtime.ensureSessionContext();
 
     // Debug tools have their own mutex (DebugServer.mutex) — record context first.
-    if (std.mem.startsWith(u8, tool_name, "debug_")) {
+    if (isDebugToolAvailable(runtime, tool_name)) {
         const result = try callDebugTool(runtime, tool_name, arguments);
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
         return result;
@@ -1601,39 +1667,26 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
     }
 
     // Observe tools — delegate to ObserveServer (has its own mutex).
-    if (std.mem.startsWith(u8, tool_name, "observe_")) {
-        if (!runtime.observe_enabled or runtime.observe_server == null) {
-            debug_log_mod.log("runtimeCallTool: rejecting disabled observe tool {s}", .{tool_name});
-            return error.ObserveDisabled;
-        }
+    if (isObserveToolAvailable(runtime, tool_name)) {
         const result = try callObserveTool(runtime, tool_name, arguments);
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
         return result;
     }
 
     // Memory tools — local SQLite or remote MCP server
-    if (std.mem.startsWith(u8, tool_name, "mem_")) {
-        if (runtime.isLocalBrain()) {
-            const mem_db = runtime.ensureMemoryDb() catch {
-                return runtime.allocator.dupe(u8, "Error: failed to open local memory database.");
-            };
-            const result = try memory_mod.callLocalTool(mem_db, tool_name, arguments);
-            try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-            return result;
-        } else {
-            // Ensure remote tools are discovered while holding the mutex
-            // (first-call safety: prevents two threads from racing on
-            // discoverRemoteTools).
-            if (runtime.remote_tools == null) {
-                try discoverRemoteTools(runtime);
-                session_ctx = try runtime.ensureSessionContext();
-            }
-
-            const result = try callRemoteHostedTool(runtime, session_ctx, tool_name, arguments);
-            session_ctx = try runtime.ensureSessionContext();
-            try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-            return result;
-        }
+    if (runtime.isLocalBrain() and memory_mod.isLocalToolName(tool_name)) {
+        const mem_db = runtime.ensureMemoryDb() catch {
+            return runtime.allocator.dupe(u8, "Error: failed to open local memory database.");
+        };
+        const result = try memory_mod.callLocalTool(mem_db, tool_name, arguments);
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
+    }
+    if (runtime.brain_type == .remote and findRemoteTool(runtime, tool_name) != null) {
+        const result = try callRemoteHostedTool(runtime, session_ctx, tool_name, arguments);
+        session_ctx = try runtime.ensureSessionContext();
+        try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
+        return result;
     }
 
     return error.Explained;
@@ -2988,28 +3041,270 @@ fn testSessionContext(allocator: std.mem.Allocator, session_id: []const u8) !ses
     );
 }
 
-fn testRuntime(allocator: std.mem.Allocator) !Runtime {
-    return .{
+const TestBrain = enum { none, local, remote };
+
+const TestRuntimeOptions = struct {
+    brain: TestBrain = .none,
+    observe_enabled: bool = true,
+    debug_tool_tier: ToolTier = .specialist,
+    remote_tools: []const RemoteTool = &.{},
+};
+
+fn testRuntimeWithOptions(allocator: std.mem.Allocator, options: TestRuntimeOptions) !Runtime {
+    const brain_type: config_mod.BrainType = switch (options.brain) {
+        .none => .none,
+        .local => blk: {
+            const path = try allocator.dupe(u8, "/tmp/cog-test-brain.db");
+            errdefer allocator.free(path);
+            break :blk .{ .local = .{
+                .path = path,
+                .brain_id = try allocator.dupe(u8, "test-brain"),
+            } };
+        },
+        .remote => blk: {
+            const api_key = try allocator.dupe(u8, "test-key");
+            errdefer allocator.free(api_key);
+            const url = try allocator.dupe(u8, "https://example.invalid/api/v1/test/brain");
+            errdefer allocator.free(url);
+            break :blk .{ .remote = .{
+                .api_key = api_key,
+                .url = url,
+                .brain_url = try allocator.dupe(u8, "https://example.invalid/test/brain"),
+            } };
+        },
+    };
+    errdefer brain_type.deinit(allocator);
+
+    var runtime: Runtime = .{
         .allocator = allocator,
-        .mem_config = null,
-        .brain_type = .none,
+        .mem_config = switch (brain_type) {
+            .remote => |config| config,
+            else => null,
+        },
+        .brain_type = brain_type,
         .mem_db = null,
         .debug_server = DebugServer.init(allocator),
-        .observe_enabled = true,
-        .observe_server = try ObserveServer.init(allocator),
+        .observe_enabled = options.observe_enabled,
+        .observe_server = null,
         .code_cache = null,
         .remote_tools = null,
         .mcp_session_id = null,
         .watcher = null,
-        .debug_tool_tier = .specialist,
+        .debug_tool_tier = options.debug_tool_tier,
         .mutex = .{},
     };
+    errdefer runtime.deinit();
+    if (options.observe_enabled) runtime.observe_server = try ObserveServer.init(allocator);
+
+    if (options.brain == .remote) {
+        const tools = try allocator.alloc(RemoteTool, options.remote_tools.len);
+        runtime.remote_tools = tools;
+        var initialized: usize = 0;
+        errdefer {
+            for (tools[0..initialized]) |tool| {
+                allocator.free(tool.name);
+                allocator.free(tool.remote_name);
+                allocator.free(tool.description);
+                allocator.free(tool.input_schema);
+            }
+            allocator.free(tools);
+            runtime.remote_tools = null;
+        }
+        for (options.remote_tools, 0..) |tool, i| {
+            const name = try allocator.dupe(u8, tool.name);
+            errdefer allocator.free(name);
+            const remote_name = try allocator.dupe(u8, tool.remote_name);
+            errdefer allocator.free(remote_name);
+            const description = try allocator.dupe(u8, tool.description);
+            errdefer allocator.free(description);
+            tools[i] = .{
+                .name = name,
+                .remote_name = remote_name,
+                .description = description,
+                .input_schema = try allocator.dupe(u8, tool.input_schema),
+            };
+            initialized += 1;
+        }
+    }
+
+    return runtime;
+}
+
+fn testRuntime(allocator: std.mem.Allocator) !Runtime {
+    return testRuntimeWithOptions(allocator, .{});
+}
+
+fn catalogContains(tools: json.Array, name: []const u8) bool {
+    for (tools.items) |tool| {
+        if (tool != .object) continue;
+        const name_value = tool.object.get("name") orelse continue;
+        if (name_value == .string and std.mem.eql(u8, name_value.string, name)) return true;
+    }
+    return false;
+}
+
+fn countCatalogTools(tools: json.Array, prefix: []const u8) usize {
+    var count: usize = 0;
+    for (tools.items) |tool| {
+        if (tool != .object) continue;
+        const name_value = tool.object.get("name") orelse continue;
+        if (name_value == .string and std.mem.startsWith(u8, name_value.string, prefix)) count += 1;
+    }
+    return count;
+}
+
+fn expectedCatalogToolCount(runtime: *const Runtime) usize {
+    var count: usize = code_tool_definitions.len;
+    if (runtime.isLocalBrain()) {
+        count += memory_mod.tool_definitions.len;
+    } else if (runtime.brain_type == .remote) {
+        count += if (runtime.remote_tools) |tools| tools.len else 0;
+    }
+    for (debug_server_mod.tool_definitions) |tool| {
+        if (tool.tier.isWithin(runtime.debug_tool_tier)) count += 1;
+    }
+    if (runtime.observe_enabled) count += observe_server_mod.tool_definitions.len;
+    return count;
+}
+
+fn expectCatalogMatchesDispatchEligibility(runtime: *Runtime) !void {
+    const catalog = try buildToolCatalogResourceJson(runtime);
+    defer std.testing.allocator.free(catalog);
+    const parsed = try json.parseFromSlice(json.Value, std.testing.allocator, catalog, .{});
+    defer parsed.deinit();
+
+    const tools_value = parsed.value.object.get("tools") orelse return error.TestUnexpectedResult;
+    if (tools_value != .array) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expectedCatalogToolCount(runtime), tools_value.array.items.len);
+
+    for (tools_value.array.items, 0..) |tool, i| {
+        if (tool != .object) return error.TestUnexpectedResult;
+        const name_value = tool.object.get("name") orelse return error.TestUnexpectedResult;
+        if (name_value != .string) return error.TestUnexpectedResult;
+        try std.testing.expect(isRuntimeToolAvailable(runtime, name_value.string));
+        for (tools_value.array.items[0..i]) |earlier| {
+            const earlier_name = earlier.object.get("name") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(!std.mem.eql(u8, earlier_name.string, name_value.string));
+        }
+    }
+
+    for (code_tool_definitions) |tool| try std.testing.expect(catalogContains(tools_value.array, tool.name));
+    try std.testing.expectEqual(code_tool_definitions.len, countCatalogTools(tools_value.array, "code_"));
+
+    var expected_debug_count: usize = 0;
+    for (debug_server_mod.tool_definitions) |tool| {
+        const expected = tool.tier.isWithin(runtime.debug_tool_tier);
+        if (expected) expected_debug_count += 1;
+        try std.testing.expectEqual(expected, catalogContains(tools_value.array, tool.name));
+    }
+    try std.testing.expectEqual(expected_debug_count, countCatalogTools(tools_value.array, "debug_"));
+
+    for (observe_server_mod.tool_definitions) |tool| {
+        try std.testing.expectEqual(runtime.observe_enabled, catalogContains(tools_value.array, tool.name));
+    }
+    try std.testing.expectEqual(if (runtime.observe_enabled) observe_server_mod.tool_definitions.len else 0, countCatalogTools(tools_value.array, "observe_"));
+
+    for (memory_mod.tool_definitions) |tool| {
+        try std.testing.expectEqual(runtime.isLocalBrain(), catalogContains(tools_value.array, tool.name));
+    }
+    if (runtime.remote_tools) |remote_tools| {
+        for (remote_tools) |tool| try std.testing.expect(catalogContains(tools_value.array, tool.name));
+    }
+    const expected_memory_count = if (runtime.isLocalBrain())
+        memory_mod.tool_definitions.len
+    else if (runtime.remote_tools) |remote_tools|
+        remote_tools.len
+    else
+        0;
+    try std.testing.expectEqual(expected_memory_count, countCatalogTools(tools_value.array, "mem_"));
+}
+
+test "MCP catalog and dispatch eligibility agree across capability gates" {
+    const remote_tools = [_]RemoteTool{
+        .{
+            .name = "mem_remote_only",
+            .remote_name = "cog_remote_only",
+            .description = "Remote-only test capability",
+            .input_schema = "{\"type\":\"object\",\"properties\":{}}",
+        },
+    };
+    const cases = [_]TestRuntimeOptions{
+        .{ .observe_enabled = false, .debug_tool_tier = .core },
+        .{ .brain = .local, .observe_enabled = true, .debug_tool_tier = .extended },
+        .{ .brain = .remote, .observe_enabled = false, .debug_tool_tier = .specialist, .remote_tools = &remote_tools },
+    };
+
+    for (cases) |options| {
+        var runtime = try testRuntimeWithOptions(std.testing.allocator, options);
+        defer runtime.deinit();
+        try expectCatalogMatchesDispatchEligibility(&runtime);
+    }
+}
+
+test "MCP dispatch rejects unknown names that share tool prefixes" {
+    var runtime = try testRuntimeWithOptions(std.testing.allocator, .{
+        .brain = .local,
+        .observe_enabled = true,
+        .debug_tool_tier = .core,
+    });
+    defer runtime.deinit();
+
+    const unknown_names = [_][]const u8{
+        "debug_not_a_tool",
+        "observe_not_a_tool",
+        "mem_not_a_tool",
+        "code_not_a_tool",
+    };
+    for (unknown_names) |name| {
+        try std.testing.expect(!isRuntimeToolAvailable(&runtime, name));
+        try std.testing.expectError(error.ToolUnavailable, runtimeCallTool(&runtime, name, null));
+    }
+}
+
+test "MCP debug dispatch respects configured tool tier" {
+    var runtime = try testRuntimeWithOptions(std.testing.allocator, .{
+        .observe_enabled = false,
+        .debug_tool_tier = .core,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expect(isRuntimeToolAvailable(&runtime, "debug_launch"));
+    try std.testing.expect(!isRuntimeToolAvailable(&runtime, "debug_threads"));
+    try std.testing.expect(!isRuntimeToolAvailable(&runtime, "debug_registers"));
+    try std.testing.expectError(error.ToolUnavailable, runtimeCallTool(&runtime, "debug_threads", null));
+    try std.testing.expectError(error.ToolUnavailable, runtimeCallTool(&runtime, "debug_registers", null));
+}
+
+test "MCP memory dispatch separates local and hosted capabilities" {
+    const remote_tools = [_]RemoteTool{
+        .{
+            .name = "mem_remote_only",
+            .remote_name = "cog_remote_only",
+            .description = "Remote-only test capability",
+            .input_schema = "{\"type\":\"object\",\"properties\":{}}",
+        },
+    };
+
+    var local = try testRuntimeWithOptions(std.testing.allocator, .{ .brain = .local, .observe_enabled = false });
+    defer local.deinit();
+    try std.testing.expect(isRuntimeToolAvailable(&local, "mem_recall"));
+    try std.testing.expect(!isRuntimeToolAvailable(&local, "mem_remote_only"));
+
+    var hosted = try testRuntimeWithOptions(std.testing.allocator, .{
+        .brain = .remote,
+        .observe_enabled = false,
+        .remote_tools = &remote_tools,
+    });
+    defer hosted.deinit();
+    try std.testing.expect(!isRuntimeToolAvailable(&hosted, "mem_recall"));
+    try std.testing.expect(isRuntimeToolAvailable(&hosted, "mem_remote_only"));
+    try std.testing.expect(!isRuntimeToolAvailable(&hosted, "mem_not_discovered"));
+    try std.testing.expectError(error.ToolUnavailable, runtimeCallTool(&hosted, "mem_not_discovered", null));
 }
 
 test "tool catalog omits observe tools when observe is disabled" {
-    var runtime = try testRuntime(std.testing.allocator);
+    var runtime = try testRuntimeWithOptions(std.testing.allocator, .{ .observe_enabled = false });
     defer runtime.deinit();
-    runtime.observe_enabled = false;
 
     const catalog = try buildToolCatalogResourceJson(&runtime);
     defer std.testing.allocator.free(catalog);
@@ -3019,19 +3314,18 @@ test "tool catalog omits observe tools when observe is disabled" {
 test "tool catalog includes observe tools when observe is enabled" {
     var runtime = try testRuntime(std.testing.allocator);
     defer runtime.deinit();
-    runtime.observe_enabled = true;
 
     const catalog = try buildToolCatalogResourceJson(&runtime);
     defer std.testing.allocator.free(catalog);
     try std.testing.expect(std.mem.indexOf(u8, catalog, "observe_status") != null);
 }
 
-test "runtimeCallTool rejects observe dispatch when observe is disabled" {
-    var runtime = try testRuntime(std.testing.allocator);
+test "runtimeCallTool rejects exact observe tools when observe is disabled" {
+    var runtime = try testRuntimeWithOptions(std.testing.allocator, .{ .observe_enabled = false });
     defer runtime.deinit();
-    runtime.observe_enabled = false;
 
     try std.testing.expectError(error.ObserveDisabled, runtimeCallTool(&runtime, "observe_status", null));
+    try std.testing.expectError(error.ToolUnavailable, runtimeCallTool(&runtime, "observe_not_a_tool", null));
 }
 
 test "remote tool discovery registers capability-only tools without exposing them" {
@@ -3100,18 +3394,31 @@ test "remote session changes rebind the active context" {
 
 test "runtimeCallTool rebinds context after first-call remote discovery" {
     const source = @embedFile("mcp.zig");
-    const remote_branch_start = std.mem.indexOf(u8, source, "        } else {\n            // Ensure remote tools are discovered while holding the mutex") orelse return error.TestUnexpectedResult;
-    const discovery = std.mem.indexOfPos(u8, source, remote_branch_start, "try discoverRemoteTools(runtime);") orelse return error.TestUnexpectedResult;
+    const runtime_call_start = std.mem.indexOf(
+        u8,
+        source,
+        "fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {",
+    ) orelse return error.TestUnexpectedResult;
+    const discovery = std.mem.indexOfPos(u8, source, runtime_call_start, "try discoverRemoteTools(runtime);") orelse return error.TestUnexpectedResult;
     const remote_call = std.mem.indexOfPos(u8, source, discovery, "callRemoteHostedTool(runtime, session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
     const between_discovery_and_call = source[discovery..remote_call];
 
-    try std.testing.expect(std.mem.indexOf(u8, between_discovery_and_call, "session_ctx = try runtime.ensureSessionContext()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, between_discovery_and_call, "var session_ctx = try runtime.ensureSessionContext()") != null);
 }
 
 test "runtimeCallTool keeps runtime mutex held across remote calls and event recording" {
     const source = @embedFile("mcp.zig");
-    const remote_branch_start = std.mem.indexOf(u8, source, "        } else {\n            // Ensure remote tools are discovered while holding the mutex") orelse return error.TestUnexpectedResult;
-    const remote_branch_end = std.mem.indexOfPos(u8, source, remote_branch_start, "            return result;\n        }\n") orelse return error.TestUnexpectedResult;
+    const remote_branch_start = std.mem.indexOf(
+        u8,
+        source,
+        "    if (runtime.brain_type == .remote and findRemoteTool(runtime, tool_name) != null) {",
+    ) orelse return error.TestUnexpectedResult;
+    const remote_branch_end = std.mem.indexOfPos(
+        u8,
+        source,
+        remote_branch_start,
+        "        return result;\n    }\n",
+    ) orelse return error.TestUnexpectedResult;
     const remote_branch = source[remote_branch_start..remote_branch_end];
 
     try std.testing.expect(std.mem.indexOf(u8, remote_branch, "runtime.mutex.unlock()") == null);

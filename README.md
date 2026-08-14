@@ -152,14 +152,15 @@ Cog runs as an [MCP server](https://modelcontextprotocol.io/) over stdio. Your A
 Your Agent  <->  MCP (stdio)  <->  cog mcp
                                      |-- Memory (local SQLite or trycog.ai)
                                      |-- Code Intelligence (local SCIP index)
-                                     |-- Debug (local daemon)
+                                     |-- Debug (in-process sessions and drivers)
 ```
 
 Tool families your agent discovers:
 
-- `cog_mem_*` for memory operations (when configured)
-- `cog_code_*` for code intelligence (query, explore, index status)
-- `cog_debug_*` for the debugger (36 tools: launch, breakpoints, stepping, inspection, and more)
+- `mem_*` for memory operations (when configured). Local brains expose Cog's local memory catalog; hosted brains expose only the capabilities discovered from that remote brain.
+- `code_query` and `code_explore` for code intelligence.
+- `debug_*` for the debugger (36 tools across core, extended, and specialist tiers; individual drivers may report unsupported operations).
+- `observe_*` for the experimental observation subsystem only when explicitly enabled. Observe is off by default; set `observe.enabled` to `true` in `.cog/settings.json` or set `COG_OBSERVE_ENABLED=1` to opt in.
 
 ### Sub-agents
 
@@ -240,7 +241,7 @@ This passes `--model` to the agent CLI, useful for choosing a faster or cheaper 
 
 <br>
 
-Your agent interacts with memory through MCP tools (`cog_mem_*`). These are discovered dynamically from your brain's remote MCP server — not CLI commands. The full set includes:
+Your agent interacts with memory through `mem_*` MCP tools, not CLI commands. Hosted capabilities are discovered dynamically from the remote brain; local brains expose the built-in local catalog. The hosted service may expose capabilities such as:
 
 **Read:** `recall`, `get`, `connections`, `trace`, `bulk_recall`, `list_short_term`, `stale`, `stats`, `orphans`, `connectivity`, `list_terms`
 
@@ -270,6 +271,8 @@ For hosted memory:
 Cog sends `COG_API_KEY` automatically only to the exact official origin `https://trycog.ai:443`. A self-hosted HTTPS origin must be approved explicitly in the global `~/.config/cog/approved-origins.json` store; an exact approved origin is allowed, while an unapproved origin is rejected before network I/O. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding.
 
 On Windows, global approved-origin reads and writes return `error.UnsupportedPlatform` because Zig 0.15 does not expose reparse-point-resistant file access needed for credential authorization state. URL parsing remains available; approval fails closed.
+
+
 **2.** For hosted memory, set your API key:
 
 ```sh
@@ -322,9 +325,8 @@ Built-in coverage comes from the bundled grammars and extension definitions in `
 
 | Tool | Description |
 |------|-------------|
-| `cog_code_explore` | Find symbols by name, return readable definition bodies, file outlines, references, and optional architecture summaries in one response. Primary tool for code exploration. |
-| `cog_code_query` | Low-level index query with modes for `find`, `refs`, `symbols`, `imports`, `contains`, `calls`, `callers`, and `overview`, all returned as concise plain text. |
-| `cog_code_status` | Check index availability and coverage. |
+| `code_explore` | Find symbols by name, return readable definition bodies, file outlines, references, and optional architecture summaries in one response. Primary tool for code exploration. |
+| `code_query` | Low-level index query with modes for `find`, `refs`, `symbols`, `imports`, `contains`, `calls`, `callers`, and `overview`, all returned as concise plain text. |
 
 `cog init` now installs stronger Cog-first guidance for supported agents, including an OpenCode override plugin and tighter sub-agent instructions so repository understanding defaults to indexed code exploration instead of ad hoc file search.
 
@@ -345,16 +347,11 @@ cog code:index "**/*.ts"    # Specific pattern
 
 Results go into `.cog/index.scip`. A built-in file watcher automatically keeps the index up to date as files are created, modified, deleted, or renamed — only watching files that match the glob patterns configured in `.cog/settings.json` under `code.index`. No manual re-indexing needed after the initial build.
 
-### File operations
+Scan, bootstrap, reconciliation, and watcher paths share the same symlink-aware boundary policy. Symlinks that resolve inside the project are followed while preserving their logical alias; targets outside the project are excluded unless their root is explicitly listed under `code.external_roots`. Project-scan recommendations for external roots require interactive approval before `cog init` persists them.
 
-CLI commands for managing files with automatic index updates:
+### CLI compatibility
 
-| Command | Description |
-|---------|-------------|
-| `cog code:edit` | Edit files with string replacement and re-index |
-| `cog code:create` | Create new files and add to index |
-| `cog code:delete` | Delete files and remove from index |
-| `cog code:rename` | Rename files and update index |
+`cog code:index` remains the CLI entry point for building `.cog/index.scip`. Code queries and indexed file operations are MCP capabilities rather than `code:*` CLI commands.
 
 ---
 
@@ -362,16 +359,18 @@ CLI commands for managing files with automatic index updates:
 
 An interactive debugger your agent controls through MCP. 36 tools covering breakpoints, stepping, variable inspection, stack traces, expression evaluation, memory reads, disassembly, and more.
 
-Under the hood, a local daemon communicates with debug adapters (DAP). The daemon starts automatically when your agent launches its first debug session.
+MCP debug sessions and drivers run inside the `cog mcp` process. A separate optional daemon remains available only for the `debug:serve`, `debug:status`, `debug:kill`, and dashboard CLI utilities; it is not auto-started by MCP tool calls. The removed `debug:send` compatibility command is not part of the current CLI.
 
 ### Key capabilities
 
 - **Launch or attach** to processes with full breakpoint support (line, function, exception, conditional, data watchpoints)
-- **Text-first debug results** — most `cog_debug_*` tools now return readable summaries instead of JSON blobs embedded in MCP text output
+- **Text-first debug results** — most `debug_*` tools now return readable summaries instead of JSON blobs embedded in MCP text output
 - **Step-over-inspect** — step repeatedly while evaluating expressions in a single call, reducing round trips
 - **Module launch mode** — debug by module name (e.g. `python -m pytest`) in addition to script path
 - **Synchronous or async** — `timeout_ms` controls whether the agent blocks for results or polls asynchronously
 - **Low-level access** — memory reads, disassembly, register inspection, core dump loading
+
+The native DWARF engine supports live process control on macOS and Linux; other platforms return `error.UnsupportedPlatform`. Reverse execution is not implemented for the native engine, and individual low-level operations can remain unavailable for a given operating system, architecture, or DAP driver.
 
 ### CLI utilities
 
@@ -382,6 +381,8 @@ Under the hood, a local daemon communicates with debug adapters (DAP). The daemo
 | `debug:kill` | Stop the daemon |
 | `debug:sign` | macOS code-signing for debug entitlements |
 
+Dashboard bindings are `q` or `Ctrl+C` to quit, `Tab` to cycle panes, `j`/Down and `k`/Up to scroll, and `[`/`]` to select the previous or next session.
+
 On macOS, `cog init` handles the code-signing for you.
 
 ---
@@ -391,13 +392,13 @@ On macOS, `cog init` handles the code-signing for you.
 You can add code intelligence and debugging support for any language through extensions.
 
 ```sh
-cog ext:install https://github.com/trycog/cog-zig.git
-cog ext:install https://github.com/trycog/cog-zig --version=0.75.0
-cog ext:update
-cog ext:update cog-zig
+cog ext:install https://github.com/trycog/cog-zig.git --trust-build
+cog ext:install https://github.com/trycog/cog-zig --version=0.75.0 --trust-build
+cog ext:update --trust-build
+cog ext:update cog-zig --trust-build
 ```
 
-Extensions install from GitHub release tarballs into `~/.config/cog/extensions/` and override built-in indexers for shared file types. By default, Cog installs the latest stable release tag; `--version` selects an exact released version; `cog ext:update` upgrades either all installed extensions or one named extension to the latest stable release available.
+Extensions install from staged GitHub release tarballs into `~/.config/cog/extensions/` and override built-in indexers for shared file types. By default, Cog installs the latest stable release tag; `--version` selects an exact released version; `cog ext:update` upgrades either all installed extensions or one named extension. Cog verifies GitHub's `sha256:` release-asset digest before extraction and transactionally promotes the staged extension. Downloaded manifest build commands are blocked unless that invocation includes `--trust-build`; build trust is separate from checksum verification and never bypasses it.
 
 ### Available extensions
 
@@ -419,11 +420,13 @@ See **[Writing a Language Extension](EXTENSIONS.md)** to build your own.
 cog doctor
 ```
 
-Validates your Cog installation: config resolution, memory backend connectivity, code index health, installed extensions, agent integration files, and debug daemon status. Reports pass/warn/fail per check with a summary line. Exits 1 on any failure — useful in CI or after setup changes.
+Validates your Cog installation: config resolution, memory backend connectivity, code index health, installed extensions, and agent integration files. Reports pass/warn/fail per check with a summary line. Exits 1 on any failure — useful in CI or after setup changes.
 
 ---
 
 ## Development
+
+The release workflow grants repository contents write access plus GitHub `id-token: write` and `attestations: write` only to the release job that creates draft assets and build provenance. Validation, CI, and build jobs retain read-only repository permissions.
 
 ```sh
 zig build test                     # Run tests

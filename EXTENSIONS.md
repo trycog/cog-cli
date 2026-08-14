@@ -10,21 +10,29 @@ Cog uses two indexing layers that work together:
 
 ### Tree-sitter (built-in, syntactic)
 
-Cog ships with tree-sitter grammars compiled into the binary for 9 languages. These provide fast, zero-dependency, per-file indexing with no external tools. Tree-sitter parsing runs in-process and produces SCIP documents directly.
+Cog ships with 17 tree-sitter grammars compiled into the binary. These provide fast, zero-dependency, per-file indexing with no external tools. Tree-sitter parsing runs in-process and produces SCIP documents directly.
 
 The tree-sitter layer is **syntactic** — it identifies definitions and references by matching AST patterns (function declarations, class definitions, import statements). It works per-file with no cross-file resolution.
 
 | Language | Extensions |
 |----------|-----------|
 | Go | `.go` |
-| TypeScript | `.ts` |
+| TypeScript | `.ts`, `.mts` |
 | TSX | `.tsx` |
-| JavaScript | `.js` |
-| Python | `.py` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Python | `.py`, `.pyi` |
 | Java | `.java` |
 | Rust | `.rs` |
-| C | `.c` |
-| C++ | `.cpp` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` |
+| JSON | `.json`, `.jsonc` |
+| Markdown | `.md`, `.markdown` |
+| MDX | `.mdx` |
+| reStructuredText | `.rst` |
+| TOML | `.toml` |
+| YAML | `.yaml`, `.yml` |
+| AsciiDoc | `.adoc`, `.asciidoc` |
+| Bash | `.sh`, `.bash`, `.bats` |
 
 ### SCIP extensions (external, semantic)
 
@@ -38,7 +46,7 @@ Tree-sitter gives every supported language instant, zero-config indexing on the 
 
 SCIP extensions add depth. A tree-sitter grammar can identify that `foo()` is a function call, but it can't tell you which `foo` — the one in `utils.zig` or the one in `math.zig`. A SCIP extension with access to the compiler's symbol table resolves that unambiguously.
 
-For the 9 built-in languages, Cog also ships built-in SCIP extension definitions (e.g., `scip-go`, `scip-python`). When these external tools are installed, Cog invokes them after tree-sitter for the same file set, and their richer results are merged into the index.
+For several built-in languages, Cog also ships SCIP extension definitions (for example `scip-go` and `scip-python`). When those external tools are installed, Cog can invoke them in addition to tree-sitter and merge their richer results into the index.
 
 ### Indexing flow
 
@@ -205,17 +213,17 @@ Common patterns:
 Users install extensions with:
 
 ```sh
-cog ext:install https://github.com/you/cog-zig.git
-cog ext:install https://github.com/you/cog-zig --version=0.75.0
-cog ext:update
-cog ext:update cog-zig
+cog ext:install https://github.com/you/cog-zig.git --trust-build
+cog ext:install https://github.com/you/cog-zig --version=0.75.0 --trust-build
+cog ext:update --trust-build
+cog ext:update cog-zig --trust-build
 ```
 
 Cog installs from an uploaded GitHub release asset, not the repository default branch or GitHub's generated source archive. Each release must contain exactly one `.tar.gz` or `.tgz` asset with GitHub's `sha256:` digest metadata. Cog streams the archive within its download limit, verifies that SHA-256 digest before extraction, and only then validates, builds, and transactionally promotes the staged extension. A digest mismatch leaves the previous installed version untouched.
 
 `--version` selects an exact released version after optional `v` prefix normalization (`0.75.0` matches `v0.75.0`). The verified digest is stored in pretty, atomically written `cog-extension-install.json` metadata. `cog ext:update` compares both the latest release tag and its archive digest; legacy installs without a recorded digest are refreshed even when the tag is unchanged.
 
-`--trust-build` is separate from artifact authenticity. Digest verification proves the downloaded bytes match GitHub's immutable release-asset record, while `--trust-build` is explicit consent to execute the archive's manifest shell build command. Authentic bytes are not automatically trusted code, and build consent never bypasses digest verification.
+`--trust-build` is separate from artifact authenticity. Digest verification proves the downloaded bytes match GitHub's immutable release-asset record, while `--trust-build` is explicit consent to execute the archive's manifest shell build command. Authentic bytes are not automatically trusted code, and build consent never bypasses digest verification. Once installed, the extension is automatically used for matching file types.
 
 Installed extensions take priority over built-in ones. If your extension handles `.py` files, it overrides the built-in `scip-python`.
 
@@ -235,7 +243,7 @@ Both drivers expose the same interface to the user: launch, breakpoints, steppin
 
 ### Debug launch flow
 
-When `cog debug:send launch` is called with a program path:
+When an agent calls the `debug_launch` MCP tool with a program path:
 
 1. Cog determines the file extension of the target program
 2. Looks up the extension (installed first, then built-in) for that file type
@@ -275,7 +283,7 @@ Add a `debugger` field to `cog-extension.json`:
 | `debugger.adapter` | object | for DAP | Adapter process configuration |
 | `debugger.adapter.command` | string | for DAP | Executable to launch (must be in `$PATH`) |
 | `debugger.adapter.args` | string[] | for DAP | Arguments. `{port}` is replaced with an available port. |
-| `debugger.adapter.transport` | string | for DAP | `"tcp"`, `"stdio"`, or `"cdp"` |
+| `debugger.adapter.transport` | string | for DAP | `"tcp"` or `"stdio"` |
 | `debugger.launch_args` | string | no | JSON template for DAP launch config. `{program}` and `{cwd}` are replaced. |
 | `debugger.boundary_markers` | string[] | no | Stack frame symbol names to filter from traces |
 
@@ -287,7 +295,7 @@ Add a `debugger` field to `cog-extension.json`:
 - **Python**: `debugpy`
 - **Ruby**: `rdbg` (debug.gem)
 - **Java**: JDWP agent
-- **JavaScript/TypeScript**: Node.js `--inspect` (Chrome DevTools Protocol, use transport `"cdp"`)
+- **JavaScript/TypeScript**: a DAP-compatible JavaScript debug adapter using `"tcp"` or `"stdio"` transport
 
 **Use `"native"`** when the language compiles to native binaries with DWARF debug info. No adapter needed — Cog reads the debug info directly:
 
@@ -299,9 +307,8 @@ Add a `debugger` field to `cog-extension.json`:
 
 | Transport | When to use | How it works |
 |-----------|-------------|--------------|
-| `tcp` | Most DAP adapters | Adapter listens on a TCP port. Cog connects after spawn. Use `{port}` in args. |
-| `stdio` | Pipe-based adapters | Cog communicates via the adapter's stdin/stdout using DAP Content-Length framing. |
-| `cdp` | Node.js debugging | Chrome DevTools Protocol over WebSocket. Used with `node --inspect`. |
+| `tcp` | Network-listening DAP adapters | Adapter listens on a TCP port. Cog connects after spawn. Use `{port}` in args. |
+| `stdio` | Pipe-based DAP adapters | Cog communicates via the adapter's stdin/stdout using DAP Content-Length framing. |
 
 ### Boundary markers
 
@@ -343,18 +350,6 @@ Examples:
 }
 ```
 
-**JavaScript (Node.js):**
-```json
-"debugger": {
-  "type": "dap",
-  "adapter": {
-    "command": "node",
-    "args": ["--inspect=0", "{program}"],
-    "transport": "cdp"
-  }
-}
-```
-
 **Native (compiled languages):**
 ```json
 "debugger": {
@@ -374,14 +369,22 @@ These languages are indexed by the built-in tree-sitter grammars. No external to
 | Language | Extensions |
 |----------|-----------|
 | Go | `.go` |
-| TypeScript | `.ts` |
+| TypeScript | `.ts`, `.mts` |
 | TSX | `.tsx` |
-| JavaScript | `.js` |
-| Python | `.py` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Python | `.py`, `.pyi` |
 | Java | `.java` |
 | Rust | `.rs` |
-| C | `.c` |
-| C++ | `.cpp` |
+| C | `.c`, `.h` |
+| C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx`, `.hh` |
+| JSON | `.json`, `.jsonc` |
+| Markdown | `.md`, `.markdown` |
+| MDX | `.mdx` |
+| reStructuredText | `.rst` |
+| TOML | `.toml` |
+| YAML | `.yaml`, `.yml` |
+| AsciiDoc | `.adoc`, `.asciidoc` |
+| Bash | `.sh`, `.bash`, `.bats` |
 
 ### SCIP extensions (external, semantic)
 
@@ -413,7 +416,7 @@ These are built-in SCIP extension definitions. Cog invokes them as external proc
 - [ ] `debugger.type` is `"dap"` or `"native"`
 - [ ] For DAP: adapter `command` is installed and in `$PATH`
 - [ ] For DAP: adapter `args` include `{port}` placeholder if using `tcp` transport
-- [ ] For DAP: `transport` is `"tcp"`, `"stdio"`, or `"cdp"`
+- [ ] For DAP: `transport` is `"tcp"` or `"stdio"`
 - [ ] For native: target binaries are compiled with debug info (DWARF)
 - [ ] `boundary_markers` list runtime-internal frame names to filter (if applicable)
 

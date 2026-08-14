@@ -29,6 +29,97 @@ const ExtUpdateOptions = struct {
     trust_build: bool = false,
 };
 
+const CommandEntry = struct {
+    name: []const u8,
+    summary: []const u8,
+};
+
+const top_level_commands = [_]CommandEntry{
+    .{ .name = "init", .summary = "Interactive setup for the current directory" },
+    .{ .name = "doctor", .summary = "Validate installation and configuration" },
+    .{ .name = "code", .summary = "Code indexing (CLI compatibility)" },
+    .{ .name = "mcp", .summary = "MCP server over stdio (primary interface)" },
+    .{ .name = "debug", .summary = "Debug daemon utilities" },
+    .{ .name = "mem", .summary = "Memory utilities" },
+    .{ .name = "ext", .summary = "Extension utilities" },
+};
+
+const observe_top_level_command = CommandEntry{ .name = "observe", .summary = "Experimental observation session utilities" };
+
+const top_level_help_aliases = [_][]const u8{ "--help", "-h", "help" };
+const top_level_version_aliases = [_][]const u8{ "--version", "-v" };
+const legacy_top_level_commands = [_][]const u8{"install"};
+
+const code_commands = [_]CommandEntry{
+    .{ .name = "code:index", .summary = "Build SCIP code index (per-file incremental)" },
+};
+
+const debug_commands = [_]CommandEntry{
+    .{ .name = "debug:serve", .summary = "Start the debug daemon" },
+    .{ .name = "debug:dashboard", .summary = "Live debug session dashboard" },
+    .{ .name = "debug:status", .summary = "Check daemon status and active sessions" },
+    .{ .name = "debug:kill", .summary = "Stop the debug daemon" },
+    .{ .name = "debug:sign", .summary = "Code-sign binary with debug entitlements (macOS)" },
+};
+
+const observe_commands = [_]CommandEntry{
+    .{ .name = "observe:status", .summary = "Show the CLI placeholder status" },
+    .{ .name = "observe:sessions", .summary = "Show the CLI placeholder session list" },
+    .{ .name = "observe:query", .summary = "Show the CLI placeholder query status" },
+    .{ .name = "observe:export", .summary = "Show the CLI placeholder export status" },
+};
+
+const memory_commands = [_]CommandEntry{
+    .{ .name = "mem:bootstrap", .summary = "Scan project files and populate memory" },
+    .{ .name = "mem:info", .summary = "Show brain type, path, and memory stats" },
+    .{ .name = "mem:upgrade", .summary = "Migrate local brain to hosted memory on trycog.ai" },
+};
+
+const extension_commands = [_]CommandEntry{
+    .{ .name = "ext:install", .summary = "Install a language extension from GitHub releases" },
+    .{ .name = "ext:update", .summary = "Update installed extensions to latest releases" },
+};
+
+fn containsCommand(entries: []const CommandEntry, name: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return true;
+    }
+    return false;
+}
+
+fn containsName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+fn isTopLevelCommand(name: []const u8, observe_enabled: bool) bool {
+    return containsCommand(&top_level_commands, name) or (observe_enabled and std.mem.eql(u8, name, observe_top_level_command.name));
+}
+
+fn isTopLevelDispatchName(name: []const u8, observe_enabled: bool) bool {
+    return isTopLevelCommand(name, observe_enabled) or
+        containsName(&top_level_help_aliases, name) or
+        containsName(&top_level_version_aliases, name) or
+        containsName(&legacy_top_level_commands, name) or
+        std.mem.eql(u8, name, code_intel.WATCHER_REINDEX_WORKER_COMMAND);
+}
+
+fn isGroupDispatchName(entries: []const CommandEntry, name: []const u8) bool {
+    return containsCommand(entries, name);
+}
+
+fn helpContainsCommand(help_text: []const u8, name: []const u8) bool {
+    return std.mem.indexOf(u8, help_text, name) != null;
+}
+
+fn appendCommandHelp(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), entries: []const CommandEntry) !void {
+    for (entries) |entry| {
+        try output.writer(allocator).print("    {s}{s}{s}  {s}{s}{s}\n", .{ bold, entry.name, reset, dim, entry.summary, reset });
+    }
+}
+
 pub fn main() void {
     mainInner() catch {
         std.process.exit(1);
@@ -261,15 +352,30 @@ fn mainInner() !void {
     return error.Explained;
 }
 
-fn printHelp(allocator: std.mem.Allocator) void {
-    const help_prefix = bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n" ++ "\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n" ++ "    " ++ bold ++ "init" ++ reset ++ "                  " ++ dim ++ "Interactive setup for the current directory" ++ reset ++ "\n" ++ "    " ++ bold ++ "doctor" ++ reset ++ "                " ++ dim ++ "Validate installation and configuration" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code" ++ reset ++ "                  " ++ dim ++ "Code indexing (CLI compatibility)" ++ reset ++ "\n" ++ "    " ++ bold ++ "mcp" ++ reset ++ "                   " ++ dim ++ "MCP server over stdio (primary interface)" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug" ++ reset ++ "                 " ++ dim ++ "Debug daemon utilities" ++ reset ++ "\n";
-    const observe_help = "    " ++ bold ++ "observe" ++ reset ++ "               " ++ dim ++ "System observability" ++ reset ++ "\n";
-    const help_suffix = "    " ++ bold ++ "mem" ++ reset ++ "                   " ++ dim ++ "Memory utilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext" ++ reset ++ "                   " ++ dim ++ "Extension utilities" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n";
-    const static_help = if (settings_mod.isObserveEnabled(allocator))
-        help_prefix ++ observe_help ++ help_suffix
-    else
-        help_prefix ++ help_suffix;
+fn buildTopLevelHelp(allocator: std.mem.Allocator, observe_enabled: bool) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.appendSlice(allocator, bold ++ "  Usage: " ++ reset ++ "cog <command> [options]\n\n" ++ cyan ++ bold ++ "  Setup" ++ reset ++ "\n");
+    try appendCommandHelp(allocator, &output, top_level_commands[0..2]);
+    try output.appendSlice(allocator, "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n");
+    try appendCommandHelp(allocator, &output, top_level_commands[2..]);
+    if (observe_enabled) try appendCommandHelp(allocator, &output, &.{observe_top_level_command});
+    try output.appendSlice(allocator, "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinExtensionList() ++ "\n");
+    return output.toOwnedSlice(allocator);
+}
 
+fn buildGroupHelp(allocator: std.mem.Allocator, title: []const u8, entries: []const CommandEntry) ![]u8 {
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.writer(allocator).print("{s}  cog {s}{s}\n\n{s}{s}  Commands{s}\n", .{ bold, title, reset, cyan, bold, reset });
+    try appendCommandHelp(allocator, &output, entries);
+    try output.append(allocator, '\n');
+    return output.toOwnedSlice(allocator);
+}
+
+fn printHelp(allocator: std.mem.Allocator) void {
+    const static_help = buildTopLevelHelp(allocator, settings_mod.isObserveEnabled(allocator)) catch return;
+    defer allocator.free(static_help);
     const footer = dim ++ "  Run 'cog <command> --help' for details on a specific command." ++ reset ++ "\n\n";
 
     const installed_block = code_intel.listInstalledBlock(allocator);
@@ -279,25 +385,17 @@ fn printHelp(allocator: std.mem.Allocator) void {
     printErr(dim ++ "  v");
     printErr(version);
     printErr(reset ++ "\n\n");
-
-    if (installed_block) |block| {
-        const combined = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ static_help, block, footer }) catch {
-            printErr(static_help);
-            printErr(block);
-            printErr(footer);
-            return;
-        };
-        defer allocator.free(combined);
-        printErr(combined);
-    } else {
-        printErr(static_help);
-        printErr(footer);
-    }
+    printErr(static_help);
+    if (installed_block) |block| printErr(block);
+    printErr(footer);
 }
 
 fn printCodeHelp() void {
+    const allocator = std.heap.page_allocator;
+    const content = buildGroupHelp(allocator, "code — Code indexing", &code_commands) catch return;
+    defer allocator.free(content);
     tui.header();
-    printErr(bold ++ "  cog code" ++ reset ++ " — Code indexing\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "code:index" ++ reset ++ "            " ++ dim ++ "Build SCIP code index (per-file incremental)" ++ reset ++ "\n" ++ "\n");
+    printErr(content);
 }
 
 fn parseExtInstallOptions(args: []const [:0]const u8) !ExtInstallOptions {
@@ -377,38 +475,40 @@ fn parseExtUpdateOptions(args: []const [:0]const u8) !ExtUpdateOptions {
 }
 
 fn printExtHelp() void {
+    const allocator = std.heap.page_allocator;
+    const content = buildGroupHelp(allocator, "ext — Extension utilities", &extension_commands) catch return;
+    defer allocator.free(content);
     tui.header();
-    printErr(bold ++ "  cog ext" ++ reset ++ " -- Extension utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext:install" ++ reset ++ "           " ++ dim ++ "Install a language extension from GitHub releases" ++ reset ++ "\n" ++ "    " ++ bold ++ "ext:update" ++ reset ++ "            " ++ dim ++ "Update installed extensions to latest releases" ++ reset ++ "\n" ++ "\n");
+    printErr(content);
 }
 
 fn printDebugHelp(allocator: std.mem.Allocator) void {
-    const static_debug = bold ++ "  cog debug" ++ reset ++ " — Debug daemon utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Server" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:serve" ++ reset ++ "           " ++ dim ++ "Start the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:dashboard" ++ reset ++ "       " ++ dim ++ "Live debug session dashboard" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:status" ++ reset ++ "          " ++ dim ++ "Check daemon status and active sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:kill" ++ reset ++ "            " ++ dim ++ "Stop the debug daemon" ++ reset ++ "\n" ++ "    " ++ bold ++ "debug:sign" ++ reset ++ "            " ++ dim ++ "Code-sign binary with debug entitlements (macOS)" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinDebugExtensionList() ++ "\n";
-
+    const static_debug = buildGroupHelp(allocator, "debug — Debug daemon utilities", &debug_commands) catch return;
+    defer allocator.free(static_debug);
     const installed_block = code_intel.listInstalledDebugBlock(allocator);
     defer if (installed_block) |b| allocator.free(b);
 
     tui.header();
-    if (installed_block) |block| {
-        const combined = std.fmt.allocPrint(allocator, "{s}{s}", .{ static_debug, block }) catch {
-            printErr(static_debug);
-            printErr(block);
-            return;
-        };
-        defer allocator.free(combined);
-        printErr(combined);
-    } else {
-        printErr(static_debug);
-    }
+    printErr(static_debug);
+    printErr(cyan ++ bold ++ "  Built-in" ++ reset ++ "\n" ++ comptime code_intel.builtinDebugExtensionList() ++ "\n");
+    if (installed_block) |block| printErr(block);
 }
 
 fn printObserveHelp() void {
+    const allocator = std.heap.page_allocator;
+    const cli_help = buildGroupHelp(allocator, "observe — Experimental observation utilities", &observe_commands) catch return;
+    defer allocator.free(cli_help);
     tui.header();
-    printErr(bold ++ "  cog observe" ++ reset ++ " — System observability\n" ++ "\n" ++ cyan ++ bold ++ "  CLI Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:status" ++ reset ++ "        " ++ dim ++ "Check available backends and platform capabilities" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:sessions" ++ reset ++ "      " ++ dim ++ "List investigation databases" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:query" ++ reset ++ "         " ++ dim ++ "Run SQL against an investigation database" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe:export" ++ reset ++ "        " ++ dim ++ "Export investigation as portable artifact" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  MCP Tools" ++ reset ++ dim ++ " (used by agents via the MCP server)" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_start" ++ reset ++ "         " ++ dim ++ "Start an observation session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_stop" ++ reset ++ "          " ++ dim ++ "Stop a session and compute causal chains" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_events" ++ reset ++ "        " ++ dim ++ "Query raw events from a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_causal_chains" ++ reset ++ " " ++ dim ++ "Get pre-computed explanatory chains" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_query" ++ reset ++ "         " ++ dim ++ "Run SQL against an investigation database" ++ reset ++ "\n" ++ "\n" ++ cyan ++ bold ++ "  Backends" ++ reset ++ "\n" ++ "    " ++ bold ++ "syscall" ++ reset ++ "               " ++ dim ++ "Kernel syscall tracing (eBPF / DTrace)" ++ reset ++ "\n" ++ "    " ++ bold ++ "gpu" ++ reset ++ "                   " ++ dim ++ "GPU operation tracing (CUDA / Metal)" ++ reset ++ "\n" ++ "    " ++ bold ++ "net" ++ reset ++ "                   " ++ dim ++ "Network flow capture and analysis" ++ reset ++ "\n" ++ "    " ++ bold ++ "cost" ++ reset ++ "                  " ++ dim ++ "Cloud cost observability (AWS / GCP / Azure)" ++ reset ++ "\n" ++ "\n");
+    printErr(cli_help);
+    printErr(dim ++ "  The observe:* CLI commands are placeholders and do not yet perform capture, query, or export operations.\n" ++ reset ++ "\n" ++ cyan ++ bold ++ "  MCP Tools" ++ reset ++ dim ++ " (available only when observe is enabled)" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_start" ++ reset ++ "         " ++ dim ++ "Create a session for an implemented backend; automatic capture is not implemented" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_stop" ++ reset ++ "          " ++ dim ++ "Finalize an existing observation session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_events" ++ reset ++ "        " ++ dim ++ "Query stored events from a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_sessions" ++ reset ++ "      " ++ dim ++ "List stored observation sessions" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_status" ++ reset ++ "        " ++ dim ++ "Report backend availability and session counts" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_causal_chains" ++ reset ++ " " ++ dim ++ "Query causal chains already stored in a session" ++ reset ++ "\n" ++ "    " ++ bold ++ "observe_query" ++ reset ++ "         " ++ dim ++ "Run bounded read-only SQL against a session database" ++ reset ++ "\n\n");
 }
 
 fn printMemHelp() void {
+    const allocator = std.heap.page_allocator;
+    const content = buildGroupHelp(allocator, "mem — Memory utilities", &memory_commands) catch return;
+    defer allocator.free(content);
     tui.header();
-    printErr(bold ++ "  cog mem" ++ reset ++ " — Memory utilities\n" ++ "\n" ++ cyan ++ bold ++ "  Commands" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:bootstrap" ++ reset ++ "         " ++ dim ++ "Scan project files and populate memory" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:info" ++ reset ++ "              " ++ dim ++ "Show brain type, path, and memory stats" ++ reset ++ "\n" ++ "    " ++ bold ++ "mem:upgrade" ++ reset ++ "           " ++ dim ++ "Migrate local brain to hosted memory on trycog.ai" ++ reset ++ "\n" ++ "\n");
+    printErr(content);
 }
 
 fn printMcpHelp() void {
@@ -429,6 +529,76 @@ fn printErr(msg: []const u8) void {
     var w = std.fs.File.stderr().writer(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
+}
+
+test "top-level help and dispatch catalog agree" {
+    const allocator = std.testing.allocator;
+
+    inline for (.{ false, true }) |observe_enabled| {
+        const help_text = try buildTopLevelHelp(allocator, observe_enabled);
+        defer allocator.free(help_text);
+
+        for (top_level_commands) |command| {
+            try std.testing.expect(isTopLevelDispatchName(command.name, observe_enabled));
+            try std.testing.expect(helpContainsCommand(help_text, command.name));
+        }
+
+        try std.testing.expectEqual(
+            observe_enabled,
+            helpContainsCommand(help_text, observe_top_level_command.name),
+        );
+        try std.testing.expectEqual(
+            observe_enabled,
+            isTopLevelDispatchName(observe_top_level_command.name, observe_enabled),
+        );
+    }
+}
+
+test "top-level aliases and compatibility commands are intentional" {
+    for (top_level_help_aliases) |alias| {
+        try std.testing.expect(isTopLevelDispatchName(alias, false));
+    }
+    for (top_level_version_aliases) |alias| {
+        try std.testing.expect(isTopLevelDispatchName(alias, false));
+    }
+    for (legacy_top_level_commands) |command| {
+        try std.testing.expect(isTopLevelDispatchName(command, false));
+    }
+
+    try std.testing.expect(isTopLevelDispatchName(code_intel.WATCHER_REINDEX_WORKER_COMMAND, false));
+    try std.testing.expect(!isTopLevelCommand(code_intel.WATCHER_REINDEX_WORKER_COMMAND, false));
+
+    const help_text = try buildTopLevelHelp(std.testing.allocator, false);
+    defer std.testing.allocator.free(help_text);
+    try std.testing.expect(!helpContainsCommand(help_text, code_intel.WATCHER_REINDEX_WORKER_COMMAND));
+    try std.testing.expect(!isTopLevelDispatchName("--help-extra", false));
+    try std.testing.expect(!isTopLevelDispatchName("debug:unknown", false));
+}
+
+test "group help and dispatch catalogs agree" {
+    const groups = .{
+        .{ .title = "code — Code indexing", .commands = code_commands[0..] },
+        .{ .title = "debug — Debug daemon utilities", .commands = debug_commands[0..] },
+        .{ .title = "observe — Experimental observation utilities", .commands = observe_commands[0..] },
+        .{ .title = "mem — Memory utilities", .commands = memory_commands[0..] },
+        .{ .title = "ext — Extension utilities", .commands = extension_commands[0..] },
+    };
+
+    inline for (groups) |group| {
+        const help_text = try buildGroupHelp(std.testing.allocator, group.title, group.commands);
+        defer std.testing.allocator.free(help_text);
+
+        for (group.commands) |command| {
+            try std.testing.expect(isGroupDispatchName(group.commands, command.name));
+            try std.testing.expect(helpContainsCommand(help_text, command.name));
+        }
+    }
+
+    try std.testing.expect(!isGroupDispatchName(&code_commands, "code:query"));
+    try std.testing.expect(!isGroupDispatchName(&debug_commands, "debug:send"));
+    try std.testing.expect(!isGroupDispatchName(&observe_commands, "observe:start"));
+    try std.testing.expect(!isGroupDispatchName(&memory_commands, "mem:recall"));
+    try std.testing.expect(!isGroupDispatchName(&extension_commands, "ext:remove"));
 }
 
 test "parseExtInstallOptions parses url and version flag" {

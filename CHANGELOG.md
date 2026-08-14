@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CLI help, README, and extension authoring guidance now match the current command surface, MCP tool names, debugger architecture, and explicit extension build trust model.
+- MCP tool advertisement and dispatch now share exact capability gates for debug tiers, observe opt-in, local memory, and dynamically discovered hosted memory tools.
+- Credential-origin documentation now reflects the current global approval-store boundary, including fail-closed Windows behavior and the fact that request callsites are not yet wired to consume approvals.
+
+### Removed
+
+- Stale CLI help and unreferenced compatibility helpers for removed code file-operation commands and `debug:send`.
+
+### Fixed
+
+- Unknown MCP tool names that merely share a `debug_`, `observe_`, `mem_`, or code-tool prefix are rejected instead of reaching a broader family dispatcher.
+
 ## [0.26.0] - 2026-04-14
 
 ### Added

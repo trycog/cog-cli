@@ -188,6 +188,19 @@ pub const tool_definitions = [_]ToolDef{
     },
 };
 
+pub fn isLocalToolName(tool_name: []const u8) bool {
+    for (tool_definitions) |tool| {
+        if (std.mem.eql(u8, tool.name, tool_name)) return true;
+    }
+    return false;
+}
+
+test "local memory tool lookup uses exact definition names" {
+    for (tool_definitions) |tool| try std.testing.expect(isLocalToolName(tool.name));
+    try std.testing.expect(!isLocalToolName("mem_recall_extra"));
+    try std.testing.expect(!isLocalToolName("recall"));
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────
 
 pub fn callLocalTool(mem_db: *MemoryDb, tool_name: []const u8, arguments: ?json.Value) ![]const u8 {

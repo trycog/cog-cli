@@ -193,6 +193,20 @@ pub fn build(b: *std.Build) void {
     indexing_integ_step.dependOn(&indexing_integ_run.step);
     if (b.args) |args| indexing_integ_run.addArgs(args);
 
+    const cli_state_exe = b.addExecutable(.{
+        .name = "test-cli-state",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_cli_state.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const cli_state_run = b.addRunArtifact(cli_state_exe);
+    cli_state_run.step.dependOn(b.getInstallStep());
+    const cli_state_step = b.step("test-cli-state", "Verify read-only CLI commands do not create project state");
+    cli_state_step.dependOn(&cli_state_run.step);
+
     // Grammar check: compilation depends on it, setup does not
     exe.step.dependOn(&check_grammars.step);
     mod_tests.step.dependOn(&check_grammars.step);

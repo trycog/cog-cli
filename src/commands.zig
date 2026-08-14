@@ -221,7 +221,7 @@ pub fn parseBrainUrl(url: []const u8) ?BrainUrlParts {
 // ── Init Command ────────────────────────────────────────────────────────
 
 pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
-    if (hasFlag(args, "--help")) {
+    if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
         printCommandHelp(help.init);
         return;
     }
