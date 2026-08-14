@@ -38,10 +38,6 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-          # Temporarily disabled: the restored caches were saved by runs whose
-          # test step crashed or hung, so rule out cache poisoning while
-          # diagnosing the aarch64 test-step hang.
-          use-cache: false
 
 
       - name: Select an Xcode SDK compatible with Zig 0.15
