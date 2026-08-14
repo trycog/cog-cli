@@ -312,6 +312,7 @@ pub fn build(b: *std.Build) void {
     cli_state_run.step.dependOn(b.getInstallStep());
     const cli_state_step = b.step("test-cli-state", "Verify read-only CLI commands do not create project state");
     cli_state_step.dependOn(&cli_state_run.step);
+    test_step.dependOn(&cli_state_run.step);
 
     // Grammar check: compilation depends on it, setup does not
     exe.step.dependOn(&check_grammars.step);
