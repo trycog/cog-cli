@@ -20,6 +20,7 @@ const extensions_mod = @import("extensions.zig");
 const memory_mod = @import("memory.zig");
 const bootstrap_mod = @import("bootstrap.zig");
 const sqlite = @import("sqlite.zig");
+const credential_boundary = @import("credential_boundary.zig");
 
 const Config = config_mod.Config;
 const help = @import("help_text.zig");
@@ -1756,9 +1757,148 @@ fn parseRemoteStats(allocator: std.mem.Allocator, body: []const u8) ?RemoteStats
     return null;
 }
 
+/// What `--approve-host` decided. Only `.approved` writes to the global store.
+const CredentialApprovalOutcome = enum { official, already_approved, approved, declined };
+
+/// Seams for the approval workflow so every branch — including the one that
+/// persists — is exercised without touching the real user's global store.
+const CredentialApprovalSeams = struct {
+    is_interactive: *const fn (context: *anyopaque) bool,
+    confirm: *const fn (context: *anyopaque, prompt: []const u8) anyerror!bool,
+    is_approved: *const fn (context: *anyopaque, allocator: std.mem.Allocator, origin: []const u8) anyerror!bool,
+    approve: *const fn (context: *anyopaque, allocator: std.mem.Allocator, origin: []const u8) anyerror!bool,
+};
+
+fn printApprovalLine(comptime fmt: []const u8, args: anytype) void {
+    var buf: [credential_boundary.max_url_bytes + 256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    printErr(msg);
+}
+
+/// Report a store failure with its security-specific cause, then collapse it to
+/// `error.Explained` so the CLI never proceeds on an unverified store.
+fn explainApprovalFailure(err: anyerror) anyerror {
+    debug_log.log("commands.doctor: credential approval store failure: {s}", .{@errorName(err)});
+    printErr(switch (err) {
+        error.UnsupportedPlatform => "  error: credential approval storage is unavailable on this platform.\n",
+        error.TrustedHomeUnavailable => "  error: could not resolve a trusted home directory for this account.\n",
+        error.ConfigPathSymlink => "  error: a component of ~/.config/cog is a symlink; refusing to store approvals.\n",
+        error.ConfigPathNotDirectory => "  error: a component of ~/.config/cog is not a directory; refusing to store approvals.\n",
+        error.ConfigDirWrongOwner => "  error: ~/.config/cog is owned by another account; refusing to store approvals.\n",
+        error.ConfigDirPermissionsTooOpen => "  error: ~/.config/cog is group- or world-accessible; run chmod 700 ~/.config/cog.\n",
+        error.StoreWrongOwner => "  error: approved-origins.json is owned by another account.\n",
+        error.StorePermissionsTooOpen => "  error: approved-origins.json is group- or world-accessible; run chmod 600 on it.\n",
+        error.MalformedStore, error.StoreTooLarge => "  error: approved-origins.json is malformed; inspect ~/.config/cog/approved-origins.json.\n",
+        error.TooManyOrigins => "  error: the approved-origins store is full; remove unused origins first.\n",
+        else => "  error: could not read or update the approved-origins store.\n",
+    });
+    return error.Explained;
+}
+
+/// Add an exact HTTPS origin to the global credential-destination allowlist.
+/// This is a deliberate user action: the origin is canonicalized first, an
+/// interactive terminal is required, and the user must confirm before anything
+/// is written. Repository state can select a self-hosted brain but can never
+/// authorize sending `COG_API_KEY` to it.
+fn approveCredentialHostWith(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    context: *anyopaque,
+    seams: CredentialApprovalSeams,
+) !CredentialApprovalOutcome {
+    var origin = credential_boundary.parseOrigin(allocator, input) catch |err| {
+        debug_log.log("commands.doctor: rejected approval origin: {s}", .{@errorName(err)});
+        printErr("  error: --approve-host expects one exact HTTPS origin, for example https://memory.example:8443\n");
+        printApprovalLine("         rejected: {s}\n", .{@errorName(err)});
+        return error.Explained;
+    };
+    defer origin.deinit(allocator);
+
+    if (origin.is_official) {
+        debug_log.log("commands.doctor: official origin requires no stored approval", .{});
+        printApprovalLine("  {s} is trusted by policy; nothing was stored.\n", .{origin.serialized});
+        return .official;
+    }
+
+    const already = seams.is_approved(context, allocator, origin.serialized) catch |err| {
+        return explainApprovalFailure(err);
+    };
+    if (already) {
+        printApprovalLine("  {s} is already an approved credential destination.\n", .{origin.serialized});
+        return .already_approved;
+    }
+
+    if (!seams.is_interactive(context)) {
+        debug_log.log("commands.doctor: refusing a non-interactive credential approval", .{});
+        printErr("  error: approving a credential destination requires an interactive terminal.\n");
+        printErr("         Run cog doctor --approve-host <origin> from a terminal and confirm the prompt.\n");
+        return error.Explained;
+    }
+
+    printApprovalLine("  Cog will send COG_API_KEY to {s} once approved.\n", .{origin.serialized});
+    var prompt_buffer: [credential_boundary.max_url_bytes + 64]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buffer, "Approve {s} as a credential destination?", .{origin.serialized}) catch {
+        return error.Explained;
+    };
+    const confirmed = seams.confirm(context, prompt) catch |err| {
+        debug_log.log("commands.doctor: approval prompt failed: {s}", .{@errorName(err)});
+        printErr("  error: could not read a confirmation from the terminal.\n");
+        return error.Explained;
+    };
+    if (!confirmed) {
+        debug_log.log("commands.doctor: approval declined by the user", .{});
+        printErr("  Declined; no credential destination was added.\n");
+        return .declined;
+    }
+
+    _ = seams.approve(context, allocator, origin.serialized) catch |err| {
+        return explainApprovalFailure(err);
+    };
+    debug_log.log("commands.doctor: stored a user-approved credential destination", .{});
+    printApprovalLine("  Approved {s}.\n", .{origin.serialized});
+    return .approved;
+}
+
+fn approvalIsInteractive(_: *anyopaque) bool {
+    return std.posix.isatty(std.fs.File.stdin().handle);
+}
+
+fn approvalConfirm(_: *anyopaque, prompt: []const u8) anyerror!bool {
+    return tui.confirm(prompt);
+}
+
+fn approvalIsApproved(_: *anyopaque, allocator: std.mem.Allocator, origin: []const u8) anyerror!bool {
+    return credential_boundary.isApproved(allocator, origin);
+}
+
+fn approvalApprove(_: *anyopaque, allocator: std.mem.Allocator, origin: []const u8) anyerror!bool {
+    return credential_boundary.approve(allocator, origin);
+}
+
+fn approveCredentialHost(allocator: std.mem.Allocator, input: []const u8) !CredentialApprovalOutcome {
+    var context: u8 = 0;
+    return approveCredentialHostWith(allocator, input, &context, .{
+        .is_interactive = approvalIsInteractive,
+        .confirm = approvalConfirm,
+        .is_approved = approvalIsApproved,
+        .approve = approvalApprove,
+    });
+}
+
 pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
         printCommandHelp(help.doctor);
+        return;
+    }
+
+    if (hasFlag(args, "--approve-host")) {
+        tui.header();
+        printErr(cyan ++ bold ++ "  Credential Approval" ++ reset ++ "\n");
+        const origin = findFlag(args, "--approve-host") orelse {
+            printErr("  error: --approve-host requires an HTTPS origin, for example https://memory.example:8443\n");
+            return error.Explained;
+        };
+        _ = try approveCredentialHost(allocator, origin);
         return;
     }
 
@@ -2653,6 +2793,182 @@ fn withTempCwd(comptime body: fn (std.mem.Allocator) anyerror!void) !void {
 
     tmp_dir.dir.setAsCwd() catch unreachable;
     try body(allocator);
+}
+
+const ApprovalProbe = struct {
+    interactive: bool = true,
+    answer: bool = true,
+    stored: bool = false,
+    confirm_calls: usize = 0,
+    approve_calls: usize = 0,
+    prompt_buffer: [512]u8 = undefined,
+    prompt_len: usize = 0,
+    approved_buffer: [512]u8 = undefined,
+    approved_len: usize = 0,
+
+    fn seams() CredentialApprovalSeams {
+        return .{
+            .is_interactive = isInteractive,
+            .confirm = confirm,
+            .is_approved = isApproved,
+            .approve = approve,
+        };
+    }
+
+    fn isInteractive(context: *anyopaque) bool {
+        return self(context).interactive;
+    }
+
+    fn confirm(context: *anyopaque, prompt: []const u8) anyerror!bool {
+        const probe = self(context);
+        probe.confirm_calls += 1;
+        probe.prompt_len = @min(prompt.len, probe.prompt_buffer.len);
+        @memcpy(probe.prompt_buffer[0..probe.prompt_len], prompt[0..probe.prompt_len]);
+        return probe.answer;
+    }
+
+    fn isApproved(context: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!bool {
+        return self(context).stored;
+    }
+
+    fn approve(context: *anyopaque, _: std.mem.Allocator, origin: []const u8) anyerror!bool {
+        const probe = self(context);
+        probe.approve_calls += 1;
+        probe.approved_len = @min(origin.len, probe.approved_buffer.len);
+        @memcpy(probe.approved_buffer[0..probe.approved_len], origin[0..probe.approved_len]);
+        return true;
+    }
+
+    fn self(context: *anyopaque) *ApprovalProbe {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn promptText(probe: *const ApprovalProbe) []const u8 {
+        return probe.prompt_buffer[0..probe.prompt_len];
+    }
+
+    fn approvedOrigin(probe: *const ApprovalProbe) []const u8 {
+        return probe.approved_buffer[0..probe.approved_len];
+    }
+};
+
+test "approve-host stores the canonical origin only after an explicit confirmation" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{};
+
+    const outcome = try approveCredentialHostWith(allocator, "https://MEMORY.example", &probe, ApprovalProbe.seams());
+    try std.testing.expectEqual(CredentialApprovalOutcome.approved, outcome);
+    try std.testing.expectEqual(@as(usize, 1), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.approve_calls);
+    try std.testing.expectEqualStrings("https://memory.example:443", probe.approvedOrigin());
+    try std.testing.expect(std.mem.indexOf(u8, probe.promptText(), "https://memory.example:443") != null);
+}
+
+test "approve-host refuses without an interactive terminal" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{ .interactive = false };
+
+    try std.testing.expectError(
+        error.Explained,
+        approveCredentialHostWith(allocator, "https://memory.example:8443", &probe, ApprovalProbe.seams()),
+    );
+    try std.testing.expectEqual(@as(usize, 0), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+}
+
+test "approve-host stores nothing when the user declines" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{ .answer = false };
+
+    const outcome = try approveCredentialHostWith(allocator, "https://memory.example:8443", &probe, ApprovalProbe.seams());
+    try std.testing.expectEqual(CredentialApprovalOutcome.declined, outcome);
+    try std.testing.expectEqual(@as(usize, 1), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+}
+
+test "approve-host never persists the official origin" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{};
+
+    const outcome = try approveCredentialHostWith(allocator, "https://TRYCOG.ai", &probe, ApprovalProbe.seams());
+    try std.testing.expectEqual(CredentialApprovalOutcome.official, outcome);
+    try std.testing.expectEqual(@as(usize, 0), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+}
+
+test "approve-host reports an already approved origin without prompting" {
+    const allocator = std.testing.allocator;
+    var probe: ApprovalProbe = .{ .stored = true };
+
+    const outcome = try approveCredentialHostWith(allocator, "https://memory.example:8443", &probe, ApprovalProbe.seams());
+    try std.testing.expectEqual(CredentialApprovalOutcome.already_approved, outcome);
+    try std.testing.expectEqual(@as(usize, 0), probe.confirm_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+}
+
+test "approve-host rejects ambiguous and non-HTTPS destinations" {
+    const allocator = std.testing.allocator;
+    const rejected = [_][]const u8{
+        "http://memory.example",
+        "https://user@memory.example",
+        "https://memory.example/owner/brain",
+        "https://memory.example?token=secret",
+        "https://memory.example#fragment",
+        "https://0x7f.0.0.1",
+        "memory.example",
+        "",
+    };
+
+    for (rejected) |input| {
+        var probe: ApprovalProbe = .{};
+        try std.testing.expectError(
+            error.Explained,
+            approveCredentialHostWith(allocator, input, &probe, ApprovalProbe.seams()),
+        );
+        try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+    }
+}
+
+test "doctor requires an origin argument for approve-host" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try std.fs.cwd().makeDir(".git");
+            try std.testing.expectError(error.Explained, doctor(allocator, &.{"--approve-host"}));
+        }
+    }.run);
+}
+
+test "repository settings never approve a credential destination" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try std.fs.cwd().makeDir(".git");
+            try std.fs.cwd().makeDir(".cog");
+            try std.fs.cwd().writeFile(.{
+                .sub_path = ".cog/settings.json",
+                .data =
+                \\{
+                \\  "credentials": { "approvedOrigins": ["https://repo.example:443"] }
+                \\}
+                \\
+                ,
+            });
+
+            var probe: ApprovalProbe = .{ .interactive = false };
+            // Repository state cannot substitute for the interactive user action,
+            // so the approval still fails closed.
+            try std.testing.expectError(
+                error.Explained,
+                approveCredentialHostWith(allocator, "https://repo.example", &probe, ApprovalProbe.seams()),
+            );
+            try std.testing.expectEqual(@as(usize, 0), probe.approve_calls);
+        }
+    }.run);
+}
+
+test "doctor help documents the credential approval workflow" {
+    try std.testing.expect(std.mem.indexOf(u8, help.doctor, "--approve-host") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help.doctor, "COG_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help.doctor, "approved-origins.json") != null);
 }
 
 test "doctor returns failure when no .cog directory" {

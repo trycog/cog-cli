@@ -276,7 +276,15 @@ For hosted memory:
 }
 ```
 
-Cog sends `COG_API_KEY` only to the exact official `https://trycog.ai:443` origin or to an exact non-official HTTPS origin already present in the global `~/.config/cog/approved-origins.json` store. Authenticated request callsites enforce this check before network I/O; unapproved self-hosted destinations fail with `error.CredentialDestinationNotApproved`. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding. The approval API exists in code, but no public credential-approval CLI command is currently exposed.
+Cog sends `COG_API_KEY` only to the exact official `https://trycog.ai:443` origin or to an exact non-official HTTPS origin already present in the global `~/.config/cog/approved-origins.json` store. Authenticated request callsites enforce this check before network I/O; unapproved self-hosted destinations fail with `error.CredentialDestinationNotApproved`. Repository settings can select a self-hosted brain, but cannot authorize credential forwarding.
+
+To approve a self-hosted destination, run:
+
+```sh
+cog doctor --approve-host https://memory.example:8443
+```
+
+The command takes one exact HTTPS origin (scheme, host, and optional port — no path, query, fragment, or userinfo), canonicalizes it, requires an interactive terminal, and asks you to confirm before anything is written. Approvals are stored only in the global store, at mode `0600` under a directory restricted to `0700`. Nothing in a repository — `.cog/settings.json`, a project `.env`, or a process-supplied `HOME` — can add an approval or move the store: the store location is resolved from the account database entry for the user Cog runs as, and every component of that path is opened without following symlinks. If the trusted home cannot be resolved, approval reads and writes fail closed.
 
 On Windows, global approved-origin reads and writes return `error.UnsupportedPlatform` because Zig 0.15 does not expose reparse-point-resistant file access needed for credential authorization state. URL parsing remains available; non-official credential destinations therefore fail closed.
 
