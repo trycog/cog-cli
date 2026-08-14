@@ -29,8 +29,12 @@ pub const memory_schema = @import("memory_schema.zig");
 pub const memory = @import("memory.zig");
 pub const observe = @import("observe.zig");
 pub const credential_boundary = @import("credential_boundary.zig");
+pub const index_manifest = @import("index_manifest.zig");
+pub const git_state = @import("git_state.zig");
 
 test {
+    _ = index_manifest;
+    _ = git_state;
     _ = config;
     _ = client;
     _ = commands;
