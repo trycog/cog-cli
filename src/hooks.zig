@@ -1561,10 +1561,6 @@ pub fn configureAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Agent)
         try writeMarkdownAgent(allocator, agent_path, header, instructions);
     } else if (agent.agent_file_header) |header| {
         try writeMarkdownAgent(allocator, agent_path, header, build_options.agent_body);
-    } else if (std.mem.eql(u8, agent.id, "codex")) {
-        const instructions = try buildCodexSpecialistInstructions(allocator, .code_query, build_options.agent_body);
-        defer allocator.free(instructions);
-        try writeTomlAgent(allocator, agent_path, "cog-code-query", "Explore code structure using the Cog SCIP index", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
         try writeRooAgent(allocator, agent_path, "cog-code-query", "Cog Code Query", roo_code_query_role);
     }
@@ -1597,10 +1593,6 @@ pub fn configureDebugAgentFile(allocator: std.mem.Allocator, agent: agents_mod.A
         try writeMarkdownAgent(allocator, debug_path, header, instructions);
     } else if (agent.debug_file_header) |header| {
         try writeMarkdownAgent(allocator, debug_path, header, build_options.debug_agent_body);
-    } else if (std.mem.eql(u8, agent.id, "codex")) {
-        const instructions = try buildCodexSpecialistInstructions(allocator, .debug, build_options.debug_agent_body);
-        defer allocator.free(instructions);
-        try writeTomlAgent(allocator, debug_path, "cog-debug", "Debug subagent that inspects runtime state via cog debugger tools", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
         try writeRooAgent(allocator, debug_path, "cog-debug", "Cog Debug", "You are a debug subagent. Use cog_debug tools to answer questions about runtime state. Launch a debug session, set breakpoints, run to them, inspect values, then stop. Return only the observed values. Do not suggest fixes.");
     }
@@ -1629,10 +1621,6 @@ pub fn configureMemAgentFile(allocator: std.mem.Allocator, agent: agents_mod.Age
         try writeMarkdownAgent(allocator, mem_path, header, instructions);
     } else if (agent.mem_file_header) |header| {
         try writeMarkdownAgent(allocator, mem_path, header, build_options.mem_agent_body);
-    } else if (std.mem.eql(u8, agent.id, "codex")) {
-        const instructions = try buildCodexSpecialistInstructions(allocator, .memory, build_options.mem_agent_body);
-        defer allocator.free(instructions);
-        try writeTomlAgent(allocator, mem_path, "cog-mem", "Memory sub-agent for recall, consolidation, and maintenance", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
         try writeRooAgent(allocator, mem_path, "cog-mem", "Cog Memory", "You are a memory sub-agent for Cog's persistent associative knowledge graph. Start with cog_mem_recall, decide whether memory is sufficient, and only then escalate to cog_code_explore or cog_code_query if memory is insufficient. If exploration teaches something durable, write it back with cog_mem_learn. Before finishing, review short-term memory with cog_mem_list_short_term and validate it with cog_mem_reinforce, cog_mem_verify, or cog_mem_flush. Return concise summaries with engram IDs.");
     }
@@ -1661,10 +1649,6 @@ pub fn configureValidateAgentFile(allocator: std.mem.Allocator, agent: agents_mo
         try writeMarkdownAgent(allocator, validate_path, header, instructions);
     } else if (agent.validate_file_header) |header| {
         try writeMarkdownAgent(allocator, validate_path, header, build_options.validate_agent_body);
-    } else if (std.mem.eql(u8, agent.id, "codex")) {
-        const instructions = try buildCodexSpecialistInstructions(allocator, .validate, build_options.validate_agent_body);
-        defer allocator.free(instructions);
-        try writeTomlAgent(allocator, validate_path, "cog-mem-validate", "Post-task memory validation — learns durable knowledge and consolidates short-term memories", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
         try writeRooAgent(allocator, validate_path, "cog-mem-validate", "Cog Memory Validate", "You are a post-task memory validation sub-agent. Store durable knowledge from the primary agent's exploration with cog_mem_learn, then consolidate short-term memories with cog_mem_list_short_term and cog_mem_reinforce or cog_mem_flush. Return concise summaries with engram IDs.");
     }
@@ -1677,49 +1661,6 @@ const CodexSpecialistKind = enum {
     validate,
     observe,
 };
-
-fn buildCodexSpecialistInstructions(allocator: std.mem.Allocator, kind: CodexSpecialistKind, body: []const u8) ![]const u8 {
-    const prelude = switch (kind) {
-        .code_query => "Host guidance:\n" ++
-            "- Treat this specialist as read-only.\n" ++
-            "- Use Cog code intelligence before any raw file search.\n" ++
-            "- " ++ agents_mod.specialist_raw_text_fallback_policy ++ "\n" ++
-            "- Do not use shell search commands like grep, rg, find, or git grep from this specialist.\n" ++
-            "- Do not edit files or run commands from this specialist.\n",
-        .debug =>
-        \\Host guidance:
-        \\- Prefer debugger evidence over speculative fixes.
-        \\- Use shell commands only to launch or reproduce the supplied test.
-        \\- Do not edit files from this specialist.
-        \\
-        ,
-        .memory =>
-        \\Host guidance:
-        \\- Use this specialist as the primary retrieval-first path.
-        \\- Start with Cog memory recall, decide whether memory is sufficient, and escalate to Cog code exploration inside the specialist only when memory is insufficient.
-        \\- Do not edit files from this specialist.
-        \\- Return concise recall or consolidation results that the main agent can act on.
-        \\
-        ,
-        .validate =>
-        \\Host guidance:
-        \\- This specialist handles the full learn-and-consolidate lifecycle in one call.
-        \\- Do not edit files or explore code from this specialist.
-        \\- Return concise summaries with engram IDs.
-        \\
-        ,
-        .observe =>
-        \\Host guidance:
-        \\- Use this specialist for system-level observability (syscalls, GPU, network, cost).
-        \\- Start observation sessions, analyze causal chains, and query raw events.
-        \\- Use shell commands only to reproduce the target workload.
-        \\- Do not edit files from this specialist.
-        \\
-        ,
-    };
-
-    return try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ prelude, body });
-}
 
 /// Shared .agents/skills files serve several hosts at once, so their
 /// instructions must not name any single host.
@@ -1898,10 +1839,6 @@ pub fn configureObserveAgentFile(allocator: std.mem.Allocator, agent: agents_mod
         try writeMarkdownAgent(allocator, observe_path, header, instructions);
     } else if (agent.observe_file_header) |header| {
         try writeMarkdownAgent(allocator, observe_path, header, build_options.observe_agent_body);
-    } else if (std.mem.eql(u8, agent.id, "codex")) {
-        const instructions = try buildCodexSpecialistInstructions(allocator, .observe, build_options.observe_agent_body);
-        defer allocator.free(instructions);
-        try writeTomlAgent(allocator, observe_path, "cog-observe", "System observability sub-agent for syscall, GPU, network, and cost investigation", instructions);
     } else if (std.mem.eql(u8, agent.id, "roo")) {
         try writeRooAgent(allocator, observe_path, "cog-observe", "Cog Observe", "You are a system observability sub-agent. Use cog_observe tools to investigate system-level behavior — syscalls, GPU operations, network flows, and costs. Start sessions, analyze causal chains, and query raw events. Return concise reports with observed behavior, causal chains, and timestamps.");
     }
@@ -1986,46 +1923,6 @@ fn findTomlSectionEnd(content: []const u8, section_start: usize) usize {
     }
 
     return content.len;
-}
-
-fn writeTomlAgent(allocator: std.mem.Allocator, path: []const u8, section_name: []const u8, description: []const u8, body: []const u8) !void {
-    debug_log.log("hooks.writeTomlAgent: path={s} section={s}", .{ path, section_name });
-    if (std.fs.path.dirname(path)) |parent| {
-        try ensureDir(parent);
-    }
-
-    const existing = try readValidatedHostConfig(allocator, path, .toml);
-    defer if (existing) |e| allocator.free(e);
-
-    const section_marker = try std.fmt.allocPrint(allocator, "[agents.{s}]", .{section_name});
-    defer allocator.free(section_marker);
-    const trimmed_body = std.mem.trimRight(u8, body, &std.ascii.whitespace);
-    const toml_section = try std.fmt.allocPrint(allocator,
-        \\{s}
-        \\description = "{s}"
-        \\developer_instructions = """
-        \\{s}
-        \\"""
-        \\
-    , .{ section_marker, description, trimmed_body });
-    defer allocator.free(toml_section);
-
-    if (existing) |content| {
-        const new_content = if (std.mem.indexOf(u8, content, section_marker)) |section_start| blk: {
-            const section_end = findTomlSectionEnd(content, section_start);
-            debug_log.log("hooks.writeTomlAgent: refreshing section={s}", .{section_name});
-            break :blk try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ content[0..section_start], toml_section, content[section_end..] });
-        } else blk: {
-            debug_log.log("hooks.writeTomlAgent: appending section={s}", .{section_name});
-            const separator = if (content.len == 0 or content[content.len - 1] == '\n') "\n" else "\n\n";
-            break :blk try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ content, separator, toml_section });
-        };
-        defer allocator.free(new_content);
-        try writeCwdFile(path, new_content);
-    } else {
-        debug_log.log("hooks.writeTomlAgent: creating section={s}", .{section_name});
-        try writeCwdFile(path, toml_section);
-    }
 }
 
 fn writeRooAgent(allocator: std.mem.Allocator, path: []const u8, slug: []const u8, name: []const u8, role_definition: []const u8) !void {
@@ -2262,15 +2159,10 @@ test "host permission and runtime mergers reject malformed existing JSON" {
 test "shared host config specialist mergers reject malformed existing configs" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
-            const codex_path = ".codex/config.toml";
             const roo_path = ".roomodes";
             const slugs = [_][]const u8{ "cog-code-query", "cog-debug", "cog-mem", "cog-mem-validate", "cog-observe" };
 
             for (slugs) |slug| {
-                try resetMalformedHostConfig(codex_path, "[broken");
-                try std.testing.expectError(error.MalformedHostConfig, writeTomlAgent(allocator, codex_path, slug, "Cog specialist", "instructions"));
-                try expectHostConfigUnchanged(allocator, codex_path, "[broken", 0o600);
-
                 try resetMalformedHostConfig(roo_path, "{broken");
                 try std.testing.expectError(error.MalformedHostConfig, writeRooAgent(allocator, roo_path, slug, "Cog Specialist", "instructions"));
                 try expectHostConfigUnchanged(allocator, roo_path, "{broken", 0o600);
@@ -3306,45 +3198,6 @@ test "writeMarkdownAgent is idempotent" {
     }.run);
 }
 
-test "writeTomlAgent appends section" {
-    try withTempCwd(struct {
-        fn run(allocator: std.mem.Allocator) !void {
-            const initial =
-                \\model = "gpt-5"
-                \\
-                \\[mcp_servers.cog]
-                \\command = "cog"
-                \\args = ["mcp"]
-            ;
-            std.fs.cwd().makeDir(".codex") catch {};
-            try writeCwdFile(".codex/config.toml", initial);
-
-            try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
-
-            const content = (try readCwdFile(allocator, ".codex/config.toml")) orelse return error.TestUnexpectedResult;
-            defer allocator.free(content);
-
-            // Has the original content
-            try std.testing.expect(std.mem.indexOf(u8, content, "model = \"gpt-5\"") != null);
-            // Has the agent section
-            try std.testing.expect(std.mem.indexOf(u8, content, "[agents.cog-code-query]") != null);
-            // Has the description
-            try std.testing.expect(std.mem.indexOf(u8, content, "description = \"Explore code structure") != null);
-        }
-    }.run);
-}
-
-test "buildCodexSpecialistInstructions adds host guidance" {
-    const code_query = try buildCodexSpecialistInstructions(std.testing.allocator, .code_query, build_options.agent_body);
-    defer std.testing.allocator.free(code_query);
-    try std.testing.expect(std.mem.indexOf(u8, code_query, "Treat this specialist as read-only") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code_query, "Use Cog code intelligence before any raw file search") != null);
-
-    const memory = try buildCodexSpecialistInstructions(std.testing.allocator, .memory, build_options.mem_agent_body);
-    defer std.testing.allocator.free(memory);
-    try std.testing.expect(std.mem.indexOf(u8, memory, "Start with Cog memory recall") != null);
-}
-
 test "buildWorkflowSpecialistInstructions adds workflow guidance" {
     const code_query = try buildWorkflowSpecialistInstructions(std.testing.allocator, "Windsurf", .code_query, build_options.agent_body);
     defer std.testing.allocator.free(code_query);
@@ -3434,56 +3287,6 @@ test "config-scoped dedicated agents get host-specific content" {
     }.run);
 }
 
-test "writeTomlAgent is idempotent" {
-    try withTempCwd(struct {
-        fn run(allocator: std.mem.Allocator) !void {
-            std.fs.cwd().makeDir(".codex") catch {};
-            try writeCwdFile(".codex/config.toml", "model = \"gpt-5\"\n");
-
-            try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
-            try writeTomlAgent(allocator, ".codex/config.toml", "cog-code-query", "Explore code structure using the Cog SCIP index", build_options.agent_body);
-
-            const content = (try readCwdFile(allocator, ".codex/config.toml")) orelse return error.TestUnexpectedResult;
-            defer allocator.free(content);
-
-            const marker = "[agents.cog-code-query]";
-            const first = std.mem.indexOf(u8, content, marker) orelse return error.TestUnexpectedResult;
-            const second = std.mem.indexOfPos(u8, content, first + marker.len, marker);
-            try std.testing.expect(second == null);
-        }
-    }.run);
-}
-
-test "writeTomlAgent refreshes generated sections and preserves unrelated config" {
-    try withTempCwd(struct {
-        fn run(allocator: std.mem.Allocator) !void {
-            const initial =
-                \\model = "gpt-5"
-                \\
-                \\[agents.cog-debug]
-                \\description = "stale"
-                \\developer_instructions = """
-                \\stale instructions"""
-                \\
-                \\[profiles.keep]
-                \\model = "gpt-5-mini"
-                \\
-            ;
-            std.fs.cwd().makeDir(".codex") catch {};
-            try writeCwdFile(".codex/config.toml", initial);
-
-            try writeTomlAgent(allocator, ".codex/config.toml", "cog-debug", "Debug subagent", "fresh instructions");
-
-            const content = (try readCwdFile(allocator, ".codex/config.toml")) orelse return error.TestUnexpectedResult;
-            defer allocator.free(content);
-            try std.testing.expect(std.mem.indexOf(u8, content, "fresh instructions") != null);
-            try std.testing.expect(std.mem.indexOf(u8, content, "stale instructions") == null);
-            try std.testing.expect(std.mem.indexOf(u8, content, "[profiles.keep]") != null);
-            try std.testing.expect(std.mem.indexOf(u8, content, "model = \"gpt-5-mini\"") != null);
-        }
-    }.run);
-}
-
 test "specialist installers cover every capability in the registry" {
     try withTempCwd(struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -3533,9 +3336,9 @@ test "raw-text fallback policy is single-sourced across every host surface" {
     defer std.testing.allocator.free(config_scoped);
     try std.testing.expect(std.mem.indexOf(u8, config_scoped, agents_mod.raw_text_fallback_exceptions) != null);
 
-    const codex = try buildCodexSpecialistInstructions(std.testing.allocator, .code_query, build_options.agent_body);
-    defer std.testing.allocator.free(codex);
-    try std.testing.expect(std.mem.indexOf(u8, codex, agents_mod.raw_text_fallback_exceptions) != null);
+    const shared_skill = try buildWorkflowSpecialistInstructions(std.testing.allocator, "this coding agent", .code_query, build_options.agent_body);
+    defer std.testing.allocator.free(shared_skill);
+    try std.testing.expect(std.mem.indexOf(u8, shared_skill, agents_mod.raw_text_fallback_exceptions) != null);
 
     // Roo's shared-config custom mode carries the same exceptions.
     try std.testing.expect(std.mem.indexOf(u8, roo_code_query_role, agents_mod.raw_text_fallback_exceptions) != null);

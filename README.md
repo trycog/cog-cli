@@ -98,7 +98,7 @@ For each agent you select, `cog init` writes the system prompt, configures the M
 
 ### Skills
 
-`npx skills add trycog/cog-cli` installs the public [`setup-cog`](skills/setup-cog/SKILL.md) skill from the [skills.sh](https://skills.sh) directory — it walks any supported agent through installing the binary, running `cog init`, and verifying with `cog doctor`. The project-local skills that `cog init` generates (`cog-explore`, `cog-remember`, and the specialist skills) follow the [Agent Skills specification](https://agentskills.io), carry a `cog-version` stamp so `cog doctor` can report asset drift, and are marked `internal` so they stay out of public skill directories.
+`npx skills add trycog/cog-cli` installs the public [`setup-cog`](skills/setup-cog/SKILL.md) skill from the [skills.sh](https://skills.sh) directory — it walks any supported agent through installing the binary, running `cog init`, and verifying with `cog doctor`. The project-local skills that `cog init` generates (`cog-explore`, `cog-remember`, and the specialist skills) follow the [Agent Skills specification](https://agentskills.io), carry a `cog-version` stamp so `cog doctor` can report asset drift, and are marked `internal` so they stay out of public skill directories. Generated skills are ordinary project files — commit them so teammates and CI agents get identical guidance, or ignore them and let `cog init` regenerate per checkout.
 
 ### Supported agents
 
@@ -122,9 +122,9 @@ Every registered host can receive the closest native equivalent of all five Cog 
 
 Stronger enforcement depends on what each host can express:
 
-- Claude Code, Gemini CLI, GitHub Copilot, and OpenCode receive dedicated agent files; tool isolation ranges from hard allowlists to advisory host configuration.
-- Cursor receives project rules rather than callable custom sub-agents because Cursor does not expose a documented repo-local custom-subagent format. Rules provide workflow guidance but cannot hard-deny tools per specialist.
-- Windsurf, Amp, Goose, and Pi receive native skill/workflow files. These are portable delegation surfaces, not guaranteed hard isolation; Amp and Pi add broader runtime policy assets where their extension systems allow it.
+- Claude Code, Gemini CLI, and OpenCode receive dedicated agent files; tool isolation ranges from hard allowlists to advisory host configuration.
+- Cursor, GitHub Copilot, Codex, and Amp consume the shared `.agents/skills/` directory — one spec-compliant skill per specialist serves all four. Skills provide workflow guidance but cannot hard-deny tools per specialist.
+- Windsurf, Goose, and Pi receive native skill files in their own skill directories. These are portable delegation surfaces, not guaranteed hard isolation; Amp and Pi add broader runtime policy assets where their extension systems allow it.
 - OpenAI Codex CLI stores each Cog specialist additively in its shared `.codex/config.toml` as an `[agents.<name>]` section. Cog refreshes its own sections while preserving unrelated TOML, but the host surface provides guidance rather than a per-file sandbox.
 - Roo Code stores each specialist as a custom mode in `.roomodes`. Native mode groups provide the closest tool scoping Roo supports, but they do not offer the same isolation guarantees as a dedicated subprocess.
 
