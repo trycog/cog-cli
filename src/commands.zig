@@ -1916,7 +1916,7 @@ fn authorizeInitMemoryHost(allocator: std.mem.Allocator, host: []const u8) !bool
     });
 }
 
-/// Read the optional "cog_version" stamp from .cog/client-context.json.
+/// Read the "version" stamp init records in .cog/client-context.json.
 /// Null — tolerated, never an error — when the file, the field, or the parse
 /// is missing: assets written before version stamping existed. The caller
 /// owns the returned copy.
@@ -1942,7 +1942,7 @@ fn readAssetVersionStamp(allocator: std.mem.Allocator, cog_dir: []const u8) ?[]u
     };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const stamp = parsed.value.object.get("cog_version") orelse return null;
+    const stamp = parsed.value.object.get("version") orelse return null;
     if (stamp != .string) return null;
     return allocator.dupe(u8, stamp.string) catch null;
 }
@@ -3478,11 +3478,11 @@ test "readAssetVersionStamp tolerates missing files and fields" {
             try std.testing.expect(readAssetVersionStamp(allocator, cog_dir) == null);
 
             // Wrong type: tolerated.
-            try std.fs.cwd().writeFile(.{ .sub_path = ".cog/client-context.json", .data = "{\n  \"cog_version\": 7\n}\n" });
+            try std.fs.cwd().writeFile(.{ .sub_path = ".cog/client-context.json", .data = "{\n  \"version\": 7\n}\n" });
             try std.testing.expect(readAssetVersionStamp(allocator, cog_dir) == null);
 
             // Present: the caller owns the copy.
-            try std.fs.cwd().writeFile(.{ .sub_path = ".cog/client-context.json", .data = "{\n  \"cog_version\": \"0.9.9\"\n}\n" });
+            try std.fs.cwd().writeFile(.{ .sub_path = ".cog/client-context.json", .data = "{\n  \"version\": \"0.9.9\"\n}\n" });
             const stamp = readAssetVersionStamp(allocator, cog_dir) orelse return error.TestUnexpectedResult;
             defer allocator.free(stamp);
             try std.testing.expectEqualStrings("0.9.9", stamp);
