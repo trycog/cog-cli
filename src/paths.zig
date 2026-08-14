@@ -200,7 +200,7 @@ fn ensurePrivateProjectTempDir(path: []const u8) !void {
 
     if (builtin.os.tag != .windows) {
         const stat = try std.posix.fstat(dir.fd);
-        if (stat.uid != std.posix.geteuid()) return error.RuntimeDirWrongOwner;
+        try validateRuntimeDirectoryOwner(path, stat.uid, std.posix.geteuid());
         if (stat.mode & 0o077 != 0) try dir.chmod(0o700);
     }
 }
@@ -226,15 +226,18 @@ fn ensurePrivateRuntimeDir(path: []const u8) !void {
 
     if (builtin.os.tag != .windows) {
         const stat = try std.posix.fstat(dir.fd);
-        if (stat.uid != std.posix.geteuid()) {
-            debug_log.log("ensurePrivateRuntimeDir: rejected foreign owner for {s}", .{path});
-            return error.RuntimeDirWrongOwner;
-        }
+        try validateRuntimeDirectoryOwner(path, stat.uid, std.posix.geteuid());
         if (stat.mode & 0o077 != 0) {
             debug_log.log("ensurePrivateRuntimeDir: restricting permissions on {s}", .{path});
             try dir.chmod(0o700);
         }
     }
+}
+
+fn validateRuntimeDirectoryOwner(path: []const u8, actual_uid: std.posix.uid_t, expected_uid: std.posix.uid_t) !void {
+    if (actual_uid == expected_uid) return;
+    debug_log.log("ensurePrivateRuntimeDir: rejected foreign owner for {s} actual_uid={d} expected_uid={d}", .{ path, actual_uid, expected_uid });
+    return error.RuntimeDirWrongOwner;
 }
 
 fn validateExistingDirectoryChain(path: []const u8) !void {
@@ -448,6 +451,18 @@ test "ensurePrivateRuntimeDir rejects a symlinked parent" {
 
     try std.testing.expectError(error.RuntimeDirSymlink, ensurePrivateRuntimeDir(runtime_dir));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("outside/cog", .{}));
+}
+
+test "runtime directory ownership rejects a foreign uid" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const effective_uid = std.posix.geteuid();
+    const foreign_uid = if (effective_uid == std.math.maxInt(@TypeOf(effective_uid))) effective_uid - 1 else effective_uid + 1;
+    try std.testing.expectError(
+        error.RuntimeDirWrongOwner,
+        validateRuntimeDirectoryOwner("/private/runtime", foreign_uid, effective_uid),
+    );
+    try validateRuntimeDirectoryOwner("/private/runtime", effective_uid, effective_uid);
 }
 
 test "getRuntimeDir ignores an empty XDG runtime path" {
