@@ -31,10 +31,12 @@ pub const observe = @import("observe.zig");
 pub const credential_boundary = @import("credential_boundary.zig");
 pub const index_manifest = @import("index_manifest.zig");
 pub const git_state = @import("git_state.zig");
+pub const update_check = @import("update_check.zig");
 
 test {
     _ = index_manifest;
     _ = git_state;
+    _ = update_check;
     _ = config;
     _ = client;
     _ = commands;
