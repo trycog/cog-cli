@@ -1,6 +1,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite.zig");
 const debug_log = @import("debug_log.zig");
+const builtin = @import("builtin");
 
 const Db = sqlite.Db;
 
@@ -359,6 +360,8 @@ test "schema migration retries the whole transaction after busy" {
 }
 
 test "concurrent schema migration is idempotent" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
@@ -378,24 +381,53 @@ test "concurrent schema migration is idempotent" {
         try setSchemaVersion(&db, 1);
     }
 
-    var started = std.atomic.Value(usize).init(0);
-    var go = std.atomic.Value(bool).init(false);
+    const ready_pipe = try std.posix.pipe();
+    defer std.posix.close(ready_pipe[0]);
+    defer std.posix.close(ready_pipe[1]);
+    const start_pipe = try std.posix.pipe();
+    defer std.posix.close(start_pipe[0]);
+    defer std.posix.close(start_pipe[1]);
+
     const Migrator = struct {
-        fn run(db_path: [*:0]const u8, ready: *std.atomic.Value(usize), start: *std.atomic.Value(bool)) void {
-            _ = ready.fetchAdd(1, .acq_rel);
-            while (!start.load(.acquire)) std.Thread.yield() catch {};
-            var db = Db.open(db_path) catch @panic("failed to open migration database");
-            defer db.close();
-            ensureSchema(&db) catch @panic("concurrent migration failed");
+        fn run(db_path: [*:0]const u8, ready_fd: std.posix.fd_t, start_fd: std.posix.fd_t) noreturn {
+            _ = std.posix.write(ready_fd, "r") catch std.posix.exit(1);
+            var signal: [1]u8 = undefined;
+            if ((std.posix.read(start_fd, &signal) catch std.posix.exit(1)) != 1) std.posix.exit(1);
+
+            var db = Db.open(db_path) catch std.posix.exit(1);
+            ensureSchema(&db) catch std.posix.exit(1);
+            db.close();
+            std.posix.exit(0);
         }
     };
 
-    const first = try std.Thread.spawn(.{}, Migrator.run, .{ path.ptr, &started, &go });
-    const second = try std.Thread.spawn(.{}, Migrator.run, .{ path.ptr, &started, &go });
-    while (started.load(.acquire) < 2) std.Thread.yield() catch {};
-    go.store(true, .release);
-    first.join();
-    second.join();
+    const first = try std.posix.fork();
+    if (first == 0) Migrator.run(path.ptr, ready_pipe[1], start_pipe[0]);
+    errdefer {
+        std.posix.kill(first, std.posix.SIG.KILL) catch {};
+        _ = std.posix.waitpid(first, 0);
+    }
+
+    const second = try std.posix.fork();
+    if (second == 0) Migrator.run(path.ptr, ready_pipe[1], start_pipe[0]);
+    errdefer {
+        std.posix.kill(second, std.posix.SIG.KILL) catch {};
+        _ = std.posix.waitpid(second, 0);
+    }
+
+    var ready: [2]u8 = undefined;
+    var ready_count: usize = 0;
+    while (ready_count < ready.len) {
+        ready_count += try std.posix.read(ready_pipe[0], ready[ready_count..]);
+    }
+    try std.testing.expectEqual(@as(usize, 2), try std.posix.write(start_pipe[1], "gg"));
+
+    const first_result = std.posix.waitpid(first, 0);
+    const second_result = std.posix.waitpid(second, 0);
+    try std.testing.expect(std.posix.W.IFEXITED(first_result.status));
+    try std.testing.expectEqual(@as(u8, 0), std.posix.W.EXITSTATUS(first_result.status));
+    try std.testing.expect(std.posix.W.IFEXITED(second_result.status));
+    try std.testing.expectEqual(@as(u8, 0), std.posix.W.EXITSTATUS(second_result.status));
 
     var db = try Db.open(path);
     defer db.close();
