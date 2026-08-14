@@ -792,24 +792,17 @@ pub const CodeIndex = struct {
             }
         }
 
-        const enclosing_range_indexes = try allocator.alloc(EnclosingRangeIndex, index.documents.len);
-        var initialized_range_indexes: usize = 0;
-        defer {
-            for (enclosing_range_indexes[0..initialized_range_indexes]) |*range_index| range_index.deinit(allocator);
-            allocator.free(enclosing_range_indexes);
-        }
-        var enclosing_range_entries: usize = 0;
-        for (index.documents, 0..) |doc, doc_idx| {
-            enclosing_range_indexes[doc_idx] = try EnclosingRangeIndex.initForDocument(allocator, doc, &symbol_to_defs);
-            initialized_range_indexes += 1;
-            enclosing_range_entries += enclosing_range_indexes[doc_idx].entries.len;
-        }
-
-        debug_log.log("CodeIndex.build: pass2 definitions={d} enclosing_ranges={d}", .{ symbol_to_defs.count(), enclosing_range_entries });
+        debug_log.log("CodeIndex.build: pass2 definitions={d}", .{symbol_to_defs.count()});
 
         // Pass 2: build containment, declared relationships, references,
         // imports, and call edges against the complete definition table.
-        for (index.documents, 0..) |doc, doc_idx| {
+        // Each document's enclosing-range index is built and released within
+        // its own iteration so peak auxiliary memory stays at one document.
+        var enclosing_range_entries: usize = 0;
+        for (index.documents) |doc| {
+            var enclosing_range_index = try EnclosingRangeIndex.initForDocument(allocator, doc, &symbol_to_defs);
+            defer enclosing_range_index.deinit(allocator);
+            enclosing_range_entries += enclosing_range_index.entries.len;
             for (doc.symbols) |sym| {
                 if (sym.symbol.len == 0) continue;
 
@@ -877,7 +870,7 @@ pub const CodeIndex = struct {
                     });
                 } else if (std.mem.startsWith(u8, occ.symbol, "cog/call/")) {
                     const call_name = occ.symbol["cog/call/".len..];
-                    const caller_symbol = enclosing_range_indexes[doc_idx].findInnermost(occ.range.start_line, occ.range.start_char) orelse continue;
+                    const caller_symbol = enclosing_range_index.findInnermost(occ.range.start_line, occ.range.start_char) orelse continue;
                     const callee_symbol = resolveCallTarget(call_name, doc.relative_path, &symbol_to_defs) orelse continue;
                     try addCallEdge(
                         allocator,
@@ -923,6 +916,7 @@ pub const CodeIndex = struct {
             }
         }
 
+        debug_log.log("CodeIndex.build: pass2 enclosing_ranges={d}", .{enclosing_range_entries});
         debug_log.log("CodeIndex.build: defs={d} refs={d} imports={d} calls={d}", .{ symbol_to_defs.count(), symbol_to_refs.count(), file_to_imports.count(), symbol_to_calls.count() });
         debug_log.log("CodeIndex.build: dedup children={d} relationships={d} reverse={d} imports={d} calls={d} callers={d}", .{
             children_seen.count(),
