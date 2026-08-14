@@ -343,6 +343,7 @@ checks = {
   "publication waits for artifact build" => release.match?(/\n  release:\n    needs: build\n/),
   "checksums precede provenance" => release.index("- name: Generate SHA-256 checksums").to_i < release.index("- name: Generate build provenance").to_i,
   "provenance verification precedes draft publication" => release.index("- name: Verify build provenance and release checksums").to_i < release.index("- name: Create draft GitHub Release").to_i,
+  "release job can write artifact metadata" => release.match?(/\n  release:.*?\n    permissions:.*?\n      artifact-metadata: write\n/m),
   "regular CI tests release validation" => ci.include?("./test/release/validate-release.sh"),
 }
 checks.each { |name, ok| puts "#{ok ? "ok" : "not ok"} - #{name}" }
