@@ -48,12 +48,12 @@ test "Cog source never uses positional writers for stdout or stderr" {
     }
 }
 
-test "MCP source never restores the shared raw payload log" {
+test "MCP source never uses a shared Cog temporary path" {
     const source = try std.fs.cwd().readFileAlloc(std.testing.allocator, "src/mcp.zig", 4 * 1024 * 1024);
     defer std.testing.allocator.free(source);
 
-    const forbidden_path = "/tmp/" ++ "cog-mcp.log";
-    try std.testing.expect(std.mem.indexOf(u8, source, forbidden_path) == null);
+    const forbidden_prefix = "/tmp/" ++ "cog";
+    try std.testing.expect(std.mem.indexOf(u8, source, forbidden_prefix) == null);
 }
 
 test "code intelligence tests use isolated temporary files" {

@@ -3125,7 +3125,7 @@ fn testRuntimeWithOptions(allocator: std.mem.Allocator, options: TestRuntimeOpti
     const brain_type: config_mod.BrainType = switch (options.brain) {
         .none => .none,
         .local => blk: {
-            const path = try allocator.dupe(u8, "/tmp/cog-test-brain.db");
+            const path = try allocator.dupe(u8, "/nonexistent/cog-test-brain.db");
             errdefer allocator.free(path);
             break :blk .{ .local = .{
                 .path = path,
