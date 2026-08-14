@@ -40,25 +40,41 @@ pub fn main() !void {
     debug_log.log("grammar_lock: acquired directory {s}", .{lock_path});
 
     installSignalForwarders();
-    var child = std.process.Child.init(args[2..], allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.pgid = 0;
-    try child.spawn();
-    const pgid: i32 = @intCast(child.id);
-    child_pgid.store(pgid, .release);
+
+    // Direct fork/exec instead of std.process.Child: the child must own a
+    // fresh process group so signals reach the whole tree, and Zig 0.15.2's
+    // spawn error path panics inside an errdefer (destroyPipe on the unused
+    // {-1,-1} progress pipe) whenever a child-side step fails, masking the
+    // real error — observed on Linux aarch64 CI runners.
+    const argv = try allocator.allocSentinel(?[*:0]const u8, args.len - 2, null);
+    for (args[2..], 0..) |arg, i| argv[i] = arg.ptr;
+
+    const pid = try posix.fork();
+    if (pid == 0) {
+        // Child: become a process-group leader, then exec the payload.
+        posix.setpgid(0, 0) catch {};
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+        _ = posix.execvpeZ(argv[0].?, argv.ptr, envp) catch {};
+        posix.exit(127);
+    }
+
+    debug_log.log("grammar_lock: spawned payload pid={d}", .{pid});
+    child_pgid.store(@intCast(pid), .release);
     const queued_signal = pending_signal.swap(0, .acq_rel);
-    if (queued_signal > 0) posix.kill(-pgid, @intCast(queued_signal)) catch {};
-    const term = try child.wait();
+    if (queued_signal > 0) posix.kill(-pid, @intCast(queued_signal)) catch {};
+
+    const wait_result = posix.waitpid(pid, 0);
     child_pgid.store(0, .release);
     pending_signal.store(0, .release);
 
-    switch (term) {
-        .Exited => |code| if (code != 0) std.process.exit(code),
-        .Signal => |signal| std.process.exit(@intCast(128 + signal)),
-        .Stopped => |signal| std.process.exit(@intCast(128 + signal)),
-        .Unknown => |code| std.process.exit(@intCast(code)),
+    const status = wait_result.status;
+    if (posix.W.IFEXITED(status)) {
+        const code = posix.W.EXITSTATUS(status);
+        if (code != 0) std.process.exit(code);
+    } else if (posix.W.IFSIGNALED(status)) {
+        std.process.exit(@intCast(128 + @as(u8, @intCast(posix.W.TERMSIG(status)))));
+    } else {
+        std.process.exit(1);
     }
 }
 
