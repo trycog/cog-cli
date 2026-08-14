@@ -24,47 +24,55 @@ pub const CoreDump = struct {
     };
 
     pub fn load(allocator: std.mem.Allocator, core_path: []const u8) !CoreDump {
-        debug_log.log("core dump: opening {s}", .{core_path});
+        debug_log.log("dwarf.core_dump: opening core file {s}", .{core_path});
         const file = try std.fs.cwd().openFile(core_path, .{});
         defer file.close();
 
         const stat = try file.stat();
-        debug_log.log("core dump: reading {d} bytes from {s}", .{ stat.size, core_path });
         const data = try allocator.alloc(u8, stat.size);
         errdefer allocator.free(data);
 
         const bytes_read = try file.readAll(data);
-        if (bytes_read < 16) {
-            allocator.free(data);
+        if (bytes_read != data.len or bytes_read < 16) {
+            debug_log.log("dwarf.core_dump: rejecting truncated core, bytes={d}, expected={d}", .{ bytes_read, data.len });
             return error.InvalidCoreFile;
+        }
+        debug_log.log("dwarf.core_dump: read {d} bytes", .{bytes_read});
+
+        if (std.mem.eql(u8, data[0..4], "\x7fELF")) {
+            debug_log.log("dwarf.core_dump: detected ELF core", .{});
+            return parseElfCore(allocator, data);
+        }
+        if (std.mem.readInt(u32, data[0..4], .little) == 0xFEEDFACF) {
+            debug_log.log("dwarf.core_dump: detected Mach-O core", .{});
+            return parseMachOCore(allocator, data);
         }
 
-        // Check magic bytes
-        if (data[0] == 0x7f and data[1] == 'E' and data[2] == 'L' and data[3] == 'F') {
-            return parseElfCore(allocator, data);
-        } else if (std.mem.readInt(u32, data[0..4], .little) == 0xFEEDFACF) {
-            return parseMachOCore(allocator, data);
-        } else {
-            allocator.free(data);
-            return error.InvalidCoreFile;
-        }
+        debug_log.log("dwarf.core_dump: rejecting unknown core format", .{});
+        return error.InvalidCoreFile;
     }
 
     pub fn readMemory(self: *const CoreDump, address: u64, size: usize, allocator: std.mem.Allocator) ![]u8 {
         for (self.segments) |seg| {
-            if (address >= seg.vaddr and address < seg.vaddr + seg.file_size) {
-                const offset_in_seg = address - seg.vaddr;
-                const available = seg.file_size - offset_in_seg;
-                const read_size = @min(size, available);
-                if (read_size == 0) return error.AddressNotMapped;
+            if (address < seg.vaddr) continue;
 
-                const file_pos = seg.file_offset + offset_in_seg;
-                if (file_pos + read_size > self.data.len) return error.AddressNotMapped;
+            const offset_in_seg = address - seg.vaddr;
+            if (offset_in_seg >= seg.file_size) continue;
 
-                const result = try allocator.alloc(u8, read_size);
-                @memcpy(result, self.data[file_pos..][0..read_size]);
-                return result;
-            }
+            const available = seg.file_size - offset_in_seg;
+            const requested: u64 = @intCast(size);
+            const read_size_u64 = @min(requested, available);
+            if (read_size_u64 == 0) return error.AddressNotMapped;
+
+            const file_pos = std.math.add(u64, seg.file_offset, offset_in_seg) catch return error.AddressNotMapped;
+            const file_end = std.math.add(u64, file_pos, read_size_u64) catch return error.AddressNotMapped;
+            if (file_end > self.data.len) return error.AddressNotMapped;
+
+            const file_start: usize = @intCast(file_pos);
+            const read_size: usize = @intCast(read_size_u64);
+            const result = try allocator.alloc(u8, read_size);
+            @memcpy(result, self.data[file_start..][0..read_size]);
+            return result;
         }
         return error.AddressNotMapped;
     }
@@ -105,47 +113,48 @@ pub const CoreDump = struct {
     const EM_AARCH64: u16 = 183;
 
     fn parseElfCore(allocator: std.mem.Allocator, data: []const u8) !CoreDump {
-        if (data.len < 64) return error.InvalidCoreFile; // ELF64 header is 64 bytes
-
-        // Verify the complete ELF64 little-endian identification, core type, and
-        // a register architecture that this reader understands.
+        const elf_header_size = 64;
+        if (data.len < elf_header_size) return error.InvalidCoreFile;
         if (!std.mem.eql(u8, data[0..4], "\x7fELF")) return error.InvalidCoreFile;
         if (data[4] != 2 or data[5] != 1 or data[6] != 1) return error.InvalidCoreFile;
 
         const e_type = std.mem.readInt(u16, data[16..18], .little);
         if (e_type != ET_CORE) return error.InvalidCoreFile;
+        if (std.mem.readInt(u32, data[20..24], .little) != 1) return error.InvalidCoreFile;
 
         const target_arch: std.Target.Cpu.Arch = switch (std.mem.readInt(u16, data[18..20], .little)) {
             EM_X86_64 => .x86_64,
             EM_AARCH64 => .aarch64,
             else => return error.UnsupportedArchitecture,
         };
-        debug_log.log("core dump: parsing ELF64 {s} core", .{@tagName(target_arch)});
+        debug_log.log("dwarf.core_dump: parsing ELF64 {s} core", .{@tagName(target_arch)});
 
         const e_phoff = std.mem.readInt(u64, data[32..40], .little);
         const e_ehsize = std.mem.readInt(u16, data[52..54], .little);
         const e_phentsize = std.mem.readInt(u16, data[54..56], .little);
         const e_phnum = std.mem.readInt(u16, data[56..58], .little);
-        if (e_ehsize != 64 or e_phentsize != @sizeOf(Elf64Phdr)) return error.InvalidCoreFile;
+        if (e_ehsize != elf_header_size or e_phentsize != @sizeOf(Elf64Phdr)) return error.InvalidCoreFile;
+
+        const ph_table_size = std.math.mul(u64, e_phentsize, e_phnum) catch return error.InvalidCoreFile;
+        const ph_table_end = std.math.add(u64, e_phoff, ph_table_size) catch return error.InvalidCoreFile;
+        if (ph_table_end > data.len) return error.InvalidCoreFile;
 
         var segments = std.ArrayListUnmanaged(Segment){};
         errdefer segments.deinit(allocator);
         var registers = RegisterState{};
         var found_regs = false;
 
-        const ph_table_size = std.math.mul(u64, e_phentsize, e_phnum) catch return error.InvalidCoreFile;
-        const ph_table_end = std.math.add(u64, e_phoff, ph_table_size) catch return error.InvalidCoreFile;
-        if (ph_table_end > data.len) return error.InvalidCoreFile;
-
         var i: u16 = 0;
         while (i < e_phnum) : (i += 1) {
-            const ph_offset = e_phoff + @as(u64, i) * @as(u64, e_phentsize);
+            const ph_entry_offset = std.math.mul(u64, i, e_phentsize) catch return error.InvalidCoreFile;
+            const ph_offset = std.math.add(u64, e_phoff, ph_entry_offset) catch return error.InvalidCoreFile;
             const phdr = std.mem.bytesAsValue(Elf64Phdr, data[ph_offset..][0..@sizeOf(Elf64Phdr)]);
 
             const segment_end = std.math.add(u64, phdr.p_offset, phdr.p_filesz) catch return error.InvalidCoreFile;
             if (segment_end > data.len) return error.InvalidCoreFile;
 
             if (phdr.p_type == PT_LOAD) {
+                if (phdr.p_filesz > phdr.p_memsz) return error.InvalidCoreFile;
                 try segments.append(allocator, .{
                     .vaddr = phdr.p_vaddr,
                     .file_offset = phdr.p_offset,
@@ -153,7 +162,6 @@ pub const CoreDump = struct {
                     .mem_size = phdr.p_memsz,
                 });
             } else if (phdr.p_type == PT_NOTE and !found_regs) {
-                // Parse NOTE segment for NT_PRSTATUS.
                 if (try parseElfNotes(data, phdr.p_offset, phdr.p_filesz, target_arch)) |regs| {
                     registers = regs;
                     found_regs = true;
@@ -161,9 +169,16 @@ pub const CoreDump = struct {
             }
         }
 
+        if (!found_regs) {
+            debug_log.log("dwarf.core_dump: rejecting ELF core without valid CORE/NT_PRSTATUS registers", .{});
+            return error.InvalidCoreFile;
+        }
+
+        const owned_segments = try segments.toOwnedSlice(allocator);
+        debug_log.log("dwarf.core_dump: loaded ELF core segments={d}", .{owned_segments.len});
         return .{
             .data = data,
-            .segments = try segments.toOwnedSlice(allocator),
+            .segments = owned_segments,
             .registers = registers,
             .allocator = allocator,
         };
@@ -408,6 +423,138 @@ pub const CoreDump = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+fn writeElfCore(
+    target_arch: std.Target.Cpu.Arch,
+    include_registers: bool,
+    note_owner: []const u8,
+    oversized_load: bool,
+    dir: std.fs.Dir,
+    name: []const u8,
+) !void {
+    std.debug.assert(note_owner.len == 5);
+
+    const header_size = 64;
+    const phdr_size = @sizeOf(CoreDump.Elf64Phdr);
+    const machine: u16 = switch (target_arch) {
+        .x86_64 => CoreDump.EM_X86_64,
+        .aarch64 => CoreDump.EM_AARCH64,
+        else => unreachable,
+    };
+    const register_bytes: usize = switch (target_arch) {
+        .x86_64 => 27 * @sizeOf(u64),
+        .aarch64 => 34 * @sizeOf(u64),
+        else => unreachable,
+    };
+    const desc_size = if (include_registers) 112 + register_bytes else 0;
+    const phdr_count: usize = if (oversized_load) 2 else 1;
+    const note_offset = header_size + phdr_count * phdr_size;
+    const note_name_size = 8;
+    const note_size = @sizeOf(CoreDump.Elf64Nhdr) + note_name_size + desc_size;
+    const load_offset = note_offset + note_size;
+    const total_size: usize = load_offset + if (oversized_load) @as(usize, 2) else 0;
+    var data: [582]u8 = [_]u8{0} ** 582;
+
+    data[0] = 0x7f;
+    data[1] = 'E';
+    data[2] = 'L';
+    data[3] = 'F';
+    data[4] = 2; // ELFCLASS64
+    data[5] = 1; // ELFDATA2LSB
+    data[6] = 1; // EV_CURRENT
+    std.mem.writeInt(u16, data[16..18], CoreDump.ET_CORE, .little);
+    std.mem.writeInt(u16, data[18..20], machine, .little);
+    std.mem.writeInt(u32, data[20..24], 1, .little); // EV_CURRENT
+    std.mem.writeInt(u64, data[32..40], header_size, .little);
+    std.mem.writeInt(u16, data[52..54], header_size, .little);
+    std.mem.writeInt(u16, data[54..56], phdr_size, .little);
+    std.mem.writeInt(u16, data[56..58], @intCast(phdr_count), .little);
+
+    std.mem.writeInt(u32, data[header_size..][0..4], CoreDump.PT_NOTE, .little);
+    std.mem.writeInt(u64, data[header_size + 8 ..][0..8], note_offset, .little);
+    std.mem.writeInt(u64, data[header_size + 32 ..][0..8], note_size, .little);
+
+    if (oversized_load) {
+        const load_phdr = header_size + phdr_size;
+        std.mem.writeInt(u32, data[load_phdr..][0..4], CoreDump.PT_LOAD, .little);
+        std.mem.writeInt(u64, data[load_phdr + 8 ..][0..8], load_offset, .little);
+        std.mem.writeInt(u64, data[load_phdr + 16 ..][0..8], 0x1000, .little);
+        std.mem.writeInt(u64, data[load_phdr + 32 ..][0..8], 2, .little);
+        std.mem.writeInt(u64, data[load_phdr + 40 ..][0..8], 1, .little);
+    }
+
+    std.mem.writeInt(u32, data[note_offset..][0..4], 5, .little);
+    std.mem.writeInt(u32, data[note_offset + 4 ..][0..4], @intCast(desc_size), .little);
+    std.mem.writeInt(u32, data[note_offset + 8 ..][0..4], CoreDump.NT_PRSTATUS, .little);
+    @memcpy(data[note_offset + @sizeOf(CoreDump.Elf64Nhdr) ..][0..5], note_owner);
+
+    if (include_registers) {
+        const register_start = note_offset + @sizeOf(CoreDump.Elf64Nhdr) + note_name_size + 112;
+        const pc_index: usize = switch (target_arch) {
+            .x86_64 => 16,
+            .aarch64 => 32,
+            else => unreachable,
+        };
+        std.mem.writeInt(u64, data[register_start + pc_index * 8 ..][0..8], 0x12345678, .little);
+    }
+
+    var file = try dir.createFile(name, .{});
+    defer file.close();
+    try file.writeAll(data[0..total_size]);
+}
+
+test "CoreDump.load rejects ELF core without register state" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeElfCore(.x86_64, false, "CORE\x00", false, tmp_dir.dir, "missing-registers.core");
+    const core_path = try tmp_dir.dir.realpathAlloc(allocator, "missing-registers.core");
+    defer allocator.free(core_path);
+
+    try std.testing.expectError(error.InvalidCoreFile, CoreDump.load(allocator, core_path));
+}
+
+test "CoreDump.load reads cross-architecture ELF register state" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    inline for (.{ std.Target.Cpu.Arch.x86_64, std.Target.Cpu.Arch.aarch64 }) |target_arch| {
+        const filename = @tagName(target_arch) ++ ".core";
+        try writeElfCore(target_arch, true, "CORE\x00", false, tmp_dir.dir, filename);
+        const core_path = try tmp_dir.dir.realpathAlloc(allocator, filename);
+        defer allocator.free(core_path);
+
+        var core = try CoreDump.load(allocator, core_path);
+        defer core.deinit();
+        try std.testing.expectEqual(@as(u64, 0x12345678), core.readRegisters().pc);
+    }
+}
+
+test "CoreDump.load rejects NT_PRSTATUS without CORE owner" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeElfCore(.x86_64, true, "LINX\x00", false, tmp_dir.dir, "wrong-owner.core");
+    const core_path = try tmp_dir.dir.realpathAlloc(allocator, "wrong-owner.core");
+    defer allocator.free(core_path);
+
+    try std.testing.expectError(error.InvalidCoreFile, CoreDump.load(allocator, core_path));
+}
+
+test "CoreDump.load rejects PT_LOAD files larger than memory" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try writeElfCore(.x86_64, true, "CORE\x00", true, tmp_dir.dir, "oversized-load.core");
+    const core_path = try tmp_dir.dir.realpathAlloc(allocator, "oversized-load.core");
+    defer allocator.free(core_path);
+
+    try std.testing.expectError(error.InvalidCoreFile, CoreDump.load(allocator, core_path));
+}
+
 test "CoreDump.readMemory returns data from matching segment" {
     const allocator = std.testing.allocator;
 
@@ -446,6 +593,41 @@ test "CoreDump.readMemory returns data from matching segment" {
     try std.testing.expectEqual(@as(u8, 0xAD), result[1]);
     try std.testing.expectEqual(@as(u8, 0xBE), result[2]);
     try std.testing.expectEqual(@as(u8, 0xEF), result[3]);
+}
+
+test "CoreDump.readMemory handles overflowing virtual and file ranges" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{ 0, 0xA5 };
+
+    const virtual_wrap = [_]CoreDump.Segment{.{
+        .vaddr = std.math.maxInt(u64) - 1,
+        .file_offset = 0,
+        .file_size = 2,
+        .mem_size = 2,
+    }};
+    var readable = CoreDump{
+        .data = &data,
+        .segments = &virtual_wrap,
+        .registers = .{},
+        .allocator = allocator,
+    };
+    const result = try readable.readMemory(std.math.maxInt(u64), 1, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, &.{0xA5}, result);
+
+    const file_wrap = [_]CoreDump.Segment{.{
+        .vaddr = 0x1000,
+        .file_offset = std.math.maxInt(u64),
+        .file_size = 1,
+        .mem_size = 1,
+    }};
+    var unmapped = CoreDump{
+        .data = &data,
+        .segments = &file_wrap,
+        .registers = .{},
+        .allocator = allocator,
+    };
+    try std.testing.expectError(error.AddressNotMapped, unmapped.readMemory(0x1000, 1, allocator));
 }
 
 test "CoreDump.readMemory returns error for unmapped address" {
