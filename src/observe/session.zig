@@ -3,6 +3,7 @@ const sqlite = @import("../sqlite.zig");
 const schema = @import("schema.zig");
 const types = @import("types.zig");
 const debug_log = @import("../debug_log.zig");
+const paths = @import("../paths.zig");
 const settings = @import("../settings.zig");
 const uuid = @import("uuid");
 
@@ -31,12 +32,14 @@ pub const SessionManager = struct {
     sessions: std.StringHashMap(*Session),
     corrupt_database_paths: std.ArrayListUnmanaged([]const u8),
     allocator: std.mem.Allocator,
+    observe_dir: ?[]const u8,
 
     pub fn init(allocator: std.mem.Allocator) !SessionManager {
         var manager: SessionManager = .{
             .sessions = std.StringHashMap(*Session).init(allocator),
             .corrupt_database_paths = .empty,
             .allocator = allocator,
+            .observe_dir = null,
         };
         errdefer manager.deinit();
         try manager.discoverPersistedSessions();
@@ -56,24 +59,74 @@ pub const SessionManager = struct {
         self.sessions.deinit();
         for (self.corrupt_database_paths.items) |path| self.allocator.free(path);
         self.corrupt_database_paths.deinit(self.allocator);
+        if (self.observe_dir) |observe_dir| self.allocator.free(observe_dir);
+    }
+
+    fn resolveObserveDir(self: *SessionManager, create_if_missing: bool) !?[]const u8 {
+        if (self.observe_dir == null) {
+            const cog_dir = paths.findCogDir(self.allocator) catch |err| switch (err) {
+                error.NoCogDir => blk: {
+                    if (!create_if_missing) {
+                        debug_log.log("SessionManager.resolveObserveDir: no project Cog directory available for discovery", .{});
+                        return null;
+                    }
+                    debug_log.log("SessionManager.resolveObserveDir: creating project Cog directory in cwd", .{});
+                    break :blk paths.findOrCreateCogDir(self.allocator) catch |create_err| {
+                        debug_log.log("SessionManager.resolveObserveDir: project Cog directory creation failed: {s}", .{@errorName(create_err)});
+                        return create_err;
+                    };
+                },
+                else => {
+                    debug_log.log("SessionManager.resolveObserveDir: project Cog directory resolution failed: {s}", .{@errorName(err)});
+                    return err;
+                },
+            };
+            defer self.allocator.free(cog_dir);
+            debug_log.log("SessionManager.resolveObserveDir: resolved project Cog directory {s}", .{cog_dir});
+
+            self.observe_dir = try std.fs.path.join(self.allocator, &.{ cog_dir, "observe" });
+            debug_log.log("SessionManager.resolveObserveDir: storage and discovery path {s}", .{self.observe_dir.?});
+        } else {
+            debug_log.log("SessionManager.resolveObserveDir: using cached path {s}", .{self.observe_dir.?});
+        }
+
+        const observe_dir = self.observe_dir.?;
+        if (create_if_missing) {
+            const cog_dir = std.fs.path.dirname(observe_dir) orelse return error.NoCogDir;
+            var project_dir = std.fs.openDirAbsolute(cog_dir, .{}) catch |err| {
+                debug_log.log("SessionManager.resolveObserveDir: failed to open project Cog directory {s}: {s}", .{ cog_dir, @errorName(err) });
+                return err;
+            };
+            defer project_dir.close();
+            project_dir.makePath("observe") catch |err| {
+                debug_log.log("SessionManager.resolveObserveDir: failed to create observe directory in {s}: {s}", .{ cog_dir, @errorName(err) });
+                return err;
+            };
+        }
+
+        return observe_dir;
     }
 
     fn discoverPersistedSessions(self: *SessionManager) !void {
-        var dir = std.fs.cwd().openDir(".cog/observe", .{ .iterate = true }) catch |err| switch (err) {
+        const observe_dir = (try self.resolveObserveDir(false)) orelse return;
+        var dir = std.fs.openDirAbsolute(observe_dir, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
-                debug_log.log("SessionManager.discover: no persisted observe directory", .{});
+                debug_log.log("SessionManager.discover: no persisted observe directory at {s}", .{observe_dir});
                 return;
             },
-            else => return err,
+            else => {
+                debug_log.log("SessionManager.discover: failed to open {s}: {s}", .{ observe_dir, @errorName(err) });
+                return err;
+            },
         };
         defer dir.close();
 
-        debug_log.log("SessionManager.discover: scanning .cog/observe", .{});
+        debug_log.log("SessionManager.discover: scanning {s}", .{observe_dir});
         var iterator = dir.iterate();
         while (try iterator.next()) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".db")) continue;
 
-            const db_path = try std.fs.path.join(self.allocator, &.{ ".cog/observe", entry.name });
+            const db_path = try std.fs.path.join(self.allocator, &.{ observe_dir, entry.name });
             self.discoverPersistedSession(db_path) catch |err| switch (err) {
                 error.CorruptSessionDatabase => {
                     debug_log.log("SessionManager.discover: reporting corrupt database path={s}", .{db_path});
@@ -177,7 +230,7 @@ pub const SessionManager = struct {
             defer self.allocator.free(path);
             debug_log.log("SessionManager.cleanup: deleting expired id={s} path={s}", .{ id, path });
             std.debug.assert(self.destroySession(id));
-            std.fs.cwd().deleteFile(path) catch |err| {
+            std.fs.deleteFileAbsolute(path) catch |err| {
                 debug_log.log("SessionManager.cleanup: delete failed path={s} error={s}", .{ path, @errorName(err) });
                 return err;
             };
@@ -193,18 +246,16 @@ pub const SessionManager = struct {
 
         debug_log.log("SessionManager.createSession: id={s} backend={s}", .{ id, backend.toString() });
 
-        // Ensure .cog/observe/ directory exists
-        std.fs.cwd().makePath(".cog/observe") catch {
-            debug_log.log("SessionManager.createSession: failed to create .cog/observe/", .{});
-            return error.Explained;
-        };
+        const observe_dir = (try self.resolveObserveDir(true)).?;
 
-        // Create the investigation database
-        const db_path = try std.fmt.allocPrint(self.allocator, ".cog/observe/{s}.db", .{id});
+        // Create the investigation database in the resolved project Cog directory.
+        const db_filename = try std.fmt.allocPrint(self.allocator, "{s}.db", .{id});
+        defer self.allocator.free(db_filename);
+        const db_path = try std.fs.path.join(self.allocator, &.{ observe_dir, db_filename });
         errdefer self.allocator.free(db_path);
         errdefer {
             debug_log.log("SessionManager.createSession: removing partial database {s}", .{db_path});
-            std.fs.cwd().deleteFile(db_path) catch |err| switch (err) {
+            std.fs.deleteFileAbsolute(db_path) catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => debug_log.log("SessionManager.createSession: failed to remove partial database {s}: {s}", .{ db_path, @errorName(err) }),
             };
@@ -272,7 +323,7 @@ pub const SessionManager = struct {
         const session = self.sessions.get(id) orelse return error.SessionNotFound;
         debug_log.log("SessionManager.finalizeSession: id={s}", .{id});
 
-        // Update status in the database
+        // Update status in the database before mutating in-memory state.
         {
             var stmt = session.db.prepare("UPDATE sessions SET status = 'finalized', stopped_at = datetime('now') WHERE id = ?") catch |err| {
                 debug_log.log("SessionManager.finalizeSession: prepare failed id={s} error={s}", .{ id, @errorName(err) });
@@ -381,6 +432,45 @@ pub const SessionManager = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+test "SessionManager stores and discovers sessions from nested project cwd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".cog");
+    try tmp.dir.makePath("nested/deep");
+
+    const project_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(project_root);
+
+    var nested = try tmp.dir.openDir("nested/deep", .{});
+    defer nested.close();
+
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try nested.setAsCwd();
+
+    var first = try SessionManager.init(std.testing.allocator);
+    const id = try std.testing.allocator.dupe(u8, try first.createSession(.syscall, null));
+    defer std.testing.allocator.free(id);
+    const db_filename = try std.testing.allocator.dupe(u8, std.fs.path.basename(first.getSession(id).?.db_path));
+    defer std.testing.allocator.free(db_filename);
+    first.deinit();
+
+    const expected_db_path = try std.fs.path.join(std.testing.allocator, &.{ project_root, ".cog", "observe", db_filename });
+    defer std.testing.allocator.free(expected_db_path);
+    var db_file = try std.fs.openFileAbsolute(expected_db_path, .{});
+    db_file.close();
+
+    var second = try SessionManager.init(std.testing.allocator);
+    defer second.deinit();
+    const discovered = second.getSession(id) orelse return error.SessionNotDiscovered;
+    try std.testing.expectEqualStrings(expected_db_path, discovered.db_path);
+    try std.testing.expectError(error.FileNotFound, nested.openDir(".cog", .{}));
+}
+
 test "SessionManager discovers persisted sessions after restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -451,12 +541,14 @@ test "SessionManager reports corrupt persisted databases without hiding healthy 
     const file = try std.fs.cwd().createFile(".cog/observe/corrupt.db", .{});
     try file.writeAll("not sqlite");
     file.close();
+    const corrupt_path = try std.fs.cwd().realpathAlloc(std.testing.allocator, ".cog/observe/corrupt.db");
+    defer std.testing.allocator.free(corrupt_path);
 
     var second = try SessionManager.init(std.testing.allocator);
     defer second.deinit();
     try std.testing.expectEqual(@as(usize, 1), second.sessionCount());
     try std.testing.expectEqual(@as(usize, 1), second.corruptDatabasePaths().len);
-    try std.testing.expectEqualStrings(".cog/observe/corrupt.db", second.corruptDatabasePaths()[0]);
+    try std.testing.expectEqualStrings(corrupt_path, second.corruptDatabasePaths()[0]);
 }
 
 test "cleanupExpiredSessions deletes expired completed databases and preserves active sessions" {
@@ -486,7 +578,7 @@ test "cleanupExpiredSessions deletes expired completed databases and preserves a
 
     try std.testing.expect(mgr.getSession(expired_id) == null);
     try std.testing.expect(mgr.getSession(active_id) != null);
-    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(expired_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(expired_path, .{}));
 }
 
 test "createSession and getSession" {

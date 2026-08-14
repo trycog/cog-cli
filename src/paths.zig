@@ -31,13 +31,16 @@ pub fn findCogDir(allocator: std.mem.Allocator) ![]const u8 {
             return std.fmt.allocPrint(allocator, "{s}/.cog", .{current});
         }
 
-        // Stop at project root (.git boundary) — don't escape into parent projects
+        // Stop at project root (.git directory or worktree file) so resolution
+        // cannot escape into an enclosing repository.
         const has_git = blk: {
-            var git_dir = dir.openDir(".git", .{}) catch break :blk false;
-            git_dir.close();
+            _ = dir.statFile(".git") catch break :blk false;
             break :blk true;
         };
-        if (has_git) break;
+        if (has_git) {
+            debug_log.log("findCogDir: stopped at git boundary {s}", .{current});
+            break;
+        }
 
         if (std.mem.eql(u8, current, home)) break;
         const parent = std.fs.path.dirname(current) orelse break;
@@ -580,4 +583,25 @@ fn unsetEnv(name: []const u8) void {
     const name_z = std.testing.allocator.dupeZ(u8, name) catch return;
     defer std.testing.allocator.free(name_z);
     _ = c_fns.unsetenv(name_z);
+}
+
+test "findCogDir stops at git file worktree boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".cog");
+    try tmp.dir.makePath("repo/nested");
+    var git_file = try tmp.dir.createFile("repo/.git", .{});
+    git_file.close();
+
+    var nested = try tmp.dir.openDir("repo/nested", .{});
+    defer nested.close();
+    var old_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        old_cwd.setAsCwd() catch {};
+        old_cwd.close();
+    }
+    try nested.setAsCwd();
+
+    try std.testing.expectError(error.NoCogDir, findCogDir(std.testing.allocator));
 }
