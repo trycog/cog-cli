@@ -28,7 +28,12 @@ pub fn findCogDir(allocator: std.mem.Allocator) ![]const u8 {
         };
         if (has_cog_dir) {
             debug_log.log("findCogDir: found at {s}/.cog", .{current});
-            return std.fmt.allocPrint(allocator, "{s}/.cog", .{current});
+            const cog_path = try std.fmt.allocPrint(allocator, "{s}/.cog", .{current});
+            errdefer allocator.free(cog_path);
+            // Every consumer — settings, index.scip, temp paths — resolves
+            // through this result, so the trust boundary is enforced here.
+            try validateOwnedCogDir(cog_path);
+            return cog_path;
         }
 
         // Stop at project root (.git directory or worktree file) so resolution
@@ -302,7 +307,9 @@ fn unixSocketHasListener(path: []const u8) bool {
     @memset(&address.path, 0);
     @memcpy(address.path[0..path.len], path);
 
-    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0) catch |err| {
+    // Non-blocking: a saturated listener backlog must not stall startup, and
+    // a connect that would block proves a listener exists anyway.
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch |err| {
         debug_log.log("unixSocketHasListener: probe socket failed: {s}; treating {s} as live", .{ @errorName(err), path });
         return true;
     };
@@ -314,6 +321,10 @@ fn unixSocketHasListener(path: []const u8) bool {
             return false;
         },
         error.FileNotFound => return false,
+        error.WouldBlock => {
+            debug_log.log("unixSocketHasListener: {s} has a busy listener; live", .{path});
+            return true;
+        },
         else => {
             debug_log.log("unixSocketHasListener: probe error {s}; treating {s} as live", .{ @errorName(err), path });
             return true;
@@ -529,6 +540,25 @@ test "getProjectTempDir creates a private directory under .cog" {
     defer dir.close();
     const stat = try std.posix.fstat(dir.fd);
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o700), stat.mode & 0o777);
+}
+
+test "findCogDir rejects a symlinked .cog directory" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir("outside");
+    try tmp.dir.symLink("outside", ".cog", .{ .is_directory = true });
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expectError(error.CogDirSymlink, findCogDir(allocator));
 }
 
 test "findOrCreateCogDir rejects a symlinked .cog directory" {
