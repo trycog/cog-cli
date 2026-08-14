@@ -39,7 +39,10 @@ const Root = struct {
     is_project: bool,
 };
 
-const DirectoryIdentity = struct {
+/// Physical identity of a directory, used to stop symlink cycles from being
+/// walked forever. Two paths that resolve to the same device/inode pair are the
+/// same directory no matter how many links were followed to reach them.
+pub const DirectoryIdentity = struct {
     device: u64,
     inode: u64,
 };
@@ -47,6 +50,10 @@ const DirectoryIdentity = struct {
 const Alias = struct {
     canonical_path: []const u8,
     logical_prefix: []const u8,
+    /// The path that was traversed to reach `canonical_path`. For a root this is
+    /// the root itself; for a symlink it is the link. Watchers use it to notice
+    /// when the link that created this alias is removed.
+    link_path: []const u8,
 };
 
 pub const PathMatcher = struct {
@@ -149,10 +156,7 @@ pub const PathMatcher = struct {
             self.allocator.free(root.logical_prefix);
         }
         self.allocator.free(self.roots);
-        for (self.aliases.items) |alias| {
-            self.allocator.free(alias.canonical_path);
-            self.allocator.free(alias.logical_prefix);
-        }
+        self.invalidateAliases();
         self.aliases.deinit(self.allocator);
         self.allocator.free(self.project_root);
     }
@@ -179,7 +183,7 @@ pub const PathMatcher = struct {
         for (self.roots) |root| {
             var active = std.AutoHashMap(DirectoryIdentity, void).init(self.allocator);
             defer active.deinit();
-            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, out, false);
+            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, out, false, null);
         }
         std.mem.sort(MatchedPath, out.items, {}, struct {
             fn lessThan(_: void, a: MatchedPath, b: MatchedPath) bool {
@@ -264,6 +268,7 @@ pub const PathMatcher = struct {
         active: *std.AutoHashMap(DirectoryIdentity, void),
         out: *std.ArrayListUnmanaged(MatchedPath),
         discover_aliases: bool,
+        alias_link: ?[]const u8,
     ) !void {
         if (depth > self.max_depth) {
             debug_log.log("PathMatcher.walk: depth cap path={s} depth={d}", .{ physical_dir, depth });
@@ -287,10 +292,18 @@ pub const PathMatcher = struct {
         try active.put(identity, {});
         defer _ = active.remove(identity);
 
+        // Registered only once the directory is known to be reachable, in
+        // bounds, and not a cycle back into an ancestor. A link that fails any
+        // of those checks contributes no files to collection, so recording it
+        // as an alias would let the watcher emit logical paths the initial
+        // collection never produced.
+        if (discover_aliases) {
+            if (alias_link) |link| try self.addAlias(physical_dir, logical_dir, link);
+        }
+
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
-            if (isExcludedDirectory(entry.name)) continue;
+            if (!isTraversableEntryName(entry.name)) continue;
 
             const physical_child = try std.fs.path.join(self.allocator, &.{ physical_dir, entry.name });
             defer self.allocator.free(physical_child);
@@ -310,17 +323,23 @@ pub const PathMatcher = struct {
             const stat = std.fs.cwd().statFile(canonical_child) catch continue;
             switch (stat.kind) {
                 .directory => {
-                    if (discover_aliases and !std.mem.eql(u8, physical_child, canonical_child)) {
-                        try self.addAlias(canonical_child, logical_child);
-                    }
-                    try self.walkDirectory(canonical_child, logical_child, depth + 1, active, out, discover_aliases);
+                    const linked = !std.mem.eql(u8, physical_child, canonical_child);
+                    try self.walkDirectory(
+                        canonical_child,
+                        logical_child,
+                        depth + 1,
+                        active,
+                        out,
+                        discover_aliases,
+                        if (linked) physical_child else null,
+                    );
                 },
                 .file => {
                     // A file reached through a symlink is a second logical name for
                     // the same physical file; record it so watcher events on the
                     // physical path still resolve to this logical path.
                     if (discover_aliases and !std.mem.eql(u8, physical_child, canonical_child)) {
-                        try self.addAlias(canonical_child, logical_child);
+                        try self.addAlias(canonical_child, logical_child, physical_child);
                     }
                     if (!discover_aliases and self.matches(logical_child)) {
                         const logical_owned = try self.allocator.dupe(u8, logical_child);
@@ -349,6 +368,7 @@ pub const PathMatcher = struct {
         for (self.aliases.items) |alias| {
             self.allocator.free(alias.canonical_path);
             self.allocator.free(alias.logical_prefix);
+            self.allocator.free(alias.link_path);
         }
         self.aliases.clearRetainingCapacity();
         self.aliases_discovered = false;
@@ -360,7 +380,7 @@ pub const PathMatcher = struct {
         errdefer self.invalidateAliases();
 
         for (self.roots) |root| {
-            try self.addAlias(root.canonical_path, root.logical_prefix);
+            try self.addAlias(root.canonical_path, root.logical_prefix, root.canonical_path);
         }
 
         // Every approved root is walked, not just the project: a symlink inside
@@ -371,13 +391,18 @@ pub const PathMatcher = struct {
             defer active.deinit();
             var ignored: std.ArrayListUnmanaged(MatchedPath) = .empty;
             defer ignored.deinit(self.allocator);
-            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, &ignored, true);
+            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, &ignored, true, null);
         }
         self.aliases_discovered = true;
         debug_log.log("PathMatcher.aliases: discovered {d} logical roots", .{self.aliases.items.len});
     }
 
-    fn addAlias(self: *PathMatcher, canonical_path: []const u8, logical_prefix: []const u8) !void {
+    fn addAlias(
+        self: *PathMatcher,
+        canonical_path: []const u8,
+        logical_prefix: []const u8,
+        link_path: []const u8,
+    ) !void {
         for (self.aliases.items) |alias| {
             if (std.mem.eql(u8, alias.canonical_path, canonical_path) and
                 std.mem.eql(u8, alias.logical_prefix, logical_prefix)) return;
@@ -386,11 +411,24 @@ pub const PathMatcher = struct {
         errdefer self.allocator.free(canonical_owned);
         const logical_owned = try self.allocator.dupe(u8, logical_prefix);
         errdefer self.allocator.free(logical_owned);
+        const link_owned = try self.allocator.dupe(u8, link_path);
+        errdefer self.allocator.free(link_owned);
         try self.aliases.append(self.allocator, .{
             .canonical_path = canonical_owned,
             .logical_prefix = logical_owned,
+            .link_path = link_owned,
         });
-        debug_log.log("PathMatcher.aliases: logical={s} physical={s}", .{ logical_prefix, canonical_path });
+        debug_log.log("PathMatcher.aliases: logical={s} physical={s} link={s}", .{ logical_prefix, canonical_path, link_path });
+    }
+
+    /// True when `physical_path` is the link that produced a known alias. A
+    /// watcher uses this to refresh aliases when a link is deleted, since the
+    /// link can no longer be inspected once it is gone.
+    pub fn isKnownAliasLink(self: *const PathMatcher, physical_path: []const u8) bool {
+        for (self.aliases.items) |alias| {
+            if (std.mem.eql(u8, alias.link_path, physical_path)) return true;
+        }
+        return false;
     }
 
     fn isAllowedCanonical(self: *const PathMatcher, canonical_path: []const u8) bool {
@@ -461,7 +499,7 @@ fn rootAliasExists(roots: []const Root, alias: []const u8) bool {
     return false;
 }
 
-fn directoryIdentity(dir: std.fs.Dir) !DirectoryIdentity {
+pub fn directoryIdentity(dir: std.fs.Dir) !DirectoryIdentity {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         const stat = try dir.stat();
         return .{ .device = 0, .inode = @intCast(stat.inode) };
@@ -538,11 +576,20 @@ pub fn isPolicyExcluded(path: []const u8) bool {
     return false;
 }
 
-fn isExcludedDirectory(name: []const u8) bool {
+pub fn isExcludedDirectory(name: []const u8) bool {
     for (excluded_directories) |excluded| {
         if (std.mem.eql(u8, name, excluded)) return true;
     }
     return false;
+}
+
+/// Single source of truth for "should this directory entry be traversed".
+/// Collection and watch registration must agree here or the watcher will index
+/// files the initial collection skipped (or miss files it included).
+pub fn isTraversableEntryName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '.') return false;
+    return !isExcludedDirectory(name);
 }
 
 fn isNegativePattern(pattern: []const u8) bool {
@@ -946,6 +993,40 @@ test "PathMatcher rediscovers aliases created after startup" {
     try matcher.mapPhysicalToLogical(physical, &pruned);
     try std.testing.expectEqual(@as(usize, 1), pruned.items.len);
     try expectContainsLogical(pruned.items, "src/main.zig");
+}
+
+test "PathMatcher refuses aliases that collection cannot reach" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "a/shallow.zig", "const shallow = true;\n");
+    try writeTestFile(project.dir, "deep/one/two/three/leaf.zig", "const leaf = true;\n");
+    try project.dir.symLink("..", "a/loop", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+        .max_depth = 2,
+    });
+    defer matcher.deinit();
+
+    const shallow_physical = try project.dir.realpathAlloc(allocator, "a/shallow.zig");
+    defer allocator.free(shallow_physical);
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(shallow_physical, &logical);
+
+    // A cycle back into the project must never become a second logical name.
+    try std.testing.expectEqual(@as(usize, 1), logical.items.len);
+    try expectContainsLogical(logical.items, "a/shallow.zig");
 }
 
 fn matcherAllocationScenario(
