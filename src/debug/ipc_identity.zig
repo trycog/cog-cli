@@ -27,7 +27,10 @@ pub fn validateProcessSnapshot(snapshot: ProcessSnapshot, expected_uid: posix.ui
 /// Require a connected Unix socket peer to have the current effective UID.
 pub fn validatePeerUid(fd: posix.socket_t) !void {
     const peer_uid = try peerUid(fd);
-    const expected_uid = posix.geteuid();
+    try validatePeerUidValue(peer_uid, posix.geteuid());
+}
+
+fn validatePeerUidValue(peer_uid: posix.uid_t, expected_uid: posix.uid_t) error{PeerWrongUser}!void {
     if (peer_uid != expected_uid) {
         debug_log.log("debug IPC: rejected peer uid={d} expected={d}", .{ peer_uid, expected_uid });
         return error.PeerWrongUser;
@@ -357,6 +360,11 @@ fn currentPid() posix.pid_t {
         extern fn getpid() posix.pid_t;
     };
     return c_fns.getpid();
+}
+
+test "validatePeerUidValue rejects a foreign peer" {
+    try std.testing.expectError(error.PeerWrongUser, validatePeerUidValue(43, 42));
+    try validatePeerUidValue(42, 42);
 }
 
 test "validateProcessSnapshot accepts matching live Cog process" {
