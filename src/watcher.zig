@@ -117,9 +117,13 @@ pub const Watcher = struct {
         defer allocator.free(index_path);
         std.fs.accessAbsolute(index_path, .{}) catch return null;
 
-        // Load index patterns from settings — no patterns means nothing to watch
+        // Load index patterns from settings — no patterns means nothing to watch.
+        // PathMatcher copies everything it needs, so the loaded settings are
+        // released on every exit path below, including the early ones.
         const s = settings_mod.Settings.load(allocator) orelse return null;
-        const patterns = if (s.code) |code| code.index orelse return null else return null;
+        defer s.deinit(allocator);
+        const code = s.code orelse return null;
+        const patterns = code.index orelse return null;
         if (patterns.len == 0) return null;
 
         // Derive project root (parent of .cog)
@@ -127,8 +131,11 @@ pub const Watcher = struct {
         var matcher = path_matcher.PathMatcher.init(allocator, .{
             .project_root = project_root,
             .patterns = patterns,
-            .external_roots = if (s.code) |code| code.external_roots orelse &.{} else &.{},
-        }) catch return null;
+            .external_roots = code.external_roots orelse &.{},
+        }) catch |err| {
+            debug_log.log("Watcher.init: path matcher setup failed error={s}", .{@errorName(err)});
+            return null;
+        };
 
         // Create pipe for inter-thread communication
         const pipe_fds = posix.pipe() catch {
@@ -212,6 +219,163 @@ pub const Watcher = struct {
         }
     }
 };
+
+// ── Watch Bookkeeping ───────────────────────────────────────────────────
+
+/// Watch-descriptor → canonical directory path registry.
+///
+/// The kernel reuses watch descriptors, and directories move and disappear
+/// while watches are live, so every mutation has to release the path it
+/// replaces. Keeping that ownership in one type means an allocation failure
+/// can never strand a path the registry no longer references.
+const WatchRegistry = struct {
+    allocator: std.mem.Allocator,
+    entries: std.AutoHashMapUnmanaged(i32, []const u8),
+
+    fn init(allocator: std.mem.Allocator) WatchRegistry {
+        return .{ .allocator = allocator, .entries = .empty };
+    }
+
+    fn deinit(self: *WatchRegistry) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |value| self.allocator.free(value.*);
+        self.entries.deinit(self.allocator);
+    }
+
+    fn put(self: *WatchRegistry, wd: i32, dir_path: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, dir_path);
+        errdefer self.allocator.free(owned);
+        const previous = try self.entries.fetchPut(self.allocator, wd, owned);
+        if (previous) |entry| self.allocator.free(entry.value);
+    }
+
+    fn get(self: *const WatchRegistry, wd: i32) ?[]const u8 {
+        return self.entries.get(wd);
+    }
+
+    fn remove(self: *WatchRegistry, wd: i32) void {
+        if (self.entries.fetchRemove(wd)) |entry| self.allocator.free(entry.value);
+    }
+
+    fn count(self: *const WatchRegistry) usize {
+        return self.entries.count();
+    }
+
+    /// Drop every watch at or below `prefix`, cancelling the kernel watch when
+    /// an inotify descriptor is supplied. Allocation-free so it stays usable
+    /// on the path where a directory has already vanished.
+    fn removeSubtree(self: *WatchRegistry, prefix: []const u8, inotify_fd: ?posix.fd_t) usize {
+        var removed: usize = 0;
+        while (true) {
+            var target: ?i32 = null;
+            var it = self.entries.iterator();
+            while (it.next()) |entry| {
+                if (!path_matcher.isContainedPath(entry.value_ptr.*, prefix)) continue;
+                target = entry.key_ptr.*;
+                break;
+            }
+            const wd = target orelse break;
+            if (builtin.os.tag == .linux) {
+                if (inotify_fd) |fd| _ = std.os.linux.inotify_rm_watch(fd, wd);
+            }
+            self.remove(wd);
+            removed += 1;
+        }
+        return removed;
+    }
+};
+
+/// What a subtree walk should do with what it finds. Collection and watch
+/// registration share one traversal so their exclusion, depth, and symlink
+/// cycle policy cannot drift apart.
+const SubtreeVisitor = struct {
+    logical_out: ?*std.ArrayListUnmanaged([]const u8) = null,
+    registry: ?*WatchRegistry = null,
+    inotify_fd: posix.fd_t = -1,
+    watch_mask: u32 = 0,
+};
+
+fn walkWatchedSubtree(
+    allocator: std.mem.Allocator,
+    matcher: *path_matcher.PathMatcher,
+    dir_path: []const u8,
+    depth: usize,
+    active: *std.AutoHashMap(path_matcher.DirectoryIdentity, void),
+    visitor: SubtreeVisitor,
+) !void {
+    if (depth > matcher.recursionLimit()) {
+        debug_log.log("Watcher.subtree: depth cap path={s} depth={d}", .{ dir_path, depth });
+        return;
+    }
+
+    const canonical = std.fs.realpathAlloc(allocator, dir_path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_log.log("Watcher.subtree: resolve {s} failed: {s}", .{ dir_path, @errorName(err) });
+            return;
+        },
+    };
+    defer allocator.free(canonical);
+
+    if (!matcher.allowsPhysicalPath(canonical)) {
+        debug_log.log("Watcher.subtree: rejected directory target={s}", .{canonical});
+        return;
+    }
+
+    var dir = std.fs.openDirAbsolute(canonical, .{ .iterate = true }) catch |err| {
+        debug_log.log("Watcher.subtree: open {s} failed: {s}", .{ canonical, @errorName(err) });
+        return;
+    };
+    defer dir.close();
+
+    const identity = path_matcher.directoryIdentity(dir) catch |err| {
+        debug_log.log("Watcher.subtree: stat {s} failed: {s}", .{ canonical, @errorName(err) });
+        return;
+    };
+    if (active.contains(identity)) {
+        debug_log.log("Watcher.subtree: cycle path={s}", .{canonical});
+        return;
+    }
+    try active.put(identity, {});
+    defer _ = active.remove(identity);
+
+    if (visitor.registry) |registry| try registerWatch(allocator, registry, visitor, canonical);
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (!path_matcher.isTraversableEntryName(entry.name)) continue;
+
+        const child = try std.fs.path.join(allocator, &.{ canonical, entry.name });
+        defer allocator.free(child);
+
+        const stat = std.fs.cwd().statFile(child) catch continue;
+        switch (stat.kind) {
+            .directory => try walkWatchedSubtree(allocator, matcher, child, depth + 1, active, visitor),
+            .file => if (visitor.logical_out) |out| try matcher.mapPhysicalToLogical(child, out),
+            else => {},
+        }
+    }
+}
+
+fn registerWatch(
+    allocator: std.mem.Allocator,
+    registry: *WatchRegistry,
+    visitor: SubtreeVisitor,
+    canonical_dir: []const u8,
+) !void {
+    if (builtin.os.tag != .linux) return;
+
+    const path_z = try allocator.dupeZ(u8, canonical_dir);
+    defer allocator.free(path_z);
+
+    const rc = std.os.linux.inotify_add_watch(visitor.inotify_fd, path_z.ptr, visitor.watch_mask);
+    const wd: i32 = @intCast(@as(isize, @bitCast(rc)));
+    if (wd < 0) {
+        debug_log.log("Watcher.subtree: inotify_add_watch failed path={s} rc={d}", .{ canonical_dir, rc });
+        return;
+    }
+    try registry.put(wd, canonical_dir);
+}
 
 // ── Shared Filtering ────────────────────────────────────────────────────
 
@@ -324,6 +488,8 @@ const CF = struct {
     const kFSEventStreamEventFlagKernelDropped: u32 = 0x00000004;
     const kFSEventStreamEventFlagRootChanged: u32 = 0x00000020;
     const kFSEventStreamEventFlagItemIsFile: u32 = 0x00010000;
+    const kFSEventStreamEventFlagItemIsDir: u32 = 0x00020000;
+    const kFSEventStreamEventFlagItemIsSymlink: u32 = 0x00040000;
     const kFSEventStreamEventFlagItemCreated: u32 = 0x00000100;
     const kFSEventStreamEventFlagItemModified: u32 = 0x00001000;
     const kFSEventStreamEventFlagItemRemoved: u32 = 0x00000200;
@@ -546,9 +712,6 @@ fn fseventsCallback(
             continue;
         }
 
-        // Only care about file events (not directory events)
-        if (flags & CF.kFSEventStreamEventFlagItemIsFile == 0) continue;
-
         // Only care about create/modify/remove/rename
         const interesting = CF.kFSEventStreamEventFlagItemCreated |
             CF.kFSEventStreamEventFlagItemModified |
@@ -557,6 +720,33 @@ fn fseventsCallback(
         if (flags & interesting == 0) continue;
 
         const abs_path = std.mem.span(event_paths[i]);
+
+        // A symlink appearing or disappearing changes which logical names a
+        // physical path answers to — same rule the inotify backend applies.
+        if (flags & CF.kFSEventStreamEventFlagItemIsSymlink != 0) {
+            noteStructuralChange(self, abs_path, false);
+        }
+
+        // FSEvents reports a moved directory as one event and never enumerates
+        // what it carried, so the subtree is reconciled explicitly rather than
+        // left half-indexed.
+        if (flags & CF.kFSEventStreamEventFlagItemIsDir != 0) {
+            const structural = CF.kFSEventStreamEventFlagItemCreated |
+                CF.kFSEventStreamEventFlagItemRemoved |
+                CF.kFSEventStreamEventFlagItemRenamed;
+            if (flags & structural == 0) continue;
+            if (directoryExists(abs_path)) {
+                debug_log.log("watcher.macos: directory appeared path={s}; indexing subtree", .{abs_path});
+                emitPhysicalSubtree(self, abs_path);
+            } else {
+                debug_log.log("watcher.macos: directory vanished path={s}; requesting resync", .{abs_path});
+                self.matcher.invalidateAliases();
+                _ = emitOverflow(self);
+            }
+            continue;
+        }
+
+        if (flags & CF.kFSEventStreamEventFlagItemIsFile == 0) continue;
         emitPhysicalPath(self, abs_path);
     }
 }
@@ -575,12 +765,8 @@ fn watcherThreadLinux(self: *Watcher) void {
     defer posix.close(inotify_fd);
 
     // Watch descriptor → directory path mapping
-    var wd_map = std.AutoHashMap(i32, []const u8).init(self.allocator);
-    defer {
-        var it = wd_map.valueIterator();
-        while (it.next()) |v| self.allocator.free(v.*);
-        wd_map.deinit();
-    }
+    var registry = WatchRegistry.init(self.allocator);
+    defer registry.deinit();
 
     const watch_mask: u32 = linux.IN.MODIFY | linux.IN.CREATE | linux.IN.DELETE |
         linux.IN.MOVED_TO | linux.IN.MOVED_FROM;
@@ -592,9 +778,12 @@ fn watcherThreadLinux(self: *Watcher) void {
     }
     self.matcher.watchRoots(&watch_roots) catch return;
     for (watch_roots.items) |root| {
-        addWatchRecursive(self, inotify_fd, watch_mask, root.physical_path, &wd_map, 0);
+        addWatchSubtree(self, inotify_fd, watch_mask, root.physical_path, &registry);
     }
-    debug_log.log("Watcher.linux: watching {d} approved physical roots", .{watch_roots.items.len});
+    debug_log.log("Watcher.linux: watching {d} approved physical roots, {d} directories", .{
+        watch_roots.items.len,
+        registry.count(),
+    });
 
     // Event buffer
     var event_buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
@@ -623,80 +812,162 @@ fn watcherThreadLinux(self: *Watcher) void {
                 continue;
             }
 
-            const name = event.getName() orelse continue;
-            const dir_path = wd_map.get(event.wd) orelse continue;
-
-            const abs_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name }) catch continue;
-            defer self.allocator.free(abs_path);
-
-            // If a directory is created or moved in, add a watch for it.
-            if (event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0 and
-                event.mask & linux.IN.ISDIR != 0)
-            {
-                addWatchRecursive(self, inotify_fd, watch_mask, abs_path, &wd_map, 0);
+            // IN_IGNORED, IN_DELETE_SELF, IN_MOVE_SELF and IN_UNMOUNT arrive
+            // without a name and regardless of the requested mask. They mean
+            // this watch descriptor no longer describes a live directory in the
+            // watched tree, so its bookkeeping has to go with it.
+            const self_events = linux.IN.IGNORED | linux.IN.DELETE_SELF |
+                linux.IN.MOVE_SELF | linux.IN.UNMOUNT;
+            if (event.mask & self_events != 0) {
+                handleWatchRetired(self, inotify_fd, event.mask, event.wd, &registry);
                 continue;
             }
 
-            // Only process file events.
-            if (event.mask & linux.IN.ISDIR != 0) continue;
+            const name = event.getName() orelse continue;
+            const dir_path = registry.get(event.wd) orelse {
+                debug_log.log("watcher.linux: event for retired wd={d}; ignoring", .{event.wd});
+                continue;
+            };
+
+            const abs_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name }) catch {
+                debug_log.log("watcher.linux: event path allocation failed; requesting resync", .{});
+                _ = emitOverflow(self);
+                continue;
+            };
+            defer self.allocator.free(abs_path);
+
+            const is_directory = event.mask & linux.IN.ISDIR != 0;
+            const appeared = event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0;
+            const vanished = event.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0;
+
+            if (is_directory and appeared) {
+                // inotify reports nothing about the contents a directory already
+                // had when it was moved in, so the subtree is walked explicitly:
+                // watch it, then index every file it brought with it.
+                debug_log.log("watcher.linux: directory appeared path={s}; watching and indexing subtree", .{abs_path});
+                addWatchSubtree(self, inotify_fd, watch_mask, abs_path, &registry);
+                emitPhysicalSubtree(self, abs_path);
+                noteStructuralChange(self, abs_path, true);
+                continue;
+            }
+
+            if (is_directory and vanished) {
+                // The descendants are already gone, so they cannot be
+                // enumerated. Retire their watches and reconcile the index
+                // through a full resync rather than leaving stale entries.
+                const retired = registry.removeSubtree(abs_path, inotify_fd);
+                debug_log.log(
+                    "watcher.linux: directory vanished path={s}; retired {d} watches, requesting resync",
+                    .{ abs_path, retired },
+                );
+                noteStructuralChange(self, abs_path, true);
+                _ = emitOverflow(self);
+                continue;
+            }
+
+            if (is_directory) continue;
+
+            if (appeared or vanished) noteStructuralChange(self, abs_path, false);
             emitPhysicalPath(self, abs_path);
         }
     }
 }
 
-fn addWatchRecursive(
+fn handleWatchRetired(
+    self: *Watcher,
+    inotify_fd: posix.fd_t,
+    mask: u32,
+    wd: i32,
+    registry: *WatchRegistry,
+) void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
+
+    const dir_path = registry.get(wd) orelse {
+        debug_log.log("watcher.linux: retired unknown wd={d} mask=0x{x}", .{ wd, mask });
+        return;
+    };
+
+    // A moved or deleted watch root takes its whole subtree with it; the
+    // descendant watches would otherwise keep reporting events under a path
+    // that no longer exists.
+    const moved_or_deleted = mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.UNMOUNT) != 0;
+    if (moved_or_deleted) {
+        const retired = registry.removeSubtree(dir_path, inotify_fd);
+        debug_log.log("watcher.linux: watch root retired wd={d} mask=0x{x}; retired {d} watches, requesting resync", .{ wd, mask, retired });
+        self.matcher.invalidateAliases();
+        _ = emitOverflow(self);
+        return;
+    }
+
+    debug_log.log("watcher.linux: watch ignored wd={d} path={s}", .{ wd, dir_path });
+    registry.remove(wd);
+}
+
+fn addWatchSubtree(
     self: *Watcher,
     inotify_fd: posix.fd_t,
     mask: u32,
     dir_path: []const u8,
-    wd_map: *std.AutoHashMap(i32, []const u8),
-    depth: usize,
+    registry: *WatchRegistry,
 ) void {
     if (builtin.os.tag != .linux) return;
-    if (depth > self.matcher.recursionLimit()) {
-        debug_log.log("Watcher.linux: depth cap path={s} depth={d}", .{ dir_path, depth });
+
+    var active = std.AutoHashMap(path_matcher.DirectoryIdentity, void).init(self.allocator);
+    defer active.deinit();
+    walkWatchedSubtree(self.allocator, &self.matcher, dir_path, 0, &active, .{
+        .registry = registry,
+        .inotify_fd = inotify_fd,
+        .watch_mask = mask,
+    }) catch |err| {
+        debug_log.log("Watcher.linux: watch setup failed path={s} error={s}; requesting resync", .{ dir_path, @errorName(err) });
+        _ = emitOverflow(self);
+    };
+}
+
+/// Index everything a directory already contained when it appeared. A resync is
+/// requested rather than dropping the subtree if the walk cannot complete.
+fn emitPhysicalSubtree(self: *Watcher, dir_path: []const u8) void {
+    var logical_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical_paths.items) |path| self.allocator.free(path);
+        logical_paths.deinit(self.allocator);
+    }
+
+    var active = std.AutoHashMap(path_matcher.DirectoryIdentity, void).init(self.allocator);
+    defer active.deinit();
+    walkWatchedSubtree(self.allocator, &self.matcher, dir_path, 0, &active, .{
+        .logical_out = &logical_paths,
+    }) catch |err| {
+        debug_log.log("Watcher.subtree: walk failed path={s} error={s}; requesting resync", .{ dir_path, @errorName(err) });
+        _ = emitOverflow(self);
         return;
-    }
+    };
 
-    const canonical_dir = std.fs.realpathAlloc(self.allocator, dir_path) catch return;
-    defer self.allocator.free(canonical_dir);
-    if (!self.matcher.allowsPhysicalPath(canonical_dir)) {
-        debug_log.log("Watcher.linux: rejected directory target={s}", .{canonical_dir});
-        return;
-    }
+    debug_log.log("Watcher.subtree: reindexing {d} logical paths under {s}", .{ logical_paths.items.len, dir_path });
+    for (logical_paths.items) |logical_path| _ = emitWatcherRecord(self, logical_path);
+}
 
-    const linux = std.os.linux;
+/// Symlinks are what create second logical names for a physical path, so a link
+/// appearing or disappearing invalidates the alias table. Plain files and
+/// directories are already covered by the prefix of an existing alias.
+fn noteStructuralChange(self: *Watcher, physical_path: []const u8, is_directory: bool) void {
+    if (is_directory) return;
+    if (!isSymbolicLink(physical_path) and !self.matcher.isKnownAliasLink(physical_path)) return;
+    debug_log.log("Watcher.aliases: symlink change at {s}; refreshing logical aliases", .{physical_path});
+    self.matcher.invalidateAliases();
+}
 
-    const path_z = self.allocator.dupeZ(u8, canonical_dir) catch return;
-    defer self.allocator.free(path_z);
+fn isSymbolicLink(physical_path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.fs.readLinkAbsolute(physical_path, &buf) catch return false;
+    return true;
+}
 
-    const rc = linux.inotify_add_watch(inotify_fd, path_z.ptr, mask);
-    const wd: i32 = @intCast(@as(isize, @bitCast(rc)));
-    if (wd < 0) return;
-
-    const owned_path = self.allocator.dupe(u8, canonical_dir) catch return;
-    if (wd_map.fetchPut(wd, owned_path) catch null) |previous| {
-        self.allocator.free(previous.value);
-    }
-
-    // Recurse into subdirectories
-    var dir = std.fs.openDirAbsolute(canonical_dir, .{ .iterate = true }) catch return;
-    defer dir.close();
-
-    var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
-        // Resolve symlinks to their target kind
-        const kind = if (entry.kind == .sym_link) blk: {
-            const stat = dir.statFile(entry.name) catch break :blk entry.kind;
-            break :blk if (stat.kind == .directory) std.fs.Dir.Entry.Kind.directory else entry.kind;
-        } else entry.kind;
-        if (kind != .directory) continue;
-        if (entry.name[0] == '.') continue;
-
-        const child = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ canonical_dir, entry.name }) catch continue;
-        defer self.allocator.free(child);
-        addWatchRecursive(self, inotify_fd, mask, child, wd_map, depth + 1);
-    }
+fn directoryExists(physical_path: []const u8) bool {
+    var dir = std.fs.openDirAbsolute(physical_path, .{}) catch return false;
+    dir.close();
+    return true;
 }
 test "BatchState flushes on size threshold" {
     var state: BatchState = .{};
@@ -775,6 +1046,244 @@ fn writeTestFile(dir: std.fs.Dir, path: []const u8, contents: []const u8) !void 
     const file = try dir.createFile(path, .{});
     defer file.close();
     try file.writeAll(contents);
+}
+
+test "watch registry owns replaced and removed paths" {
+    const allocator = std.testing.allocator;
+    var registry = WatchRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.put(1, "/project/src");
+    try registry.put(1, "/project/lib");
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try std.testing.expectEqualStrings("/project/lib", registry.get(1).?);
+
+    try registry.put(2, "/project/docs");
+    registry.remove(1);
+    try std.testing.expectEqual(@as(usize, 1), registry.count());
+    try std.testing.expect(registry.get(1) == null);
+}
+
+test "watch registry prunes only the moved subtree" {
+    const allocator = std.testing.allocator;
+    var registry = WatchRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.put(1, "/project");
+    try registry.put(2, "/project/src");
+    try registry.put(3, "/project/src/deep");
+    try registry.put(4, "/project/srcext");
+    try registry.put(5, "/project/docs");
+
+    try std.testing.expectEqual(@as(usize, 2), registry.removeSubtree("/project/src", null));
+    try std.testing.expectEqual(@as(usize, 3), registry.count());
+    try std.testing.expect(registry.get(2) == null);
+    try std.testing.expect(registry.get(3) == null);
+    try std.testing.expectEqualStrings("/project", registry.get(1).?);
+    try std.testing.expectEqualStrings("/project/srcext", registry.get(4).?);
+    try std.testing.expectEqualStrings("/project/docs", registry.get(5).?);
+}
+
+fn watchRegistryAllocationScenario(allocator: std.mem.Allocator) !void {
+    var registry = WatchRegistry.init(allocator);
+    defer registry.deinit();
+
+    try registry.put(1, "/project");
+    try registry.put(2, "/project/src");
+    try registry.put(2, "/project/src-renamed");
+    _ = registry.removeSubtree("/project/src", null);
+    try registry.put(3, "/project/docs");
+}
+
+test "watch registry releases every path under allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        watchRegistryAllocationScenario,
+        .{},
+    );
+}
+
+fn expectContainsPath(observed: []const []const u8, expected: []const u8) !void {
+    for (observed) |path| {
+        if (std.mem.eql(u8, path, expected)) return;
+    }
+    std.debug.print("missing path {s} in:\n", .{expected});
+    for (observed) |path| std.debug.print("  {s}\n", .{path});
+    return error.TestExpectedPath;
+}
+
+fn collectSubtreeForTest(
+    matcher: *path_matcher.PathMatcher,
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var active = std.AutoHashMap(path_matcher.DirectoryIdentity, void).init(allocator);
+    defer active.deinit();
+    try walkWatchedSubtree(allocator, matcher, dir_path, 0, &active, .{ .logical_out = out });
+}
+
+test "watched subtree collection applies the shared exclusion policy" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, "node_modules/pkg/index.zig", "const dep = true;\n");
+    try writeTestFile(project.dir, "zig-out/bin/tool.zig", "const tool = true;\n");
+    try writeTestFile(project.dir, ".hidden/secret.zig", "const secret = true;\n");
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try path_matcher.PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    try collectSubtreeForTest(&matcher, allocator, project_root, &logical);
+
+    try std.testing.expectEqual(@as(usize, 1), logical.items.len);
+    try expectContainsPath(logical.items, "src/main.zig");
+}
+
+test "watched subtree collection reports every logical alias of moved-in files" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "packages/app/main.zig", "pub fn main() void {}\n");
+    try project.dir.symLink("packages/app", "app-link", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try path_matcher.PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    const moved_in = try project.dir.realpathAlloc(allocator, "packages");
+    defer allocator.free(moved_in);
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    try collectSubtreeForTest(&matcher, allocator, moved_in, &logical);
+
+    try expectContainsPath(logical.items, "packages/app/main.zig");
+    try expectContainsPath(logical.items, "app-link/main.zig");
+}
+
+test "watched subtree collection terminates symlink cycles and honors the depth cap" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "a/shallow.zig", "const shallow = true;\n");
+    try writeTestFile(project.dir, "a/b/c/too-deep.zig", "const deep = true;\n");
+    try project.dir.symLink("..", "a/loop", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try path_matcher.PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+        .max_depth = 2,
+    });
+    defer matcher.deinit();
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    try collectSubtreeForTest(&matcher, allocator, project_root, &logical);
+
+    try std.testing.expectEqual(@as(usize, 1), logical.items.len);
+    try expectContainsPath(logical.items, "a/shallow.zig");
+}
+
+test "recursive watch setup mirrors the collection policy" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/deep/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, "node_modules/pkg/index.zig", "const dep = true;\n");
+    try writeTestFile(project.dir, ".hidden/secret.zig", "const secret = true;\n");
+    try project.dir.symLink("..", "src/loop", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try path_matcher.PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    const linux = std.os.linux;
+    const rc = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
+    const inotify_fd: posix.fd_t = @intCast(@as(isize, @bitCast(rc)));
+    try std.testing.expect(inotify_fd >= 0);
+    defer posix.close(inotify_fd);
+
+    var registry = WatchRegistry.init(allocator);
+    defer registry.deinit();
+
+    var active = std.AutoHashMap(path_matcher.DirectoryIdentity, void).init(allocator);
+    defer active.deinit();
+    try walkWatchedSubtree(allocator, &matcher, project_root, 0, &active, .{
+        .registry = &registry,
+        .inotify_fd = inotify_fd,
+        .watch_mask = linux.IN.MODIFY,
+    });
+
+    var watched: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer watched.deinit(allocator);
+    var it = registry.entries.valueIterator();
+    while (it.next()) |value| try watched.append(allocator, value.*);
+
+    try expectContainsPath(watched.items, project_root);
+    for (watched.items) |path| {
+        try std.testing.expect(std.mem.indexOf(u8, path, "node_modules") == null);
+        try std.testing.expect(std.mem.indexOf(u8, path, "/.hidden") == null);
+    }
+}
+
+test "Watcher.init releases the settings it copies" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, ".cog/index.scip", "");
+    try writeTestFile(project.dir, ".cog/settings.json",
+        \\{"code": {"index": ["**/*.zig"]}}
+    );
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer original_cwd.close();
+    try project.dir.setAsCwd();
+    defer original_cwd.setAsCwd() catch {};
+
+    var watcher = Watcher.init(allocator) orelse return error.TestUnexpectedResult;
+    watcher.deinit();
 }
 
 test "watcher events match initial PathMatcher collection" {
