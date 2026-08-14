@@ -4973,6 +4973,10 @@ test "DapProxy keys loaded modules by protocol id" {
     var proxy = DapProxy.init(allocator);
     defer proxy.deinit();
 
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"name\":\"missing-id.so\"}}", DapProxy.handleModuleEvent);
+    try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"id\":true,\"name\":\"invalid-id.so\"}}", DapProxy.handleModuleEvent);
+    try std.testing.expectEqual(@as(usize, 0), proxy.loaded_modules.items.len);
+
     try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"id\":1,\"name\":\"libshared.so\"}}", DapProxy.handleModuleEvent);
     try handleTestEvent(&proxy, allocator, "{\"reason\":\"new\",\"module\":{\"id\":\"two\",\"name\":\"libshared.so\"}}", DapProxy.handleModuleEvent);
     try std.testing.expectEqual(@as(usize, 2), proxy.loaded_modules.items.len);
@@ -4990,6 +4994,9 @@ test "DapProxy ignores invalid stack frame id ranges" {
     var proxy = DapProxy.init(allocator);
     defer proxy.deinit();
 
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":\"frame\"}", DapProxy.handleInvalidatedEvent);
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":true}", DapProxy.handleInvalidatedEvent);
+    try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":{}}", DapProxy.handleInvalidatedEvent);
     try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":-1}", DapProxy.handleInvalidatedEvent);
     try handleTestEvent(&proxy, allocator, "{\"areas\":[\"variables\"],\"stackFrameId\":4294967296}", DapProxy.handleInvalidatedEvent);
     try std.testing.expectEqual(@as(usize, 0), proxy.invalidated_areas.items.len);
