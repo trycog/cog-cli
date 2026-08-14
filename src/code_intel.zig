@@ -1667,15 +1667,16 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer allocator.free(encoded);
 
-    const out_file = std.fs.createFileAbsolute(index_path, .{}) catch {
-        printErr("error: failed to write index file\n");
+    const lock_fd = acquireIndexLock(allocator, cog_dir) orelse {
+        printErr("error: failed to lock index file\n");
         return error.Explained;
     };
-    defer out_file.close();
-    out_file.writeAll(encoded) catch {
+    defer releaseIndexLock(lock_fd);
+    debug_log.log("codeIndex: atomically replacing index bytes={d}", .{encoded.len});
+    if (!writeEncodedIndexAtomically(allocator, index_path, encoded)) {
         printErr("error: failed to write index file\n");
         return error.Explained;
-    };
+    }
 
     // Add external symbols to total count
     total_symbols += master_index.external_symbols.len;
@@ -1702,10 +1703,18 @@ const IndexResult = struct {
 /// Load existing SCIP index or return an empty one.
 /// Caller must free backing_data after the index is no longer needed.
 fn loadExistingIndex(allocator: std.mem.Allocator, index_path: []const u8) IndexResult {
-    const file = std.fs.openFileAbsolute(index_path, .{}) catch return .{ .index = emptyIndex(), .backing_data = null };
+    debug_log.log("loadExistingIndex: opening {s}", .{index_path});
+    const file = std.fs.openFileAbsolute(index_path, .{}) catch |err| {
+        debug_log.log("loadExistingIndex: open failed error={s}; using empty index", .{@errorName(err)});
+        return .{ .index = emptyIndex(), .backing_data = null };
+    };
     defer file.close();
 
-    const data = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch return .{ .index = emptyIndex(), .backing_data = null };
+    const data = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch |err| {
+        debug_log.log("loadExistingIndex: read failed error={s}; using empty index", .{@errorName(err)});
+        return .{ .index = emptyIndex(), .backing_data = null };
+    };
+    debug_log.log("loadExistingIndex: read bytes={d}", .{data.len});
 
     const index = scip.decode(allocator, data) catch {
         allocator.free(data);
@@ -1735,9 +1744,18 @@ fn freeSymbolInformation(allocator: std.mem.Allocator, sym: *scip.SymbolInformat
 
 /// Read a file's contents. Returns null on failure.
 fn readFileContents(allocator: std.mem.Allocator, file_path: []const u8) ?[]const u8 {
-    const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
+    debug_log.log("readFileContents: opening {s}", .{file_path});
+    const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+        debug_log.log("readFileContents: open failed path={s} error={s}", .{ file_path, @errorName(err) });
+        return null;
+    };
     defer file.close();
-    return file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch null;
+    const data = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch |err| {
+        debug_log.log("readFileContents: read failed path={s} error={s}", .{ file_path, @errorName(err) });
+        return null;
+    };
+    debug_log.log("readFileContents: read path={s} bytes={d}", .{ file_path, data.len });
+    return data;
 }
 
 /// Recursively collect files from a directory.
@@ -2420,20 +2438,27 @@ fn mergeDocument(allocator: std.mem.Allocator, index: *scip.Index, new_doc: scip
 /// Remove a document from the index by relative_path.
 fn removeDocument(allocator: std.mem.Allocator, index: *scip.Index, rel_path: []const u8) void {
     for (index.documents, 0..) |*doc, i| {
-        if (std.mem.eql(u8, doc.relative_path, rel_path)) {
+        if (!std.mem.eql(u8, doc.relative_path, rel_path)) continue;
+
+        const old_documents = index.documents;
+        const new_len = old_documents.len - 1;
+        if (new_len == 0) {
             scip.freeDocument(allocator, doc);
-            // Swap-remove
-            const last = index.documents.len - 1;
-            if (i != last) {
-                index.documents[i] = index.documents[last];
-            }
-            // Shrink
-            const new_docs = allocator.alloc(scip.Document, last) catch return;
-            @memcpy(new_docs, index.documents[0..last]);
-            allocator.free(index.documents);
-            index.documents = new_docs;
+            allocator.free(old_documents);
+            index.documents = &.{};
             return;
         }
+
+        const new_documents = allocator.alloc(scip.Document, new_len) catch {
+            debug_log.log("removeDocument: allocation failed path={s}; preserving index", .{rel_path});
+            return;
+        };
+        @memcpy(new_documents[0..i], old_documents[0..i]);
+        @memcpy(new_documents[i..], old_documents[i + 1 ..]);
+        scip.freeDocument(allocator, doc);
+        allocator.free(old_documents);
+        index.documents = new_documents;
+        return;
     }
 }
 
@@ -2689,6 +2714,7 @@ fn saveIndex(allocator: std.mem.Allocator, index: scip.Index, index_path: []cons
 }
 
 fn writeEncodedIndexAtomically(allocator: std.mem.Allocator, index_path: []const u8, encoded: []const u8) bool {
+    debug_log.log("writeEncodedIndexAtomically: starting path={s} bytes={d}", .{ index_path, encoded.len });
     const parent = std.fs.path.dirname(index_path) orelse return false;
     const basename = std.fs.path.basename(index_path);
     const tmp_name = std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ basename, std.time.nanoTimestamp() }) catch return false;
@@ -2706,8 +2732,12 @@ fn writeEncodedIndexAtomically(allocator: std.mem.Allocator, index_path: []const
 
     tmp_file.writeAll(encoded) catch return false;
     tmp_file.sync() catch return false;
-    dir.rename(tmp_name, basename) catch return false;
+    dir.rename(tmp_name, basename) catch |err| {
+        debug_log.log("writeEncodedIndexAtomically: rename failed error={s}", .{@errorName(err)});
+        return false;
+    };
     renamed = true;
+    debug_log.log("writeEncodedIndexAtomically: replaced path={s}", .{index_path});
     return true;
 }
 

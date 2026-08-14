@@ -37,8 +37,9 @@ pub const BatchState = struct {
 };
 
 const LineDecoder = struct {
-    buf: [MAX_WATCHER_LINE_BYTES]u8 = undefined,
+    buf: [MAX_WATCHER_LINE_BYTES + 4096]u8 = undefined,
     len: usize = 0,
+    line_buf: [MAX_WATCHER_LINE_BYTES]u8 = undefined,
     discarding: bool = false,
     overflow_pending: bool = false,
 
@@ -56,6 +57,11 @@ const LineDecoder = struct {
             }
             self.buf[self.len] = byte;
             self.len += 1;
+            if (self.len > MAX_WATCHER_LINE_BYTES and std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') == null) {
+                self.len = 0;
+                self.discarding = true;
+                self.overflow_pending = true;
+            }
         }
     }
 
@@ -64,19 +70,17 @@ const LineDecoder = struct {
             self.overflow_pending = false;
             return .overflow;
         }
-        const nl = std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') orelse return null;
-        const line = self.buf[0..nl];
-        if (line.len > 0 and line[0] == 0) {
+        while (true) {
+            const nl = std.mem.indexOfScalar(u8, self.buf[0..self.len], '\n') orelse return null;
+            const line = self.buf[0..nl];
+            if (line.len <= self.line_buf.len) @memcpy(self.line_buf[0..line.len], line);
             const remaining = self.len - (nl + 1);
             if (remaining > 0) std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[nl + 1 .. self.len]);
             self.len = remaining;
-            return .overflow;
+            if (line.len == 0) continue;
+            if (line[0] == 0 or line.len > self.line_buf.len) return .overflow;
+            return .{ .path = self.line_buf[0..line.len] };
         }
-        const remaining = self.len - (nl + 1);
-        if (remaining > 0) std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[nl + 1 .. self.len]);
-        self.len = remaining;
-        if (line.len == 0) return self.next();
-        return .{ .path = line };
     }
 
     fn feed(self: *LineDecoder, input: []const u8) ?DrainEvent {
@@ -95,6 +99,7 @@ pub const Watcher = struct {
     index_patterns: []const []const u8,
     read_buf: [4096]u8,
     decoder: LineDecoder,
+    overflow_pending: std.atomic.Value(bool),
     // CFRunLoop cross-thread wakeup (macOS only).
     // Stored as usize for atomic access; 0 means not yet set.
     macos_run_loop: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -147,6 +152,7 @@ pub const Watcher = struct {
             .index_patterns = patterns,
             .read_buf = undefined,
             .decoder = .{},
+            .overflow_pending = std.atomic.Value(bool).init(false),
             .macos_run_loop = std.atomic.Value(usize).init(0),
             .macos_stop_fn = std.atomic.Value(usize).init(0),
         };
@@ -194,6 +200,10 @@ pub const Watcher = struct {
     /// Drain one newline-delimited watcher event.
     /// Path slices remain valid until the next drainOne() call.
     pub fn drainOne(self: *Watcher) ?DrainEvent {
+        if (self.overflow_pending.swap(false, .acq_rel)) {
+            debug_log.log("watcher: consuming pending overflow resync", .{});
+            return .overflow;
+        }
         if (self.decoder.next()) |event| return event;
         while (true) {
             const n = posix.read(self.pipe_read, &self.read_buf) catch return null;
@@ -273,8 +283,17 @@ fn emitWatcherRecord(self: *Watcher, record: []const u8) bool {
 
 fn emitOverflow(self: *Watcher) bool {
     const marker = "\x00\n";
-    const written = posix.write(self.pipe_write, marker) catch return false;
-    return written == marker.len;
+    const written = posix.write(self.pipe_write, marker) catch |err| {
+        self.overflow_pending.store(true, .release);
+        debug_log.log("watcher: overflow marker write failed error={s}; atomic resync remains pending", .{@errorName(err)});
+        return false;
+    };
+    if (written != marker.len) {
+        self.overflow_pending.store(true, .release);
+        debug_log.log("watcher: overflow marker short write bytes={d}/{d}; atomic resync remains pending", .{ written, marker.len });
+        return false;
+    }
+    return true;
 }
 
 // ── macOS Backend (FSEvents) ────────────────────────────────────────────
@@ -692,6 +711,23 @@ test "BatchState flushes after quiet window" {
     try std.testing.expect(state.shouldFlush(10 + QUIET_WINDOW_NS));
 }
 
+test "line decoder preserves multiple records from one read" {
+    var decoder = LineDecoder{};
+
+    const first_event = decoder.feed("first.zig\nsecond.zig\n").?;
+    switch (first_event) {
+        .path => |path| try std.testing.expectEqualStrings("first.zig", path),
+        .overflow => return error.TestUnexpectedResult,
+    }
+
+    const second_event = decoder.next().?;
+    switch (second_event) {
+        .path => |path| try std.testing.expectEqualStrings("second.zig", path),
+        .overflow => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(decoder.next() == null);
+}
+
 test "line decoder reports overflow and resumes at newline" {
     const allocator = std.testing.allocator;
     var decoder = LineDecoder{};
@@ -707,4 +743,28 @@ test "line decoder reports overflow and resumes at newline" {
         .path => |path| try std.testing.expectEqualStrings("resynced.zig", path),
         .overflow => return error.TestUnexpectedResult,
     }
+}
+
+test "line decoder handles many records from one read" {
+    const allocator = std.testing.allocator;
+    var decoder = LineDecoder{};
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+
+    const record_count = 100;
+    for (0..record_count) |_| try input.appendSlice(allocator, "a\n");
+    try input.appendSlice(allocator, "last.zig\n");
+
+    var decoded_count: usize = 0;
+    var event = decoder.feed(input.items);
+    while (event) |decoded| : (event = decoder.next()) {
+        switch (decoded) {
+            .path => |path| {
+                decoded_count += 1;
+                if (decoded_count == record_count + 1) try std.testing.expectEqualStrings("last.zig", path);
+            },
+            .overflow => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(record_count + 1, decoded_count);
 }

@@ -362,6 +362,28 @@ const Runtime = struct {
             self.invalidateCodeCache();
             return error.IndexUnavailable;
         };
+        if (disk_generation) |before| {
+            if (!before.eql(fresh_generation)) {
+                debug_log_mod.log("mcp.cache: generation changed during load; retrying once", .{});
+                var discarded = fresh;
+                discarded.deinit(self.allocator);
+                const retry = code_intel.loadIndexForRuntime(self.allocator) catch |err| {
+                    self.invalidateCodeCache();
+                    return err;
+                };
+                const retry_generation = self.indexGeneration() orelse {
+                    var retry_discarded = retry;
+                    retry_discarded.deinit(self.allocator);
+                    self.invalidateCodeCache();
+                    return error.IndexUnavailable;
+                };
+                if (self.code_cache) |*old| old.deinit(self.allocator);
+                self.code_cache = retry;
+                self.code_cache_generation = retry_generation;
+                debug_log_mod.log("mcp.cache: retry refreshed inode={d} size={d} mtime={d}", .{ retry_generation.inode, retry_generation.size, retry_generation.mtime });
+                return &self.code_cache.?;
+            }
+        }
         if (self.code_cache) |*old| old.deinit(self.allocator);
         self.code_cache = fresh;
         self.code_cache_generation = fresh_generation;
