@@ -1676,6 +1676,7 @@ pub fn queryIndexInfo(allocator: std.mem.Allocator) ?IndexInfo {
 pub fn dispatch(allocator: std.mem.Allocator, subcmd: []const u8, args: []const [:0]const u8) !void {
     debug_log.log("code_intel.dispatch: {s}", .{subcmd});
     if (std.mem.eql(u8, subcmd, "code:index")) return codeIndex(allocator, args);
+    if (std.mem.eql(u8, subcmd, "code:sync")) return codeSync(allocator, args);
 
     if (std.mem.eql(u8, subcmd, "code:query") or
         std.mem.eql(u8, subcmd, "code:status") or
@@ -2915,6 +2916,224 @@ fn appendConfiguredReindexPaths(
             .logical_path = doc.relative_path,
             .physical_path = null,
         });
+    }
+}
+
+pub const SYNC_WORKER_COMMAND = "__mcp-sync";
+
+/// Percentage of the matched set above which a targeted batch loses to a
+/// full resync: once most files must be re-parsed anyway, decoding and
+/// merging the mostly-invalid old index is pure overhead.
+const sync_full_resync_percent: usize = 40;
+
+pub const SyncOutcome = enum { unchanged, changed, failed };
+
+pub const SyncResult = struct {
+    outcome: SyncOutcome,
+    changed: usize = 0,
+    removed: usize = 0,
+    full_resync: bool = false,
+};
+
+/// Whether reconciliation should rebuild from the configured patterns rather
+/// than patch the existing index.
+fn shouldFullResync(manifest_missing: bool, changed: usize, removed: usize, matched: usize) bool {
+    if (manifest_missing) return true;
+    if (matched == 0) return changed + removed > 0;
+    return (changed + removed) * 100 > matched * sync_full_resync_percent;
+}
+
+/// Reconcile the index with the working tree: stat every matched file
+/// against the provenance manifest and repair only what drifted. The
+/// in-sync case costs one directory walk plus one stat per file and never
+/// opens the index.
+pub fn syncConfiguredFiles(allocator: std.mem.Allocator) SyncResult {
+    return syncConfiguredFilesInner(allocator, true);
+}
+
+/// Report drift without repairing it. Used by diagnostics.
+pub fn scanConfiguredDrift(allocator: std.mem.Allocator) SyncResult {
+    return syncConfiguredFilesInner(allocator, false);
+}
+
+fn syncConfiguredFilesInner(allocator: std.mem.Allocator, apply: bool) SyncResult {
+    const failed: SyncResult = .{ .outcome = .failed };
+
+    const settings = settings_mod.Settings.load(allocator) orelse return failed;
+    defer settings.deinit(allocator);
+    const code = settings.code orelse return failed;
+    const patterns = code.index orelse return failed;
+    if (patterns.len == 0) return failed;
+
+    const cog_dir_path = paths.findCogDir(allocator) catch return failed;
+    defer allocator.free(cog_dir_path);
+    const project_root = std.fs.path.dirname(cog_dir_path) orelse return failed;
+
+    var matched_files: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer {
+        for (matched_files.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
+        matched_files.deinit(allocator);
+    }
+    collectConfiguredFiles(
+        allocator,
+        project_root,
+        patterns,
+        code.external_roots orelse &.{},
+        &matched_files,
+    ) catch return failed;
+
+    var cog_dir = std.fs.openDirAbsolute(cog_dir_path, .{}) catch return failed;
+    defer cog_dir.close();
+    var manifest_loaded = index_manifest.load(allocator, cog_dir);
+    defer if (manifest_loaded) |*loaded| loaded.deinit();
+    const manifest_missing = manifest_loaded == null;
+
+    var root_dir = std.fs.openDirAbsolute(project_root, .{}) catch return failed;
+    defer root_dir.close();
+
+    // `drifted` borrows strings from matched_files; `removed` borrows from
+    // the loaded manifest. Both outlive their use below.
+    var drifted: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer drifted.deinit(allocator);
+    var removed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer removed.deinit(allocator);
+
+    if (manifest_loaded) |loaded| {
+        var by_path: std.StringHashMapUnmanaged(index_manifest.Entry) = .empty;
+        defer by_path.deinit(allocator);
+        for (loaded.value.entries) |entry| by_path.put(allocator, entry.path, entry) catch return failed;
+
+        var matched_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer matched_set.deinit(allocator);
+
+        for (matched_files.items) |file| {
+            matched_set.put(allocator, file.logical_path, {}) catch return failed;
+            const recorded = by_path.get(file.logical_path) orelse {
+                drifted.append(allocator, file) catch return failed;
+                continue;
+            };
+            // Stat the logical path exactly as the manifest writer did so the
+            // comparison is like-for-like across symlink aliases.
+            const current = index_manifest.statFile(root_dir, file.logical_path) orelse {
+                drifted.append(allocator, file) catch return failed;
+                continue;
+            };
+            if (current.size != recorded.size or current.mtime_ns != recorded.mtime_ns) {
+                drifted.append(allocator, file) catch return failed;
+            }
+        }
+        for (loaded.value.entries) |entry| {
+            if (!matched_set.contains(entry.path)) {
+                removed.append(allocator, entry.path) catch return failed;
+            }
+        }
+    }
+
+    debug_log.log("syncConfiguredFiles: matched={d} drifted={d} removed={d} manifest_missing={any} apply={any}", .{
+        matched_files.items.len,
+        drifted.items.len,
+        removed.items.len,
+        manifest_missing,
+        apply,
+    });
+
+    if (!manifest_missing and drifted.items.len == 0 and removed.items.len == 0) {
+        return .{ .outcome = .unchanged };
+    }
+
+    const full = shouldFullResync(manifest_missing, drifted.items.len, removed.items.len, matched_files.items.len);
+    const report: SyncResult = .{
+        .outcome = .changed,
+        .changed = if (manifest_missing) matched_files.items.len else drifted.items.len,
+        .removed = removed.items.len,
+        .full_resync = full,
+    };
+    if (!apply) return report;
+
+    if (full) {
+        debug_log.log("syncConfiguredFiles: escalating to full resync", .{});
+        if (!reindexConfiguredFiles(allocator)) return failed;
+        return report;
+    }
+
+    const lock_fd = acquireIndexLock(allocator, cog_dir_path) orelse return failed;
+    defer releaseIndexLock(lock_fd);
+    const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir_path}) catch return failed;
+    defer allocator.free(index_path);
+
+    // Declared before the index so its deinit runs last: merged documents
+    // borrow their strings from this store and must not outlive it.
+    var backing_store: IndexBackingStore = .{};
+    defer backing_store.deinit(allocator);
+
+    const loaded_index = loadExistingIndex(allocator, index_path);
+    var master_index = loaded_index.index;
+    defer scip.freeIndex(allocator, &master_index);
+    defer if (loaded_index.backing_data) |data| allocator.free(data);
+
+    var batch: std.ArrayListUnmanaged(ReindexPath) = .empty;
+    defer batch.deinit(allocator);
+    for (drifted.items) |file| {
+        batch.append(allocator, .{
+            .logical_path = file.logical_path,
+            .physical_path = file.physical_path,
+        }) catch return failed;
+    }
+    for (removed.items) |logical_path| {
+        batch.append(allocator, .{ .logical_path = logical_path, .physical_path = null }) catch return failed;
+    }
+
+    if (!applyReindexBatch(allocator, &master_index, batch.items, &backing_store)) return failed;
+    if (!saveIndex(allocator, master_index, index_path)) return failed;
+    return report;
+}
+
+/// Hidden worker entry: reconcile in a dedicated process so the MCP server
+/// never runs allocator-heavy indexing on its own threads.
+pub fn runSyncWorker(allocator: std.mem.Allocator) u8 {
+    debug_log.log("sync worker: starting reconcile", .{});
+    const result = syncConfiguredFiles(allocator);
+    const exit_code: u8 = switch (result.outcome) {
+        .changed => 0,
+        .unchanged => 1,
+        .failed => 2,
+    };
+    debug_log.log("sync worker: completed outcome={s} changed={d} removed={d} full={any}", .{
+        @tagName(result.outcome),
+        result.changed,
+        result.removed,
+        result.full_resync,
+    });
+    return exit_code;
+}
+
+fn codeSync(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    if (hasFlag(args, "--help") or hasFlag(args, "-h")) {
+        printCommandHelp(help.code_sync);
+        return;
+    }
+
+    const started_ms = std.time.milliTimestamp();
+    const result = syncConfiguredFiles(allocator);
+    const elapsed_ms = std.time.milliTimestamp() - started_ms;
+    switch (result.outcome) {
+        .unchanged => printErr("  Index is in sync with the working tree.\n"),
+        .changed => {
+            var buffer: [160]u8 = undefined;
+            const line = std.fmt.bufPrint(
+                &buffer,
+                "  Index updated: {d} file(s) reindexed, {d} removed{s} ({d} ms).\n",
+                .{ result.changed, result.removed, if (result.full_resync) " via full resync" else "", elapsed_ms },
+            ) catch "  Index updated.\n";
+            printErr(line);
+        },
+        .failed => {
+            printErr("error: index sync failed; run with --debug for details or rebuild with cog code:index\n");
+            return error.Explained;
+        },
     }
 }
 
@@ -5803,6 +6022,100 @@ test "index writes refresh the provenance manifest for managed documents" {
     try std.testing.expectEqual(@as(usize, 1), loaded.value.entries.len);
     try std.testing.expectEqualStrings("tracked.zig", loaded.value.entries[0].path);
     try std.testing.expectEqual(@as(u64, 19), loaded.value.entries[0].size);
+}
+
+test "shouldFullResync escalates on missing manifest and large drift" {
+    try std.testing.expect(shouldFullResync(true, 0, 0, 10));
+    try std.testing.expect(!shouldFullResync(false, 4, 0, 10));
+    try std.testing.expect(shouldFullResync(false, 5, 0, 10));
+    try std.testing.expect(shouldFullResync(false, 0, 5, 10));
+    try std.testing.expect(!shouldFullResync(false, 0, 0, 0));
+    try std.testing.expect(shouldFullResync(false, 1, 0, 0));
+}
+
+test "syncConfiguredFiles repairs drift and converges" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var original_cwd = try std.fs.cwd().openDir(".", .{});
+    defer {
+        original_cwd.setAsCwd() catch unreachable;
+        original_cwd.close();
+    }
+    try tmp.dir.makeDir(".cog");
+    try tmp.dir.writeFile(.{ .sub_path = ".cog/settings.json", .data = 
+        \\{
+        \\  "code": {
+        \\    "index": ["**/*.go"]
+        \\  }
+        \\}
+    });
+    const names = [_][]const u8{ "a.go", "b.go", "c.go", "d.go", "e.go", "f.go" };
+    for (names, 0..) |name, i| {
+        var buffer: [96]u8 = undefined;
+        const source = try std.fmt.bufPrint(&buffer, "package p\n\nfunc F{d}() int {{ return {d} }}\n", .{ i, i });
+        try tmp.dir.writeFile(.{ .sub_path = name, .data = source });
+    }
+    try tmp.dir.setAsCwd();
+
+    try std.testing.expect(reindexConfiguredFiles(allocator));
+
+    // Nothing drifted: the scan must not touch the index.
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
+
+    // One modified plus one added is 2 of 7 matched files — small drift
+    // takes the targeted batch path, not a full resync.
+    try tmp.dir.writeFile(.{ .sub_path = "b.go", .data = "package p\n\nfunc F1() int { return 100 }\n\nfunc Extra() int { return 7 }\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "g.go", .data = "package p\n\nfunc G() int { return 9 }\n" });
+
+    const repaired = syncConfiguredFiles(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, repaired.outcome);
+    try std.testing.expectEqual(@as(usize, 2), repaired.changed);
+    try std.testing.expectEqual(@as(usize, 0), repaired.removed);
+    try std.testing.expect(!repaired.full_resync);
+
+    // A deletion alone is 1 of 6 — also targeted, and it must drop the
+    // document rather than reindex anything.
+    try tmp.dir.deleteFile("a.go");
+    const pruned = syncConfiguredFiles(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, pruned.outcome);
+    try std.testing.expectEqual(@as(usize, 0), pruned.changed);
+    try std.testing.expectEqual(@as(usize, 1), pruned.removed);
+    try std.testing.expect(!pruned.full_resync);
+
+    // The manifest mirrors the repaired document set.
+    var cog_dir = try tmp.dir.openDir(".cog", .{});
+    defer cog_dir.close();
+    {
+        var loaded = index_manifest.load(allocator, cog_dir) orelse return error.TestUnexpectedResult;
+        defer loaded.deinit();
+        var saw_g = false;
+        for (loaded.value.entries) |entry| {
+            try std.testing.expect(!std.mem.eql(u8, entry.path, "a.go"));
+            if (std.mem.eql(u8, entry.path, "g.go")) saw_g = true;
+        }
+        try std.testing.expect(saw_g);
+    }
+
+    // Convergence: a second reconcile finds nothing to do.
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
+
+    // Unknown provenance escalates to a full resync and self-heals.
+    try cog_dir.deleteFile(index_manifest.manifest_basename);
+    const rebuilt = syncConfiguredFiles(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, rebuilt.outcome);
+    try std.testing.expect(rebuilt.full_resync);
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
+
+    // Drift reporting without repair leaves the drift in place.
+    try tmp.dir.writeFile(.{ .sub_path = "c.go", .data = "package p\n\nfunc F2() int { return 200 }\n\nfunc More() int { return 8 }\n" });
+    const scanned = scanConfiguredDrift(allocator);
+    try std.testing.expectEqual(SyncOutcome.changed, scanned.outcome);
+    try std.testing.expectEqual(@as(usize, 1), scanned.changed);
+    try std.testing.expectEqual(SyncOutcome.changed, scanConfiguredDrift(allocator).outcome);
+    try std.testing.expectEqual(SyncOutcome.changed, syncConfiguredFiles(allocator).outcome);
+    try std.testing.expectEqual(SyncOutcome.unchanged, syncConfiguredFiles(allocator).outcome);
 }
 
 test "set-based relationship and import dedup preserves first-seen order" {

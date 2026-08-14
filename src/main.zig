@@ -52,6 +52,7 @@ const legacy_top_level_commands = [_][]const u8{"install"};
 
 const code_commands = [_]CommandEntry{
     .{ .name = "code:index", .summary = "Build SCIP code index (per-file incremental)" },
+    .{ .name = "code:sync", .summary = "Reconcile the index with the working tree" },
 };
 
 const debug_commands = [_]CommandEntry{
@@ -191,6 +192,11 @@ fn mainInner() !void {
         if (cmd_args.len != 0) return error.InvalidArguments;
         debug_log.log("dispatch hidden watcher resync worker", .{});
         std.process.exit(code_intel.runWatcherResyncWorker(allocator));
+    }
+    if (std.mem.eql(u8, subcmd, code_intel.SYNC_WORKER_COMMAND)) {
+        if (cmd_args.len != 0) return error.InvalidArguments;
+        debug_log.log("dispatch hidden index sync worker", .{});
+        std.process.exit(code_intel.runSyncWorker(allocator));
     }
 
     // For non-MCP commands, close the log header now. MCP mode defers
