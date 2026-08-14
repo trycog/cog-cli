@@ -2484,6 +2484,62 @@ const IndexBackingStore = struct {
 ///
 /// String storage for every merged document is handed to `store`, which the
 /// caller must keep alive until after the index is encoded.
+/// Pair watcher-supplied logical paths with the physical source each one
+/// aliases.
+///
+/// The watcher emits logical paths, so a single physical file can arrive
+/// under several names — `src/main.zig`, a symlink alias `src-link/main.zig`,
+/// or an `@external/...` alias that has no counterpart under the project
+/// root. Each logical name must keep its own document while reading the one
+/// physical source behind it.
+///
+/// Paths with no match fall back to themselves so ordinary relative paths and
+/// genuine deletions still resolve through the existence check.
+fn appendAliasedReindexPaths(
+    allocator: std.mem.Allocator,
+    logical_paths: []const []const u8,
+    matched_files: []const path_matcher.MatchedPath,
+    out: *std.ArrayListUnmanaged(ReindexPath),
+) !void {
+    try out.ensureTotalCapacity(allocator, logical_paths.len);
+    for (logical_paths) |logical_path| {
+        const physical_path = findPhysicalPath(matched_files, logical_path) orelse logical_path;
+        if (physical_path.ptr != logical_path.ptr) {
+            debug_log.log("reindexFiles: alias logical={s} physical={s}", .{ logical_path, physical_path });
+        }
+        out.appendAssumeCapacity(.{
+            .logical_path = logical_path,
+            .physical_path = physical_path,
+        });
+    }
+}
+
+/// Collect the configured logical/physical pairs used to resolve aliases.
+///
+/// Best effort: a project without configured index patterns leaves `out`
+/// empty, and callers then treat logical paths as physical.
+fn collectAliasSources(
+    allocator: std.mem.Allocator,
+    cog_dir: []const u8,
+    out: *std.ArrayListUnmanaged(path_matcher.MatchedPath),
+) void {
+    const settings = settings_mod.Settings.load(allocator) orelse return;
+    defer settings.deinit(allocator);
+    const code = settings.code orelse return;
+    const patterns = code.index orelse return;
+    const project_root = std.fs.path.dirname(cog_dir) orelse return;
+    debug_log.log("reindexFiles: resolving aliases project_root={s}", .{project_root});
+    collectConfiguredFiles(
+        allocator,
+        project_root,
+        patterns,
+        code.external_roots orelse &.{},
+        out,
+    ) catch |err| {
+        debug_log.log("reindexFiles: alias resolution failed error={s}; using logical paths", .{@errorName(err)});
+    };
+}
+
 fn applyReindexBatch(
     allocator: std.mem.Allocator,
     master_index: *scip.Index,
@@ -2669,15 +2725,31 @@ pub fn reindexFiles(allocator: std.mem.Allocator, file_paths: []const []const u8
     defer scip.freeIndex(allocator, &master_index);
     defer if (loaded.backing_data) |data| allocator.free(data);
 
-    var batch = allocator.alloc(ReindexPath, unique.len) catch return false;
-    defer allocator.free(batch);
-    for (unique, 0..) |file_path, i| {
-        batch[i] = .{
-            .logical_path = file_path,
-            .physical_path = file_path,
-        };
+    // Only pay for alias resolution when a path is not directly readable from
+    // the project root. Ordinary edits and symlink aliases resolve as-is; an
+    // unreadable path is either an @external alias or a real deletion, and
+    // only the matcher can tell those apart.
+    const needs_alias_resolution = blk: {
+        for (unique) |file_path| {
+            std.fs.cwd().access(file_path, .{}) catch break :blk true;
+        }
+        break :blk false;
+    };
+
+    var alias_sources: std.ArrayListUnmanaged(path_matcher.MatchedPath) = .empty;
+    defer {
+        for (alias_sources.items) |file| {
+            allocator.free(file.logical_path);
+            allocator.free(file.physical_path);
+        }
+        alias_sources.deinit(allocator);
     }
-    if (!applyReindexBatch(allocator, &master_index, batch, &backing_store)) return false;
+    if (needs_alias_resolution) collectAliasSources(allocator, cog_dir, &alias_sources);
+
+    var batch: std.ArrayListUnmanaged(ReindexPath) = .empty;
+    defer batch.deinit(allocator);
+    appendAliasedReindexPaths(allocator, unique, alias_sources.items, &batch) catch return false;
+    if (!applyReindexBatch(allocator, &master_index, batch.items, &backing_store)) return false;
     debug_log.log("reindexFiles: encoding documents={d}", .{master_index.documents.len});
     return saveIndex(allocator, master_index, index_path);
 }
@@ -4730,6 +4802,46 @@ test "configured reconciliation retains physical reads and removes stale aliases
     try std.testing.expectEqualStrings("/shared/lib.zig", batch.items[1].physical_path.?);
     try std.testing.expectEqualStrings("old/generated.zig", batch.items[2].logical_path);
     try std.testing.expect(batch.items[2].physical_path == null);
+}
+
+test "watcher reindex batch maps logical aliases onto their physical sources" {
+    const allocator = std.testing.allocator;
+    // Two logical aliases deliberately share one physical source, and one
+    // alias is reachable only through an external root.
+    const matched = [_]path_matcher.MatchedPath{
+        .{ .logical_path = "@external/shared/lib.zig", .physical_path = "/shared/lib.zig" },
+        .{ .logical_path = "src/main.zig", .physical_path = "/project/src/main.zig" },
+        .{ .logical_path = "src-link/main.zig", .physical_path = "/project/src/main.zig" },
+    };
+    const logical_paths = [_][]const u8{
+        "@external/shared/lib.zig",
+        "src/main.zig",
+        "src-link/main.zig",
+        "removed/gone.zig",
+    };
+
+    var batch: std.ArrayListUnmanaged(ReindexPath) = .empty;
+    defer batch.deinit(allocator);
+    try appendAliasedReindexPaths(allocator, &logical_paths, &matched, &batch);
+
+    try std.testing.expectEqual(@as(usize, 4), batch.items.len);
+
+    // An @external alias must read its physical source instead of being
+    // treated as a missing file and dropped from the index.
+    try std.testing.expectEqualStrings("@external/shared/lib.zig", batch.items[0].logical_path);
+    try std.testing.expectEqualStrings("/shared/lib.zig", batch.items[0].physical_path.?);
+
+    // Both aliases keep their own logical document name while reading the
+    // single physical source they share.
+    try std.testing.expectEqualStrings("src/main.zig", batch.items[1].logical_path);
+    try std.testing.expectEqualStrings("/project/src/main.zig", batch.items[1].physical_path.?);
+    try std.testing.expectEqualStrings("src-link/main.zig", batch.items[2].logical_path);
+    try std.testing.expectEqualStrings("/project/src/main.zig", batch.items[2].physical_path.?);
+
+    // An unmatched path falls back to itself so the existence check still
+    // resolves it as a removal.
+    try std.testing.expectEqualStrings("removed/gone.zig", batch.items[3].logical_path);
+    try std.testing.expectEqualStrings("removed/gone.zig", batch.items[3].physical_path.?);
 }
 
 test "collectConfiguredFiles uses PathMatcher logical paths and external roots" {
