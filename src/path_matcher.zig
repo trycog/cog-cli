@@ -71,60 +71,69 @@ pub const PathMatcher = struct {
             roots.deinit(allocator);
         }
 
-        try roots.append(allocator, .{
-            .canonical_path = try allocator.dupe(u8, project_root),
-            .logical_prefix = try allocator.dupe(u8, ""),
-            .is_project = true,
-        });
+        try appendRoot(allocator, &roots, project_root, "", true);
 
         for (options.external_roots) |configured_root| {
-            const canonical = resolveConfiguredRoot(allocator, project_root, configured_root) catch |err| {
-                debug_log.log("PathMatcher.init: external root {s} rejected: {s}", .{ configured_root, @errorName(err) });
-                continue;
+            const canonical = resolveConfiguredRoot(allocator, project_root, configured_root) catch |err| switch (err) {
+                // Allocator exhaustion is never a policy decision — surface it so
+                // callers cannot silently observe a truncated root set.
+                error.OutOfMemory => return err,
+                else => {
+                    debug_log.log("PathMatcher.init: external root {s} rejected: {s}", .{ configured_root, @errorName(err) });
+                    continue;
+                },
             };
-            errdefer allocator.free(canonical);
+            var adopted = false;
+            defer if (!adopted) allocator.free(canonical);
+
             if (isContainedPath(canonical, project_root)) {
-                allocator.free(canonical);
+                debug_log.log("PathMatcher.init: external root {s} already inside project", .{canonical});
                 continue;
             }
-            var duplicate = false;
-            for (roots.items) |root| {
-                if (std.mem.eql(u8, root.canonical_path, canonical)) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (duplicate) {
-                allocator.free(canonical);
+            if (rootCanonicalExists(roots.items, canonical)) {
+                debug_log.log("PathMatcher.init: duplicate external root {s}", .{canonical});
                 continue;
             }
 
             const alias = try externalAlias(allocator, configured_root, canonical, roots.items);
+            errdefer allocator.free(alias);
             try roots.append(allocator, .{
                 .canonical_path = canonical,
                 .logical_prefix = alias,
                 .is_project = false,
             });
+            adopted = true;
             debug_log.log("PathMatcher.init: approved external root {s} as {s}", .{ canonical, alias });
         }
 
-        const patterns = try allocator.alloc([]const u8, options.patterns.len);
-        errdefer allocator.free(patterns);
-        for (options.patterns, 0..) |pattern, i| {
-            patterns[i] = try allocator.dupe(u8, pattern);
-            errdefer for (patterns[0 .. i + 1]) |owned| allocator.free(owned);
+        var patterns: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (patterns.items) |owned| allocator.free(owned);
+            patterns.deinit(allocator);
+        }
+        try patterns.ensureTotalCapacityPrecise(allocator, options.patterns.len);
+        for (options.patterns) |pattern| {
+            const owned = try allocator.dupe(u8, pattern);
+            errdefer allocator.free(owned);
+            try patterns.append(allocator, owned);
+        }
+
+        const owned_patterns = try patterns.toOwnedSlice(allocator);
+        errdefer {
+            for (owned_patterns) |owned| allocator.free(owned);
+            allocator.free(owned_patterns);
         }
 
         debug_log.log("PathMatcher.init: project={s} patterns={d} external_roots={d} max_depth={d}", .{
             project_root,
-            patterns.len,
+            owned_patterns.len,
             roots.items.len - 1,
             options.max_depth,
         });
         return .{
             .allocator = allocator,
             .project_root = project_root,
-            .patterns = patterns,
+            .patterns = owned_patterns,
             .roots = try roots.toOwnedSlice(allocator),
             .aliases = .empty,
             .aliases_discovered = false,
@@ -185,10 +194,15 @@ pub const PathMatcher = struct {
     pub fn watchRoots(self: *PathMatcher, out: *std.ArrayListUnmanaged(WatchRoot)) !void {
         try self.ensureAliasesDiscovered();
         for (self.roots) |root| {
+            const physical = try self.allocator.dupe(u8, root.canonical_path);
+            errdefer self.allocator.free(physical);
+            const logical = try self.allocator.dupe(u8, root.logical_prefix);
+            errdefer self.allocator.free(logical);
             try out.append(self.allocator, .{
-                .physical_path = try self.allocator.dupe(u8, root.canonical_path),
-                .logical_prefix = try self.allocator.dupe(u8, root.logical_prefix),
+                .physical_path = physical,
+                .logical_prefix = logical,
             });
+            debug_log.log("PathMatcher.watchRoots: physical={s} logical={s}", .{ physical, logical });
         }
     }
 
@@ -198,16 +212,23 @@ pub const PathMatcher = struct {
         out: *std.ArrayListUnmanaged([]const u8),
     ) !void {
         try self.ensureAliasesDiscovered();
-        const canonical = std.fs.realpathAlloc(self.allocator, physical_path) catch try self.allocator.dupe(u8, physical_path);
+        const canonical = std.fs.realpathAlloc(self.allocator, physical_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // Deleted paths cannot be canonicalized; fall back to the reported
+            // path so removals still reconcile against every logical alias.
+            else => try self.allocator.dupe(u8, physical_path),
+        };
         defer self.allocator.free(canonical);
         for (self.aliases.items) |alias| {
             const suffix = relativeContained(canonical, alias.canonical_path) orelse continue;
             const logical = try joinLogical(self.allocator, alias.logical_prefix, suffix);
-            if (logical.len > 0 and self.matches(logical) and !containsString(out.items, logical)) {
-                try out.append(self.allocator, logical);
-            } else {
-                self.allocator.free(logical);
-            }
+            var adopted = false;
+            defer if (!adopted) self.allocator.free(logical);
+            if (logical.len == 0) continue;
+            if (!self.matches(logical)) continue;
+            if (containsString(out.items, logical)) continue;
+            try out.append(self.allocator, logical);
+            adopted = true;
         }
     }
 
@@ -276,7 +297,10 @@ pub const PathMatcher = struct {
             const logical_child = try joinLogical(self.allocator, logical_dir, entry.name);
             defer self.allocator.free(logical_child);
 
-            const canonical_child = std.fs.realpathAlloc(self.allocator, physical_child) catch continue;
+            const canonical_child = std.fs.realpathAlloc(self.allocator, physical_child) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
             defer self.allocator.free(canonical_child);
             if (!self.isAllowedCanonical(canonical_child)) {
                 debug_log.log("PathMatcher.walk: rejected external target logical={s} target={s}", .{ logical_child, canonical_child });
@@ -291,11 +315,23 @@ pub const PathMatcher = struct {
                     }
                     try self.walkDirectory(canonical_child, logical_child, depth + 1, active, out, discover_aliases);
                 },
-                .file => if (!discover_aliases and self.matches(logical_child)) {
-                    try out.append(self.allocator, .{
-                        .logical_path = try self.allocator.dupe(u8, logical_child),
-                        .physical_path = try self.allocator.dupe(u8, canonical_child),
-                    });
+                .file => {
+                    // A file reached through a symlink is a second logical name for
+                    // the same physical file; record it so watcher events on the
+                    // physical path still resolve to this logical path.
+                    if (discover_aliases and !std.mem.eql(u8, physical_child, canonical_child)) {
+                        try self.addAlias(canonical_child, logical_child);
+                    }
+                    if (!discover_aliases and self.matches(logical_child)) {
+                        const logical_owned = try self.allocator.dupe(u8, logical_child);
+                        errdefer self.allocator.free(logical_owned);
+                        const physical_owned = try self.allocator.dupe(u8, canonical_child);
+                        errdefer self.allocator.free(physical_owned);
+                        try out.append(self.allocator, .{
+                            .logical_path = logical_owned,
+                            .physical_path = physical_owned,
+                        });
+                    }
                 },
                 else => {},
             }
@@ -323,9 +359,13 @@ pub const PathMatcher = struct {
             if (std.mem.eql(u8, alias.canonical_path, canonical_path) and
                 std.mem.eql(u8, alias.logical_prefix, logical_prefix)) return;
         }
+        const canonical_owned = try self.allocator.dupe(u8, canonical_path);
+        errdefer self.allocator.free(canonical_owned);
+        const logical_owned = try self.allocator.dupe(u8, logical_prefix);
+        errdefer self.allocator.free(logical_owned);
         try self.aliases.append(self.allocator, .{
-            .canonical_path = try self.allocator.dupe(u8, canonical_path),
-            .logical_prefix = try self.allocator.dupe(u8, logical_prefix),
+            .canonical_path = canonical_owned,
+            .logical_prefix = logical_owned,
         });
         debug_log.log("PathMatcher.aliases: logical={s} physical={s}", .{ logical_prefix, canonical_path });
     }
@@ -364,6 +404,31 @@ fn externalAlias(
         candidate = try std.fmt.allocPrint(allocator, "@external/{s}-{d}", .{ base, suffix });
     }
     return candidate;
+}
+
+fn appendRoot(
+    allocator: std.mem.Allocator,
+    roots: *std.ArrayListUnmanaged(Root),
+    canonical_path: []const u8,
+    logical_prefix: []const u8,
+    is_project: bool,
+) !void {
+    const canonical_owned = try allocator.dupe(u8, canonical_path);
+    errdefer allocator.free(canonical_owned);
+    const logical_owned = try allocator.dupe(u8, logical_prefix);
+    errdefer allocator.free(logical_owned);
+    try roots.append(allocator, .{
+        .canonical_path = canonical_owned,
+        .logical_prefix = logical_owned,
+        .is_project = is_project,
+    });
+}
+
+fn rootCanonicalExists(roots: []const Root, canonical: []const u8) bool {
+    for (roots) |root| {
+        if (std.mem.eql(u8, root.canonical_path, canonical)) return true;
+    }
+    return false;
 }
 
 fn rootAliasExists(roots: []const Root, alias: []const u8) bool {
@@ -719,6 +784,64 @@ test "PathMatcher rejects canonical boundary prefix tricks" {
     }
     try matcher.collect(&paths);
     try expectLogicalPaths(&.{"main.zig"}, paths.items);
+}
+
+fn matcherAllocationScenario(
+    allocator: std.mem.Allocator,
+    project_root: []const u8,
+    external_root: []const u8,
+) !void {
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{ "**/*.zig", "!**/generated/**" },
+        .external_roots = &.{external_root},
+    });
+    defer matcher.deinit();
+
+    var paths: std.ArrayListUnmanaged(MatchedPath) = .empty;
+    defer {
+        matcher.freeMatchedPaths(paths.items);
+        paths.deinit(allocator);
+    }
+    try matcher.collect(&paths);
+
+    var roots: std.ArrayListUnmanaged(WatchRoot) = .empty;
+    defer {
+        matcher.freeWatchRoots(roots.items);
+        roots.deinit(allocator);
+    }
+    try matcher.watchRoots(&roots);
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    if (paths.items.len > 0) try matcher.mapPhysicalToLogical(paths.items[0].physical_path, &logical);
+}
+
+test "PathMatcher unwinds every partial allocation" {
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var external = std.testing.tmpDir(.{});
+    defer external.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, "src/generated/skip.zig", "const skip = true;\n");
+    try writeTestFile(external.dir, "lib/shared.zig", "pub const shared = true;\n");
+
+    const external_root = try external.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(external_root);
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(project_root);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        matcherAllocationScenario,
+        .{ project_root, external_root },
+    );
 }
 
 test "PathMatcher terminates symlink cycles and enforces depth cap" {
