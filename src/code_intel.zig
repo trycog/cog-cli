@@ -108,7 +108,7 @@ const ProgressEvent = union(enum) {
 
 fn printStdout(text: []const u8) void {
     var buf: [8192]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
+    var w = std.fs.File.stdout().writerStreaming(&buf);
     w.interface.writeAll(text) catch {};
     w.interface.writeByte('\n') catch {};
     w.interface.flush() catch {};
@@ -116,7 +116,7 @@ fn printStdout(text: []const u8) void {
 
 fn printErr(msg: []const u8) void {
     var buf: [8192]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
 }

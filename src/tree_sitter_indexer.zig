@@ -302,7 +302,7 @@ pub const Indexer = struct {
                 config.scip_name,
             }) catch "query compile error\n";
             var buf: [4096]u8 = undefined;
-            var w = std.fs.File.stderr().writer(&buf);
+            var w = std.fs.File.stderr().writerStreaming(&buf);
             w.interface.writeAll(err_msg) catch {};
             w.interface.flush() catch {};
             return error.QueryCompilationFailed;

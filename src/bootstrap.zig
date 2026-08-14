@@ -316,7 +316,7 @@ fn extractMcpResultText(root: std.json.Value) ?[]const u8 {
 fn printErr(msg: []const u8) void {
     if (@import("builtin").is_test) return;
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
 }
@@ -2354,7 +2354,7 @@ fn logSubsystemError(allocator: std.mem.Allocator, label: []const u8, stderr_dat
             if (debug and !use_tui) {
                 printFmtErr(allocator, "    " ++ dim ++ "--- agent stderr ---" ++ reset ++ "\n", .{});
                 var buf: [8192]u8 = undefined;
-                var w = std.fs.File.stderr().writer(&buf);
+                var w = std.fs.File.stderr().writerStreaming(&buf);
                 w.interface.writeAll(data) catch {};
                 w.interface.flush() catch {};
                 printFmtErr(allocator, "    " ++ dim ++ "--- end stderr ---" ++ reset ++ "\n", .{});

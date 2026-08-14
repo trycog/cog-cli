@@ -130,7 +130,7 @@ pub const Settings = struct {
 
     fn warnInvalidSettings(path: []const u8) void {
         var buf: [8192]u8 = undefined;
-        var w = std.fs.File.stderr().writer(&buf);
+        var w = std.fs.File.stderr().writerStreaming(&buf);
         w.interface.writeAll("warning: invalid JSON in ") catch {};
         w.interface.writeAll(path) catch {};
         w.interface.writeAll("\n") catch {};

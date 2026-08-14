@@ -15,7 +15,7 @@ const reset = "\x1B[0m";
 fn printErr(msg: []const u8) void {
     if (@import("builtin").is_test) return;
     var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
 }

@@ -164,6 +164,17 @@ pub fn build(b: *std.Build) void {
     const live_mcp_client_test_step = b.step("test-live-mcp-client", "Test live MCP client contracts");
     live_mcp_client_test_step.dependOn(&run_live_mcp_client_tests.step);
 
+    const standard_stream_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/standard_streams_test.zig"),
+            .target = target,
+        }),
+    });
+    const run_standard_stream_tests = b.addRunArtifact(standard_stream_tests);
+    run_standard_stream_tests.setCwd(b.path("."));
+    const standard_stream_test_step = b.step("test-standard-streams", "Test redirected standard-stream output");
+    standard_stream_test_step.dependOn(&run_standard_stream_tests.step);
+
     const fetch_source_test_exe = b.addExecutable(.{
         .name = "fetch-source-test-helper",
         .root_module = b.createModule(.{
@@ -208,6 +219,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_grammar_lock_tests.step);
     test_step.dependOn(&run_fetch_source_tests.step);
     test_step.dependOn(&run_live_mcp_client_tests.step);
+    test_step.dependOn(&run_standard_stream_tests.step);
     test_step.dependOn(&grammar_setup_tests.step);
     test_step.dependOn(windows_cross_step);
 

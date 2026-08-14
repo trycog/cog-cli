@@ -705,7 +705,7 @@ fn isStderrTty() bool {
 fn stderrWrite(data: []const u8) void {
     if (@import("builtin").is_test) return;
     var buf: [8192]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
+    var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.writeAll(data) catch {};
     w.interface.flush() catch {};
 }
