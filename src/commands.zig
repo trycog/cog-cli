@@ -663,6 +663,20 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
+    // Migration: earlier versions generated Cursor rules, Copilot agent
+    // files, and Codex TOML sections that the shared skills directory
+    // replaced. Leaving them active would give hosts duplicate, conflicting
+    // specialist guidance.
+    const superseded_removed = hooks_mod.removeSupersededSpecialistSurfaces(allocator) catch |err| blk: {
+        debug_log.log("commands.init: superseded surface migration failed: {s}", .{@errorName(err)});
+        break :blk 0;
+    };
+    if (superseded_removed > 0) {
+        var migrate_buf: [96]u8 = undefined;
+        const migrate_msg = std.fmt.bufPrint(&migrate_buf, "  Removed {d} superseded specialist artifact(s) from the previous layout.\n", .{superseded_removed}) catch "  Removed superseded specialist artifacts.\n";
+        printErr(migrate_msg);
+    }
+
     // A shared prompt target must be safe for every selected host that reads it.
     // Intersect actual installation results so one failed or skipped specialist
     // cannot leave a mandate behind for that host.
@@ -2316,6 +2330,17 @@ pub fn doctor(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // ── 5. Agent Integration ───────────────────────────────────────────
 
     printErr("\n" ++ cyan ++ bold ++ "  Agent Integration" ++ reset ++ "\n");
+
+    // Report-only: artifacts from the pre-skills layout still being read by
+    // hosts alongside the new shared skills.
+    const superseded_count = hooks_mod.countSupersededSpecialistSurfaces(allocator);
+    if (superseded_count > 0) {
+        var superseded_buf: [128]u8 = undefined;
+        const superseded_msg = std.fmt.bufPrint(&superseded_buf, "    " ++ yellow ++ "!" ++ reset ++ " {d} superseded specialist artifact(s) from an older layout — run cog init to migrate\n", .{superseded_count}) catch "    " ++ yellow ++ "!" ++ reset ++ " Superseded specialist artifacts present — run cog init to migrate\n";
+        printErr(superseded_msg);
+        warnings += 1;
+        debug_log.log("doctor: superseded specialist artifacts count={d}", .{superseded_count});
+    }
 
     agent_check: {
         if (maybe_cog_dir == null) {

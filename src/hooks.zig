@@ -1883,6 +1883,105 @@ fn writeRuntimePolicyAsset(path: []const u8, content: []const u8) !void {
     try writeCwdFile(path, content);
 }
 
+/// Specialist artifacts earlier Cog versions generated for hosts whose
+/// surface moved to the shared skills directory. Every name is
+/// Cog-generated, so removal at these exact paths never touches user files.
+const superseded_specialist_files = [_][]const u8{
+    ".cursor/rules/cog-code-query.mdc",
+    ".cursor/rules/cog-debug.mdc",
+    ".cursor/rules/cog-mem.mdc",
+    ".cursor/rules/cog-mem-validate.mdc",
+    ".cursor/rules/cog-observe.mdc",
+    ".github/agents/cog-code-query.agent.md",
+    ".github/agents/cog-debug.agent.md",
+    ".github/agents/cog-mem.agent.md",
+    ".github/agents/cog-mem-validate.agent.md",
+    ".github/agents/cog-observe.agent.md",
+};
+
+const superseded_codex_config = ".codex/config.toml";
+const superseded_codex_sections = [_][]const u8{
+    "[agents.cog-code-query]",
+    "[agents.cog-debug]",
+    "[agents.cog-mem]",
+    "[agents.cog-mem-validate]",
+    "[agents.cog-observe]",
+};
+
+fn isTomlTableHeader(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    return trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']';
+}
+
+fn isSupersededCodexHeader(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r");
+    for (superseded_codex_sections) |header| {
+        if (std.mem.eql(u8, trimmed, header)) return true;
+    }
+    return false;
+}
+
+/// How many superseded artifacts are present. Report-only; used by doctor.
+pub fn countSupersededSpecialistSurfaces(allocator: std.mem.Allocator) usize {
+    var count: usize = 0;
+    for (superseded_specialist_files) |path| {
+        if (fileExistsInCwd(path)) count += 1;
+    }
+    if (readCwdFile(allocator, superseded_codex_config) catch null) |content| {
+        defer allocator.free(content);
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            if (isSupersededCodexHeader(line)) count += 1;
+        }
+    }
+    return count;
+}
+
+/// Remove specialist surfaces superseded by the shared skills directory,
+/// returning how many artifacts were removed. Files are deleted only at
+/// their exact generated names, and Codex sections are stripped while every
+/// other line of the user's config is preserved.
+pub fn removeSupersededSpecialistSurfaces(allocator: std.mem.Allocator) !usize {
+    var removed: usize = 0;
+    for (superseded_specialist_files) |path| {
+        std.fs.cwd().deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        debug_log.log("hooks.removeSupersededSpecialistSurfaces: removed {s}", .{path});
+        removed += 1;
+    }
+
+    const content = (readCwdFile(allocator, superseded_codex_config) catch null) orelse return removed;
+    defer allocator.free(content);
+
+    var kept: std.ArrayListUnmanaged(u8) = .empty;
+    defer kept.deinit(allocator);
+    var stripped: usize = 0;
+    var skipping = false;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (isSupersededCodexHeader(line)) {
+            skipping = true;
+            stripped += 1;
+            continue;
+        }
+        if (skipping) {
+            if (!isTomlTableHeader(line)) continue;
+            skipping = false;
+        }
+        if (!first) try kept.append(allocator, '\n');
+        try kept.appendSlice(allocator, line);
+        first = false;
+    }
+    if (stripped == 0) return removed;
+
+    debug_log.log("hooks.removeSupersededSpecialistSurfaces: stripping {d} codex sections", .{stripped});
+    try writeCwdFile(superseded_codex_config, kept.items);
+    return removed + stripped;
+}
+
 /// Project-relative path a workflow skill installs to for a host. Caller
 /// owns the returned copy.
 pub fn workflowSkillPath(allocator: std.mem.Allocator, agent: agents_mod.Agent, skill: agents_mod.WorkflowSkill) ![]u8 {
@@ -3519,6 +3618,56 @@ test "configureWorkflowSkill writes stamped spec-compliant files" {
                 return error.TestUnexpectedResult;
             defer allocator.free(remember);
             try std.testing.expect(std.mem.indexOf(u8, remember, "IF-THEN rules") != null);
+        }
+    }.run);
+}
+
+test "superseded specialist surfaces are removed exactly and counted" {
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            // Old-layout artifacts from a previous cog version.
+            try ensureDir(".cursor/rules");
+            try writeCwdFile(".cursor/rules/cog-code-query.mdc", "old rule\n");
+            try writeCwdFile(".cursor/rules/cog-debug.mdc", "old rule\n");
+            try writeCwdFile(".cursor/rules/custom.mdc", "user rule\n");
+            try ensureDir(".github/agents");
+            try writeCwdFile(".github/agents/cog-mem.agent.md", "old agent\n");
+            try ensureDir(".codex");
+            try writeCwdFile(".codex/config.toml",
+                \\[user_section]
+                \\keep = true
+                \\
+                \\[agents.cog-code-query]
+                \\description = "old"
+                \\instructions = "old"
+                \\
+                \\[agents.cog-debug]
+                \\description = "old"
+                \\
+                \\[mcp_servers.cog]
+                \\command = "cog"
+                \\
+            );
+
+            try std.testing.expectEqual(@as(usize, 5), countSupersededSpecialistSurfaces(allocator));
+            const removed = try removeSupersededSpecialistSurfaces(allocator);
+            try std.testing.expectEqual(@as(usize, 5), removed);
+
+            // Cog-generated artifacts are gone; user content is untouched.
+            try std.testing.expect(!fileExistsInCwd(".cursor/rules/cog-code-query.mdc"));
+            try std.testing.expect(!fileExistsInCwd(".cursor/rules/cog-debug.mdc"));
+            try std.testing.expect(!fileExistsInCwd(".github/agents/cog-mem.agent.md"));
+            try std.testing.expect(fileExistsInCwd(".cursor/rules/custom.mdc"));
+
+            const toml = (try readCwdFile(allocator, ".codex/config.toml")) orelse return error.TestUnexpectedResult;
+            defer allocator.free(toml);
+            try std.testing.expect(std.mem.indexOf(u8, toml, "[user_section]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, toml, "[mcp_servers.cog]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, toml, "[agents.cog-") == null);
+
+            // Idempotent: nothing left to remove.
+            try std.testing.expectEqual(@as(usize, 0), countSupersededSpecialistSurfaces(allocator));
+            try std.testing.expectEqual(@as(usize, 0), try removeSupersededSpecialistSurfaces(allocator));
         }
     }.run);
 }
