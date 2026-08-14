@@ -4108,7 +4108,7 @@ test "debug_run lifecycle fixture is stable across repeated active stops" {
     var srv = DebugServer.init(allocator);
     defer srv.deinit();
 
-    var mocks: [25]driver_mod.MockDriver = [_]driver_mod.MockDriver{.{}} ** 25;
+    var mocks: [50]driver_mod.MockDriver = [_]driver_mod.MockDriver{.{}} ** 50;
     for (&mocks, 0..) |*mock, i| {
         mock.setBlockRun(true);
         const session_id = try srv.session_manager.createSession(mock.activeDriver(), null, .none);
@@ -4129,6 +4129,9 @@ test "debug_run lifecycle fixture is stable across repeated active stops" {
 
         try std.testing.expect(mock.stopped);
         try std.testing.expect(mock.deinitialized);
+        try std.testing.expect(!mock.run_active);
+        try std.testing.expect(!mock.sync_lifecycle_while_run_active);
+        try std.testing.expectEqual(@as(u32, 1), mock.run_count);
         try std.testing.expectEqual(@as(usize, 0), srv.session_manager.sessionCount());
     }
 }

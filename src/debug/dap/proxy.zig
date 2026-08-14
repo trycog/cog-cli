@@ -4650,9 +4650,25 @@ test "DetachedProcess closes adapter pipes idempotently" {
     try std.testing.expect(process.stderr == null);
 }
 
+fn countOpenFileDescriptors() !?usize {
+    const path = switch (builtin.os.tag) {
+        .linux => "/proc/self/fd",
+        .macos, .freebsd, .openbsd, .netbsd, .dragonfly => "/dev/fd",
+        else => return null,
+    };
+    var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var count: usize = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next()) |_| count += 1;
+    return count;
+}
+
 test "DetachedProcess repeatedly launches stops and reaps adapter fixture" {
     const allocator = std.testing.allocator;
-    for (0..16) |_| {
+    const open_fds_before = try countOpenFileDescriptors();
+    for (0..50) |_| {
         var process = try spawnDetached(allocator, &.{ "/bin/sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done" });
         const pid = process.id;
         process.terminateAndReap();
@@ -4662,6 +4678,12 @@ test "DetachedProcess repeatedly launches stops and reaps adapter fixture" {
         try std.testing.expect(process.stdout == null);
         try std.testing.expect(process.stderr == null);
         try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, 0));
+        var status: c_int = 0;
+        try std.testing.expectEqual(@as(std.posix.pid_t, -1), std.c.waitpid(pid, &status, 1));
+        try std.testing.expectEqual(std.posix.E.CHILD, @as(std.posix.E, @enumFromInt(std.c._errno().*)));
+    }
+    if (open_fds_before) |before| {
+        try std.testing.expectEqual(before, (try countOpenFileDescriptors()).?);
     }
 }
 
