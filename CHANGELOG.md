@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.27.0] - 2026-08-14
+## [0.27.1] - 2026-08-14
 
 ### Added
 
@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cog no longer aborts on Linux when locking or restricting a directory: descriptors used for `flock` (grammar setup serialization) and `fchmod` (`.cog` write-bit clearing) are now opened as real directory descriptors instead of `O_PATH` handles, which Linux rejects with `EBADF` for those operations.
+- The grammar setup lock wrapper now forks and execs its payload directly, so a failed spawn reports the real error instead of panicking inside Zig 0.15.2's spawn cleanup, and signal forwarding covers the whole payload process group.
 - Local memory now honors association weights and recall limits, ranks direct term matches ahead of body-only matches before applying bounded memory weight, preserves intra-batch associations transactionally, records lifecycle metadata as schema version 2, retries complete migrations under contention, and filters expired or deprecated memories from recall.
 - Code intelligence now resolves cross-document calls and imports independent of document order, attaches nested calls to the innermost definition, preserves same-name symbol kinds, and captures broader Java, JavaScript, C, and C++ relationships.
 - Incremental reindexing now keeps merged SCIP storage alive through encoding, maps external-indexer output onto every logical alias, preserves dependency documents, and splits oversized watcher batches instead of dropping paths.
@@ -788,7 +790,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
 [0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
-[0.27.0]: https://github.com/trycog/cog-cli/releases/tag/v0.27.0
+[0.27.1]: https://github.com/trycog/cog-cli/releases/tag/v0.27.1
 [0.26.0]: https://github.com/trycog/cog-cli/releases/tag/v0.26.0
 [0.25.0]: https://github.com/trycog/cog-cli/releases/tag/v0.25.0
 [0.24.2]: https://github.com/trycog/cog-cli/releases/tag/v0.24.2
