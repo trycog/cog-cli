@@ -2722,7 +2722,9 @@ pub const DebugServer = struct {
         try jw.objectField("events");
         try jw.beginArray();
 
-        // Collect notifications from all or specific sessions
+        // Collect notifications from all or specific sessions. Polling is
+        // intentional activity even when no event is currently available.
+        const now = std.time.milliTimestamp();
         var it = self.session_manager.sessions.iterator();
         while (it.next()) |entry| {
             if (session_id_filter) |filter| {
@@ -2730,6 +2732,8 @@ pub const DebugServer = struct {
             }
 
             const session = entry.value_ptr.*;
+            session.last_activity = now;
+            debug_log.log("DebugServer.toolPollEvents: refreshed activity session_id={s}", .{entry.key_ptr.*});
 
             // Check for completed async run
             if (session.pending_run) |pr| {
@@ -3964,6 +3968,38 @@ test "debug_stop preserves active terminate and detach semantics" {
         try std.testing.expect(!mock.sync_lifecycle_while_run_active);
         try std.testing.expect(mock.deinitialized);
     }
+}
+
+test "debug_poll_events refreshes intentional session activity" {
+    const allocator = std.testing.allocator;
+    var srv = DebugServer.init(allocator);
+    defer srv.deinit();
+
+    var mock1 = driver_mod.MockDriver{};
+    var mock2 = driver_mod.MockDriver{};
+    const session_id1 = try srv.session_manager.createSession(mock1.activeDriver(), null, .none);
+    const session_id2 = try srv.session_manager.createSession(mock2.activeDriver(), null, .none);
+    const session1 = srv.session_manager.sessions.get(session_id1).?;
+    const session2 = srv.session_manager.sessions.get(session_id2).?;
+
+    const stale = std.time.milliTimestamp() - 10_000;
+    session1.last_activity = stale;
+    session2.last_activity = stale;
+
+    const filtered_args = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1"}
+    , .{});
+    defer filtered_args.deinit();
+    try expectStoppedResult(try srv.callTool(allocator, "debug_poll_events", filtered_args.value));
+
+    try std.testing.expect(session1.last_activity > stale);
+    try std.testing.expectEqual(stale, session2.last_activity);
+
+    session1.last_activity = stale;
+    try expectStoppedResult(try srv.callTool(allocator, "debug_poll_events", null));
+
+    try std.testing.expect(session1.last_activity > stale);
+    try std.testing.expect(session2.last_activity > stale);
 }
 
 test "debug_poll_events does not consume synchronous run completion" {

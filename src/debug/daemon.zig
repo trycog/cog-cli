@@ -170,6 +170,11 @@ pub const DaemonServer = struct {
         var iter = self.server.session_manager.sessions.iterator();
         while (iter.next()) |entry| {
             const session = entry.value_ptr.*;
+            if (session.pending_run != null or session.status == .running) {
+                debug_log.log("DaemonServer.reapOrphanedSessions: retaining active session_id={s}", .{entry.key_ptr.*});
+                continue;
+            }
+
             // Check per-session idle timeout
             if (session.last_activity > 0 and
                 now - session.last_activity > self.session_idle_timeout_ms)
@@ -382,7 +387,7 @@ test "reaping a session queues dashboard end until delivery" {
 
 // ── Signal Handling ─────────────────────────────────────────────────────
 
-test "orphan reaper synchronizes active run teardown" {
+test "orphan reaper preserves sessions with active runs" {
     const allocator = std.testing.allocator;
     var daemon = DaemonServer.init(allocator, 1);
     defer daemon.deinit();
@@ -408,9 +413,10 @@ test "orphan reaper synchronizes active run teardown" {
     session.last_activity = std.time.milliTimestamp() - 10;
     daemon.reapOrphanedSessions();
 
-    try std.testing.expectEqual(@as(usize, 0), daemon.server.session_manager.sessionCount());
-    try std.testing.expect(mock.terminated);
-    try std.testing.expect(mock.deinitialized);
+    try std.testing.expectEqual(@as(usize, 1), daemon.server.session_manager.sessionCount());
+    try std.testing.expect(session.pending_run != null);
+    try std.testing.expect(!mock.terminated);
+    try std.testing.expect(!mock.deinitialized);
 }
 
 var g_daemon_socket_path: [128]u8 = undefined;
