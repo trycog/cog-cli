@@ -72,6 +72,18 @@ pub fn parseOrigin(allocator: std.mem.Allocator, input: []const u8) !Origin {
     return origin;
 }
 
+/// Parse and canonicalize the origin of an authenticated HTTPS request.
+/// Paths are permitted, but queries, fragments, and userinfo remain rejected.
+pub fn parseRequestOrigin(allocator: std.mem.Allocator, input: []const u8) !Origin {
+    const parts = parseUrlParts(input) catch |err| {
+        debug_log.log("credential_boundary.parseRequestOrigin: rejected input: {s}", .{@errorName(err)});
+        return err;
+    };
+    const origin = try canonicalOrigin(allocator, parts.authority);
+    debug_log.log("credential_boundary.parseRequestOrigin: accepted official={any}", .{origin.is_official});
+    return origin;
+}
+
 /// Parse and canonicalize a credential-bearing brain URL with exactly two
 /// non-empty path segments.
 pub fn parseBrainUrl(allocator: std.mem.Allocator, input: []const u8) !BrainUrl {
@@ -632,6 +644,19 @@ test "parseOrigin preserves explicit non-default port identity" {
 test "parseOrigin accepts a trailing slash only" {
     try expectOrigin("https://example.com/", "https://example.com:443", false);
     try std.testing.expectError(error.PathNotAllowed, parseOrigin(std.testing.allocator, "https://example.com/a"));
+}
+
+test "parseRequestOrigin canonicalizes authenticated request destinations" {
+    const allocator = std.testing.allocator;
+    var official = try parseRequestOrigin(allocator, "https://TRYCOG.AI/api/v1/owner/brain/mcp");
+    defer official.deinit(allocator);
+    try std.testing.expectEqualStrings("https://trycog.ai:443", official.serialized);
+    try std.testing.expect(official.is_official);
+
+    var self_hosted = try parseRequestOrigin(allocator, "https://memory.example:8443/api/v1/verify");
+    defer self_hosted.deinit(allocator);
+    try std.testing.expectEqualStrings("https://memory.example:8443", self_hosted.serialized);
+    try std.testing.expect(!self_hosted.is_official);
 }
 
 test "parseOrigin rejects canonical output beyond the URL limit" {
