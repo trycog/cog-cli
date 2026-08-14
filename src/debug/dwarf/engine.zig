@@ -4206,11 +4206,47 @@ pub const DwarfEngine = struct {
 
     // ── Modules ─────────────────────────────────────────────────────
 
+    fn freeModule(allocator: std.mem.Allocator, module: types.Module) void {
+        allocator.free(module.id);
+        allocator.free(module.name);
+        allocator.free(module.path);
+        allocator.free(module.symbol_status);
+    }
+
+    fn appendOwnedModule(
+        mods: *std.ArrayListUnmanaged(types.Module),
+        allocator: std.mem.Allocator,
+        id: []const u8,
+        name: []const u8,
+        path: []const u8,
+        symbol_status: []const u8,
+    ) !void {
+        var module = types.Module{
+            .id = "",
+            .name = "",
+        };
+        errdefer {
+            if (module.id.len > 0) allocator.free(module.id);
+            if (module.name.len > 0) allocator.free(module.name);
+            if (module.path.len > 0) allocator.free(module.path);
+            if (module.symbol_status.len > 0) allocator.free(module.symbol_status);
+        }
+
+        module.id = try allocator.dupe(u8, id);
+        module.name = try allocator.dupe(u8, name);
+        module.path = try allocator.dupe(u8, path);
+        module.symbol_status = try allocator.dupe(u8, symbol_status);
+        try mods.append(allocator, module);
+    }
+
     fn engineModules(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const types.Module {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
 
         var mods = std.ArrayListUnmanaged(types.Module).empty;
-        errdefer mods.deinit(allocator);
+        errdefer {
+            for (mods.items) |module| freeModule(allocator, module);
+            mods.deinit(allocator);
+        }
 
         if (self.program_path) |path| {
             const has_macho_debug = self.binary != null and self.binary.?.sections.debug_info != null;
@@ -4222,12 +4258,14 @@ pub const DwarfEngine = struct {
                 sym_status,
             });
 
-            try mods.append(allocator, .{
-                .id = try allocator.dupe(u8, "main"),
-                .name = try allocator.dupe(u8, std.fs.path.basename(path)),
-                .path = try allocator.dupe(u8, path),
-                .symbol_status = try allocator.dupe(u8, sym_status),
-            });
+            try appendOwnedModule(
+                &mods,
+                allocator,
+                "main",
+                std.fs.path.basename(path),
+                path,
+                sym_status,
+            );
         }
 
         debug_log.log("dwarf.engine: getModules count={d}", .{mods.items.len});
@@ -4236,26 +4274,58 @@ pub const DwarfEngine = struct {
 
     // ── Loaded Sources ──────────────────────────────────────────────
 
+    fn freeLoadedSource(allocator: std.mem.Allocator, source: types.LoadedSource) void {
+        allocator.free(source.name);
+        allocator.free(source.path);
+    }
+
+    fn appendOwnedLoadedSource(
+        sources: *std.ArrayListUnmanaged(types.LoadedSource),
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        path: []const u8,
+        source_reference: u32,
+    ) !void {
+        var source = types.LoadedSource{
+            .name = "",
+            .source_reference = source_reference,
+        };
+        errdefer {
+            if (source.name.len > 0) allocator.free(source.name);
+            if (source.path.len > 0) allocator.free(source.path);
+        }
+
+        source.name = try allocator.dupe(u8, name);
+        source.path = try allocator.dupe(u8, path);
+        try sources.append(allocator, source);
+    }
+
     fn engineLoadedSources(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]const types.LoadedSource {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
 
         var sources = std.ArrayListUnmanaged(types.LoadedSource).empty;
-        errdefer sources.deinit(allocator);
+        errdefer {
+            for (sources.items) |source| freeLoadedSource(allocator, source);
+            sources.deinit(allocator);
+        }
 
         // Both the Mach-O and ELF loaders normalize DWARF file entries into this cache.
         // Using it here preserves compressed-section handling and avoids reparsing line data.
         var seen = std.StringHashMapUnmanaged(void).empty;
         defer seen.deinit(allocator);
 
-        for (self.file_entries) |fe| {
+        for (self.file_entries, 0..) |fe, index| {
             if (fe.name.len == 0) continue;
             const gop = try seen.getOrPut(allocator, fe.name);
             if (gop.found_existing) continue;
 
-            try sources.append(allocator, .{
-                .name = try allocator.dupe(u8, std.fs.path.basename(fe.name)),
-                .path = try allocator.dupe(u8, fe.name),
-            });
+            try appendOwnedLoadedSource(
+                &sources,
+                allocator,
+                std.fs.path.basename(fe.name),
+                fe.name,
+                @intCast(index + 1),
+            );
         }
 
         debug_log.log("dwarf.engine: getLoadedSources count={d}", .{sources.items.len});
@@ -4546,37 +4616,19 @@ pub const DwarfEngine = struct {
 
     fn engineSource(ctx: *anyopaque, allocator: std.mem.Allocator, source_ref: u32) anyerror![]const u8 {
         const self: *DwarfEngine = @ptrCast(@alignCast(ctx));
-        // Source references map to file entries from DWARF debug line info
-        // Get file entries from the debug binary
-        const debug_binary: *const binary_macho.MachoBinary = blk: {
-            if (self.dsym_binary) |*dsym| {
-                if (dsym.sections.debug_line != null) break :blk dsym;
-            }
-            if (self.binary) |*bin| {
-                if (bin.sections.debug_line != null) break :blk bin;
-            }
-            return error.NotSupported;
-        };
 
-        const line_data = debug_binary.getSectionData(debug_binary.sections.debug_line orelse return error.NotSupported) orelse return error.NotSupported;
-        const line_str_data = if (debug_binary.sections.debug_line_str) |s| debug_binary.getSectionData(s) else null;
-
-        const result = parser.parseLineProgramWithFilesEx(line_data, allocator, line_str_data) catch return error.NotSupported;
-        defer allocator.free(result.line_entries);
-        defer allocator.free(result.file_entries);
-
-        // source_ref is 1-based index into file entries
-        if (source_ref == 0 or source_ref > result.file_entries.len) return error.InvalidSourceReference;
-        const fe = result.file_entries[source_ref - 1];
+        if (source_ref == 0 or source_ref > self.file_entries.len) return error.InvalidSourceReference;
+        const fe = self.file_entries[source_ref - 1];
         if (fe.name.len == 0) return error.InvalidSourceReference;
 
-        // Read the file from disk
-        const file = std.fs.openFileAbsolute(fe.name, .{}) catch |err| {
-            // Try relative to cwd
-            const cwd_file = std.fs.cwd().openFile(fe.name, .{}) catch return err;
-            defer cwd_file.close();
-            return try cwd_file.readToEndAlloc(allocator, 10 * 1024 * 1024);
-        };
+        debug_log.log("dwarf.engine: reading source reference={d} path={s}", .{ source_ref, fe.name });
+        if (std.fs.path.isAbsolute(fe.name)) {
+            const file = try std.fs.openFileAbsolute(fe.name, .{});
+            defer file.close();
+            return try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+        }
+
+        const file = try std.fs.cwd().openFile(fe.name, .{});
         defer file.close();
         return try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
     }
@@ -5185,6 +5237,51 @@ pub const DwarfEngine = struct {
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
+fn freeTestModules(allocator: std.mem.Allocator, modules: []const types.Module) void {
+    for (modules) |module| {
+        allocator.free(module.id);
+        allocator.free(module.name);
+        allocator.free(module.path);
+        allocator.free(module.symbol_status);
+    }
+    allocator.free(modules);
+}
+
+fn exerciseModuleAllocationFailures(allocator: std.mem.Allocator) !void {
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+    engine.program_path = try allocator.dupe(u8, "test/fixtures/simple.elf.o");
+
+    const modules = try DwarfEngine.engineModules(&engine, allocator);
+    defer freeTestModules(allocator, modules);
+}
+
+fn freeTestSources(allocator: std.mem.Allocator, sources: []const types.LoadedSource) void {
+    for (sources) |source| {
+        allocator.free(source.name);
+        allocator.free(source.path);
+    }
+    allocator.free(sources);
+}
+
+fn exerciseLoadedSourceAllocationFailures(allocator: std.mem.Allocator) !void {
+    var engine = DwarfEngine.init(allocator);
+    defer engine.deinit();
+
+    const file_entries = try allocator.alloc(parser.FileEntry, 2);
+    file_entries[0] = .{ .name = "test/fixtures/simple.c", .dir_index = 0 };
+    file_entries[1] = .{ .name = "test/fixtures/simple.c", .dir_index = 0 };
+    engine.file_entries = file_entries;
+
+    const sources = try DwarfEngine.engineLoadedSources(&engine, allocator);
+    defer freeTestSources(allocator, sources);
+}
+
+test "DwarfEngine module and source responses roll back allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseModuleAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseLoadedSourceAllocationFailures, .{});
+}
+
 test "DwarfEngine initial state" {
     var engine = DwarfEngine.init(std.testing.allocator);
     defer engine.deinit();
@@ -5298,13 +5395,20 @@ test "DwarfEngine reports ELF module and loaded sources" {
     }
 
     var found_simple_source = false;
+    var simple_source_ref: u32 = 0;
     for (sources) |source| {
         if (std.mem.eql(u8, source.name, "simple.c")) {
             found_simple_source = true;
+            simple_source_ref = source.source_reference;
             break;
         }
     }
     try std.testing.expect(found_simple_source);
+    try std.testing.expect(simple_source_ref > 0);
+
+    const source_contents = try driver.source(allocator, simple_source_ref);
+    defer allocator.free(source_contents);
+    try std.testing.expect(std.mem.indexOf(u8, source_contents, "int main") != null);
 }
 
 test "DwarfEngine stores inlined subroutine info" {
