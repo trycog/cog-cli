@@ -18,12 +18,39 @@ pub const Entry = struct {
     path: []const u8,
     size: u64,
     mtime_ns: i128,
+    // Content hash (XxHash64) confirming stat-level drift: checkout churn
+    // restores files with fresh mtimes but identical bytes. Null when the
+    // content was unavailable at write time or the manifest predates hashing.
+    hash: ?u64 = null,
 };
 
 pub const ManifestFile = struct {
     version: u32,
+    // The configured index pattern set at write time, so reconciliation works
+    // for projects indexed with explicit CLI patterns and no settings entry.
+    patterns: []const []const u8 = &.{},
+    external_roots: []const []const u8 = &.{},
+    // Resolved git HEAD at write time; enables the candidate fast path.
+    head_commit: ?[]const u8 = null,
     entries: []Entry,
 };
+
+pub fn hashContent(bytes: []const u8) u64 {
+    return std.hash.XxHash64.hash(0, bytes);
+}
+
+const max_hashed_file_bytes: usize = 256 * 1024 * 1024;
+
+/// Hash a file's content by absolute or root-relative physical path. Null on
+/// any failure — the entry then carries stat evidence only.
+pub fn hashPhysicalFile(allocator: std.mem.Allocator, physical_path: []const u8) ?u64 {
+    const content = std.fs.cwd().readFileAlloc(allocator, physical_path, max_hashed_file_bytes) catch |err| {
+        debug_log.log("index_manifest.hashPhysicalFile: {s}: {s}", .{ physical_path, @errorName(err) });
+        return null;
+    };
+    defer allocator.free(content);
+    return hashContent(content);
+}
 
 pub const Loaded = std.json.Parsed(ManifestFile);
 
@@ -57,15 +84,16 @@ pub fn load(allocator: std.mem.Allocator, cog_dir: std.fs.Dir) ?Loaded {
 
 /// Atomically write the manifest into a Cog directory as pretty-printed JSON.
 /// Returns false on failure; callers log and continue, because the manifest
-/// is recoverable provenance, not index data.
-pub fn write(allocator: std.mem.Allocator, cog_dir: std.fs.Dir, entries: []const Entry) bool {
+/// is recoverable provenance, not index data. The version field is always
+/// stamped by this module.
+pub fn write(allocator: std.mem.Allocator, cog_dir: std.fs.Dir, manifest: ManifestFile) bool {
+    var stamped = manifest;
+    stamped.version = manifest_version;
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     var stringify: std.json.Stringify = .{ .writer = &aw.writer, .options = .{ .whitespace = .indent_2 } };
-    stringify.write(ManifestFile{
-        .version = manifest_version,
-        .entries = @constCast(entries),
-    }) catch |err| {
+    stringify.write(stamped) catch |err| {
         debug_log.log("index_manifest.write: encode failed: {s}", .{@errorName(err)});
         return false;
     };
@@ -75,7 +103,7 @@ pub fn write(allocator: std.mem.Allocator, cog_dir: std.fs.Dir, entries: []const
         debug_log.log("index_manifest.write: write failed: {s}", .{@errorName(err)});
         return false;
     };
-    debug_log.log("index_manifest.write: entries={d}", .{entries.len});
+    debug_log.log("index_manifest.write: entries={d} patterns={d}", .{ stamped.entries.len, stamped.patterns.len });
     return true;
 }
 
@@ -106,14 +134,20 @@ test "manifest round-trips entries through pretty-printed JSON" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const entries = [_]Entry{
-        .{ .path = "src/main.zig", .size = 123, .mtime_ns = 1_755_000_000_123_456_789 },
+    var entries = [_]Entry{
+        .{ .path = "src/main.zig", .size = 123, .mtime_ns = 1_755_000_000_123_456_789, .hash = 0xdead_beef },
         .{ .path = "src/util.zig", .size = 456, .mtime_ns = 1_755_000_000_987_654_321 },
     };
-    try std.testing.expect(write(allocator, tmp.dir, &entries));
+    var patterns = [_][]const u8{"**/*.zig"};
+    try std.testing.expect(write(allocator, tmp.dir, .{
+        .version = manifest_version,
+        .patterns = &patterns,
+        .head_commit = "0123456789abcdef",
+        .entries = &entries,
+    }));
 
     // Configuration files are always pretty-printed, never minified.
-    const raw = try tmp.dir.readFileAlloc(allocator, manifest_basename, 4096);
+    const raw = try tmp.dir.readFileAlloc(allocator, manifest_basename, 8192);
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\n  \"version\": 1") != null);
     try std.testing.expect(std.mem.endsWith(u8, raw, "\n"));
@@ -124,6 +158,31 @@ test "manifest round-trips entries through pretty-printed JSON" {
     try std.testing.expectEqualStrings("src/main.zig", loaded.value.entries[0].path);
     try std.testing.expectEqual(@as(u64, 123), loaded.value.entries[0].size);
     try std.testing.expectEqual(@as(i128, 1_755_000_000_123_456_789), loaded.value.entries[0].mtime_ns);
+    try std.testing.expectEqual(@as(?u64, 0xdead_beef), loaded.value.entries[0].hash);
+    try std.testing.expectEqual(@as(?u64, null), loaded.value.entries[1].hash);
+    try std.testing.expectEqual(@as(usize, 1), loaded.value.patterns.len);
+    try std.testing.expectEqualStrings("**/*.zig", loaded.value.patterns[0]);
+    try std.testing.expectEqualStrings("0123456789abcdef", loaded.value.head_commit.?);
+}
+
+test "manifests without the extended fields load with defaults" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = manifest_basename, .data = 
+        \\{
+        \\  "version": 1,
+        \\  "entries": [
+        \\    { "path": "a.go", "size": 10, "mtime_ns": 5 }
+        \\  ]
+        \\}
+    });
+    var loaded = load(allocator, tmp.dir) orelse return error.TestUnexpectedResult;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), loaded.value.patterns.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), loaded.value.head_commit);
+    try std.testing.expectEqual(@as(?u64, null), loaded.value.entries[0].hash);
 }
 
 test "manifest load tolerates missing, malformed, and mismatched files" {
