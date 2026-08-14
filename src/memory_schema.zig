@@ -100,7 +100,9 @@ const cleanup_short_term =
     \\  AND created_at < datetime('now', '-24 hours');
 ;
 
-const current_schema_version: i64 = 1;
+const initial_schema_version: i64 = 1;
+const lifecycle_schema_version: i64 = 2;
+const current_schema_version: i64 = lifecycle_schema_version;
 
 const lifecycle_columns = [_]struct {
     name: []const u8,
@@ -137,17 +139,17 @@ pub fn ensureSchema(db: *Db) !void {
     const version = getSchemaVersion(db);
     debug_log.log("memory_schema: current version={d}", .{version});
 
-    if (version < current_schema_version) {
-        // Create all tables
+    if (version == 0) {
+        // Create the latest table shape, then record the initial version so
+        // every later change is still applied and committed as an explicit
+        // migration step.
         try db.exec(engrams_ddl);
         try db.exec(synapses_ddl);
         try db.exec(engrams_fts_ddl);
         try db.exec(indexes_ddl);
         try db.exec(triggers_ddl);
-
-        // Set version
-        try setSchemaVersion(db, current_schema_version);
-        debug_log.log("memory_schema: schema created at version {d}", .{current_schema_version});
+        try setSchemaVersion(db, initial_schema_version);
+        debug_log.log("memory_schema: base schema created at version {d}", .{initial_schema_version});
     }
 
     try retrySchemaMigration(db, runSchemaMigration);
@@ -194,9 +196,17 @@ fn runSchemaMigration(db: *Db) sqlite.Error!void {
         };
     };
 
-    try ensureLifecycleColumns(db);
-    try db.exec("DROP TRIGGER IF EXISTS engrams_au");
-    try db.exec(triggers_ddl);
+    const version = getSchemaVersion(db);
+    if (version < lifecycle_schema_version) {
+        debug_log.log(
+            "memory_schema: migrating version {d} to {d}",
+            .{ version, lifecycle_schema_version },
+        );
+        try ensureLifecycleColumns(db);
+        try db.exec("DROP TRIGGER IF EXISTS engrams_au");
+        try db.exec(triggers_ddl);
+        try setSchemaVersion(db, lifecycle_schema_version);
+    }
     try db.exec("COMMIT");
     transaction_open = false;
     debug_log.log("memory_schema: migration transaction committed", .{});
@@ -322,7 +332,7 @@ test "ensureSchema migrates version 1 databases without losing data" {
     try std.testing.expectEqualStrings("long", stmt.columnText(2).?);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), stmt.columnReal(3), 0.001);
     try std.testing.expectEqual(@as(i64, 0), stmt.columnInt(4));
-    try std.testing.expectEqual(@as(i64, 1), getSchemaVersion(&db));
+    try std.testing.expectEqual(@as(i64, 2), getSchemaVersion(&db));
 }
 
 test "schema migration retries the whole transaction after busy" {
