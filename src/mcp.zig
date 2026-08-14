@@ -19,6 +19,7 @@ const repo_context_mod = @import("repo_context.zig");
 const session_context_mod = @import("session_context.zig");
 const memory_envelope_mod = @import("memory_envelope.zig");
 const settings_mod = @import("settings.zig");
+const update_check_mod = @import("update_check.zig");
 
 const Config = config_mod.Config;
 const DebugServer = debug_server_mod.DebugServer;
@@ -243,6 +244,14 @@ const HandlerThreads = struct {
     }
 };
 
+/// A due update notice staged for the agent: the pre-formatted line to
+/// prepend and the bare latest version to confirm via markNotified once the
+/// line is actually delivered. Both are allocator-owned.
+const PendingUpdateNotice = struct {
+    line: []const u8,
+    latest: []const u8,
+};
+
 const Runtime = struct {
     allocator: std.mem.Allocator,
     mem_config: ?Config,
@@ -268,6 +277,11 @@ const Runtime = struct {
     client_agent_name: ?[]const u8 = null,
     client_agent_version: ?[]const u8 = null,
     client_model: ?[]const u8 = null,
+    /// Update notice staged by UpdateCheckState, consumed once by the next
+    /// code tool result. Its own mutex: handler threads take it while the
+    /// main runtime mutex may be held for long index operations.
+    pending_update_notice: ?PendingUpdateNotice = null,
+    update_notice_mutex: std.Thread.Mutex = .{},
     /// Protects code_cache, remote_tools, mcp_session_id, and mem_db from concurrent access.
     mutex: std.Thread.Mutex = .{},
 
@@ -320,11 +334,35 @@ const Runtime = struct {
         }
         self.repo_context_cache.deinit(self.allocator);
         if (self.mcp_session_id) |sid| self.allocator.free(sid);
+        if (self.pending_update_notice) |notice| {
+            self.allocator.free(notice.line);
+            self.allocator.free(notice.latest);
+        }
         if (self.client_agent_name) |v| self.allocator.free(v);
         if (self.client_agent_version) |v| self.allocator.free(v);
         if (self.client_model) |v| self.allocator.free(v);
         self.debug_server.deinit();
         if (self.observe_server) |*server| server.deinit();
+    }
+
+    fn setPendingUpdateNotice(self: *Runtime, notice: PendingUpdateNotice) void {
+        self.update_notice_mutex.lock();
+        defer self.update_notice_mutex.unlock();
+        if (self.pending_update_notice) |old| {
+            self.allocator.free(old.line);
+            self.allocator.free(old.latest);
+        }
+        self.pending_update_notice = notice;
+    }
+
+    /// Take-and-clear so the notice is delivered exactly once per session
+    /// even with concurrent handler threads.
+    fn takePendingUpdateNotice(self: *Runtime) ?PendingUpdateNotice {
+        self.update_notice_mutex.lock();
+        defer self.update_notice_mutex.unlock();
+        const notice = self.pending_update_notice orelse return null;
+        self.pending_update_notice = null;
+        return notice;
     }
 
     fn hasMemory(self: *const Runtime) bool {
@@ -569,6 +607,12 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
     defer index_sync.deinit(allocator);
     index_sync.spawn(&runtime, "startup", std.time.nanoTimestamp());
 
+    // Throttled release check: one detached worker per session; a due notice
+    // rides along with the next code tool result. An in-flight worker at
+    // shutdown finishes on its own, exactly like the reconcile worker.
+    var update_state: UpdateCheckState = .{};
+    update_state.spawn(&runtime);
+
     while (!shutdown_requested.load(.acquire)) {
         if (builtin.os.tag != .windows) {
             var fds: [2]posix.pollfd = undefined;
@@ -596,6 +640,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
                 watcher_overflow = false;
             }
             index_sync.tick(&runtime, now_ns);
+            update_state.tick(&runtime);
             if (poll_result == 0) continue;
 
             if (fds[0].revents & posix.POLL.ERR != 0) {
@@ -1696,14 +1741,14 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             return err;
         };
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire) > 0, result);
+        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire) > 0, applyPendingUpdateNotice(runtime, result));
     } else if (std.mem.eql(u8, tool_name, "code_explore")) {
         const result = callCodeExplore(runtime, arguments) catch |err| {
             debug_log_mod.log("runtimeCallTool: code_explore failed: {s}", .{@errorName(err)});
             return err;
         };
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire) > 0, result);
+        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire) > 0, applyPendingUpdateNotice(runtime, result));
     }
 
     // Observe tools — delegate to ObserveServer (has its own mutex).
@@ -2409,6 +2454,42 @@ test "code tool results disclose an in-flight reconcile" {
     try std.testing.expect(std.mem.endsWith(u8, warned, "Matches for `foo`"));
 }
 
+/// Prepend `notice_line` to `result`. Takes ownership of `result`; on
+/// allocation failure the original result is returned untouched — a missed
+/// notice must never break a tool answer.
+fn withUpdateNotice(allocator: std.mem.Allocator, notice_line: []const u8, result: []const u8) []const u8 {
+    const combined = std.fmt.allocPrint(allocator, "{s}{s}", .{ notice_line, result }) catch return result;
+    allocator.free(result);
+    return combined;
+}
+
+/// Deliver the session's update notice at most once: the first code tool
+/// result after the worker reap carries it; the pending state is cleared and
+/// the display is confirmed via markNotified. Follows the withSyncWarning
+/// precedent of disclosure-by-prefix.
+fn applyPendingUpdateNotice(runtime: *Runtime, result: []const u8) []const u8 {
+    const pending = runtime.takePendingUpdateNotice() orelse return result;
+    defer {
+        runtime.allocator.free(pending.line);
+        runtime.allocator.free(pending.latest);
+    }
+    const combined = withUpdateNotice(runtime.allocator, pending.line, result);
+    update_check_mod.markNotified(runtime.allocator, pending.latest);
+    debug_log_mod.log("update check: notice delivered with code tool result", .{});
+    return combined;
+}
+
+test "update notices prepend to a code tool result exactly once" {
+    const allocator = std.testing.allocator;
+
+    const base = try allocator.dupe(u8, "Matches for `foo`");
+    const line = "NOTE: Cog v9.9.9 is available (installed v0.0.1). Ask the user before updating.\n\n";
+    const combined = withUpdateNotice(allocator, line, base);
+    defer allocator.free(combined);
+    try std.testing.expect(std.mem.startsWith(u8, combined, "NOTE: Cog v9.9.9 is available"));
+    try std.testing.expect(std.mem.endsWith(u8, combined, "Matches for `foo`"));
+}
+
 const git_sentinel_interval_ns: i128 = 2 * std.time.ns_per_s;
 const unwatched_sync_interval_ns: i128 = 120 * std.time.ns_per_s;
 
@@ -2529,6 +2610,69 @@ const IndexSyncState = struct {
         // the repair on its own and is reparented at process exit.
         if (self.project_root) |root| allocator.free(root);
         self.project_root = null;
+    }
+};
+
+/// Drives the throttled update check from the serve loop, mirroring
+/// IndexSyncState: spawn the hidden worker once at startup (posix only,
+/// skipped when opted out), reap it non-blocking, then evaluate the cache
+/// exactly once. A due notice is staged on the Runtime; delivery and
+/// markNotified happen when a code tool result actually carries it.
+const UpdateCheckState = struct {
+    child: ?std.process.Child = null,
+    evaluated: bool = false,
+
+    fn spawn(self: *UpdateCheckState, runtime: *Runtime) void {
+        if (builtin.os.tag == .windows) return;
+        if (self.evaluated or self.child != null) return;
+        if (update_check_mod.isDisabledByEnv()) {
+            debug_log_mod.log("update check: disabled via {s}=0", .{update_check_mod.OPT_OUT_ENV});
+            self.evaluated = true;
+            return;
+        }
+
+        const allocator = runtime.allocator;
+        const exe_path = std.fs.selfExePathAlloc(allocator) catch |err| {
+            debug_log_mod.log("update check: self executable lookup failed error={s}", .{@errorName(err)});
+            self.evaluated = true;
+            return;
+        };
+        defer allocator.free(exe_path);
+        const argv = [_][]const u8{ exe_path, update_check_mod.UPDATE_CHECK_WORKER_COMMAND };
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch |err| {
+            debug_log_mod.log("update check: worker spawn failed error={s}", .{@errorName(err)});
+            self.evaluated = true;
+            return;
+        };
+        debug_log_mod.log("update check: worker spawned", .{});
+        self.child = child;
+    }
+
+    /// Non-blocking reap so the serve loop never stalls behind the check.
+    fn tick(self: *UpdateCheckState, runtime: *Runtime) void {
+        if (builtin.os.tag == .windows) return;
+        const child = self.child orelse return;
+        const wait_result = std.posix.waitpid(child.id, std.posix.W.NOHANG);
+        if (wait_result.pid == 0) return;
+
+        self.child = null;
+        self.evaluated = true;
+        debug_log_mod.log("update check: worker reaped", .{});
+
+        const allocator = runtime.allocator;
+        const notice = update_check_mod.pendingNoticeFromCache(allocator) orelse return;
+        defer notice.deinit(allocator);
+        const line = update_check_mod.formatAgentNotice(allocator, notice) orelse return;
+        const latest = allocator.dupe(u8, notice.latest) catch {
+            allocator.free(line);
+            return;
+        };
+        runtime.setPendingUpdateNotice(.{ .line = line, .latest = latest });
+        debug_log_mod.log("update check: notice staged latest={s}", .{latest});
     }
 };
 
