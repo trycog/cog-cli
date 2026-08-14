@@ -7,19 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Exact-origin approval workflow for self-hosted memory credentials through `cog doctor --approve-host`, backed by a user-global approval store that repository configuration cannot override.
+- Deterministic SCIP indexing benchmark and fuzz-smoke gates covering full indexing, batched reindexing, cache loading, representative queries, and malformed protobuf input.
+- Capability-negotiated hosted-memory write envelopes with local session, repository, host-integration, and code/debug provenance.
+- Capability-driven Cog specialist assets for all eleven supported agent hosts, including optional validation and observe specialists where each host can represent them.
+- Persisted observe-session discovery, status filtering, retention cleanup, corrupt-database reporting, and project-root storage resolution for the opt-in observe scaffold.
+- Format-neutral native debugger support for ELF modules, stable loaded sources, process-or-core memory access, and validated x86_64 and AArch64 core register notes.
+
 ### Changed
 
-- CLI help, README, and extension authoring guidance now match the current command surface, MCP tool names, debugger architecture, and explicit extension build trust model.
-- MCP tool advertisement and dispatch now share exact capability gates for debug tiers, observe opt-in, local memory, and dynamically discovered hosted memory tools.
-- Credential-origin documentation now reflects enforced pre-request destination checks, the global approval-store boundary, unavailable public approval CLI, and fail-closed Windows behavior.
+- Initial indexing, bootstrap scans, configured resyncs, and filesystem watching now share one symlink-aware path policy, preserve logical aliases, and support explicitly approved `code.external_roots`.
+- Watcher updates are deduplicated and applied in bounded batched index transactions, with cache generation checks so external index replacements become visible without restarting MCP.
+- DAP transport now serializes reads and writes, uses absolute deadlines, tracks breakpoint events, bounds retained adapter events, and owns detached process groups through cleanup.
+- Extension installation now consumes one GitHub release archive, verifies its published SHA-256 digest, requires separate `--trust-build` consent for manifest shell commands, and transactionally preserves the previous install on failure.
+- Release automation now validates tag/version/changelog consistency, archive formats, checksums, provenance, and artifact metadata before publication.
+- CLI help, README, extension authoring guidance, and the agent support matrix now match the registered command surface, tool names, observe gating, debugger architecture, credential boundary, and extension trust model.
+- MCP tool advertisement and dispatch now share exact capability gates for debug tiers, observe opt-in, local memory, and dynamically discovered hosted-memory tools.
+- Standard input, output, and error handling now uses streaming writers so redirected output is appended correctly instead of depending on seekable files.
 
 ### Removed
 
 - Stale CLI help and unreferenced compatibility helpers for removed code file-operation commands and `debug:send`.
+- Raw MCP traffic logging that could persist request payloads outside Cog's normal debug-log boundary.
 
 ### Fixed
 
-- Unknown MCP tool names that merely share a `debug_`, `observe_`, `mem_`, or code-tool prefix are rejected instead of reaching a broader family dispatcher.
+- Local memory now honors association weights and recall limits, ranks full-text matches deterministically, preserves intra-batch associations transactionally, retries complete schema migrations under contention, and filters expired or deprecated memories from recall.
+- Code intelligence now resolves cross-document calls and imports independent of document order, attaches nested calls to the innermost definition, preserves same-name symbol kinds, and captures broader Java, JavaScript, C, and C++ relationships.
+- Incremental reindexing now keeps merged SCIP storage alive through encoding, maps external-indexer output onto every logical alias, preserves dependency documents, and splits oversized watcher batches instead of dropping paths.
+- MCP framing and handler shutdown are bounded, malformed or oversized messages resynchronize safely, remote tools retain required runtime synchronization, and unknown prefixed tool names no longer reach broader family dispatchers.
+- DAP runs, reverse requests, memory decoding, temporary timeouts, adapter processes, dashboard framing, reconnects, and session teardown now have deterministic ownership and error handling.
+- Native debugging now validates ELF `CORE`/`NT_PRSTATUS` notes, reports ELF modules and sources consistently, hardens Linux process identity handling, and returns stable source references.
+- Observe stop, status, event-count, persistence, and finalization failures now propagate instead of reporting false success; healthy persisted sessions remain available when another database is corrupt.
+- Host setup now rejects malformed, oversized, unreadable, or unsafe existing configuration instead of treating it as absent, and generated specialist prompts never require an asset that was skipped or unsupported.
+- Project and global settings, bootstrap checkpoints, agent usage state, host assets, index files, and extension directories now use atomic persistence with rollback and restrictive permissions.
+
+### Security
+
+- `COG_API_KEY` is sent automatically only to exact `https://trycog.ai:443`; every other credential destination must be an explicitly approved HTTPS origin, authenticated redirects remain disabled, and Windows approval persistence fails closed when safe path traversal is unavailable.
+- Debug sockets, PID files, entitlements, DAP diagnostics, and temporary outputs now live in verified user-owned private runtime paths with restrictive modes, symlink rejection, peer/process identity checks, and no Cog-owned shared `/tmp` state.
+- MCP frames, handler concurrency, observe queries, DAP queues, HTTP responses, redirects, downloads, subprocess lifetimes, and SQLite contention now have explicit bounds and failure behavior.
+- Built-in grammar sources are pinned to immutable revisions with verified hashes, external index output uses private pre-created files, and archive extraction rejects traversal, links, and ambiguous release assets.
 
 ## [0.26.0] - 2026-04-14
 
