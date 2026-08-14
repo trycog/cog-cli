@@ -437,7 +437,10 @@ fn joinLogical(allocator: std.mem.Allocator, prefix: []const u8, suffix: []const
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, suffix });
 }
 
-fn isPolicyExcluded(path: []const u8) bool {
+/// The shared exclusion policy every traversal applies. Exposed so index
+/// reconciliation can ask the same question the collector asks: could this
+/// logical path ever have been produced here?
+pub fn isPolicyExcluded(path: []const u8) bool {
     var components = std.mem.splitScalar(u8, path, '/');
     while (components.next()) |component| {
         if (component.len == 0) continue;

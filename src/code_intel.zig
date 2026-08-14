@@ -2507,6 +2507,37 @@ fn remapExternalDocuments(
     }
 }
 
+/// The logical namespace `PathMatcher` gives to approved external roots.
+/// Nothing else produces it, which is what makes it a reliable ownership mark.
+const external_alias_prefix = "@external/";
+
+/// Decide whether a document in the master index belongs to the source set
+/// this project manages.
+///
+/// A full resync converges the index onto the freshly matched set, so a
+/// managed document that is no longer matched has to go — the file was
+/// deleted, the configured patterns narrowed, or a negative pattern now
+/// excludes it.
+///
+/// External indexers also emit documents nobody configured: a type stub under
+/// `node_modules`, a vendored gem, an absolute path into a language runtime.
+/// `PathMatcher` never traverses those locations, so cog's own collection can
+/// never produce such a path — their absence from the matched set says nothing
+/// about whether they are stale. Deleting them on every resync would throw
+/// away the cross-repository symbols that make go-to-definition work into
+/// dependencies, and no configured pattern could rebuild them.
+///
+/// So a path is managed exactly when the matcher could have produced it: an
+/// `@external/...` alias, or a relative path the shared policy does not
+/// exclude. Absolute paths and paths inside excluded directories are the
+/// indexer's, not ours.
+fn isManagedDocumentPath(logical_path: []const u8) bool {
+    if (logical_path.len == 0) return false;
+    if (std.mem.startsWith(u8, logical_path, external_alias_prefix)) return true;
+    if (std.fs.path.isAbsolute(logical_path)) return false;
+    return !path_matcher.isPolicyExcluded(logical_path);
+}
+
 fn appendConfiguredReindexPaths(
     allocator: std.mem.Allocator,
     matched_files: []const path_matcher.MatchedPath,
@@ -2522,6 +2553,11 @@ fn appendConfiguredReindexPaths(
     }
     for (indexed_documents) |doc| {
         if (findPhysicalPath(matched_files, doc.relative_path) != null) continue;
+        if (!isManagedDocumentPath(doc.relative_path)) {
+            debug_log.log("reindexConfiguredFiles: retaining unmanaged document path={s}", .{doc.relative_path});
+            continue;
+        }
+        debug_log.log("reindexConfiguredFiles: removing stale managed document path={s}", .{doc.relative_path});
         out.appendAssumeCapacity(.{
             .logical_path = doc.relative_path,
             .physical_path = null,
@@ -4985,6 +5021,61 @@ test "external documents fan out to every configured logical alias" {
         out.items[0].symbols[0].display_name,
         out.items[1].symbols[0].display_name,
     );
+}
+
+fn findBatchEntry(batch: []const ReindexPath, logical_path: []const u8) ?ReindexPath {
+    for (batch) |entry| {
+        if (std.mem.eql(u8, entry.logical_path, logical_path)) return entry;
+    }
+    return null;
+}
+
+test "configured reconciliation converges on the managed source set" {
+    const allocator = std.testing.allocator;
+
+    const matched = [_]path_matcher.MatchedPath{
+        .{ .logical_path = "src/main.zig", .physical_path = "/project/src/main.zig" },
+        .{ .logical_path = "@external/shared/lib.zig", .physical_path = "/shared/lib.zig" },
+    };
+    const documents = [_]scip.Document{
+        // Still matched: refreshed from its physical source.
+        .{ .language = "zig", .relative_path = "src/main.zig", .occurrences = &.{}, .symbols = &.{} },
+        // Managed but no longer matched because the pattern narrowed.
+        .{ .language = "zig", .relative_path = "src/legacy.zig", .occurrences = &.{}, .symbols = &.{} },
+        // Excluded by a negative pattern, still inside the managed space.
+        .{ .language = "zig", .relative_path = "src/generated/skip.zig", .occurrences = &.{}, .symbols = &.{} },
+        // An external alias the settings no longer configure.
+        .{ .language = "zig", .relative_path = "@external/dropped/old.zig", .occurrences = &.{}, .symbols = &.{} },
+        // Dependency-generated: the indexer walked into these on its own, and
+        // no configured pattern can ever reproduce them.
+        .{ .language = "typescript", .relative_path = "node_modules/@types/node/index.d.ts", .occurrences = &.{}, .symbols = &.{} },
+        .{ .language = "ruby", .relative_path = "/usr/lib/ruby/3.4/set.rb", .occurrences = &.{}, .symbols = &.{} },
+    };
+
+    var batch: std.ArrayListUnmanaged(ReindexPath) = .empty;
+    defer batch.deinit(allocator);
+    try appendConfiguredReindexPaths(allocator, &matched, &documents, &batch);
+
+    // Two matched sources plus three managed removals — and nothing else.
+    try std.testing.expectEqual(@as(usize, 5), batch.items.len);
+
+    const main_entry = findBatchEntry(batch.items, "src/main.zig") orelse
+        return error.MissingMatchedSource;
+    try std.testing.expectEqualStrings("/project/src/main.zig", main_entry.physical_path.?);
+    const external_entry = findBatchEntry(batch.items, "@external/shared/lib.zig") orelse
+        return error.MissingMatchedSource;
+    try std.testing.expectEqualStrings("/shared/lib.zig", external_entry.physical_path.?);
+
+    // A null physical path is how the batch spells "remove this document".
+    for ([_][]const u8{ "src/legacy.zig", "src/generated/skip.zig", "@external/dropped/old.zig" }) |stale| {
+        const entry = findBatchEntry(batch.items, stale) orelse return error.MissingStaleRemoval;
+        try std.testing.expect(entry.physical_path == null);
+    }
+
+    // Deleting these would throw away cross-repository symbols that no
+    // configured pattern can rebuild.
+    try std.testing.expect(findBatchEntry(batch.items, "node_modules/@types/node/index.d.ts") == null);
+    try std.testing.expect(findBatchEntry(batch.items, "/usr/lib/ruby/3.4/set.rb") == null);
 }
 
 test "configured reconciliation retains physical reads and removes stale aliases" {
