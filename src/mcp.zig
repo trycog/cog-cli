@@ -253,9 +253,10 @@ const Runtime = struct {
     observe_server: ?ObserveServer,
     code_cache: ?code_intel.CodeIndex = null,
     code_cache_generation: ?IndexGeneration = null,
-    // True while a reconcile worker runs; code tools disclose possible
-    // staleness instead of answering with silent confidence.
-    index_sync_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Nonzero while any reindex — reconcile worker or watcher batch — is in
+    // flight; code tools disclose possible staleness instead of answering
+    // with silent confidence. A counter because the windows can overlap.
+    index_sync_pending: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     remote_tools: ?[]RemoteTool = null,
     mcp_session_id: ?[]const u8 = null,
     session_contexts: std.StringHashMapUnmanaged(session_context_mod.SessionContext) = .empty,
@@ -590,7 +591,7 @@ pub fn serve(allocator: std.mem.Allocator, version: []const u8, args: []const [:
             }
             if (watcher_batch.shouldFlush(now_ns)) {
                 debug_log_mod.log("watcher batch: flushing pending={d}", .{watcher_batch.pending_count});
-                processWatcherEvents(&runtime, &watcher_paths, watcher_overflow);
+                processWatcherEvents(&runtime, &watcher_paths, watcher_overflow, &index_sync);
                 watcher_batch.reset();
                 watcher_overflow = false;
             }
@@ -1695,14 +1696,14 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
             return err;
         };
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire), result);
+        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire) > 0, result);
     } else if (std.mem.eql(u8, tool_name, "code_explore")) {
         const result = callCodeExplore(runtime, arguments) catch |err| {
             debug_log_mod.log("runtimeCallTool: code_explore failed: {s}", .{@errorName(err)});
             return err;
         };
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
-        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire), result);
+        return withSyncWarning(runtime.allocator, runtime.index_sync_pending.load(.acquire) > 0, result);
     }
 
     // Observe tools — delegate to ObserveServer (has its own mutex).
@@ -2263,14 +2264,26 @@ fn processWatcherEvents(
     runtime: *Runtime,
     paths_buf: *std.ArrayListUnmanaged([]const u8),
     overflow: bool,
+    index_sync: *IndexSyncState,
 ) void {
     const allocator = runtime.allocator;
     if (!overflow and paths_buf.items.len == 0) return;
-    debug_log_mod.log("watcher batch: spawning worker paths={d} overflow={any}", .{ paths_buf.items.len, overflow });
-    const result = if (overflow)
-        spawnResyncWorker(allocator)
-    else
-        reindexBatchInChunks(allocator, paths_buf.items);
+
+    if (overflow) {
+        // Event loss means the whole index may be behind. The reconcile
+        // worker converges it without blocking the serve loop, and the
+        // pending counter keeps code tools honest meanwhile.
+        debug_log_mod.log("watcher batch: overflow; delegating to reconcile worker", .{});
+        for (paths_buf.items) |file_path| allocator.free(file_path);
+        paths_buf.clearRetainingCapacity();
+        index_sync.spawn(runtime, "watcher overflow", std.time.nanoTimestamp());
+        return;
+    }
+
+    debug_log_mod.log("watcher batch: spawning worker paths={d}", .{paths_buf.items.len});
+    _ = runtime.index_sync_pending.fetchAdd(1, .acq_rel);
+    defer _ = runtime.index_sync_pending.fetchSub(1, .acq_rel);
+    const result = reindexBatchInChunks(allocator, paths_buf.items);
 
     for (paths_buf.items) |file_path| allocator.free(file_path);
     paths_buf.clearRetainingCapacity();
@@ -2404,12 +2417,16 @@ const unwatched_sync_interval_ns: i128 = 120 * std.time.ns_per_s;
 /// file watcher is available. The reconcile itself runs in a re-executed
 /// worker process; visibility of its result comes from the per-query index
 /// generation check, so completion only has to clear the pending flag.
+const max_consecutive_sync_failures: u8 = 2;
+
 const IndexSyncState = struct {
     child: ?std.process.Child = null,
     project_root: ?[]const u8 = null,
     git_stamp: ?git_state.SyncStamp = null,
     last_git_check_ns: i128 = 0,
     last_trigger_ns: i128 = 0,
+    consecutive_failures: u8 = 0,
+    backoff_logged: bool = false,
 
     fn tick(self: *IndexSyncState, runtime: *Runtime, now_ns: i128) void {
         if (builtin.os.tag == .windows) return;
@@ -2420,6 +2437,16 @@ const IndexSyncState = struct {
             self.checkGitSentinel(runtime, now_ns);
         }
         if (runtime.watcher == null and now_ns - self.last_trigger_ns >= unwatched_sync_interval_ns) {
+            // A worker that keeps failing (no patterns configured, broken
+            // settings) must not respawn every period.
+            if (self.consecutive_failures >= max_consecutive_sync_failures) {
+                if (!self.backoff_logged) {
+                    debug_log_mod.log("index sync: periodic reconcile disabled after {d} failures; run cog code:sync to retry", .{self.consecutive_failures});
+                    self.backoff_logged = true;
+                }
+                self.last_trigger_ns = now_ns;
+                return;
+            }
             self.spawn(runtime, "unwatched periodic", now_ns);
         }
     }
@@ -2449,7 +2476,7 @@ const IndexSyncState = struct {
             return;
         };
         debug_log_mod.log("index sync: reconcile worker spawned reason={s}", .{reason});
-        runtime.index_sync_pending.store(true, .release);
+        _ = runtime.index_sync_pending.fetchAdd(1, .acq_rel);
         self.child = child;
     }
 
@@ -2460,11 +2487,19 @@ const IndexSyncState = struct {
         if (wait_result.pid == 0) return;
 
         self.child = null;
-        runtime.index_sync_pending.store(false, .release);
+        _ = runtime.index_sync_pending.fetchSub(1, .acq_rel);
         if (std.posix.W.IFEXITED(wait_result.status)) {
-            debug_log_mod.log("index sync: worker exited code={d}", .{std.posix.W.EXITSTATUS(wait_result.status)});
+            const exit_code = std.posix.W.EXITSTATUS(wait_result.status);
+            debug_log_mod.log("index sync: worker exited code={d}", .{exit_code});
+            if (exit_code >= 2) {
+                self.consecutive_failures +|= 1;
+            } else {
+                self.consecutive_failures = 0;
+                self.backoff_logged = false;
+            }
         } else {
             debug_log_mod.log("index sync: worker terminated abnormally", .{});
+            self.consecutive_failures +|= 1;
         }
     }
 
