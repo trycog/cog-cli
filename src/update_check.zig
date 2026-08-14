@@ -9,8 +9,15 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const debug_log = @import("debug_log.zig");
 const fs_util = @import("fs_util.zig");
+const paths = @import("paths.zig");
+const curl = @import("curl.zig");
+
+/// The running binary's version, sourced from build.zig.zon via build
+/// options — the same value mcp.serve logs at startup.
+pub const installed_version: []const u8 = build_options.version;
 
 /// Environment variable that disables all polling and notices when set to "0".
 pub const OPT_OUT_ENV = "COG_UPDATE_CHECK";
@@ -329,6 +336,110 @@ pub fn formatAgentNotice(allocator: std.mem.Allocator, notice: NoticeInfo) ?[]u8
             "brew upgrade cog or https://github.com/trycog/cog-cli/releases\n\n",
         .{ notice.latest, notice.installed },
     ) catch null;
+}
+
+// ── Public API ──────────────────────────────────────────────────────────
+
+const releases_url = "https://api.github.com/repos/trycog/cog-cli/releases/latest";
+const max_release_response_bytes: usize = 1024 * 1024;
+
+/// Production fetch: unauthenticated HTTPS GET against the GitHub releases
+/// API through src/curl.zig, which enforces HTTPS-only transport, TLS
+/// verification, redirect limits, and timeouts. RequestOptions exposes no
+/// timeout override, so the module defaults apply; the poll runs in a
+/// detached worker, so it never blocks a user-visible operation. The only
+/// header is a User-Agent, which the GitHub API requires.
+fn fetchLatestTag(allocator: std.mem.Allocator) ?[]u8 {
+    curl.globalInit();
+    debug_log.log("update_check.fetchLatestTag: GET {s}", .{releases_url});
+    const response = curl.getWithOptions(
+        allocator,
+        releases_url,
+        &.{"User-Agent: cog-cli"},
+        .{ .max_response_bytes = max_release_response_bytes },
+    ) catch |err| {
+        debug_log.log("update_check.fetchLatestTag: request failed: {s}", .{@errorName(err)});
+        return null;
+    };
+    defer allocator.free(response.body);
+    if (response.status_code != 200) {
+        debug_log.log("update_check.fetchLatestTag: status={d}", .{response.status_code});
+        return null;
+    }
+    return parseLatestTag(allocator, response.body);
+}
+
+/// Resolve ~/.config/cog as an open directory. `create` makes the directory
+/// when a write may follow; the read-only paths never create anything.
+fn openGlobalConfigDir(allocator: std.mem.Allocator, create: bool) ?std.fs.Dir {
+    const path = paths.getGlobalConfigDir(allocator) catch |err| {
+        debug_log.log("update_check: no global config dir: {s}", .{@errorName(err)});
+        return null;
+    };
+    defer allocator.free(path);
+    if (create) {
+        std.fs.cwd().makePath(path) catch |err| {
+            debug_log.log("update_check: cannot create {s}: {s}", .{ path, @errorName(err) });
+            return null;
+        };
+    }
+    return std.fs.openDirAbsolute(path, .{}) catch |err| {
+        debug_log.log("update_check: cannot open {s}: {s}", .{ path, @errorName(err) });
+        return null;
+    };
+}
+
+/// True when the COG_UPDATE_CHECK=0 opt-out is set in this process's
+/// environment. All public entry points honor it.
+pub fn isDisabledByEnv() bool {
+    return isOptedOut(std.posix.getenv(OPT_OUT_ENV));
+}
+
+/// Poll for the latest release if the 24h throttle allows, update the cache,
+/// and return the notice that is due, if any. The returned NoticeInfo is
+/// owned by `allocator`; release it with deinit. Displaying callers should
+/// confirm via markNotified so the 7-day renotify window starts. Every
+/// failure is silent. In test builds this is a no-op: hermetic tests must
+/// never reach the network or the user's real config directory — they
+/// exercise the *InDir seams instead.
+pub fn checkNow(allocator: std.mem.Allocator) ?NoticeInfo {
+    if (builtin.is_test) return null;
+    if (isDisabledByEnv()) {
+        debug_log.log("update_check.checkNow: disabled via {s}=0", .{OPT_OUT_ENV});
+        return null;
+    }
+    var dir = openGlobalConfigDir(allocator, true) orelse return null;
+    defer dir.close();
+    return checkNowInDir(allocator, dir, std.time.timestamp(), installed_version, fetchLatestTag);
+}
+
+/// Read-only cache evaluation — no network, no writes. Same ownership story
+/// as checkNow.
+pub fn pendingNoticeFromCache(allocator: std.mem.Allocator) ?NoticeInfo {
+    if (builtin.is_test) return null;
+    if (isDisabledByEnv()) return null;
+    var dir = openGlobalConfigDir(allocator, false) orelse return null;
+    defer dir.close();
+    return noticeFromCacheInDir(allocator, dir, std.time.timestamp(), installed_version);
+}
+
+/// Record that a notice for `latest` was actually displayed.
+pub fn markNotified(allocator: std.mem.Allocator, latest: []const u8) void {
+    if (builtin.is_test) return;
+    var dir = openGlobalConfigDir(allocator, true) orelse return;
+    defer dir.close();
+    markNotifiedInDir(allocator, dir, std.time.timestamp(), latest);
+}
+
+/// Synchronous doctor status: polls if the throttle allows (never when opted
+/// out), and reports the truth regardless of notification history. An
+/// `update_available` result carries an owned NoticeInfo to deinit.
+pub fn statusForDoctor(allocator: std.mem.Allocator) UpdateStatus {
+    if (isDisabledByEnv()) return .disabled;
+    if (builtin.is_test) return .unknown;
+    var dir = openGlobalConfigDir(allocator, true) orelse return .unknown;
+    defer dir.close();
+    return statusInDir(allocator, dir, std.time.timestamp(), installed_version, fetchLatestTag);
 }
 
 // ── Tests: orchestration seams ──────────────────────────────────────────

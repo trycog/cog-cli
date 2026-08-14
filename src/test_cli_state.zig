@@ -101,6 +101,8 @@ fn runMcpStartupPrivacyRegression(allocator: std.mem.Allocator, cog_path: []cons
     try env.put("HOME", home);
     try env.put("XDG_RUNTIME_DIR", runtime);
     try env.put("TMPDIR", temp);
+    // Hermetic: the spawned server must not poll the network for updates.
+    try env.put("COG_UPDATE_CHECK", "0");
 
     var child = std.process.Child.init(&.{ cog_path, "mcp" }, allocator);
     child.cwd = TEST_ROOT;
@@ -251,6 +253,8 @@ fn runScratchInit(gpa: std.mem.Allocator, scratch_base: []const u8, cog_path: []
     try env.put("HOME", home);
     try env.put("XDG_RUNTIME_DIR", runtime);
     try env.put("TMPDIR", temp);
+    // Hermetic: the spawned init must not poll the network or mention updates.
+    try env.put("COG_UPDATE_CHECK", "0");
     env.remove("COG_OBSERVE_ENABLED");
 
     var child = std.process.Child.init(&.{ cog_path, "init" }, arena);
