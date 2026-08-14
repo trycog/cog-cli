@@ -28,6 +28,10 @@ const red = "\x1B[31m";
 
 const max_consecutive_errors = 5;
 
+/// The logical namespace `PathMatcher` gives approved external roots. Sources
+/// under it have no name that resolves from the project root.
+const external_alias_prefix = "@external/";
+
 // ── Ctrl+C handling ─────────────────────────────────────────────────────
 // Track active child PIDs so Ctrl+C can kill them immediately.
 // Uses a watchdog thread that reads stdin in raw mode, bypassing OS signal
@@ -1421,7 +1425,7 @@ fn runBootstrap(
     printErr("\n" ++ bold ++ "  Collecting files..." ++ reset ++ "\n");
     var files = try collectSourceFiles(allocator, cog_dir);
     defer {
-        for (files.items) |f| allocator.free(f);
+        for (files.items) |f| freeSourceFile(allocator, f);
         files.deinit(allocator);
     }
 
@@ -2148,13 +2152,19 @@ fn runSubsystem(
 ) FileResult {
     const fail: FileResult = .{ .success = false, .input_tokens = 0, .output_tokens = 0, .cost_microdollars = 0 };
 
-    // Build file_paths as newline-joined string of all files in this subsystem
+    // Build file_paths as newline-joined string of all files in this
+    // subsystem. The agent is spawned with cwd set to the project root, so it
+    // is handed the readable path — identical to the logical name except for
+    // sources that live outside the project root entirely.
     var file_paths_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer file_paths_buf.deinit(allocator);
-    for (subsystem.files, 0..) |f, i| {
+    for (subsystem.read_paths, 0..) |f, i| {
         file_paths_buf.appendSlice(allocator, f) catch return fail;
-        if (i + 1 < subsystem.files.len) {
+        if (i + 1 < subsystem.read_paths.len) {
             file_paths_buf.append(allocator, '\n') catch return fail;
+        }
+        if (i < subsystem.files.len and !std.mem.eql(u8, f, subsystem.files[i])) {
+            debug_log.log("runSubsystem: reading logical={s} as {s}", .{ subsystem.files[i], f });
         }
     }
     const file_paths_str = file_paths_buf.items;
@@ -2539,7 +2549,10 @@ fn runAssociationPhase(
 const Subsystem = struct {
     id: []const u8, // 16-char hex hash of sorted file list
     label: []const u8, // human-readable: common directory or "root"
-    files: []const []const u8, // sorted file paths
+    files: []const []const u8, // sorted logical paths — index and checkpoint identity
+    /// What the agent is told to open, parallel to `files`. Differs only where
+    /// a logical path does not resolve from the project root.
+    read_paths: []const []const u8,
     cross_file_context: []const u8, // intra-cluster cross-file relationships text
 };
 
@@ -2580,9 +2593,11 @@ const FilePairContext = struct {
 /// 3. Merge small clusters (<3 files) into most-coupled neighbor
 /// 4. Split large clusters (>12 files) by subdirectory or alphabetically
 /// 5. Generate subsystem IDs and cross-file context per cluster
-fn buildSubsystemClusters(allocator: std.mem.Allocator, files: []const []const u8, cog_dir: []const u8) ?[]Subsystem {
-    if (files.len == 0) return null;
+fn buildSubsystemClusters(allocator: std.mem.Allocator, sources: []const SourceFile, cog_dir: []const u8) ?[]Subsystem {
+    if (sources.len == 0) return null;
 
+    // Clustering, subsystem ids and every SCIP lookup key off the logical
+    // path; the readable path is attached again once clusters are final.
     // Step 1: Seed by directory
     var dir_groups: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty;
     defer {
@@ -2591,7 +2606,8 @@ fn buildSubsystemClusters(allocator: std.mem.Allocator, files: []const []const u
         dir_groups.deinit(allocator);
     }
 
-    for (files) |file_path| {
+    for (sources) |source| {
+        const file_path = source.logical_path;
         const dir_name = std.fs.path.dirname(file_path) orelse "root";
         const gop = dir_groups.getOrPut(allocator, dir_name) catch continue;
         if (!gop.found_existing) {
@@ -2600,7 +2616,7 @@ fn buildSubsystemClusters(allocator: std.mem.Allocator, files: []const []const u
         gop.value_ptr.append(allocator, file_path) catch continue;
     }
 
-    debug_log.log("buildSubsystemClusters: seeded {d} directory groups from {d} files", .{ dir_groups.count(), files.len });
+    debug_log.log("buildSubsystemClusters: seeded {d} directory groups from {d} files", .{ dir_groups.count(), sources.len });
 
     // Step 2: Build weighted cross-file graph from SCIP
     var file_pair_weights: std.HashMapUnmanaged(FilePairKey, usize, FilePairContext, 80) = .empty;
@@ -2938,10 +2954,22 @@ fn buildSubsystemClusters(allocator: std.mem.Allocator, files: []const []const u
             owned_files[fi] = allocator.dupe(u8, f) catch "";
         }
 
+        // Reattach the path the agent can actually open to each logical name.
+        const owned_read_paths = allocator.alloc([]const u8, cluster.file_list.items.len) catch {
+            allocator.free(id);
+            for (owned_files) |f| allocator.free(f);
+            allocator.free(owned_files);
+            continue;
+        };
+        for (cluster.file_list.items, 0..) |f, fi| {
+            owned_read_paths[fi] = allocator.dupe(u8, readPathFor(sources, f)) catch "";
+        }
+
         // Make owned label
         const label = allocator.dupe(u8, cluster.label) catch {
             allocator.free(id);
             allocator.free(owned_files);
+            allocator.free(owned_read_paths);
             continue;
         };
 
@@ -2952,12 +2980,15 @@ fn buildSubsystemClusters(allocator: std.mem.Allocator, files: []const []const u
             .id = id,
             .label = label,
             .files = owned_files,
+            .read_paths = owned_read_paths,
             .cross_file_context = cross_ctx,
         }) catch {
             allocator.free(id);
             allocator.free(label);
             for (owned_files) |f| allocator.free(f);
             allocator.free(owned_files);
+            for (owned_read_paths) |f| allocator.free(f);
+            allocator.free(owned_read_paths);
             allocator.free(cross_ctx);
             continue;
         };
@@ -3015,6 +3046,17 @@ fn commonPrefixLen(a: []const u8, b: []const u8) usize {
     return i;
 }
 
+/// Look up the readable path for a logical source name.
+///
+/// Falls back to the logical name so a cluster built from a source set that
+/// no longer lists the file still produces a usable prompt.
+fn readPathFor(sources: []const SourceFile, logical_path: []const u8) []const u8 {
+    for (sources) |source| {
+        if (std.mem.eql(u8, source.logical_path, logical_path)) return source.read_path;
+    }
+    return logical_path;
+}
+
 /// Free all memory associated with a subsystem slice.
 fn freeSubsystems(allocator: std.mem.Allocator, subsystems: []Subsystem) void {
     for (subsystems) |*sub| {
@@ -3022,6 +3064,8 @@ fn freeSubsystems(allocator: std.mem.Allocator, subsystems: []Subsystem) void {
         allocator.free(sub.label);
         for (sub.files) |f| allocator.free(f);
         allocator.free(sub.files);
+        for (sub.read_paths) |f| allocator.free(f);
+        allocator.free(sub.read_paths);
         allocator.free(sub.cross_file_context);
     }
     allocator.free(subsystems);
@@ -3442,13 +3486,41 @@ fn replacePlaceholder(allocator: std.mem.Allocator, template: []const u8, placeh
     return result;
 }
 
+/// A source the agent must be able to open, paired with the identity the SCIP
+/// index and the bootstrap checkpoint know it by.
+///
+/// `logical_path` is the index key: `@external/shared/lib.zig` for a source
+/// reachable only through an approved external root. Agents run with cwd set
+/// to the project root and cannot open that name, so `read_path` carries a
+/// path that resolves from there — the logical path itself for ordinary
+/// project files and symlink aliases, the absolute physical source otherwise.
+pub const SourceFile = struct {
+    logical_path: []const u8,
+    read_path: []const u8,
+};
+
+pub fn freeSourceFile(allocator: std.mem.Allocator, file: SourceFile) void {
+    allocator.free(file.logical_path);
+    allocator.free(file.read_path);
+}
+
+/// Pick the name an agent can open with the project root as its cwd.
+///
+/// Every logical path `PathMatcher` produces resolves from the project root
+/// except the `@external/` namespace, which exists precisely because those
+/// sources live outside it and have no name there.
+fn readableSourcePath(path: path_matcher.MatchedPath) []const u8 {
+    if (std.mem.startsWith(u8, path.logical_path, external_alias_prefix)) return path.physical_path;
+    return path.logical_path;
+}
+
 /// Collect files for bootstrap using settings.json code.index patterns as the
 /// source of truth.  When patterns are defined, only SCIP-indexed files that
 /// match a pattern are included — plus any pattern-matched files that aren't
 /// in the SCIP index (e.g. "**/*.md").  When no patterns are defined, all
 /// SCIP-indexed files are included (backwards-compatible default).
-pub fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.ArrayListUnmanaged([]const u8) {
-    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+pub fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !std.ArrayListUnmanaged(SourceFile) {
+    var files: std.ArrayListUnmanaged(SourceFile) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(allocator);
 
@@ -3474,17 +3546,25 @@ pub fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !st
         try matcher.collect(&matched);
         for (matched.items) |path| {
             if (seen.contains(path.logical_path)) continue;
-            const duped = try allocator.dupe(u8, path.logical_path);
-            try files.append(allocator, duped);
-            try seen.put(allocator, duped, {});
+            const logical = try allocator.dupe(u8, path.logical_path);
+            errdefer allocator.free(logical);
+            const read_path = try allocator.dupe(u8, readableSourcePath(path));
+            errdefer allocator.free(read_path);
+            if (!std.mem.eql(u8, logical, read_path)) {
+                debug_log.log("collectSourceFiles: logical={s} read_path={s}", .{ logical, read_path });
+            }
+            try files.append(allocator, .{ .logical_path = logical, .read_path = read_path });
+            try seen.put(allocator, logical, {});
         }
     } else {
         // No patterns — include all SCIP-indexed files (legacy behavior).
+        // The index records logical paths only, so an `@external/` document
+        // indexed through an explicit CLI pattern has no physical path to
+        // recover here and stays unreadable until patterns are configured.
         loadScipFiles(allocator, cog_dir, &files, &seen);
     }
 
-    // Sort alphabetically
-    sortFiles(files.items);
+    sortSourceFiles(files.items);
 
     return files;
 }
@@ -3495,7 +3575,7 @@ pub fn collectSourceFiles(allocator: std.mem.Allocator, cog_dir: []const u8) !st
 fn loadScipFiles(
     allocator: std.mem.Allocator,
     cog_dir: []const u8,
-    files: *std.ArrayListUnmanaged([]const u8),
+    files: *std.ArrayListUnmanaged(SourceFile),
     seen: *std.StringHashMapUnmanaged(void),
 ) void {
     const index_path = std.fmt.allocPrint(allocator, "{s}/index.scip", .{cog_dir}) catch return;
@@ -3517,8 +3597,13 @@ fn loadScipFiles(
             const path = extractDocumentPath(doc_data) orelse continue;
             if (path.len > 0 and !seen.contains(path)) {
                 const duped = allocator.dupe(u8, path) catch continue;
-                files.append(allocator, duped) catch {
+                const read_path = allocator.dupe(u8, path) catch {
                     allocator.free(duped);
+                    continue;
+                };
+                files.append(allocator, .{ .logical_path = duped, .read_path = read_path }) catch {
+                    allocator.free(duped);
+                    allocator.free(read_path);
                     continue;
                 };
                 seen.put(allocator, duped, {}) catch {};
@@ -3546,6 +3631,16 @@ fn sortFiles(items: [][]const u8) void {
     std.mem.sort([]const u8, items, {}, struct {
         fn lessThan(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+}
+
+/// Order by logical path so clustering and subsystem ids stay stable no
+/// matter where the physical sources happen to live.
+fn sortSourceFiles(items: []SourceFile) void {
+    std.mem.sort(SourceFile, items, {}, struct {
+        fn lessThan(_: void, a: SourceFile, b: SourceFile) bool {
+            return std.mem.order(u8, a.logical_path, b.logical_path) == .lt;
         }
     }.lessThan);
 }
@@ -3912,7 +4007,7 @@ test "collectSourceFiles uses PathMatcher logical source set" {
     defer allocator.free(cog_dir);
     var files = try collectSourceFiles(allocator, cog_dir);
     defer {
-        for (files.items) |file| allocator.free(file);
+        for (files.items) |file| freeSourceFile(allocator, file);
         files.deinit(allocator);
     }
 
@@ -3920,17 +4015,46 @@ test "collectSourceFiles uses PathMatcher logical source set" {
     var saw_src = false;
     var saw_src_alias = false;
     var saw_shared_alias = false;
-    var saw_external_alias = false;
+    var external_alias: ?SourceFile = null;
     for (files.items) |file| {
-        if (std.mem.eql(u8, file, "src/main.zig")) saw_src = true;
-        if (std.mem.eql(u8, file, "src-link/main.zig")) saw_src_alias = true;
-        if (std.mem.eql(u8, file, "shared-link/shared.zig")) saw_shared_alias = true;
-        if (std.mem.startsWith(u8, file, "@external/") and std.mem.endsWith(u8, file, "/shared.zig")) saw_external_alias = true;
+        if (std.mem.eql(u8, file.logical_path, "src/main.zig")) saw_src = true;
+        if (std.mem.eql(u8, file.logical_path, "src-link/main.zig")) saw_src_alias = true;
+        if (std.mem.eql(u8, file.logical_path, "shared-link/shared.zig")) saw_shared_alias = true;
+        if (std.mem.startsWith(u8, file.logical_path, "@external/") and
+            std.mem.endsWith(u8, file.logical_path, "/shared.zig"))
+        {
+            external_alias = file;
+        }
     }
     try std.testing.expect(saw_src);
     try std.testing.expect(saw_src_alias);
     try std.testing.expect(saw_shared_alias);
-    try std.testing.expect(saw_external_alias);
+
+    // The agent subprocess runs with cwd set to the project root, so every
+    // read path has to open from there. cwd is the project root here.
+    for (files.items) |file| {
+        var opened = std.fs.cwd().openFile(file.read_path, .{}) catch |err| {
+            std.debug.print("unreadable source {s} -> {s}: {s}\n", .{
+                file.logical_path,
+                file.read_path,
+                @errorName(err),
+            });
+            return err;
+        };
+        opened.close();
+    }
+
+    // An @external alias keeps the identity the SCIP index knows it by while
+    // being read through its physical source.
+    const external_file = external_alias orelse return error.MissingExternalAlias;
+    try std.testing.expect(std.fs.path.isAbsolute(external_file.read_path));
+    try std.testing.expect(!std.mem.eql(u8, external_file.logical_path, external_file.read_path));
+
+    // An ordinary project source is still named relative to the project root.
+    for (files.items) |file| {
+        if (!std.mem.eql(u8, file.logical_path, "src/main.zig")) continue;
+        try std.testing.expectEqualStrings("src/main.zig", file.read_path);
+    }
 }
 
 test "sortFiles" {
@@ -4032,7 +4156,12 @@ test "buildSubsystemClusters basic" {
     // buildSubsystemClusters returns null when SCIP index doesn't exist,
     // so verify graceful failure with a nonexistent directory.
     const allocator = std.testing.allocator;
-    const result = buildSubsystemClusters(allocator, &.{ "src/a.zig", "src/b.zig", "lib/c.zig" }, "/tmp/nonexistent-cog-dir");
+    const sources = [_]SourceFile{
+        .{ .logical_path = "src/a.zig", .read_path = "src/a.zig" },
+        .{ .logical_path = "src/b.zig", .read_path = "src/b.zig" },
+        .{ .logical_path = "lib/c.zig", .read_path = "lib/c.zig" },
+    };
+    const result = buildSubsystemClusters(allocator, &sources, "/tmp/nonexistent-cog-dir");
     try std.testing.expectEqual(@as(?[]Subsystem, null), result);
 }
 
@@ -4041,7 +4170,13 @@ test "buildSubsystemClusters grouping" {
     const allocator = std.testing.allocator;
 
     // With no valid SCIP dir, clusters won't form — this tests the null path
-    const result = buildSubsystemClusters(allocator, &.{ "src/a.zig", "src/b.zig", "src/c.zig", "lib/d.zig" }, "/tmp/no-such-dir");
+    const sources = [_]SourceFile{
+        .{ .logical_path = "src/a.zig", .read_path = "src/a.zig" },
+        .{ .logical_path = "src/b.zig", .read_path = "src/b.zig" },
+        .{ .logical_path = "src/c.zig", .read_path = "src/c.zig" },
+        .{ .logical_path = "lib/d.zig", .read_path = "lib/d.zig" },
+    };
+    const result = buildSubsystemClusters(allocator, &sources, "/tmp/no-such-dir");
     try std.testing.expectEqual(@as(?[]Subsystem, null), result);
 }
 
@@ -4061,7 +4196,7 @@ test "recordProcessedCheckpoint rolls back in-memory progress when persistence f
     }
     var mutex: std.Thread.Mutex = .{};
     const subsystems = [_]Subsystem{
-        .{ .id = "new-subsystem", .label = "new", .files = &.{"src/new.zig"}, .cross_file_context = "" },
+        .{ .id = "new-subsystem", .label = "new", .files = &.{"src/new.zig"}, .read_paths = &.{"src/new.zig"}, .cross_file_context = "" },
     };
 
     try std.testing.expectError(
@@ -4087,8 +4222,8 @@ test "saveCheckpoint writes deterministic pretty JSON and preserves mode" {
     try processed.put(allocator, "z-subsystem", {});
     try processed.put(allocator, "a-subsystem", {});
     const subsystems = [_]Subsystem{
-        .{ .id = "z-subsystem", .label = "z", .files = &.{ "z/two.zig", "z/one.zig" }, .cross_file_context = "" },
-        .{ .id = "a-subsystem", .label = "a", .files = &.{"a/main.zig"}, .cross_file_context = "" },
+        .{ .id = "z-subsystem", .label = "z", .files = &.{ "z/two.zig", "z/one.zig" }, .read_paths = &.{ "z/two.zig", "z/one.zig" }, .cross_file_context = "" },
+        .{ .id = "a-subsystem", .label = "a", .files = &.{"a/main.zig"}, .read_paths = &.{"a/main.zig"}, .cross_file_context = "" },
     };
 
     try saveCheckpoint(allocator, path, &processed, &subsystems);
