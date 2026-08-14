@@ -31,7 +31,7 @@ jobs:
         include:
           - os: ubuntu-latest       # x86_64 Linux
           - os: ubuntu-24.04-arm    # aarch64 Linux
-          - os: macos-latest        # aarch64 macOS
+          - os: macos-15            # aarch64 macOS; newer images default to an SDK Zig 0.15 cannot link
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -41,6 +41,20 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+
+
+      - name: Select an Xcode SDK compatible with Zig 0.15
+        if: runner.os == 'macOS'
+        run: |
+          xc=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$xc" ]; then
+            echo "No Xcode 16.x on this image; Zig 0.15.2 cannot link against newer SDKs" >&2
+            ls -d /Applications/Xcode*.app >&2 || true
+            exit 1
+          fi
+          echo "Selecting $xc"
+          sudo xcode-select -s "$xc"
+          echo "DEVELOPER_DIR=$xc/Contents/Developer" >> "$GITHUB_ENV"
 
       - name: Download grammars
         run: zig build setup
