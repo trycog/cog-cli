@@ -7,10 +7,11 @@ Examine the project directory structure and source files to determine:
 
 # Instructions
 
-1. List the files and directories in the current working directory. If any entries are symlinks to directories, follow them and examine their contents too — workspace directories often symlink to multiple projects
-2. Identify the primary programming languages by examining file extensions, config files (package.json, mix.exs, Cargo.toml, go.mod, build.zig, Gemfile, etc.), and directory structure
-3. Determine the glob patterns that would capture all relevant source files for indexing (e.g. `src/**/*.ex`, `lib/**/*.rb`)
-4. From the available Cog extensions list below, recommend any that match the detected languages
+1. List the files and directories in the current working directory. Follow directory symlinks only when their canonical targets remain inside the canonical project root.
+2. If a useful symlink target or source directory is outside the canonical project root, do not inspect its contents. Recommend its path in `external_roots` so Cog can ask the user for explicit approval before crossing the boundary.
+3. Identify the primary programming languages by examining file extensions, config files (package.json, mix.exs, Cargo.toml, go.mod, build.zig, Gemfile, etc.), and directory structure.
+4. Determine the glob patterns that would capture all relevant source files for indexing (e.g. `src/**/*.ex`, `lib/**/*.rb`).
+5. From the available Cog extensions list below, recommend any that match the detected languages.
 
 # Available Cog Extensions
 
@@ -29,11 +30,13 @@ You MUST respond with ONLY a JSON object (no markdown, no explanation, no code f
 ```
 {
   "index_patterns": ["src/**/*.ex", "lib/**/*.ex", "test/**/*.exs"],
+  "external_roots": ["../shared"],
   "extensions": ["cog-elixir"]
 }
 ```
 
 - `index_patterns`: Array of glob patterns for source files to index. Use `**` for recursive matching. Include test directories if they contain meaningful code. Exclude vendored dependencies (node_modules, deps, _build, etc.).
+- `external_roots`: Array of useful source roots outside the canonical project boundary. Recommend only paths whose contents were not inspected because approval is required. Use project-relative paths when practical. Empty array if none apply.
 - `extensions`: Array of Cog extension names to install. Only include extensions from the available list above. Empty array if no extensions apply.
 
 Respond with ONLY the JSON object. No other text.

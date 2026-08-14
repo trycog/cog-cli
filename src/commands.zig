@@ -824,12 +824,50 @@ fn maybeRunProjectScan(allocator: std.mem.Allocator) !void {
                 }
                 printErr("\n");
 
-                try writeSettingsCodeIndex(allocator, pattern_strs.items);
+                try writeSettingsCodeConfig(allocator, pattern_strs.items, &.{}, true);
                 printErr("  ");
                 tui.checkmark();
                 printErr(" Written to .cog/settings.json\n\n");
             }
         }
+    }
+
+    // External roots always require explicit interactive approval.
+    var approved_external_roots: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer approved_external_roots.deinit(allocator);
+    if (parsed.value.object.get("external_roots")) |roots_value| {
+        if (roots_value == .array) {
+            var approve_all = false;
+            for (roots_value.array.items) |root_value| {
+                if (root_value != .string or root_value.string.len == 0) continue;
+                const root = root_value.string;
+                var approved = approve_all;
+                if (!approved) {
+                    const prompt = try std.fmt.allocPrint(allocator, "Allow indexing external root {s}?", .{root});
+                    defer allocator.free(prompt);
+                    switch (try tui.confirmWithAll(prompt)) {
+                        .no => continue,
+                        .yes => approved = true,
+                        .all => {
+                            approved = true;
+                            approve_all = true;
+                        },
+                    }
+                }
+                if (approved) {
+                    try approved_external_roots.append(allocator, root);
+                    debug_log.log("maybeRunProjectScan: approved external root {s}", .{root});
+                }
+            }
+            if (approved_external_roots.items.len > 0) printErr("\n");
+        }
+    }
+
+    if (approved_external_roots.items.len > 0) {
+        try writeSettingsCodeConfig(allocator, &.{}, approved_external_roots.items, false);
+        printErr("  ");
+        tui.checkmark();
+        printErr(" External roots written to .cog/settings.json\n\n");
     }
 
     // Extract extensions
@@ -1027,7 +1065,12 @@ fn runProjectScan(
     return stdout_data;
 }
 
-fn writeSettingsCodeIndex(allocator: std.mem.Allocator, patterns: []const []const u8) !void {
+fn writeSettingsCodeConfig(
+    allocator: std.mem.Allocator,
+    patterns: []const []const u8,
+    external_roots: []const []const u8,
+    replace_index: bool,
+) !void {
     // Read existing settings
     const existing = try readCwdFileOptional(allocator, ".cog/settings.json");
     defer if (existing) |e| allocator.free(e);
@@ -1059,29 +1102,25 @@ fn writeSettingsCodeIndex(allocator: std.mem.Allocator, patterns: []const []cons
                     if (code == .object) {
                         var code_iter = code.object.iterator();
                         while (code_iter.next()) |entry| {
-                            if (std.mem.eql(u8, entry.key_ptr.*, "index")) continue;
+                            if (replace_index and std.mem.eql(u8, entry.key_ptr.*, "index")) continue;
+                            if (external_roots.len > 0 and std.mem.eql(u8, entry.key_ptr.*, "external_roots")) continue;
                             try s.objectField(entry.key_ptr.*);
                             try s.write(entry.value_ptr.*);
                         }
                     }
                 }
 
-                // Write new index patterns
-                try s.objectField("index");
-                try s.beginArray();
-                for (patterns) |pat| {
-                    try s.write(pat);
-                }
-                try s.endArray();
+                if (replace_index) try writeStringArrayField(&s, "index", patterns);
+                if (external_roots.len > 0) try writeStringArrayField(&s, "external_roots", external_roots);
                 try s.endObject(); // code
             } else {
-                try writeFreshCodeIndex(&s, patterns);
+                try writeFreshCodeConfig(&s, patterns, external_roots, replace_index);
             }
         } else |_| {
-            try writeFreshCodeIndex(&s, patterns);
+            try writeFreshCodeConfig(&s, patterns, external_roots, replace_index);
         }
     } else {
-        try writeFreshCodeIndex(&s, patterns);
+        try writeFreshCodeConfig(&s, patterns, external_roots, replace_index);
     }
 
     try s.endObject();
@@ -1098,16 +1137,24 @@ fn writeSettingsCodeIndex(allocator: std.mem.Allocator, patterns: []const []cons
     try writeCwdFile(".cog/settings.json", with_newline);
 }
 
-fn writeFreshCodeIndex(s: *Stringify, patterns: []const []const u8) !void {
+fn writeFreshCodeConfig(
+    s: *Stringify,
+    patterns: []const []const u8,
+    external_roots: []const []const u8,
+    replace_index: bool,
+) !void {
     try s.objectField("code");
     try s.beginObject();
-    try s.objectField("index");
-    try s.beginArray();
-    for (patterns) |pat| {
-        try s.write(pat);
-    }
-    try s.endArray();
+    if (replace_index) try writeStringArrayField(s, "index", patterns);
+    if (external_roots.len > 0) try writeStringArrayField(s, "external_roots", external_roots);
     try s.endObject();
+}
+
+fn writeStringArrayField(s: *Stringify, field: []const u8, values: []const []const u8) !void {
+    try s.objectField(field);
+    try s.beginArray();
+    for (values) |value| try s.write(value);
+    try s.endArray();
 }
 
 // ── Brain Setup ─────────────────────────────────────────────────────────
