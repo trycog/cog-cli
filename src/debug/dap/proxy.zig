@@ -764,6 +764,203 @@ pub const DapProxy = struct {
         return @intCast(@min(remaining_ms, @as(u64, std.math.maxInt(i32))));
     }
 
+    const DispatchTarget = union(enum) {
+        response: i64,
+        event: []const u8,
+        child_config,
+    };
+
+    const DispatchResult = enum {
+        consumed,
+        matched,
+        abort_wait,
+    };
+
+    fn dispatchMessage(self: *DapProxy, allocator: std.mem.Allocator, body: []const u8, target: DispatchTarget) !DispatchResult {
+        const parsed = json.parseFromSlice(json.Value, allocator, body, .{}) catch {
+            debug_log.log("dap.proxy: discarded malformed DAP message", .{});
+            return .consumed;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return .consumed;
+
+        const msg_type = parsed.value.object.get("type") orelse return .consumed;
+        if (msg_type != .string) return .consumed;
+
+        if (std.mem.eql(u8, msg_type.string, "response")) {
+            const expected_seq = switch (target) {
+                .response => |seq| seq,
+                else => {
+                    dapLog("[DAP dispatchMessage] Discarding response outside request wait", .{});
+                    return .consumed;
+                },
+            };
+            if (parsed.value.object.get("request_seq")) |request_seq| {
+                if (request_seq == .integer and request_seq.integer != expected_seq) {
+                    dapLog("[DAP dispatchMessage] Discarding stale response request_seq={d} expected={d}", .{ request_seq.integer, expected_seq });
+                    return .consumed;
+                }
+            }
+            return .matched;
+        }
+
+        if (std.mem.eql(u8, msg_type.string, "event")) {
+            const event = parsed.value.object.get("event") orelse return .consumed;
+            if (event != .string) return .consumed;
+            dapLog("[DAP dispatchMessage] Processing event: {s}", .{event.string});
+            self.handleEventMessage(parsed.value.object, event.string, body);
+
+            if (target == .event and std.mem.eql(u8, target.event, event.string)) return .matched;
+
+            self.bufferEvent(event.string, body);
+            if (target == .event and
+                (std.mem.eql(u8, target.event, "stopped") or std.mem.eql(u8, target.event, "initialized")) and
+                (std.mem.eql(u8, event.string, "exited") or std.mem.eql(u8, event.string, "terminated")))
+            {
+                dapLog("[DAP dispatchMessage] Session ended while waiting for event: {s}", .{target.event});
+                return .abort_wait;
+            }
+            return .consumed;
+        }
+
+        if (std.mem.eql(u8, msg_type.string, "request")) {
+            try self.handleReverseRequest(allocator, parsed.value.object, body);
+        }
+        return .consumed;
+    }
+
+    fn handleEventMessage(self: *DapProxy, object: std.json.ObjectMap, event_name: []const u8, body_json: []const u8) void {
+        const body = object.get("body");
+
+        if (std.mem.eql(u8, event_name, "stopped")) {
+            if (body) |value| {
+                if (value == .object) {
+                    if (value.object.get("threadId")) |thread_id| {
+                        if (thread_id == .integer) self.thread_id = thread_id.integer;
+                    }
+                }
+            }
+            self.queueNotification("debug/stopped", body_json);
+        } else if (std.mem.eql(u8, event_name, "output")) {
+            if (body) |value| {
+                if (value == .object) {
+                    const category = if (value.object.get("category")) |category_value|
+                        (if (category_value == .string) category_value.string else "console")
+                    else
+                        "console";
+                    if (std.mem.eql(u8, category, "telemetry")) return;
+                    const text = if (value.object.get("output")) |output_value|
+                        (if (output_value == .string) output_value.string else "")
+                    else
+                        "";
+                    if (text.len > 0) {
+                        const log_len = @min(text.len, 256);
+                        dapLog("[DAP handleEventMessage] output({s}): {s}", .{ category, text[0..log_len] });
+                        self.bufferOutput(category, text);
+                    }
+                    self.queueNotification("debug/output", body_json);
+                }
+            }
+        } else if (std.mem.eql(u8, event_name, "breakpoint")) {
+            if (body) |value| {
+                if (value == .object) {
+                    if (value.object.get("breakpoint")) |breakpoint| {
+                        if (breakpoint == .object) self.handleBreakpointEvent(breakpoint.object);
+                    }
+                }
+            }
+            self.queueNotification("debug/breakpoint_verified", body_json);
+        } else if (std.mem.eql(u8, event_name, "module")) {
+            if (body) |value| {
+                if (value == .object) self.handleModuleEvent(value.object);
+            }
+            self.queueNotification("debug/module", body_json);
+        } else if (std.mem.eql(u8, event_name, "continued")) {
+            self.queueNotification("debug/continued", body_json);
+        } else if (std.mem.eql(u8, event_name, "thread")) {
+            self.queueNotification("debug/thread", body_json);
+        } else if (std.mem.eql(u8, event_name, "loadedSource")) {
+            // Suppressed from poll_events; use debug_loaded_sources instead.
+        } else if (std.mem.eql(u8, event_name, "process")) {
+            self.queueNotification("debug/process", body_json);
+        } else if (std.mem.eql(u8, event_name, "capabilities")) {
+            if (body) |value| {
+                if (value == .object) {
+                    if (value.object.get("capabilities")) |capabilities| {
+                        if (capabilities == .object) self.updateCapabilitiesFromEvent(capabilities.object);
+                    }
+                }
+            }
+            self.queueNotification("debug/capabilities_changed", body_json);
+        } else if (std.mem.eql(u8, event_name, "memory")) {
+            if (body) |value| {
+                if (value == .object) self.handleMemoryEvent(value.object);
+            }
+            self.queueNotification("debug/memory_changed", body_json);
+        } else if (std.mem.eql(u8, event_name, "progressStart")) {
+            if (body) |value| {
+                if (value == .object) self.handleProgressStart(value.object);
+            }
+            self.queueNotification("debug/progress", body_json);
+        } else if (std.mem.eql(u8, event_name, "progressUpdate")) {
+            if (body) |value| {
+                if (value == .object) self.handleProgressUpdate(value.object);
+            }
+            self.queueNotification("debug/progress", body_json);
+        } else if (std.mem.eql(u8, event_name, "progressEnd")) {
+            if (body) |value| {
+                if (value == .object) self.handleProgressEnd(value.object);
+            }
+            self.queueNotification("debug/progress", body_json);
+        } else if (std.mem.eql(u8, event_name, "exited")) {
+            self.queueNotification("debug/exited", body_json);
+        } else if (std.mem.eql(u8, event_name, "terminated")) {
+            self.initialized = false;
+            self.queueNotification("debug/terminated", body_json);
+        } else if (std.mem.eql(u8, event_name, "invalidated")) {
+            if (body) |value| {
+                if (value == .object) self.handleInvalidatedEvent(value.object);
+            }
+            self.queueNotification("debug/invalidated", body_json);
+        } else {
+            dapLog("[DAP handleEventMessage] Buffered unrecognized event: {s}", .{event_name});
+        }
+    }
+
+    fn handleReverseRequest(self: *DapProxy, allocator: std.mem.Allocator, object: std.json.ObjectMap, body_json: []const u8) !void {
+        const command = object.get("command") orelse return;
+        if (command != .string) return;
+        const request_seq = if (object.get("seq")) |value|
+            (if (value == .integer) value.integer else 0)
+        else
+            0;
+
+        dapLog("[DAP handleReverseRequest] command={s} request_seq={d}", .{ command.string, request_seq });
+        if (std.mem.eql(u8, command.string, "startDebugging")) {
+            self.queueNotification("debug/start_debugging", body_json);
+            if (object.get("arguments")) |arguments| {
+                if (arguments == .object) {
+                    if (arguments.object.get("configuration")) |configuration| {
+                        var config_aw: Writer.Allocating = .init(self.allocator);
+                        defer config_aw.deinit();
+                        var config_stringify: Stringify = .{ .writer = &config_aw.writer };
+                        try config_stringify.write(configuration);
+                        const config_json = try config_aw.toOwnedSlice();
+                        if (self.pending_child_config) |old| self.allocator.free(old);
+                        self.pending_child_config = config_json;
+                        debug_log.log("dap.proxy: captured child debug configuration bytes={d}", .{config_json.len});
+                    }
+                }
+            }
+            self.sendReverseResponse(allocator, request_seq, command.string, true, null);
+        } else if (std.mem.eql(u8, command.string, "runInTerminal")) {
+            self.queueNotification("debug/run_in_terminal", body_json);
+            self.sendReverseResponse(allocator, request_seq, command.string, false, "runInTerminal is unsupported by Cog");
+        } else {
+            self.sendReverseResponse(allocator, request_seq, command.string, false, "unsupported reverse request");
+        }
+    }
+
     /// Read messages from the adapter until we get a matching response (type == "response").
     /// Verifies request_seq matches the expected seq to correlate responses.
     /// Events are processed inline (e.g., update thread_id from stopped events).
@@ -778,244 +975,28 @@ pub const DapProxy = struct {
 
         while (true) {
             loop_count += 1;
-            // Try to decode a message from the buffer
             while (true) {
                 const decoded = transport.decodeMessage(allocator, self.read_buffer.items) catch |err| switch (err) {
-                    error.MissingHeader, error.TruncatedBody => break, // need more data
+                    error.MissingHeader, error.TruncatedBody => break,
                     else => return err,
                 };
 
-                // Remove consumed bytes from read_buffer
                 const remaining = self.read_buffer.items.len - decoded.bytes_consumed;
                 if (remaining > 0) {
                     std.mem.copyForwards(u8, self.read_buffer.items[0..remaining], self.read_buffer.items[decoded.bytes_consumed..]);
                 }
                 self.read_buffer.items.len = remaining;
 
-                // Check if this is a response or an event
-                const parsed = json.parseFromSlice(json.Value, allocator, decoded.body, .{}) catch {
-                    allocator.free(decoded.body);
-                    continue;
-                };
-                defer parsed.deinit();
-
-                const msg_type = if (parsed.value == .object)
-                    if (parsed.value.object.get("type")) |t| if (t == .string) t.string else null else null
-                else
-                    null;
-
-                if (msg_type) |mt| {
-                    if (std.mem.eql(u8, mt, "response")) {
-                        // Verify request_seq matches expected seq
-                        const req_seq = if (parsed.value.object.get("request_seq")) |rs|
-                            (if (rs == .integer) rs.integer else null)
-                        else
-                            null;
-                        if (req_seq) |rs| {
-                            if (rs != expected_seq) {
-                                // Stale response from a previous request — discard and keep reading
-                                allocator.free(decoded.body);
-                                continue;
-                            }
-                        }
-                        return decoded.body;
-                    } else if (std.mem.eql(u8, mt, "event")) {
-                        // Handle events
-                        if (parsed.value.object.get("event")) |evt| {
-                            if (evt == .string) {
-                                dapLog("[DAP readResponse] Processing event: {s} (while waiting for seq={d})", .{ evt.string, expected_seq });
-                                if (std.mem.eql(u8, evt.string, "stopped")) {
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            if (body.object.get("threadId")) |tid| {
-                                                if (tid == .integer) self.thread_id = tid.integer;
-                                            }
-                                        }
-                                    }
-                                    // Queue notification for poll_events
-                                    self.queueNotification("debug/stopped", decoded.body);
-                                    // Also buffer for waitForEvent so it isn't lost
-                                    self.bufferEvent("stopped", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "output")) {
-                                    // Capture debuggee output (skip telemetry — adapter-internal metrics)
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            const category = if (body.object.get("category")) |c|
-                                                (if (c == .string) c.string else "console")
-                                            else
-                                                "console";
-                                            if (!std.mem.eql(u8, category, "telemetry")) {
-                                                const text = if (body.object.get("output")) |o|
-                                                    (if (o == .string) o.string else "")
-                                                else
-                                                    "";
-                                                if (text.len > 0) {
-                                                    const log_len = @min(text.len, 256);
-                                                    dapLog("[DAP readResponse] output({s}): {s}", .{ category, text[0..log_len] });
-                                                    self.bufferOutput(category, text);
-                                                }
-                                                self.queueNotification("debug/output", decoded.body);
-                                            }
-                                        }
-                                    }
-                                } else if (std.mem.eql(u8, evt.string, "breakpoint")) {
-                                    // Breakpoint verification event
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            if (body.object.get("breakpoint")) |bp| {
-                                                if (bp == .object) {
-                                                    self.handleBreakpointEvent(bp.object);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    self.queueNotification("debug/breakpoint_verified", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "module")) {
-                                    // Module load/unload event — track loaded modules
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            self.handleModuleEvent(body.object);
-                                        }
-                                    }
-                                    self.queueNotification("debug/module", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "continued")) {
-                                    // Thread continued event
-                                    self.queueNotification("debug/continued", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "thread")) {
-                                    // Thread create/exit event
-                                    self.queueNotification("debug/thread", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "loadedSource")) {
-                                    // Suppressed from poll_events — use cog_debug_loaded_sources instead.
-                                } else if (std.mem.eql(u8, evt.string, "process")) {
-                                    // Process event
-                                    self.queueNotification("debug/process", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "capabilities")) {
-                                    // Capabilities changed event — update adapter_capabilities
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            if (body.object.get("capabilities")) |caps| {
-                                                if (caps == .object) {
-                                                    self.updateCapabilitiesFromEvent(caps.object);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    self.queueNotification("debug/capabilities_changed", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "memory")) {
-                                    // Memory event — track memory changes
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            self.handleMemoryEvent(body.object);
-                                        }
-                                    }
-                                    self.queueNotification("debug/memory_changed", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "progressStart")) {
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            self.handleProgressStart(body.object);
-                                        }
-                                    }
-                                    self.queueNotification("debug/progress", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "progressUpdate")) {
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            self.handleProgressUpdate(body.object);
-                                        }
-                                    }
-                                    self.queueNotification("debug/progress", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "progressEnd")) {
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            self.handleProgressEnd(body.object);
-                                        }
-                                    }
-                                    self.queueNotification("debug/progress", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "exited")) {
-                                    // Exited event — process exited with exit code (per DAP spec)
-                                    self.queueNotification("debug/exited", decoded.body);
-                                    self.bufferEvent("exited", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "terminated")) {
-                                    // Terminated event — debug session end
-                                    self.initialized = false;
-                                    self.queueNotification("debug/terminated", decoded.body);
-                                    self.bufferEvent("terminated", decoded.body);
-                                } else if (std.mem.eql(u8, evt.string, "invalidated")) {
-                                    // Invalidated event — parse areas and stack frame ID
-                                    if (parsed.value.object.get("body")) |body| {
-                                        if (body == .object) {
-                                            self.handleInvalidatedEvent(body.object);
-                                        }
-                                    }
-                                    self.queueNotification("debug/invalidated", decoded.body);
-                                } else {
-                                    // Unrecognized event — buffer it for waitForEvent
-                                    dapLog("[DAP readResponse] Buffering unrecognized event: {s}", .{evt.string});
-                                    self.bufferEvent(evt.string, decoded.body);
-                                }
-                            }
-                        }
-                        // Continue reading for the actual response
+                switch (try self.dispatchMessage(allocator, decoded.body, .{ .response = expected_seq })) {
+                    .matched => return decoded.body,
+                    .abort_wait => {
                         allocator.free(decoded.body);
-                        continue;
-                    } else if (std.mem.eql(u8, mt, "request")) {
-                        // Reverse request from adapter (e.g., startDebugging, runInTerminal)
-                        if (parsed.value.object.get("command")) |cmd| {
-                            if (cmd == .string) {
-                                dapLog("[DAP readResponse] Reverse request: command={s}", .{cmd.string});
-                                if (std.mem.eql(u8, cmd.string, "startDebugging")) {
-                                    // Queue notification with the launch config
-                                    self.queueNotification("debug/start_debugging", decoded.body);
-                                    // Capture the child session configuration for connectChildSession()
-                                    if (parsed.value.object.get("arguments")) |args_val| {
-                                        if (args_val == .object) {
-                                            if (args_val.object.get("configuration")) |config_val| {
-                                                var config_aw: Writer.Allocating = .init(self.allocator);
-                                                var config_s: Stringify = .{ .writer = &config_aw.writer };
-                                                config_s.write(config_val) catch {};
-                                                if (config_aw.toOwnedSlice()) |config_json| {
-                                                    if (self.pending_child_config) |old| self.allocator.free(old);
-                                                    self.pending_child_config = config_json;
-                                                    dapLog("[DAP readResponse] Captured child session config ({d} bytes)", .{config_json.len});
-                                                } else |_| {}
-                                            }
-                                        }
-                                    }
-                                    // Send success response back to adapter
-                                    const req_seq = if (parsed.value.object.get("seq")) |v|
-                                        (if (v == .integer) v.integer else 0)
-                                    else
-                                        0;
-                                    dapLog("[DAP readResponse] Responding to startDebugging (req_seq={d})", .{req_seq});
-                                    self.sendReverseResponse(allocator, req_seq, "startDebugging", true, null);
-                                } else if (std.mem.eql(u8, cmd.string, "runInTerminal")) {
-                                    // Queue notification for AI agent to handle
-                                    self.queueNotification("debug/run_in_terminal", decoded.body);
-                                    // Send synthetic success response
-                                    const req_seq = if (parsed.value.object.get("seq")) |v|
-                                        (if (v == .integer) v.integer else 0)
-                                    else
-                                        0;
-                                    dapLog("[DAP readResponse] Responding to runInTerminal (req_seq={d})", .{req_seq});
-                                    self.sendReverseResponse(allocator, req_seq, "runInTerminal", false, "runInTerminal is unsupported by Cog");
-                                } else {
-                                    const req_seq = if (parsed.value.object.get("seq")) |v|
-                                        (if (v == .integer) v.integer else 0)
-                                    else
-                                        0;
-                                    dapLog("[DAP readResponse] Rejecting unsupported reverse request: {s}", .{cmd.string});
-                                    self.sendReverseResponse(allocator, req_seq, cmd.string, false, "unsupported reverse request");
-                                }
-                            }
-                        }
-                        allocator.free(decoded.body);
-                        continue;
-                    }
+                        return error.Timeout;
+                    },
+                    .consumed => allocator.free(decoded.body),
                 }
-                allocator.free(decoded.body);
             }
 
-            // Poll only for the remaining absolute deadline so event traffic or
-            // partial frames cannot restart the request timeout.
             const remaining_ms = remainingDeadlineNs(deadline_ns, timer.read()) orelse {
                 dapLog("[DAP readResponse] TIMEOUT after {d}ms", .{self.request_timeout_ms});
                 return error.Timeout;
@@ -1032,7 +1013,6 @@ pub const DapProxy = struct {
                 return error.Timeout;
             }
 
-            // Read more data from adapter
             const n = self.transportRead(&read_buf) catch return error.ReadFailed;
             if (n == 0) {
                 dapLog("[DAP readResponse] Connection closed (0 bytes)", .{});
@@ -1065,7 +1045,6 @@ pub const DapProxy = struct {
         defer self.connection_mutex.unlock();
         dapLog("[DAP waitForEvent] Waiting for event: {s} (buffer={d} bytes, buffered_events={d})", .{ event_name, self.read_buffer.items.len, self.buffered_events.items.len });
 
-        // Check buffered events first (events consumed by readResponse during request handling)
         for (self.buffered_events.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry.event_name, event_name)) {
                 dapLog("[DAP waitForEvent] Found buffered event: {s}", .{event_name});
@@ -1077,7 +1056,6 @@ pub const DapProxy = struct {
         }
 
         const poll_fd = try self.transportPollFd();
-
         var read_buf: [8192]u8 = undefined;
         var loop_count: u32 = 0;
         var timer = std.time.Timer.start() catch return error.ReadFailed;
@@ -1085,7 +1063,6 @@ pub const DapProxy = struct {
 
         while (true) {
             loop_count += 1;
-            // Try to decode from buffer
             while (true) {
                 const decoded = transport.decodeMessage(allocator, self.read_buffer.items) catch |err| switch (err) {
                     error.MissingHeader, error.TruncatedBody => break,
@@ -1098,91 +1075,14 @@ pub const DapProxy = struct {
                 }
                 self.read_buffer.items.len = remaining;
 
-                const parsed = json.parseFromSlice(json.Value, allocator, decoded.body, .{}) catch {
-                    allocator.free(decoded.body);
-                    continue;
-                };
-                defer parsed.deinit();
-
-                if (parsed.value == .object) {
-                    const msg_type_str = if (parsed.value.object.get("type")) |t| (if (t == .string) t.string else "?") else "?";
-                    const evt_str = if (parsed.value.object.get("event")) |e| (if (e == .string) e.string else "?") else "?";
-                    dapLog("[DAP waitForEvent] Got message type={s} event={s} (want={s}, loop {d})", .{ msg_type_str, evt_str, event_name, loop_count });
-                    if (parsed.value.object.get("type")) |t| {
-                        if (t == .string and std.mem.eql(u8, t.string, "event")) {
-                            if (parsed.value.object.get("event")) |evt| {
-                                if (evt == .string and std.mem.eql(u8, evt.string, event_name)) {
-                                    dapLog("[DAP waitForEvent] Found target event: {s}", .{event_name});
-                                    return decoded.body;
-                                }
-                                // Buffer non-matching events so they are not lost.
-                                // Without this, events like `terminated` or `stopped`
-                                // arriving while waiting for a different event would
-                                // be silently discarded.
-                                if (evt == .string) {
-                                    dapLog("[DAP waitForEvent] Buffering non-target event: {s}", .{evt.string});
-                                    self.bufferEvent(evt.string, decoded.body);
-                                    // If the program exited/terminated while we're waiting
-                                    // for "stopped" or "initialized", bail out early — the
-                                    // expected event will never arrive.
-                                    if ((std.mem.eql(u8, event_name, "stopped") or std.mem.eql(u8, event_name, "initialized")) and
-                                        (std.mem.eql(u8, evt.string, "exited") or std.mem.eql(u8, evt.string, "terminated")))
-                                    {
-                                        dapLog("[DAP waitForEvent] Program exited/terminated while waiting for {s} — aborting wait", .{event_name});
-                                        return error.Timeout;
-                                    }
-                                    // Also queue notifications for important events so
-                                    // they are visible via poll_events (mirrors readResponse).
-                                    if (std.mem.eql(u8, evt.string, "output")) {
-                                        if (parsed.value.object.get("body")) |body| {
-                                            if (body == .object) {
-                                                const category = if (body.object.get("category")) |c|
-                                                    (if (c == .string) c.string else "console")
-                                                else
-                                                    "console";
-                                                if (!std.mem.eql(u8, category, "telemetry")) {
-                                                    const text = if (body.object.get("output")) |o|
-                                                        (if (o == .string) o.string else "")
-                                                    else
-                                                        "";
-                                                    if (text.len > 0) {
-                                                        const log_len = @min(text.len, 256);
-                                                        dapLog("[DAP waitForEvent] output({s}): {s}", .{ category, text[0..log_len] });
-                                                        self.bufferOutput(category, text);
-                                                    }
-                                                    self.queueNotification("debug/output", decoded.body);
-                                                }
-                                            }
-                                        }
-                                    } else if (std.mem.eql(u8, evt.string, "stopped")) {
-                                        if (parsed.value.object.get("body")) |body| {
-                                            if (body == .object) {
-                                                if (body.object.get("threadId")) |tid| {
-                                                    if (tid == .integer) self.thread_id = tid.integer;
-                                                }
-                                            }
-                                        }
-                                        self.queueNotification("debug/stopped", decoded.body);
-                                    } else if (std.mem.eql(u8, evt.string, "continued")) {
-                                        self.queueNotification("debug/continued", decoded.body);
-                                    } else if (std.mem.eql(u8, evt.string, "breakpoint")) {
-                                        if (parsed.value.object.get("body")) |body| {
-                                            if (body == .object) {
-                                                if (body.object.get("breakpoint")) |bp| {
-                                                    if (bp == .object) {
-                                                        self.handleBreakpointEvent(bp.object);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        self.queueNotification("debug/breakpoint_verified", decoded.body);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                switch (try self.dispatchMessage(allocator, decoded.body, .{ .event = event_name })) {
+                    .matched => return decoded.body,
+                    .abort_wait => {
+                        allocator.free(decoded.body);
+                        return error.Timeout;
+                    },
+                    .consumed => allocator.free(decoded.body),
                 }
-                allocator.free(decoded.body);
             }
 
             const remaining_ms = remainingDeadlineNs(deadline_ns, timer.read()) orelse {
@@ -1694,95 +1594,39 @@ pub const DapProxy = struct {
         var timer = std.time.Timer.start() catch return error.ReadFailed;
 
         while (self.pending_child_config == null) {
+            while (true) {
+                const decoded = transport.decodeMessage(allocator, self.read_buffer.items) catch |err| switch (err) {
+                    error.MissingHeader, error.TruncatedBody => break,
+                    else => return err,
+                };
+                const remaining = self.read_buffer.items.len - decoded.bytes_consumed;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, self.read_buffer.items[0..remaining], self.read_buffer.items[decoded.bytes_consumed..]);
+                }
+                self.read_buffer.items.len = remaining;
+
+                _ = try self.dispatchMessage(allocator, decoded.body, .child_config);
+                allocator.free(decoded.body);
+                if (self.pending_child_config != null) break;
+            }
+            if (self.pending_child_config != null) break;
+
             const elapsed_ms = @divTrunc(timer.read(), std.time.ns_per_ms);
-            const remaining = remainingDeadlineMs(timeout_ms, elapsed_ms) orelse {
+            const remaining_ms = remainingDeadlineMs(timeout_ms, elapsed_ms) orelse {
                 dapLog("[DAP waitForChildConfig] Timeout after {d}ms — no startDebugging received", .{elapsed_ms});
-                return; // Not an error — adapter may not use child sessions
+                return;
             };
             var poll_fds = [_]std.posix.pollfd{.{
                 .fd = poll_fd,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const poll_result = std.posix.poll(&poll_fds, remaining) catch return;
+            const poll_result = std.posix.poll(&poll_fds, remaining_ms) catch return;
             if (poll_result == 0) continue;
 
             const n = self.transportRead(&read_buf) catch return;
             if (n == 0) return;
             self.read_buffer.appendSlice(self.allocator, read_buf[0..n]) catch return;
-
-            // Try to decode and process buffered messages — readResponse logic
-            // for handling reverse requests is inline in readResponse, so we
-            // manually decode and process here.
-            while (true) {
-                const decoded = transport.decodeMessage(allocator, self.read_buffer.items) catch break;
-                const rem = self.read_buffer.items.len - decoded.bytes_consumed;
-                if (rem > 0) {
-                    std.mem.copyForwards(u8, self.read_buffer.items[0..rem], self.read_buffer.items[decoded.bytes_consumed..]);
-                }
-                self.read_buffer.items.len = rem;
-
-                const parsed = json.parseFromSlice(json.Value, allocator, decoded.body, .{}) catch {
-                    allocator.free(decoded.body);
-                    continue;
-                };
-                defer parsed.deinit();
-
-                if (parsed.value == .object) {
-                    const mt = if (parsed.value.object.get("type")) |t| (if (t == .string) t.string else "") else "";
-                    if (std.mem.eql(u8, mt, "request")) {
-                        // Reverse request — handle startDebugging and runInTerminal
-                        if (parsed.value.object.get("command")) |cmd_val| {
-                            if (cmd_val == .string) {
-                                if (std.mem.eql(u8, cmd_val.string, "startDebugging")) {
-                                    // Capture child config
-                                    if (parsed.value.object.get("arguments")) |args_val| {
-                                        if (args_val == .object) {
-                                            if (args_val.object.get("configuration")) |config_val| {
-                                                var config_aw: Writer.Allocating = .init(self.allocator);
-                                                var config_s: Stringify = .{ .writer = &config_aw.writer };
-                                                config_s.write(config_val) catch {};
-                                                if (config_aw.toOwnedSlice()) |config_json| {
-                                                    if (self.pending_child_config) |old| self.allocator.free(old);
-                                                    self.pending_child_config = config_json;
-                                                    dapLog("[DAP waitForChildConfig] Captured child config ({d} bytes)", .{config_json.len});
-                                                } else |_| {}
-                                            }
-                                        }
-                                    }
-                                    // Respond to adapter
-                                    const req_seq = if (parsed.value.object.get("seq")) |v|
-                                        (if (v == .integer) v.integer else 0)
-                                    else
-                                        0;
-                                    self.sendReverseResponse(allocator, req_seq, "startDebugging", true, null);
-                                } else if (std.mem.eql(u8, cmd_val.string, "runInTerminal")) {
-                                    const req_seq = if (parsed.value.object.get("seq")) |v|
-                                        (if (v == .integer) v.integer else 0)
-                                    else
-                                        0;
-                                    self.sendReverseResponse(allocator, req_seq, "runInTerminal", false, "runInTerminal is unsupported by Cog");
-                                } else {
-                                    const req_seq = if (parsed.value.object.get("seq")) |v|
-                                        (if (v == .integer) v.integer else 0)
-                                    else
-                                        0;
-                                    self.sendReverseResponse(allocator, req_seq, cmd_val.string, false, "unsupported reverse request");
-                                }
-                            }
-                        }
-                    } else if (std.mem.eql(u8, mt, "event")) {
-                        // Buffer events for later consumption
-                        if (parsed.value.object.get("event")) |evt| {
-                            if (evt == .string) {
-                                self.bufferEvent(evt.string, decoded.body);
-                            }
-                        }
-                    }
-                    // Responses are also buffered (rare but possible)
-                }
-                allocator.free(decoded.body);
-            }
         }
         dapLog("[DAP waitForChildConfig] Child config received in {d}ms", .{@divTrunc(timer.read(), std.time.ns_per_ms)});
     }
@@ -4755,6 +4599,139 @@ fn exerciseBoundedQueueAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "DapProxy bounded queues release partial allocations" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBoundedQueueAllocationFailures, .{});
+}
+
+const DispatchTestTransport = struct {
+    adapter_stdin: std.posix.fd_t,
+    adapter_stdout: std.posix.fd_t,
+
+    fn init(proxy: *DapProxy) !DispatchTestTransport {
+        const stdin_pipe = try std.posix.pipe();
+        errdefer {
+            std.posix.close(stdin_pipe[0]);
+            std.posix.close(stdin_pipe[1]);
+        }
+        const stdout_pipe = try std.posix.pipe();
+        errdefer {
+            std.posix.close(stdout_pipe[0]);
+            std.posix.close(stdout_pipe[1]);
+        }
+
+        proxy.transport = .{ .stdio = .{ .process = .{
+            .id = 0,
+            .stdin = .{ .handle = stdin_pipe[1] },
+            .stdout = .{ .handle = stdout_pipe[0] },
+        } } };
+        return .{
+            .adapter_stdin = stdin_pipe[0],
+            .adapter_stdout = stdout_pipe[1],
+        };
+    }
+
+    fn deinit(self: *DispatchTestTransport) void {
+        std.posix.close(self.adapter_stdin);
+        std.posix.close(self.adapter_stdout);
+    }
+
+    fn appendMessage(self: *DispatchTestTransport, proxy: *DapProxy, allocator: std.mem.Allocator, message: []const u8) !void {
+        _ = self;
+        const encoded = try transport.encodeMessage(allocator, message);
+        defer allocator.free(encoded);
+        try proxy.read_buffer.appendSlice(proxy.allocator, encoded);
+    }
+
+    fn readResponseBody(self: *DispatchTestTransport, allocator: std.mem.Allocator) ![]const u8 {
+        var buffer: [2048]u8 = undefined;
+        const bytes_read = try std.posix.read(self.adapter_stdin, &buffer);
+        const decoded = try transport.decodeMessage(allocator, buffer[0..bytes_read]);
+        return decoded.body;
+    }
+};
+
+test "DapProxy readResponse and waitForEvent share event dispatch" {
+    const allocator = std.testing.allocator;
+    const module_event =
+        \\{"seq":1,"type":"event","event":"module","body":{"reason":"new","module":{"id":7,"name":"app"}}}
+    ;
+
+    var response_proxy = DapProxy.init(allocator);
+    defer response_proxy.deinit();
+    var response_transport = try DispatchTestTransport.init(&response_proxy);
+    defer response_transport.deinit();
+    try response_transport.appendMessage(&response_proxy, allocator, module_event);
+    try response_transport.appendMessage(&response_proxy, allocator,
+        \\{"seq":2,"type":"response","request_seq":41,"command":"threads","success":true}
+    );
+    const response = try response_proxy.readResponse(allocator, 41);
+    defer allocator.free(response);
+
+    var event_proxy = DapProxy.init(allocator);
+    defer event_proxy.deinit();
+    var event_transport = try DispatchTestTransport.init(&event_proxy);
+    defer event_transport.deinit();
+    try event_transport.appendMessage(&event_proxy, allocator, module_event);
+    try event_transport.appendMessage(&event_proxy, allocator,
+        \\{"seq":2,"type":"event","event":"initialized"}
+    );
+    const initialized = try event_proxy.waitForEvent(allocator, "initialized");
+    defer allocator.free(initialized);
+
+    try std.testing.expectEqual(@as(usize, 1), response_proxy.loaded_modules.items.len);
+    try std.testing.expectEqual(@as(usize, 1), event_proxy.loaded_modules.items.len);
+    try std.testing.expectEqualStrings("app", response_proxy.loaded_modules.items[0].name);
+    try std.testing.expectEqualStrings("app", event_proxy.loaded_modules.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), response_proxy.pending_notifications.items.len);
+    try std.testing.expectEqual(@as(usize, 1), event_proxy.pending_notifications.items.len);
+    try std.testing.expectEqualStrings("debug/module", response_proxy.pending_notifications.items[0].method);
+    try std.testing.expectEqualStrings("debug/module", event_proxy.pending_notifications.items[0].method);
+}
+
+test "DapProxy readResponse and waitForEvent share reverse request dispatch" {
+    const allocator = std.testing.allocator;
+    const reverse_request =
+        \\{"seq":27,"type":"request","command":"startDebugging","arguments":{"configuration":{"type":"node","request":"launch","name":"child"}}}
+    ;
+
+    var response_proxy = DapProxy.init(allocator);
+    defer response_proxy.deinit();
+    var response_transport = try DispatchTestTransport.init(&response_proxy);
+    defer response_transport.deinit();
+    try response_transport.appendMessage(&response_proxy, allocator, reverse_request);
+    try response_transport.appendMessage(&response_proxy, allocator,
+        \\{"seq":28,"type":"response","request_seq":41,"command":"threads","success":true}
+    );
+    const response = try response_proxy.readResponse(allocator, 41);
+    defer allocator.free(response);
+
+    var event_proxy = DapProxy.init(allocator);
+    defer event_proxy.deinit();
+    var event_transport = try DispatchTestTransport.init(&event_proxy);
+    defer event_transport.deinit();
+    try event_transport.appendMessage(&event_proxy, allocator, reverse_request);
+    try event_transport.appendMessage(&event_proxy, allocator,
+        \\{"seq":28,"type":"event","event":"initialized"}
+    );
+    const initialized = try event_proxy.waitForEvent(allocator, "initialized");
+    defer allocator.free(initialized);
+
+    try std.testing.expect(response_proxy.pending_child_config != null);
+    try std.testing.expect(event_proxy.pending_child_config != null);
+    try std.testing.expectEqualStrings(response_proxy.pending_child_config.?, event_proxy.pending_child_config.?);
+    try std.testing.expectEqualStrings("debug/start_debugging", response_proxy.pending_notifications.items[0].method);
+    try std.testing.expectEqualStrings("debug/start_debugging", event_proxy.pending_notifications.items[0].method);
+
+    const response_reverse = try response_transport.readResponseBody(allocator);
+    defer allocator.free(response_reverse);
+    const event_reverse = try event_transport.readResponseBody(allocator);
+    defer allocator.free(event_reverse);
+    const parsed_response = try json.parseFromSlice(json.Value, allocator, response_reverse, .{});
+    defer parsed_response.deinit();
+    const parsed_event = try json.parseFromSlice(json.Value, allocator, event_reverse, .{});
+    defer parsed_event.deinit();
+    try std.testing.expect(parsed_response.value.object.get("success").?.bool);
+    try std.testing.expect(parsed_event.value.object.get("success").?.bool);
+    try std.testing.expectEqual(@as(i64, 27), parsed_response.value.object.get("request_seq").?.integer);
+    try std.testing.expectEqual(@as(i64, 27), parsed_event.value.object.get("request_seq").?.integer);
 }
 
 test "DapProxy builds failure response for unsupported reverse request" {
