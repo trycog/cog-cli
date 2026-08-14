@@ -109,10 +109,16 @@ fn runMcpStartupPrivacyRegression(allocator: std.mem.Allocator, cog_path: []cons
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     try child.spawn();
+    // If the shutdown byte cannot be delivered, reap the spawned server
+    // instead of leaking it past the failed test.
+    errdefer _ = child.kill() catch {};
 
     const child_stdin = child.stdin.?;
     child.stdin = null;
-    try child_stdin.writeAll(&.{0x03});
+    {
+        errdefer child_stdin.close();
+        try child_stdin.writeAll(&.{0x03});
+    }
     child_stdin.close();
 
     const term = try child.wait();
