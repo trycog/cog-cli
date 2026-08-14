@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const debug_log = @import("../../debug_log.zig");
 const process_types = @import("process_types.zig");
 
@@ -465,6 +464,8 @@ pub const CoreDump = struct {
     const MH_CORE: u32 = 4;
     const LC_SEGMENT_64: u32 = 0x19;
     const LC_THREAD: u32 = 0x5;
+    const CPU_TYPE_X86_64: i32 = 0x01000007;
+    const CPU_TYPE_ARM64: i32 = 0x0100000C;
 
     fn parseMachOCore(allocator: std.mem.Allocator, data: []const u8) !CoreDump {
         if (data.len < @sizeOf(MachHeader64)) return error.InvalidCoreFile;
@@ -480,10 +481,13 @@ pub const CoreDump = struct {
         var offset: u64 = @sizeOf(MachHeader64);
         var cmd_i: u32 = 0;
         while (cmd_i < header.ncmds) : (cmd_i += 1) {
-            if (offset + 8 > data.len) break;
+            // A load-command table that stops short of ncmds is malformed;
+            // silently accepting the partial parse would report a valid core
+            // with missing segments or registers.
+            if (offset + 8 > data.len) return error.InvalidCoreFile;
             const cmd = std.mem.readInt(u32, data[offset..][0..4], .little);
             const cmdsize = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little);
-            if (cmdsize < 8 or offset + cmdsize > data.len) break;
+            if (cmdsize < 8 or offset + cmdsize > data.len) return error.InvalidCoreFile;
 
             if (cmd == LC_SEGMENT_64 and offset + @sizeOf(SegmentCommand64) <= data.len) {
                 const seg = std.mem.bytesAsValue(SegmentCommand64, data[offset..][0..@sizeOf(SegmentCommand64)]);
@@ -499,7 +503,7 @@ pub const CoreDump = struct {
                 // LC_THREAD contains thread state: flavor(u32) + count(u32) + register data
                 const thread_data_offset = offset + 8; // skip cmd + cmdsize
                 const thread_data_end = offset + cmdsize;
-                if (parseMachOThreadState(data, thread_data_offset, thread_data_end)) |regs| {
+                if (parseMachOThreadState(data, header.cputype, thread_data_offset, thread_data_end)) |regs| {
                     registers = regs;
                     found_regs = true;
                 }
@@ -517,7 +521,7 @@ pub const CoreDump = struct {
         };
     }
 
-    fn parseMachOThreadState(data: []const u8, start: u64, end: u64) ?RegisterState {
+    fn parseMachOThreadState(data: []const u8, cputype: i32, start: u64, end: u64) ?RegisterState {
         var offset = start;
 
         while (offset + 8 <= end and offset + 8 <= data.len) {
@@ -525,10 +529,14 @@ pub const CoreDump = struct {
             const count = std.mem.readInt(u32, data[offset + 4 ..][0..4], .little); // count in u32 units
             offset += 8;
 
+            // The state must stay inside its own load command; reading up to
+            // data.len would interpret neighboring command bytes as registers.
             const state_size: u64 = @as(u64, count) * 4;
-            if (offset + state_size > data.len) return null;
+            if (offset + state_size > end) return null;
 
-            if (builtin.cpu.arch == .aarch64) {
+            // Flavors are numbered per architecture, so dispatch must follow
+            // the core file's cpu type, not the host that inspects it.
+            if (cputype == CPU_TYPE_ARM64) {
                 // ARM_THREAD_STATE64 flavor = 6
                 if (flavor == 6 and state_size >= 33 * 8 + 4) {
                     var state = RegisterState{};
@@ -543,7 +551,7 @@ pub const CoreDump = struct {
                     state.gprs[29] = state.fp;
                     return state;
                 }
-            } else if (builtin.cpu.arch == .x86_64) {
+            } else if (cputype == CPU_TYPE_X86_64) {
                 // x86_THREAD_STATE64 flavor = 4
                 if (flavor == 4 and state_size >= 21 * 8) {
                     var state = RegisterState{};
@@ -978,6 +986,68 @@ test "ELF NT_FILE mappings derive validated PIE runtime base" {
 
     mappings.items[1].start = 0x5555_7000;
     try std.testing.expectError(error.InvalidExecutableMapping, core.executableRuntimeBase(path));
+}
+
+fn writeMachOCoreHeader(buf: []u8, ncmds: u32, cputype: i32) void {
+    std.mem.writeInt(u32, buf[0..4], 0xFEEDFACF, .little);
+    std.mem.writeInt(i32, buf[4..8], cputype, .little);
+    std.mem.writeInt(u32, buf[12..16], CoreDump.MH_CORE, .little);
+    std.mem.writeInt(u32, buf[16..20], ncmds, .little);
+}
+
+test "Mach-O cores reject truncated load command tables" {
+    const allocator = std.testing.allocator;
+    var buf: [40]u8 = [_]u8{0} ** 40;
+    writeMachOCoreHeader(&buf, 1, CoreDump.CPU_TYPE_ARM64);
+    // The single command claims more bytes than the file holds.
+    std.mem.writeInt(u32, buf[32..36], CoreDump.LC_SEGMENT_64, .little);
+    std.mem.writeInt(u32, buf[36..40], 0x48, .little);
+
+    const data = try allocator.dupe(u8, &buf);
+    defer allocator.free(data);
+    try std.testing.expectError(error.InvalidCoreFile, CoreDump.parseMachOCore(allocator, data));
+}
+
+test "Mach-O thread state honors the core cpu type" {
+    const allocator = std.testing.allocator;
+    // x86_THREAD_STATE64 inside an x86_64 core must parse on every host.
+    var buf: [32 + 16 + 168]u8 = [_]u8{0} ** (32 + 16 + 168);
+    writeMachOCoreHeader(&buf, 1, CoreDump.CPU_TYPE_X86_64);
+    std.mem.writeInt(u32, buf[32..36], CoreDump.LC_THREAD, .little);
+    std.mem.writeInt(u32, buf[36..40], 16 + 168, .little);
+    std.mem.writeInt(u32, buf[40..44], 4, .little); // x86_THREAD_STATE64
+    std.mem.writeInt(u32, buf[44..48], 42, .little); // count in u32 units
+    std.mem.writeInt(u64, buf[48 + 128 ..][0..8], 0x1122334455667788, .little); // rip
+
+    const data = try allocator.dupe(u8, &buf);
+    var core = CoreDump.parseMachOCore(allocator, data) catch |err| {
+        allocator.free(data);
+        return err;
+    };
+    defer core.deinit();
+    try std.testing.expectEqual(@as(u64, 0x1122334455667788), core.registers.pc);
+}
+
+test "Mach-O thread state stays inside its load command" {
+    const allocator = std.testing.allocator;
+    // The LC_THREAD command holds only the flavor/count header while the
+    // declared state size points at bytes past the command's end; those bytes
+    // must not be interpreted as registers.
+    var buf: [32 + 16 + 272]u8 = [_]u8{0} ** (32 + 16 + 272);
+    writeMachOCoreHeader(&buf, 1, CoreDump.CPU_TYPE_ARM64);
+    std.mem.writeInt(u32, buf[32..36], CoreDump.LC_THREAD, .little);
+    std.mem.writeInt(u32, buf[36..40], 16, .little);
+    std.mem.writeInt(u32, buf[40..44], 6, .little); // ARM_THREAD_STATE64
+    std.mem.writeInt(u32, buf[44..48], 68, .little); // 272 bytes, beyond the command
+    std.mem.writeInt(u64, buf[48 + 32 * 8 ..][0..8], 0xdeadbeef, .little); // would-be pc
+
+    const data = try allocator.dupe(u8, &buf);
+    var core = CoreDump.parseMachOCore(allocator, data) catch |err| {
+        allocator.free(data);
+        return err;
+    };
+    defer core.deinit();
+    try std.testing.expectEqual(@as(u64, 0), core.registers.pc);
 }
 
 test "ELF NT_FILE mappings reject invalid page size" {
