@@ -48,12 +48,34 @@ test "Cog source never uses positional writers for stdout or stderr" {
     }
 }
 
-test "MCP source never uses a shared Cog temporary path" {
-    const source = try std.fs.cwd().readFileAlloc(std.testing.allocator, "src/mcp.zig", 4 * 1024 * 1024);
-    defer std.testing.allocator.free(source);
+test "no source file uses a shared Cog temporary path" {
+    const allocator = std.testing.allocator;
+
+    // paths.zig may name the retired shared paths: it emits a one-release
+    // diagnostic for them and never opens, trusts, or removes those nodes.
+    const allowed = [_][]const u8{"paths.zig"};
+
+    var src_dir = try std.fs.cwd().openDir("src", .{ .iterate = true });
+    defer src_dir.close();
+    var walker = try src_dir.walk(allocator);
+    defer walker.deinit();
 
     const forbidden_prefix = "/tmp/" ++ "cog";
-    try std.testing.expect(std.mem.indexOf(u8, source, forbidden_prefix) == null);
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const allowed_file = for (allowed) |name| {
+            if (std.mem.eql(u8, entry.basename, name)) break true;
+        } else false;
+        if (allowed_file) continue;
+
+        const source = try src_dir.readFileAlloc(allocator, entry.path, 16 * 1024 * 1024);
+        defer allocator.free(source);
+        if (std.mem.indexOf(u8, source, forbidden_prefix) != null) {
+            std.debug.print("shared Cog temporary path referenced in src/{s}\n", .{entry.path});
+            return error.SharedCogTempPath;
+        }
+    }
 }
 
 test "code intelligence tests use isolated temporary files" {
