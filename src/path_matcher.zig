@@ -338,18 +338,41 @@ pub const PathMatcher = struct {
         }
     }
 
+    /// Drop every discovered alias so the next lookup rebuilds them.
+    ///
+    /// Symlinks are created and removed while the watcher runs, so a one-shot
+    /// discovery latch would keep mapping events through links that no longer
+    /// exist and would never learn links added after startup.
+    pub fn invalidateAliases(self: *PathMatcher) void {
+        if (!self.aliases_discovered and self.aliases.items.len == 0) return;
+        debug_log.log("PathMatcher.aliases: invalidating {d} logical roots", .{self.aliases.items.len});
+        for (self.aliases.items) |alias| {
+            self.allocator.free(alias.canonical_path);
+            self.allocator.free(alias.logical_prefix);
+        }
+        self.aliases.clearRetainingCapacity();
+        self.aliases_discovered = false;
+    }
+
     fn ensureAliasesDiscovered(self: *PathMatcher) !void {
         if (self.aliases_discovered) return;
+
+        errdefer self.invalidateAliases();
 
         for (self.roots) |root| {
             try self.addAlias(root.canonical_path, root.logical_prefix);
         }
 
-        var active = std.AutoHashMap(DirectoryIdentity, void).init(self.allocator);
-        defer active.deinit();
-        var ignored: std.ArrayListUnmanaged(MatchedPath) = .empty;
-        defer ignored.deinit(self.allocator);
-        try self.walkDirectory(self.project_root, "", 0, &active, &ignored, true);
+        // Every approved root is walked, not just the project: a symlink inside
+        // an external root is as much a second logical name as one inside the
+        // project, and the watcher must resolve both identically.
+        for (self.roots) |root| {
+            var active = std.AutoHashMap(DirectoryIdentity, void).init(self.allocator);
+            defer active.deinit();
+            var ignored: std.ArrayListUnmanaged(MatchedPath) = .empty;
+            defer ignored.deinit(self.allocator);
+            try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, &ignored, true);
+        }
         self.aliases_discovered = true;
         debug_log.log("PathMatcher.aliases: discovered {d} logical roots", .{self.aliases.items.len});
     }
@@ -784,6 +807,145 @@ test "PathMatcher rejects canonical boundary prefix tricks" {
     }
     try matcher.collect(&paths);
     try expectLogicalPaths(&.{"main.zig"}, paths.items);
+}
+
+fn expectContainsLogical(paths: []const []const u8, expected: []const u8) !void {
+    for (paths) |path| {
+        if (std.mem.eql(u8, path, expected)) return;
+    }
+    std.debug.print("missing logical path {s} in:\n", .{expected});
+    for (paths) |path| std.debug.print("  {s}\n", .{path});
+    return error.TestExpectedLogicalPath;
+}
+
+fn expectContainsLogicalSuffix(paths: []const []const u8, suffix: []const u8) !void {
+    for (paths) |path| {
+        if (std.mem.endsWith(u8, path, suffix) and std.mem.startsWith(u8, path, "@external/")) return;
+    }
+    std.debug.print("missing external logical suffix {s} in:\n", .{suffix});
+    for (paths) |path| std.debug.print("  {s}\n", .{path});
+    return error.TestExpectedLogicalPath;
+}
+
+test "PathMatcher discovers aliases inside every approved external root" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+    var external = std.testing.tmpDir(.{});
+    defer external.cleanup();
+
+    try writeTestFile(external.dir, "lib/shared.zig", "pub const shared = true;\n");
+    try external.dir.symLink("lib", "lib-link", .{ .is_directory = true });
+
+    const external_root = try external.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(external_root);
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+        .external_roots = &.{external_root},
+    });
+    defer matcher.deinit();
+
+    const shared_physical = try external.dir.realpathAlloc(allocator, "lib/shared.zig");
+    defer allocator.free(shared_physical);
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(shared_physical, &logical);
+
+    try expectContainsLogicalSuffix(logical.items, "/lib/shared.zig");
+    try expectContainsLogicalSuffix(logical.items, "/lib-link/shared.zig");
+}
+
+test "PathMatcher maps symlinked files to their logical alias" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+    try project.dir.symLink("src/main.zig", "entry.zig", .{});
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    const physical = try project.dir.realpathAlloc(allocator, "src/main.zig");
+    defer allocator.free(physical);
+
+    var logical: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (logical.items) |path| allocator.free(path);
+        logical.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(physical, &logical);
+
+    try expectContainsLogical(logical.items, "src/main.zig");
+    try expectContainsLogical(logical.items, "entry.zig");
+}
+
+test "PathMatcher rediscovers aliases created after startup" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/main.zig", "pub fn main() void {}\n");
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    const physical = try project.dir.realpathAlloc(allocator, "src/main.zig");
+    defer allocator.free(physical);
+
+    var before: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (before.items) |path| allocator.free(path);
+        before.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(physical, &before);
+    try std.testing.expectEqual(@as(usize, 1), before.items.len);
+
+    try project.dir.symLink("src", "src-link", .{ .is_directory = true });
+    matcher.invalidateAliases();
+
+    var after: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (after.items) |path| allocator.free(path);
+        after.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(physical, &after);
+
+    try expectContainsLogical(after.items, "src/main.zig");
+    try expectContainsLogical(after.items, "src-link/main.zig");
+
+    // A removed link must stop producing logical paths after rediscovery.
+    try project.dir.deleteFile("src-link");
+    matcher.invalidateAliases();
+
+    var pruned: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (pruned.items) |path| allocator.free(path);
+        pruned.deinit(allocator);
+    }
+    try matcher.mapPhysicalToLogical(physical, &pruned);
+    try std.testing.expectEqual(@as(usize, 1), pruned.items.len);
+    try expectContainsLogical(pruned.items, "src/main.zig");
 }
 
 fn matcherAllocationScenario(
