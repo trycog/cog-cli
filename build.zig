@@ -114,10 +114,69 @@ pub fn build(b: *std.Build) void {
     });
     const run_grammar_source_tests = b.addRunArtifact(grammar_source_tests);
 
+    const verify_source_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/verify_source.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_verify_source_tests = b.addRunArtifact(verify_source_tests);
+    const verify_source_test_exe = b.addExecutable(.{
+        .name = "verify-source-test-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/verify_source.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    const grammar_lock_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/grammar_lock.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_grammar_lock_tests = b.addRunArtifact(grammar_lock_tests);
+    const grammar_lock_test_exe = b.addExecutable(.{
+        .name = "grammar-lock-test-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/grammar_lock.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    const fetch_source_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fetch_source.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_fetch_source_tests = b.addRunArtifact(fetch_source_tests);
+    const fetch_source_test_exe = b.addExecutable(.{
+        .name = "fetch-source-test-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fetch_source.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    const grammar_setup_tests = b.addSystemCommand(&.{ "sh", "test/grammar_setup.sh" });
+    grammar_setup_tests.addFileArg(b.path("priv/grammar_setup.sh"));
+    grammar_setup_tests.addFileArg(grammar_lock_test_exe.getEmittedBin());
+    grammar_setup_tests.addFileArg(fetch_source_test_exe.getEmittedBin());
+    grammar_setup_tests.addFileArg(verify_source_test_exe.getEmittedBin());
+    grammar_setup_tests.addFileArg(b.path("build.zig"));
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_grammar_source_tests.step);
+    test_step.dependOn(&run_verify_source_tests.step);
+    test_step.dependOn(&run_grammar_lock_tests.step);
+    test_step.dependOn(&run_fetch_source_tests.step);
+    test_step.dependOn(&grammar_setup_tests.step);
 
     // Benchmark
     const bench_exe = b.addExecutable(.{
@@ -221,7 +280,23 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    addSetupStep(b, verify_source);
+    const grammar_lock = b.addExecutable(.{
+        .name = "grammar-lock",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/grammar_lock.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const fetch_source = b.addExecutable(.{
+        .name = "fetch-source",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fetch_source.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    addSetupStep(b, verify_source, grammar_lock, fetch_source);
 
     // Release step
     const release_step = b.step("release", "Build release tarballs");
@@ -372,34 +447,21 @@ fn addRelease(
     release_step.dependOn(&install_tar.step);
 }
 
-fn addSetupStep(b: *std.Build, verify_source: *std.Build.Step.Compile) void {
+fn addSetupStep(
+    b: *std.Build,
+    verify_source: *std.Build.Step.Compile,
+    grammar_lock: *std.Build.Step.Compile,
+    fetch_source: *std.Build.Step.Compile,
+) void {
     var script = std.ArrayList(u8).initCapacity(b.allocator, 32 * 1024) catch @panic("OOM");
     var writer = script.writer(b.allocator);
     writer.writeAll(
         \\set -eu
-        \\WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/cog-grammars.XXXXXX")
-        \\STAGING="$WORKDIR/grammars"
-        \\BACKUP="$WORKDIR/previous-grammars"
-        \\mkdir -p "$STAGING"
-        \\cleanup() {
-        \\  status=$?
-        \\  trap - EXIT INT TERM
-        \\  if [ "$status" -ne 0 ] && [ -d "$BACKUP" ] && [ ! -d grammars ]; then mv "$BACKUP" grammars; fi
-        \\  rm -rf "$WORKDIR"
-        \\  exit "$status"
-        \\}
-        \\trap cleanup EXIT
-        \\trap 'trap - INT; exit 130' INT
-        \\trap 'trap - TERM; exit 143' TERM
-        \\fetch_source() {
-        \\  repo="$1"
-        \\  commit="$2"
-        \\  sha256="$3"
-        \\  archive="$4"
-        \\  curl --fail --location --silent --show-error --output "$archive" "https://codeload.github.com/$repo/tar.gz/$commit"
-        \\  "$VERIFY_SOURCE" "$archive" "$sha256"
-        \\}
         \\VERIFY_SOURCE="$1"
+        \\SETUP_LIB="$2"
+        \\FETCH_SOURCE="$3"
+        \\. "$SETUP_LIB"
+        \\grammar_setup_init
         \\ARCHIVE="$WORKDIR/tree-sitter.tar.gz"
     ) catch @panic("OOM");
     writer.writeByte('\n') catch @panic("OOM");
@@ -418,14 +480,19 @@ fn addSetupStep(b: *std.Build, verify_source: *std.Build.Step.Compile) void {
     }
 
     writer.writeAll(
-        \\if [ -d grammars ]; then mv grammars "$BACKUP"; fi
-        \\mv "$STAGING" grammars
-        \\rm -rf "$BACKUP"
+        \\grammar_setup_promote
+        \\grammar_setup_finish
         \\echo "Installed verified tree-sitter grammar sources"
     ) catch @panic("OOM");
 
-    const cmd = b.addSystemCommand(&.{ "sh", "-c", script.items, "sh" });
+    const cmd = b.addSystemCommand(&.{"true"});
+    cmd.argv.clearRetainingCapacity();
+    cmd.addArtifactArg(grammar_lock);
+    cmd.addArg(".");
+    cmd.addArgs(&.{ "sh", "-c", script.items, "sh" });
     cmd.addFileArg(verify_source.getEmittedBin());
+    cmd.addFileArg(b.path("priv/grammar_setup.sh"));
+    cmd.addFileArg(fetch_source.getEmittedBin());
     const setup_step = b.step("setup", "Download and verify tree-sitter grammars");
     setup_step.dependOn(&cmd.step);
 }
@@ -433,8 +500,7 @@ fn addSetupStep(b: *std.Build, verify_source: *std.Build.Step.Compile) void {
 fn appendCoreSetup(writer: anytype) void {
     const source = tree_sitter_source;
     writer.print(
-        \\fetch_source "{s}" "{s}" "{s}" "$ARCHIVE"
-        \\tar xzf "$ARCHIVE" -C "$WORKDIR"
+        \\grammar_setup_fetch_source "{s}" "{s}" "{s}" "$ARCHIVE" "$WORKDIR"
         \\EXTRACTED="$WORKDIR/tree-sitter-{s}"
         \\mkdir -p "$STAGING/tree-sitter/src" "$STAGING/tree-sitter/include"
         \\cp -R "$EXTRACTED/lib/src/"* "$STAGING/tree-sitter/src/"
@@ -448,8 +514,7 @@ fn appendGrammarSetup(writer: anytype, grammar: GrammarSource) void {
     const repo_name = std.fs.path.basename(grammar.repo);
     writer.print(
         \\ARCHIVE="$WORKDIR/{s}.tar.gz"
-        \\fetch_source "{s}" "{s}" "{s}" "$ARCHIVE"
-        \\tar xzf "$ARCHIVE" -C "$WORKDIR"
+        \\grammar_setup_fetch_source "{s}" "{s}" "{s}" "$ARCHIVE" "$WORKDIR"
         \\EXTRACTED="$WORKDIR/{s}-{s}"
         \\mkdir -p "$STAGING/{s}/tree_sitter"
         \\cp "$EXTRACTED/{s}/parser.c" "$STAGING/{s}/parser.c"
@@ -493,8 +558,7 @@ fn appendGrammarSetup(writer: anytype, grammar: GrammarSource) void {
 fn appendTypescriptSetup(writer: anytype, source: GrammarSource) void {
     writer.print(
         \\ARCHIVE="$WORKDIR/typescript.tar.gz"
-        \\fetch_source "{s}" "{s}" "{s}" "$ARCHIVE"
-        \\tar xzf "$ARCHIVE" -C "$WORKDIR"
+        \\grammar_setup_fetch_source "{s}" "{s}" "{s}" "$ARCHIVE" "$WORKDIR"
         \\EXTRACTED="$WORKDIR/tree-sitter-typescript-{s}"
         \\mkdir -p "$STAGING/typescript/tree_sitter" "$STAGING/tsx/tree_sitter" "$STAGING/common"
         \\cp "$EXTRACTED/typescript/src/parser.c" "$STAGING/typescript/parser.c"
