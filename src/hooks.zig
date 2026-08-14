@@ -1946,13 +1946,30 @@ fn writeRuntimePolicyAsset(path: []const u8, content: []const u8) !void {
     try writeCwdFile(path, content);
 }
 
+/// Install the always-on workflow skills the kernel prompt points at.
+/// Bodies carry the detailed procedures that used to live in the prompt;
+/// hosts sharing a skills directory simply overwrite identical content.
+pub fn configureWorkflowSkills(allocator: std.mem.Allocator, agent: agents_mod.Agent, memory_enabled: bool) !void {
+    debug_log.log("hooks.configureWorkflowSkills: agent={s} memory={any}", .{ agent.id, memory_enabled });
+    for (agents_mod.workflow_skills) |skill| {
+        if (skill.requires_memory and !memory_enabled) continue;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}/SKILL.md", .{ agent.skills_dir, skill.name });
+        defer allocator.free(path);
+        const body = if (std.mem.eql(u8, skill.name, "cog-explore"))
+            build_options.explore_skill_body
+        else
+            build_options.remember_skill_body;
+        try writeMarkdownAgent(allocator, path, skill.header, body);
+    }
+}
+
 fn writeMarkdownAgent(allocator: std.mem.Allocator, path: []const u8, header: []const u8, body: []const u8) !void {
     debug_log.log("hooks.writeMarkdownAgent: path={s}", .{path});
     if (std.fs.path.dirname(path)) |parent| {
         try ensureDir(parent);
     }
 
-    const content = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ header, body });
+    const content = try buildMarkdownAgentContent(allocator, header, body);
     defer allocator.free(content);
     try writeCwdFile(path, content);
 }

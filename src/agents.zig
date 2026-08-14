@@ -161,6 +161,23 @@ const skill_header_mem = skillHeader("cog-mem", "Recall project knowledge from C
 const skill_header_validate = skillHeader("cog-mem-validate", "Consolidate Cog memory after completing work: learn durable facts, reinforce validated short-term memories, and flush incorrect ones. Use before finishing any task that explored code or created memories.");
 const skill_header_observe = skillHeader("cog-observe", "Investigate system-level behavior with Cog observability: syscalls, GPU, network, and resource costs. Use when a performance issue cannot be explained at the application level.");
 
+const skill_header_explore = skillHeader("cog-explore", "Batched workflow for Cog code intelligence: query batching rules, wildcard and synonym syntax, and follow-up discipline for cog_code_explore and cog_code_query. Load before the first code-intelligence call in a session.");
+const skill_header_remember = skillHeader("cog-remember", "Rules and quality guardrails for recording durable knowledge with Cog memory: IF-THEN recording triggers, concept and predicate quality, and array batching. Load before calling cog_mem_learn, cog_mem_associate, or other memory-writing tools.");
+
+/// Always-installed workflow skills that carry the detailed procedures the
+/// kernel prompt only points at. Installed into every host's skills
+/// directory; memory guidance is skipped when memory is not configured.
+pub const WorkflowSkill = struct {
+    name: []const u8,
+    header: []const u8,
+    requires_memory: bool,
+};
+
+pub const workflow_skills = [_]WorkflowSkill{
+    .{ .name = "cog-explore", .header = skill_header_explore, .requires_memory = false },
+    .{ .name = "cog-remember", .header = skill_header_remember, .requires_memory = true },
+};
+
 pub const AgentCapabilities = struct {
     repo_local_mcp: bool,
     auto_tool_permissions: bool,
@@ -275,6 +292,8 @@ pub const specialist_raw_text_fallback_policy =
 pub const Agent = struct {
     id: []const u8,
     display_name: []const u8,
+    /// Directory receiving generated SKILL.md folders for this host.
+    skills_dir: []const u8,
     prompt_target: PromptTarget,
     mcp_path: ?[]const u8,
     mcp_format: McpFormat,
@@ -763,6 +782,7 @@ pub const agents = [_]Agent{
     .{
         .id = "claude_code",
         .display_name = "Claude Code",
+        .skills_dir = ".claude/skills",
         .prompt_target = .claude_md,
         .mcp_path = ".mcp.json",
         .mcp_format = .json_mcpServers,
@@ -896,6 +916,7 @@ pub const agents = [_]Agent{
     .{
         .id = "gemini",
         .display_name = "Gemini CLI",
+        .skills_dir = ".agents/skills",
         .prompt_target = .gemini_md,
         .mcp_path = ".gemini/settings.json",
         .mcp_format = .json_mcpServers,
@@ -951,6 +972,7 @@ pub const agents = [_]Agent{
     .{
         .id = "copilot",
         .display_name = "GitHub Copilot",
+        .skills_dir = ".agents/skills",
         .prompt_target = .copilot_instructions,
         .mcp_path = ".vscode/mcp.json",
         .mcp_format = .json_servers,
@@ -969,6 +991,7 @@ pub const agents = [_]Agent{
     .{
         .id = "windsurf",
         .display_name = "Windsurf",
+        .skills_dir = ".windsurf/skills",
         .prompt_target = .agents_md,
         .mcp_path = null,
         .mcp_format = .global_only,
@@ -987,6 +1010,7 @@ pub const agents = [_]Agent{
     .{
         .id = "cursor",
         .display_name = "Cursor",
+        .skills_dir = ".agents/skills",
         .prompt_target = .agents_md,
         .mcp_path = ".cursor/mcp.json",
         .mcp_format = .json_mcpServers,
@@ -1005,6 +1029,7 @@ pub const agents = [_]Agent{
     .{
         .id = "codex",
         .display_name = "OpenAI Codex CLI",
+        .skills_dir = ".agents/skills",
         .prompt_target = .agents_md,
         .mcp_path = ".codex/config.toml",
         .mcp_format = .toml,
@@ -1023,6 +1048,7 @@ pub const agents = [_]Agent{
     .{
         .id = "amp",
         .display_name = "Amp",
+        .skills_dir = ".agents/skills",
         .prompt_target = .agents_md,
         .mcp_path = ".amp/settings.json",
         .mcp_format = .json_amp,
@@ -1041,6 +1067,7 @@ pub const agents = [_]Agent{
     .{
         .id = "goose",
         .display_name = "Goose",
+        .skills_dir = ".goose/skills",
         .prompt_target = .agents_md,
         .mcp_path = null,
         .mcp_format = .global_only,
@@ -1059,6 +1086,7 @@ pub const agents = [_]Agent{
     .{
         .id = "roo",
         .display_name = "Roo Code",
+        .skills_dir = ".agents/skills",
         .prompt_target = .agents_md,
         .mcp_path = ".roo/mcp.json",
         .mcp_format = .json_mcpServers,
@@ -1077,6 +1105,7 @@ pub const agents = [_]Agent{
     .{
         .id = "opencode",
         .display_name = "OpenCode",
+        .skills_dir = ".agents/skills",
         .prompt_target = .agents_md,
         .mcp_path = "opencode.json",
         .mcp_format = .json_mcp,
@@ -1181,6 +1210,7 @@ pub const agents = [_]Agent{
     .{
         .id = "pi",
         .display_name = "Pi",
+        .skills_dir = ".pi/skills",
         .prompt_target = .agents_md,
         .mcp_path = ".pi/mcp.json",
         .mcp_format = .json_pi,
@@ -1750,4 +1780,20 @@ test "generated skill files satisfy the agent skills specification" {
     // Amp, Goose, Pi, Windsurf, Cursor, Codex, and Copilot each expose five
     // skills (observe included); anything fewer means a surface regressed.
     try std.testing.expect(validated >= 7 * 5);
+
+    // Workflow skills obey the same specification rules.
+    for (workflow_skills) |skill| {
+        try std.testing.expect(skill.name.len >= 1 and skill.name.len <= 64);
+        const name_line = try std.fmt.allocPrint(allocator, "name: {s}\n", .{skill.name});
+        defer allocator.free(name_line);
+        try std.testing.expect(std.mem.indexOf(u8, skill.header, name_line) != null);
+        try std.testing.expect(std.mem.indexOf(u8, skill.header, "internal: \"true\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, skill.header, cog_version_token) != null);
+    }
+
+    // Every host must offer a skills directory for the workflow skills.
+    for (agents) |agent| {
+        try std.testing.expect(agent.skills_dir.len > 0);
+        try std.testing.expect(std.mem.endsWith(u8, agent.skills_dir, "skills"));
+    }
 }

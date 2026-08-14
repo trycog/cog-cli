@@ -608,6 +608,11 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 installed_specialists[selected_pos].set(kind, installed);
             }
         }
+
+        // e. Workflow skills carry the procedures the kernel prompt points
+        // at; every host has a skills directory for them.
+        var workflow_skills_configured = false;
+        try runHostConfigStep("workflow skills", hooks_mod.configureWorkflowSkills(allocator, agent, setup_mem), &workflow_skills_configured);
     }
 
     // A shared prompt target must be safe for every selected host that reads it.
@@ -2727,12 +2732,19 @@ test "deployBootstrapTemplates upgrades legacy prompts and preserves managed rep
     try std.testing.expectEqualStrings(build_options.bootstrap_associate_prompt, associate_content);
 }
 
-test "prompt markdown includes stronger memory gate guidance" {
-    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "Record knowledge as you work - use IF-THEN rules:") != null);
+test "kernel prompt keeps mandates and routes detail to skills" {
+    // Always-on mandates stay in the kernel.
     try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "prior knowledge may help") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "Do not launch a separate") != null);
     try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "## BEFORE Responding - Memory Gate") != null);
-    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "Budget: 2-3 code-intelligence calls before responding.") != null);
+    // Procedure detail lives in the installed workflow skills the kernel
+    // points at, keeping the resident prompt small.
+    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "cog-explore") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "cog-remember") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_options.prompt_md, "IF-THEN rules:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, build_options.explore_skill_body, "Budget: 2-3 code-intelligence calls before responding.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_options.remember_skill_body, "IF-THEN rules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, build_options.remember_skill_body, "Never store secrets, credentials, or PII.") != null);
 }
 
 test "README support matrix matches the registry" {
