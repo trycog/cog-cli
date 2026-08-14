@@ -2409,15 +2409,100 @@ fn findPhysicalPath(matched_files: []const path_matcher.MatchedPath, logical_pat
     return null;
 }
 
-fn remapExternalDocumentPaths(
+/// Deep-copy the arrays a document owns so an extra alias can hold its own.
+///
+/// Strings stay borrowed from the indexer's backing buffer — only the arrays
+/// `scip.freeDocument` releases are duplicated.
+fn dupeDocumentBody(allocator: std.mem.Allocator, doc: scip.Document) !scip.Document {
+    const occurrences = try allocator.dupe(scip.Occurrence, doc.occurrences);
+    errdefer allocator.free(occurrences);
+
+    const symbols = try allocator.alloc(scip.SymbolInformation, doc.symbols.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (symbols[0..initialized]) |*sym| freeSymbolInformation(allocator, sym);
+        allocator.free(symbols);
+    }
+
+    for (doc.symbols, 0..) |sym, i| {
+        const documentation = try allocator.dupe([]const u8, sym.documentation);
+        errdefer allocator.free(documentation);
+        const relationships = try allocator.dupe(scip.Relationship, sym.relationships);
+        symbols[i] = .{
+            .symbol = sym.symbol,
+            .documentation = documentation,
+            .relationships = relationships,
+            .kind = sym.kind,
+            .display_name = sym.display_name,
+            .enclosing_symbol = sym.enclosing_symbol,
+        };
+        initialized = i + 1;
+    }
+
+    return .{
+        .language = doc.language,
+        .relative_path = doc.relative_path,
+        .occurrences = occurrences,
+        .symbols = symbols,
+    };
+}
+
+/// Rewrite external indexer documents onto every logical alias configured for
+/// the physical path the indexer echoed back.
+///
+/// External indexers are handed physical paths and report those same paths in
+/// `relative_path`, but the master index is keyed by logical path — the
+/// convention tree-sitter documents already follow. A single physical source
+/// can be reachable under several logical names (a symlink alias, an
+/// `@external/...` alias with no counterpart under the project root), so each
+/// alias needs its own document instead of the first one winning.
+///
+/// Documents with no mapping are dependency-generated: the indexer walked into
+/// them on its own (a vendored gem, a type stub under `node_modules`). Those
+/// are not ours to rename and pass through untouched.
+///
+/// Every appended document owns its arrays. The first alias reuses the arrays
+/// the decoder produced and each additional alias receives a deep copy,
+/// because `scip.freeDocument` releases those arrays per document.
+fn remapExternalDocuments(
+    allocator: std.mem.Allocator,
     mappings: []const ExternalReindexPath,
     documents: []scip.Document,
-) void {
-    for (documents) |*doc| {
+    out: *std.ArrayListUnmanaged(scip.Document),
+) !void {
+    // Each document either passes through once or fans out across the
+    // mappings that name it, so this bound cannot be exceeded.
+    try out.ensureUnusedCapacity(allocator, documents.len + mappings.len);
+
+    for (documents) |doc| {
+        var aliases: usize = 0;
         for (mappings) |mapping| {
             if (!std.mem.eql(u8, doc.relative_path, mapping.physical_path)) continue;
-            doc.relative_path = mapping.logical_path;
-            break;
+            aliases += 1;
+            if (aliases == 1) {
+                var first = doc;
+                first.relative_path = mapping.logical_path;
+                out.appendAssumeCapacity(first);
+            } else {
+                // A failed copy costs this one alias its document until the
+                // next reindex; it must never cost two aliases one shared
+                // array, which `scip.freeDocument` would release twice.
+                var extra = dupeDocumentBody(allocator, doc) catch {
+                    aliases -= 1;
+                    debug_log.log("remapExternalDocuments: alias copy failed logical={s}", .{mapping.logical_path});
+                    continue;
+                };
+                extra.relative_path = mapping.logical_path;
+                out.appendAssumeCapacity(extra);
+            }
+            debug_log.log("remapExternalDocuments: alias logical={s} physical={s}", .{
+                mapping.logical_path,
+                mapping.physical_path,
+            });
+        }
+        if (aliases == 0) {
+            debug_log.log("remapExternalDocuments: unmapped document retained path={s}", .{doc.relative_path});
+            out.appendAssumeCapacity(doc);
         }
     }
 }
@@ -2685,8 +2770,22 @@ fn applyReindexBatch(
             scip.freeIndex(allocator, &failed_index);
             continue;
         }
-        remapExternalDocumentPaths(ext_mappings[ext_idx].items, result.index.documents);
-        for (result.index.documents) |doc| mergeDocument(allocator, master_index, doc);
+        var remapped: std.ArrayListUnmanaged(scip.Document) = .empty;
+        defer remapped.deinit(allocator);
+        // Only the capacity reservation can fail here; a failed alias copy is
+        // absorbed inside the remap, so no document is left half-owned.
+        remapExternalDocuments(allocator, ext_mappings[ext_idx].items, result.index.documents, &remapped) catch {
+            debug_log.log("reindexFiles: alias remap failed command={s} docs={d}", .{
+                scip_config.command,
+                result.index.documents.len,
+            });
+            for (result.index.documents) |*doc| scip.freeDocument(allocator, doc);
+            allocator.free(result.index.documents);
+            for (result.index.external_symbols) |*sym| freeSymbolInformation(allocator, sym);
+            allocator.free(result.index.external_symbols);
+            continue;
+        };
+        for (remapped.items) |doc| mergeDocument(allocator, master_index, doc);
         allocator.free(result.index.documents);
         for (result.index.external_symbols) |sym| mergeExternalSymbolList(allocator, &external_symbol_list, sym);
         allocator.free(result.index.external_symbols);
@@ -4394,6 +4493,9 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
     var seen_names: [16][]const u8 = undefined;
     var unique_exts: [16]extensions.Extension = undefined;
     var ext_files: [16]std.ArrayListUnmanaged([]const u8) = [_]std.ArrayListUnmanaged([]const u8){.empty} ** 16;
+    // External indexers echo back the physical paths they were given, so the
+    // logical alias each one belongs to has to be remembered here.
+    var ext_mappings: [16]std.ArrayListUnmanaged(ExternalReindexPath) = [_]std.ArrayListUnmanaged(ExternalReindexPath){.empty} ** 16;
     var num_unique: usize = 0;
 
     // Cache extension resolution by file extension
@@ -4464,13 +4566,19 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
                         break;
                     }
                 }
+                const mapping: ExternalReindexPath = .{
+                    .logical_path = file_path,
+                    .physical_path = physical_path,
+                };
                 if (!found and num_unique < 16) {
                     seen_names[num_unique] = resolved.name;
                     unique_exts[num_unique] = resolved;
                     ext_files[num_unique].append(allocator, physical_path) catch {};
+                    ext_mappings[num_unique].append(allocator, mapping) catch {};
                     num_unique += 1;
                 } else if (found) {
                     ext_files[found_idx].append(allocator, physical_path) catch {};
+                    ext_mappings[found_idx].append(allocator, mapping) catch {};
                 }
             },
         }
@@ -4485,9 +4593,33 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
         if (batch_files.len == 0) continue;
         debug_log.log("codeIndexInner: invoking bulk external indexer {s} for {d} files", .{ scip_config.command, batch_files.len });
         debug_log.logResourceUsage("codeIndexInner:external:start");
-        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, null) catch continue;
+        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, null) catch |err| {
+            debug_log.log("codeIndexInner: external batch failed command={s} files={d} error={s}", .{
+                scip_config.command,
+                batch_files.len,
+                @errorName(err),
+            });
+            continue;
+        };
         backing_buffers.append(allocator, result.backing_data.?) catch {};
-        for (result.index.documents) |doc| {
+
+        // Documents come back keyed by the physical paths the indexer was
+        // given; the index is keyed by logical path, exactly as the
+        // tree-sitter branch above already stores it.
+        var remapped: std.ArrayListUnmanaged(scip.Document) = .empty;
+        defer remapped.deinit(allocator);
+        remapExternalDocuments(allocator, ext_mappings[ext_idx].items, result.index.documents, &remapped) catch {
+            debug_log.log("codeIndexInner: alias remap failed command={s} docs={d}", .{
+                scip_config.command,
+                result.index.documents.len,
+            });
+            for (result.index.documents) |*doc| scip.freeDocument(allocator, doc);
+            allocator.free(result.index.documents);
+            for (result.index.external_symbols) |*sym| freeSymbolInformation(allocator, sym);
+            allocator.free(result.index.external_symbols);
+            continue;
+        };
+        for (remapped.items) |doc| {
             mergeDocumentList(allocator, &doc_list, doc);
             total_symbols += doc.symbols.len;
         }
@@ -4503,6 +4635,7 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
 
     for (0..num_unique) |ext_idx| {
         ext_files[ext_idx].deinit(allocator);
+        ext_mappings[ext_idx].deinit(allocator);
     }
 
     // Transfer documents back to master_index for encoding/freeing
@@ -4765,19 +4898,93 @@ test "collectMatchedFiles applies shared excludes and preserves symlink aliases"
     try std.testing.expectEqualStrings("workspace-assets/js/app.js", files.items[1].logical_path);
 }
 
-test "external reindex remaps physical documents to logical aliases" {
+/// Build a document that owns its arrays, so tests exercise the same
+/// ownership rules `scip.freeDocument` enforces on decoded documents.
+fn testDocument(
+    allocator: std.mem.Allocator,
+    language: []const u8,
+    relative_path: []const u8,
+) !scip.Document {
+    const occurrences = try allocator.alloc(scip.Occurrence, 1);
+    errdefer allocator.free(occurrences);
+    occurrences[0] = .{
+        .range = .{ .start_line = 3, .start_char = 0, .end_line = 3, .end_char = 7 },
+        .symbol = "pkg/Widget#",
+        .symbol_roles = scip.SymbolRole.Definition,
+        .syntax_kind = 0,
+    };
+
+    const documentation = try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(documentation);
+    const relationships = try allocator.alloc(scip.Relationship, 0);
+    errdefer allocator.free(relationships);
+
+    const symbols = try allocator.alloc(scip.SymbolInformation, 1);
+    symbols[0] = .{
+        .symbol = "pkg/Widget#",
+        .documentation = documentation,
+        .relationships = relationships,
+        .kind = 5,
+        .display_name = "Widget",
+        .enclosing_symbol = "",
+    };
+
+    return .{
+        .language = language,
+        .relative_path = relative_path,
+        .occurrences = occurrences,
+        .symbols = symbols,
+    };
+}
+
+test "external documents fan out to every configured logical alias" {
+    const allocator = std.testing.allocator;
+
+    // One physical source is reachable under two logical names, a second is
+    // reachable only through an external root, and the indexer also reports a
+    // document nothing asked for.
     const mappings = [_]ExternalReindexPath{
+        .{ .logical_path = "src/main.rb", .physical_path = "/project/src/main.rb" },
+        .{ .logical_path = "src-link/main.rb", .physical_path = "/project/src/main.rb" },
         .{ .logical_path = "@external/shared/lib.rb", .physical_path = "/shared/lib.rb" },
     };
+
     var documents = [_]scip.Document{
-        .{ .language = "ruby", .relative_path = "/shared/lib.rb", .occurrences = &.{}, .symbols = &.{} },
-        .{ .language = "ruby", .relative_path = "other.rb", .occurrences = &.{}, .symbols = &.{} },
+        try testDocument(allocator, "ruby", "/project/src/main.rb"),
+        try testDocument(allocator, "ruby", "/shared/lib.rb"),
+        try testDocument(allocator, "ruby", "vendor/bundle/rack.rb"),
     };
 
-    remapExternalDocumentPaths(&mappings, &documents);
+    var out: std.ArrayListUnmanaged(scip.Document) = .empty;
+    defer {
+        for (out.items) |*doc| scip.freeDocument(allocator, doc);
+        out.deinit(allocator);
+    }
+    try remapExternalDocuments(allocator, &mappings, &documents, &out);
 
-    try std.testing.expectEqualStrings("@external/shared/lib.rb", documents[0].relative_path);
-    try std.testing.expectEqualStrings("other.rb", documents[1].relative_path);
+    // Every configured alias keeps its own document, matching how tree-sitter
+    // documents are already keyed by logical path.
+    try std.testing.expectEqual(@as(usize, 4), out.items.len);
+    try std.testing.expectEqualStrings("src/main.rb", out.items[0].relative_path);
+    try std.testing.expectEqualStrings("src-link/main.rb", out.items[1].relative_path);
+    try std.testing.expectEqualStrings("@external/shared/lib.rb", out.items[2].relative_path);
+
+    // A document the indexer generated for a dependency is not ours to
+    // rename, so it passes through untouched.
+    try std.testing.expectEqualStrings("vendor/bundle/rack.rb", out.items[3].relative_path);
+
+    // Each alias owns its own arrays: freeing all four documents in the
+    // deferred cleanup above must not double-free the shared source.
+    try std.testing.expect(out.items[0].occurrences.ptr != out.items[1].occurrences.ptr);
+    try std.testing.expect(out.items[0].symbols.ptr != out.items[1].symbols.ptr);
+    try std.testing.expectEqual(
+        out.items[0].occurrences[0].range.start_line,
+        out.items[1].occurrences[0].range.start_line,
+    );
+    try std.testing.expectEqualStrings(
+        out.items[0].symbols[0].display_name,
+        out.items[1].symbols[0].display_name,
+    );
 }
 
 test "configured reconciliation retains physical reads and removes stale aliases" {
