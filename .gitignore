@@ -56,3 +56,4 @@ opencode.json
 /debug*.txt
 /CLAUDE.md.debug
 *.txt
+zig-pkg/
