@@ -135,18 +135,23 @@ fn runFullIndex(allocator: std.mem.Allocator, index_path: []const u8) !struct { 
 }
 
 fn runReindexBatch(allocator: std.mem.Allocator, index_path: []const u8) !u64 {
-    debug_log.log("bench_indexing: reindex batch start files={d}", .{REINDEX_BATCH_SIZE});
-    var timer = try std.time.Timer.start();
+    var batch_paths: [REINDEX_BATCH_SIZE][]const u8 = undefined;
+    var initialized_paths: usize = 0;
+    defer for (batch_paths[0..initialized_paths]) |path| allocator.free(path);
+
     for (0..REINDEX_BATCH_SIZE) |i| {
-        const rel_path = try std.fmt.allocPrint(allocator, "pkg_{d:0>2}/module_{d:0>2}.go", .{ i / 8, i });
-        defer allocator.free(rel_path);
-        if (!code_intel.reindexFile(allocator, rel_path)) {
-            fail("indexing benchmark failed to reindex {s}\n", .{rel_path});
-        }
+        batch_paths[i] = try std.fmt.allocPrint(allocator, "pkg_{d:0>2}/module_{d:0>2}.go", .{ i / 8, i });
+        initialized_paths += 1;
+    }
+
+    debug_log.log("bench_indexing: reindex transaction start files={d}", .{batch_paths.len});
+    var timer = try std.time.Timer.start();
+    if (!code_intel.reindexFiles(allocator, &batch_paths)) {
+        fail("indexing benchmark failed to reindex {d}-file batch\n", .{batch_paths.len});
     }
     const elapsed = timer.read();
     expectSnapshot(try snapshotIndex(allocator, index_path));
-    debug_log.log("bench_indexing: reindex batch done", .{});
+    debug_log.log("bench_indexing: reindex transaction done files={d}", .{batch_paths.len});
     return elapsed;
 }
 
@@ -216,11 +221,13 @@ pub fn main() !void {
     defer if (gpa.deinit() == .leak) fail("indexing benchmark leaked memory\n", .{});
     const allocator = gpa.allocator();
 
-    const bench_root = std.posix.getenv(FIXTURE_ROOT_ENV) orelse return error.MissingBenchmarkRoot;
+    const configured_bench_root = std.posix.getenv(FIXTURE_ROOT_ENV) orelse return error.MissingBenchmarkRoot;
+    const bench_root = try std.fs.cwd().realpathAlloc(allocator, configured_bench_root);
+    defer allocator.free(bench_root);
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
     if (!std.mem.eql(u8, cwd, bench_root)) return error.UnexpectedBenchmarkCwd;
-    debug_log.log("bench_indexing: fixture root={s}", .{bench_root});
+    debug_log.log("bench_indexing: fixture root configured={s} resolved={s}", .{ configured_bench_root, bench_root });
 
     debug_log.log("bench_indexing: reset fixture", .{});
     std.fs.cwd().deleteTree(".cog") catch |err| if (err != error.FileNotFound) return err;
