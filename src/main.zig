@@ -123,8 +123,22 @@ fn appendCommandHelp(allocator: std.mem.Allocator, output: *std.ArrayListUnmanag
     }
 }
 
+/// Commands that already printed an actionable message return `error.Explained`,
+/// so repeating it would be noise. Anything else reaching `main` is a failure the
+/// user never heard about, and exiting 1 in silence is indistinguishable from a hang.
+fn fatalErrorMessage(err: anyerror) ?[]const u8 {
+    if (err == error.Explained) return null;
+    return @errorName(err);
+}
+
 pub fn main() void {
-    mainInner() catch {
+    mainInner() catch |err| {
+        if (fatalErrorMessage(err)) |name| {
+            debug_log.log("main: unhandled error {s}", .{name});
+            printErr("error: ");
+            printErr(name);
+            printErr("\nRun the command again with " ++ dim ++ "--debug" ++ reset ++ " for a detailed log.\n");
+        }
         std.process.exit(1);
     };
 }
@@ -546,6 +560,12 @@ fn printErr(msg: []const u8) void {
     var w = std.fs.File.stderr().writerStreaming(&buf);
     w.interface.writeAll(msg) catch {};
     w.interface.flush() catch {};
+}
+
+test "unhandled errors are reported, explained ones stay quiet" {
+    try std.testing.expect(fatalErrorMessage(error.Explained) == null);
+    try std.testing.expectEqualStrings("FileTooBig", fatalErrorMessage(error.FileTooBig).?);
+    try std.testing.expectEqualStrings("OutOfMemory", fatalErrorMessage(error.OutOfMemory).?);
 }
 
 test "top-level help and dispatch catalog agree" {
