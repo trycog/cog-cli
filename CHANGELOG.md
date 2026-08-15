@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `cog code:index` no longer appears to hang on large projects. Three separate defects stacked into one silent 80-second failure: file collection walked the entire project twice — once to discover symlink aliases, once to match — ignoring the configured `code.index` patterns, so a project indexing `src/**/*.zig` beside a large scratch directory spent all of its time in directories that could never produce a match; the whole file list was then handed to an external indexer in a single invocation whose SCIP output exceeded the 256 MiB read limit; and the resulting error was discarded by the top-level handler, which exited 1 without printing anything. Traversal now skips entries no include pattern can reach, external indexers are invoked in bounded batches, and any unhandled error is reported with a pointer to `--debug`.
+- `rss_kb` in the debug log now reports kilobytes on macOS. Darwin reports `ru_maxrss` in bytes where Linux reports kilobytes, so the same field meant different units depending on the host.
+
 ## [0.27.2] - 2026-08-15
 
 ### Fixed
