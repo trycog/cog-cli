@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `cog init` no longer prints a `memory address ... leaked` report after running a project scan: the scan agent's captured stderr is now released instead of being discarded, and the reader thread is always joined before the scan returns.
 - A project-scan agent that exits on a signal (for example when it is interrupted) is now reported as a scan that produced no results, instead of aborting `cog init` on an invalid exit-status read.
+- Choosing "Custom command" or "Custom host" at a Cog prompt no longer leaks the text you typed: `cog init`, `cog mem:bootstrap`, and `cog mem:upgrade` now release it on every exit path.
+- Prompts read exactly one line from a non-interactive stdin instead of consuming the whole buffer, so `cog init` and the other interactive commands can be driven from a pipe or script. Previously every answer after the first was swallowed and the command aborted.
 
 ## [0.27.1] - 2026-08-14
 

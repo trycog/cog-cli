@@ -652,6 +652,10 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     };
     defer allocator.free(api_key);
 
+    // A typed-in host is owned; every other source is borrowed.
+    var owned_host: ?[]const u8 = null;
+    defer if (owned_host) |h| allocator.free(h);
+
     // Step 4: Host selection TUI
     const host: []const u8 = if (getFlagValue(args, "--host")) |h| h else blk: {
         var host_items_buf: [2]tui.MenuItem = undefined;
@@ -665,7 +669,10 @@ fn memUpgrade(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         });
         break :blk switch (host_result) {
             .selected => @as([]const u8, "trycog.ai"),
-            .input => |custom| custom,
+            .input => |custom| {
+                owned_host = custom;
+                break :blk custom;
+            },
             .back, .cancelled => {
                 printErr("  Aborted.\n");
                 return;
@@ -1373,6 +1380,7 @@ fn memBootstrap(allocator: std.mem.Allocator, args: []const [:0]const u8) !void 
         .input => |cmd| cmd,
         else => null,
     };
+    defer if (custom_cmd) |cmd| allocator.free(cmd);
 
     // Warn about cost and get confirmation
     printErr("\n");

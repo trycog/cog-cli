@@ -400,6 +400,10 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                     printErr("  memory powered by a knowledge graph with biological\n");
                     printErr("  memory dynamics.\n\n");
 
+                    // A typed-in host is owned; every other source is borrowed.
+                    var owned_host: ?[]const u8 = null;
+                    defer if (owned_host) |h| allocator.free(h);
+
                     // Ask for host (--host flag overrides the interactive prompt)
                     const effective_host: []const u8 = if (findFlag(args, "--host")) |h| h else blk: {
                         var host_items_buf: [3]tui.MenuItem = undefined;
@@ -435,7 +439,10 @@ pub fn init(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                                 @as([]const u8, "trycog.ai")
                             else
                                 (existing_custom_host orelse unreachable),
-                            .input => |custom| custom,
+                            .input => |custom| {
+                                owned_host = custom;
+                                break :blk custom;
+                            },
                             .back, .cancelled => {
                                 printErr("  Aborted.\n");
                                 return;
@@ -792,6 +799,7 @@ fn maybeRunProjectScan(allocator: std.mem.Allocator) !void {
         .input => |cmd| cmd,
         else => null,
     };
+    defer if (custom_cmd) |cmd| allocator.free(cmd);
 
     if (selected_agent) |agent| {
         try agent_usage.incrementCounts(allocator, &.{agent.id});
@@ -3549,6 +3557,54 @@ test "runProjectScan reports no result when the agent dies from a signal" {
             );
 
             try std.testing.expect(runProjectScan(allocator, null, "/bin/sh ./scan.sh") == null);
+        }
+    }.run);
+}
+
+/// Redirects stdin to a pipe preloaded with `answers` for the duration of `body`,
+/// so interactive prompts can be driven without a terminal.
+fn withPipedStdin(
+    answers: []const u8,
+    allocator: std.mem.Allocator,
+    comptime body: fn (std.mem.Allocator) anyerror!void,
+) !void {
+    const saved_stdin = try std.posix.dup(std.posix.STDIN_FILENO);
+    defer {
+        std.posix.dup2(saved_stdin, std.posix.STDIN_FILENO) catch {};
+        std.posix.close(saved_stdin);
+    }
+
+    const fds = try std.posix.pipe();
+    _ = try std.posix.write(fds[1], answers);
+    std.posix.close(fds[1]);
+    try std.posix.dup2(fds[0], std.posix.STDIN_FILENO);
+    std.posix.close(fds[0]);
+
+    try body(allocator);
+}
+
+test "maybeRunProjectScan releases a custom scan command" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeScanScript(
+                \\echo "scan noise" >&2
+                \\exit 3
+                \\
+            );
+
+            var answers_buf: [64]u8 = undefined;
+            const answers = try std.fmt.bufPrint(
+                &answers_buf,
+                "y\n{d}\n/bin/sh ./scan.sh\n",
+                .{bootstrap_mod.cli_agents.len + 1},
+            );
+
+            try withPipedStdin(answers, allocator, struct {
+                fn body(alloc: std.mem.Allocator) !void {
+                    try maybeRunProjectScan(alloc);
+                }
+            }.body);
         }
     }.run);
 }
