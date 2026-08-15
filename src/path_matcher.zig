@@ -178,6 +178,26 @@ pub const PathMatcher = struct {
         return included;
     }
 
+    /// True when some include pattern could still match a path at or beneath
+    /// `logical_path`. Traversal asks this before opening a directory entry, so
+    /// walking costs time proportional to the configured patterns rather than to
+    /// the whole tree: a project indexing `src/**/*.zig` beside a large scratch
+    /// directory should not pay to walk the scratch directory — and it pays
+    /// twice, because alias discovery walks before matching does.
+    ///
+    /// Every path `matches` accepts also passes this test, so pruning can never
+    /// discard a file the collector would have kept.
+    pub fn couldContainMatch(self: *const PathMatcher, logical_path: []const u8) bool {
+        for (self.patterns) |pattern| {
+            // Negations only subtract from what an include already matched, so
+            // they never make an unreachable directory worth entering.
+            if (isNegativePattern(pattern)) continue;
+            if (pattern.len == 0) continue;
+            if (patternReachesDirectory(pattern, logical_path)) return true;
+        }
+        return false;
+    }
+
     pub fn collect(self: *PathMatcher, out: *std.ArrayListUnmanaged(MatchedPath)) !void {
         try self.ensureAliasesDiscovered();
         for (self.roots) |root| {
@@ -317,14 +337,24 @@ pub const PathMatcher = struct {
             if (alias_link) |link| try self.addAlias(physical_dir, logical_dir, link);
         }
 
+        var pruned: usize = 0;
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             if (!isTraversableEntryName(entry.name)) continue;
 
-            const physical_child = try std.fs.path.join(self.allocator, &.{ physical_dir, entry.name });
-            defer self.allocator.free(physical_child);
             const logical_child = try joinLogical(self.allocator, logical_dir, entry.name);
             defer self.allocator.free(logical_child);
+
+            // Asked before any syscall, so an out-of-reach subtree costs only the
+            // name the iterator already produced rather than a realpath and stat
+            // for every file beneath it.
+            if (!self.couldContainMatch(logical_child)) {
+                pruned += 1;
+                continue;
+            }
+
+            const physical_child = try std.fs.path.join(self.allocator, &.{ physical_dir, entry.name });
+            defer self.allocator.free(physical_child);
 
             const canonical_child = std.fs.realpathAlloc(self.allocator, physical_child) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -370,6 +400,10 @@ pub const PathMatcher = struct {
                 },
                 else => {},
             }
+        }
+
+        if (pruned > 0) {
+            debug_log.log("PathMatcher.walk: pruned {d} unreachable entries under {s}", .{ pruned, physical_dir });
         }
     }
 
@@ -622,6 +656,35 @@ fn isNegativePattern(pattern: []const u8) bool {
     return pattern.len > 1 and pattern[0] == '!';
 }
 
+fn nextPathSegment(iter: *std.mem.SplitIterator(u8, .scalar)) ?[]const u8 {
+    while (iter.next()) |segment| {
+        if (segment.len == 0) continue;
+        if (std.mem.eql(u8, segment, ".")) continue;
+        return segment;
+    }
+    return null;
+}
+
+/// Whether `pattern` could match anything at or beneath `logical_dir`.
+///
+/// The directory's segments are matched against the pattern's leading segments.
+/// Running out of pattern first means the pattern is anchored above the
+/// directory and can never reach inside it; a segment containing `**` means the
+/// opposite, that any remaining depth is admitted. `**` is checked by substring
+/// rather than equality because `globMatch` lets it cross separators wherever it
+/// appears, so `x**` spans just as `**` does.
+fn patternReachesDirectory(pattern: []const u8, logical_dir: []const u8) bool {
+    var pattern_segments = std.mem.splitScalar(u8, pattern, '/');
+    var dir_segments = std.mem.splitScalar(u8, logical_dir, '/');
+
+    while (nextPathSegment(&dir_segments)) |dir_segment| {
+        const pattern_segment = nextPathSegment(&pattern_segments) orelse return false;
+        if (std.mem.indexOf(u8, pattern_segment, "**") != null) return true;
+        if (!globMatch(pattern_segment, dir_segment)) return false;
+    }
+    return true;
+}
+
 pub fn globMatch(pattern: []const u8, path: []const u8) bool {
     var pi: usize = 0;
     var si: usize = 0;
@@ -789,6 +852,65 @@ test "PathMatcher external roots opt in symlink targets and direct aliases" {
     try std.testing.expect(std.mem.endsWith(u8, paths.items[1].logical_path, "/lib/shared.zig"));
     try std.testing.expect(paths.items[1].logical_path[0] != '/');
     try std.testing.expect(std.mem.indexOf(u8, paths.items[1].logical_path, "..") == null);
+}
+
+test "pattern reach prunes directories no include pattern can enter" {
+    // An anchored pattern cannot reach a sibling tree, however large it is.
+    try std.testing.expect(patternReachesDirectory("src/**/*.zig", "src"));
+    try std.testing.expect(patternReachesDirectory("src/**/*.zig", "src/webidl/generated"));
+    try std.testing.expect(!patternReachesDirectory("src/**/*.zig", "tmp"));
+    try std.testing.expect(!patternReachesDirectory("src/**/*.zig", "tmp/node_clone/lib"));
+
+    // `**` admits any remaining depth, so a tree-spanning pattern prunes nothing.
+    try std.testing.expect(patternReachesDirectory("**/*.zig", "tmp/node_clone/lib"));
+
+    // A wildcard inside one segment still stops at the segment boundary.
+    try std.testing.expect(patternReachesDirectory("packages/*/src/*.ts", "packages/app"));
+    try std.testing.expect(!patternReachesDirectory("packages/*/src/*.ts", "vendored/app"));
+
+    // A pattern with no segments left is anchored above the directory.
+    try std.testing.expect(!patternReachesDirectory("build.zig", "src"));
+    try std.testing.expect(!patternReachesDirectory("README.md", "docs/guide"));
+
+    // Anything the matcher accepts must stay reachable, or the walk would prune
+    // a directory that still holds matches.
+    try std.testing.expect(patternReachesDirectory("src/**/*.zig", "src/main.zig"));
+}
+
+test "collection skips trees no include pattern can reach" {
+    const allocator = std.testing.allocator;
+    var project = std.testing.tmpDir(.{});
+    defer project.cleanup();
+
+    try writeTestFile(project.dir, "src/app/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(project.dir, "tmp/clone/lib/other.zig", "const other = true;\n");
+    try project.dir.symLink("app", "src/app-link", .{ .is_directory = true });
+    try project.dir.symLink("clone/lib", "tmp/lib-link", .{ .is_directory = true });
+
+    const project_root = try project.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"src/**/*.zig"},
+    });
+    defer matcher.deinit();
+
+    var paths: std.ArrayListUnmanaged(MatchedPath) = .empty;
+    defer {
+        matcher.freeMatchedPaths(paths.items);
+        paths.deinit(allocator);
+    }
+    try matcher.collect(&paths);
+    try expectLogicalPaths(&.{ "src/app-link/main.zig", "src/app/main.zig" }, paths.items);
+
+    // The link under `tmp/` is never recorded. No include pattern can match a
+    // path beneath it, so discovering it costs a full walk and yields an alias
+    // `mapPhysicalToLogical` would reject anyway.
+    for (matcher.aliases.items) |alias| {
+        try std.testing.expect(std.mem.indexOf(u8, alias.logical_prefix, "tmp") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), matcher.aliases.items.len);
 }
 
 test "PathMatcher maps watched physical paths to every approved logical alias" {
