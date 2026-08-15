@@ -1704,11 +1704,12 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
     // All non-debug tool paths access shared Runtime state.
     debug_log_mod.log("runtimeCallTool: acquiring mutex for {s}", .{tool_name});
     runtime.mutex.lock();
+    var mutex_locked = true;
     debug_log_mod.log("runtimeCallTool: mutex acquired for {s}", .{tool_name});
-    defer {
+    defer if (mutex_locked) {
         runtime.mutex.unlock();
         debug_log_mod.log("runtimeCallTool: mutex released for {s}", .{tool_name});
-    }
+    };
 
     if (runtime.brain_type == .remote and std.mem.startsWith(u8, tool_name, "mem_") and runtime.remote_tools == null) {
         debug_log_mod.log("runtimeCallTool: discovering hosted memory tools before eligibility check", .{});
@@ -1725,9 +1726,21 @@ fn runtimeCallTool(runtime: *Runtime, tool_name: []const u8, arguments: ?json.Va
 
     var session_ctx = try runtime.ensureSessionContext();
 
-    // Debug tools have their own mutex (DebugServer.mutex) — record context first.
+    // Debug tools have their own mutex (DebugServer.mutex) and block for as long
+    // as the debuggee runs — a pause against an already-stopped process can block
+    // indefinitely. Release runtime.mutex first: holding it here would stall every
+    // other tool, including mem_* and code_*, behind an unresponsive debuggee.
     if (isDebugToolAvailable(runtime, tool_name)) {
+        runtime.mutex.unlock();
+        mutex_locked = false;
+        debug_log_mod.log("runtimeCallTool: mutex released for blocking debug tool {s}", .{tool_name});
         const result = try callDebugTool(runtime, tool_name, arguments);
+        errdefer runtime.allocator.free(result);
+        runtime.mutex.lock();
+        mutex_locked = true;
+        debug_log_mod.log("runtimeCallTool: mutex re-acquired after debug tool {s}", .{tool_name});
+        // session_contexts may have rehashed while unlocked, so re-resolve.
+        session_ctx = try runtime.ensureSessionContext();
         try session_context_mod.recordToolEvent(session_ctx, tool_name, arguments);
         return result;
     }
@@ -3959,6 +3972,41 @@ test "runtimeCallTool keeps runtime mutex held across remote calls and event rec
     const record_event = std.mem.indexOf(u8, remote_branch, "session_context_mod.recordToolEvent(session_ctx, tool_name, arguments)") orelse return error.TestUnexpectedResult;
     try std.testing.expect(remote_call < rebind_context);
     try std.testing.expect(rebind_context < record_event);
+}
+
+test "a blocking debug tool releases the runtime mutex" {
+    const allocator = std.testing.allocator;
+    const driver_mod = @import("debug/driver.zig");
+
+    var runtime = try testRuntime(allocator);
+    defer runtime.deinit();
+
+    var mock = driver_mod.MockDriver{};
+    mock.setBlockRun(true);
+    const session_id = try runtime.debug_server.session_manager.createSession(mock.activeDriver(), null, .none);
+    runtime.debug_server.session_manager.getSession(session_id).?.status = .stopped;
+
+    const args = try json.parseFromSlice(json.Value, allocator,
+        \\{"session_id":"session-1","action":"continue","timeout_ms":60000}
+    , .{});
+    defer args.deinit();
+
+    const Worker = struct {
+        fn run(rt: *Runtime, tool_args: json.Value) void {
+            const result = runtimeCallTool(rt, "debug_run", tool_args) catch return;
+            rt.allocator.free(result);
+        }
+    };
+    var worker = try std.Thread.spawn(.{}, Worker.run, .{ &runtime, args.value });
+    defer worker.join();
+    defer mock.releaseRun();
+
+    mock.waitForRunEntered();
+
+    // Every other tool shares runtime.mutex. A debuggee that never stops must
+    // not be able to wedge mem_* and code_* behind it.
+    try std.testing.expect(runtime.mutex.tryLock());
+    runtime.mutex.unlock();
 }
 
 test "capability-only hosted tools stay hidden while registering support" {
