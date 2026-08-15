@@ -846,14 +846,31 @@ fn selectFallback(allocator: std.mem.Allocator, options: SelectOptions) !SelectR
     return .{ .selected = idx };
 }
 
+/// Reads one line from stdin without consuming bytes past the newline, so a
+/// piped sequence of answers delivers exactly one answer per prompt.
+fn readLineInto(buf: []u8) !usize {
+    var len: usize = 0;
+    while (true) {
+        var byte: [1]u8 = undefined;
+        const n = try posix.read(std.fs.File.stdin().handle, &byte);
+        if (n == 0) {
+            if (len == 0) return error.EndOfStream;
+            break;
+        }
+        if (byte[0] == '\n') break;
+        if (len < buf.len) {
+            buf[len] = byte[0];
+            len += 1;
+        }
+    }
+    if (len > 0 and buf[len - 1] == '\r') len -= 1;
+    return len;
+}
+
 fn readLine(allocator: std.mem.Allocator) ![]const u8 {
     var buf: [1024]u8 = undefined;
-    const n = try posix.read(std.fs.File.stdin().handle, &buf);
-    if (n == 0) return error.EndOfStream;
-    var line = buf[0..n];
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    return allocator.dupe(u8, line);
+    const len = try readLineInto(&buf);
+    return allocator.dupe(u8, buf[0..len]);
 }
 
 // ── Multi-Select (TTY) ──────────────────────────────────────────────────
@@ -995,12 +1012,10 @@ fn multiSelectFallback(allocator: std.mem.Allocator, options: MultiSelectOptions
     stderrWrite("  Enter numbers separated by commas: ");
 
     var input_buf: [256]u8 = undefined;
-    const n = posix.read(std.fs.File.stdin().handle, &input_buf) catch return .cancelled;
+    const n = readLineInto(&input_buf) catch return .cancelled;
     if (n == 0) return .cancelled;
 
-    var line = input_buf[0..n];
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    const line = input_buf[0..n];
 
     // Parse comma-separated numbers
     var indices: std.ArrayListUnmanaged(usize) = .empty;
@@ -1076,7 +1091,7 @@ fn confirmOverwriteFallback(path: []const u8) !OverwriteAction {
     stderrWrite("? (yes/No/all/diff) ");
 
     var buf: [64]u8 = undefined;
-    const n = posix.read(std.fs.File.stdin().handle, &buf) catch return .no;
+    const n = readLineInto(&buf) catch return .no;
     if (n == 0) return .no;
     if (buf[0] == 'y' or buf[0] == 'Y') return .yes;
     if (buf[0] == 'a' or buf[0] == 'A') return .all;
@@ -1112,7 +1127,7 @@ fn confirmFallback(prompt: []const u8) !bool {
     stderrWrite(" (y/N) ");
 
     var buf: [64]u8 = undefined;
-    const n = posix.read(std.fs.File.stdin().handle, &buf) catch return false;
+    const n = readLineInto(&buf) catch return false;
     if (n == 0) return false;
     return buf[0] == 'y' or buf[0] == 'Y';
 }
@@ -1153,7 +1168,7 @@ fn confirmWithAllFallback(prompt: []const u8) !ConfirmAllResult {
     stderrWrite(" (y/N/a) ");
 
     var buf: [64]u8 = undefined;
-    const n = posix.read(std.fs.File.stdin().handle, &buf) catch return .no;
+    const n = readLineInto(&buf) catch return .no;
     if (n == 0) return .no;
     if (buf[0] == 'y' or buf[0] == 'Y') return .yes;
     if (buf[0] == 'a' or buf[0] == 'A') return .all;
@@ -1208,4 +1223,34 @@ pub fn validateBrainName(input: []const u8) ?[]const u8 {
     }
 
     return null; // valid
+}
+
+test "non-tty prompts consume exactly one line each" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const saved_stdin = try posix.dup(posix.STDIN_FILENO);
+    defer {
+        posix.dup2(saved_stdin, posix.STDIN_FILENO) catch {};
+        posix.close(saved_stdin);
+    }
+
+    const fds = try posix.pipe();
+    _ = try posix.write(fds[1], "y\n2\nhello world\n");
+    posix.close(fds[1]);
+    try posix.dup2(fds[0], posix.STDIN_FILENO);
+    posix.close(fds[0]);
+
+    try std.testing.expect(try confirm("first question?"));
+
+    var items = [_]MenuItem{
+        .{ .label = "Preset" },
+        .{ .label = "Custom command", .is_input_option = true },
+    };
+    switch (try select(std.testing.allocator, .{ .prompt = "pick one:", .items = &items })) {
+        .input => |cmd| {
+            defer std.testing.allocator.free(cmd);
+            try std.testing.expectEqualStrings("hello world", cmd);
+        },
+        else => return error.ExpectedCustomInput,
+    }
 }
