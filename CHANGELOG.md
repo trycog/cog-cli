@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A project-scan agent that exits on a signal (for example when it is interrupted) is now reported as a scan that produced no results, instead of aborting `cog init` on an invalid exit-status read.
 - Choosing "Custom command" or "Custom host" at a Cog prompt no longer leaks the text you typed: `cog init`, `cog mem:bootstrap`, and `cog mem:upgrade` now release it on every exit path.
 - Prompts read exactly one line from a non-interactive stdin instead of consuming the whole buffer, so `cog init` and the other interactive commands can be driven from a pipe or script. Previously every answer after the first was swallowed and the command aborted.
+- A stuck debug session no longer freezes the entire MCP server. Pausing a debuggee that was already stopped waited for a stop event that the operating system reports only once and would never send again, and that wait was held under the global runtime lock — so every other tool, `mem_*` and `code_*` included, hung behind one wedged debuggee until the session timed out. Pause now reports the existing stop instead of signalling a stopped process, every remaining wait has a deadline, and debug tools no longer hold the runtime lock while they block.
 
 ## [0.27.1] - 2026-08-14
 
