@@ -1289,7 +1289,9 @@ pub const DebugServer = struct {
             return okText(allocator, "Restarted session `{s}`.", .{session_id_val.string});
         }
 
-        // Pause is non-blocking — keep synchronous
+        // Pause is bounded by the driver, so it stays synchronous rather than
+        // paying for a worker thread. It is not free: a pause still waits for
+        // the debuggee to report its stop, just never indefinitely.
         if (action == .pause) {
             session.status = .running;
             var state = session.driver.runEx(allocator, action, run_options) catch |err| {

@@ -28,6 +28,11 @@ const InstructionBreakpoint = types.InstructionBreakpoint;
 
 // ── DWARF Debug Engine ──────────────────────────────────────────────────
 
+/// How long a pause waits for the debuggee to report its stop. A SIGSTOP that
+/// is going to land lands immediately, so this only bounds the pathological
+/// case; the server's own run timeout is the budget that users actually see.
+const pause_wait_timeout_ms: u64 = 2_000;
+
 const HardwareWatchpoint = struct {
     active: bool = false,
     id: u32 = 0, // breakpoint ID (slot + 1000)
@@ -1068,12 +1073,25 @@ pub const DwarfEngine = struct {
                 return .{ .stop_reason = .exception };
             },
             .pause => {
+                // A stopped debuggee has already had its stop reported, and waitpid()
+                // reports each stop exactly once. Signalling it again produces nothing
+                // to reap, so waiting would park this thread forever and stall every
+                // other tool sharing the server. The process is stopped either way.
+                if (!self.process.is_running) {
+                    debug_log.log("dwarf.engine: pause skipped, process already stopped", .{});
+                    return .{ .stop_reason = .pause };
+                }
                 // Send SIGSTOP to pause a running process
                 if (self.process.pid) |pid| {
                     const posix = std.posix;
                     posix.kill(pid, posix.SIG.STOP) catch {};
                 }
-                const result = try self.process.waitForStop();
+                // Bounded: the signal may still race a process that is exiting or
+                // being reaped elsewhere, and no pause is worth a stuck thread.
+                const result = (try self.process.waitForStopTimeout(pause_wait_timeout_ms)) orelse {
+                    debug_log.log("dwarf.engine: pause wait timed out after {d}ms", .{pause_wait_timeout_ms});
+                    return .{ .stop_reason = .pause };
+                };
                 return switch (result.status) {
                     .stopped => .{ .stop_reason = .pause },
                     .exited => .{ .stop_reason = if (result.exit_code == 0) .exited else .exception, .exit_code = result.exit_code },
@@ -5097,6 +5115,19 @@ test "DwarfEngine initial state" {
     try std.testing.expect(!engine.launched);
     try std.testing.expect(engine.program_path == null);
     try std.testing.expectEqual(@as(usize, 0), engine.bp_manager.list().len);
+}
+
+test "pause on an already-stopped process reports the existing stop" {
+    var engine = DwarfEngine.init(std.testing.allocator);
+    defer engine.deinit();
+
+    // A stopped debuggee has no further stop event to report, so waiting for one
+    // parks this thread forever -- and every MCP tool queued behind it.
+    engine.process.is_running = false;
+
+    var driver = engine.activeDriver();
+    const state = try driver.run(std.testing.allocator, .pause);
+    try std.testing.expectEqual(StopReason.pause, state.stop_reason);
 }
 
 test "DwarfEngine implements ActiveDriver interface" {
