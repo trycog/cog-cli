@@ -7,7 +7,12 @@ const debug_log = @import("../../debug_log.zig");
 // ── Linux ptrace-based Process Control ──────────────────────────────────
 
 const WUNTRACED: u32 = 0x00000002;
+const WNOHANG: u32 = 0x00000001;
 const SIGKILL: u8 = 9;
+
+/// Poll cadence for bounded waits. Short enough that a pause feels immediate,
+/// long enough that waiting costs no measurable CPU.
+const wait_poll_interval_ns: u64 = 2 * std.time.ns_per_ms;
 
 const PTRACE_TRACEME: u32 = 0;
 const PTRACE_PEEKDATA: u32 = 2;
@@ -123,26 +128,51 @@ pub const PtraceProcessControl = struct {
     pub fn waitForStop(self: *PtraceProcessControl) !process_types.WaitResult {
         if (self.pid) |pid| {
             const result = posix.waitpid(pid, WUNTRACED);
-            self.is_running = false;
-
-            const status = result.status;
-            // WIFEXITED: (status & 0x7f) == 0
-            if ((status & 0x7f) == 0) {
-                self.pid = null;
-                return .{ .status = .exited, .exit_code = @intCast((status >> 8) & 0xff) };
-            }
-            // WIFSIGNALED: low 7 bits are signal number (non-zero, not 0x7f)
-            if ((status & 0x7f) != 0 and (status & 0x7f) != 0x7f) {
-                self.pid = null;
-                return .{ .status = .signaled, .signal = @intCast(status & 0x7f) };
-            }
-            // WIFSTOPPED: (status & 0xff) == 0x7f
-            if ((status & 0xff) == 0x7f) {
-                return .{ .status = .stopped, .signal = @intCast((status >> 8) & 0xff) };
-            }
-            return .{ .status = .unknown };
+            return self.reapStatus(result.status);
         }
         return error.NoProcess;
+    }
+
+    /// Wait for a stop event, giving up after `timeout_ms` and returning null.
+    ///
+    /// Each stop is reported exactly once, so a wait for an event that is never
+    /// coming -- SIGSTOP against a process that is already stopped -- blocks
+    /// forever. Callers that cannot prove an event is pending must use this
+    /// instead of `waitForStop`, because a parked debugger thread stalls every
+    /// other tool sharing the server.
+    pub fn waitForStopTimeout(self: *PtraceProcessControl, timeout_ms: u64) !?process_types.WaitResult {
+        const pid = self.pid orelse return error.NoProcess;
+        const deadline_ms = std.time.milliTimestamp() +| @as(i64, @intCast(timeout_ms));
+        while (true) {
+            const result = posix.waitpid(pid, WUNTRACED | WNOHANG);
+            if (result.pid != 0) return self.reapStatus(result.status);
+            if (std.time.milliTimestamp() >= deadline_ms) {
+                debug_log.log("dwarf.process: pid={d} wait timed out after {d}ms", .{ pid, timeout_ms });
+                return null;
+            }
+            std.Thread.sleep(wait_poll_interval_ns);
+        }
+    }
+
+    /// Interpret a raw wait status, releasing process state when the child is gone.
+    fn reapStatus(self: *PtraceProcessControl, status: u32) process_types.WaitResult {
+        self.is_running = false;
+
+        // WIFEXITED: (status & 0x7f) == 0
+        if ((status & 0x7f) == 0) {
+            self.pid = null;
+            return .{ .status = .exited, .exit_code = @intCast((status >> 8) & 0xff) };
+        }
+        // WIFSIGNALED: low 7 bits are signal number (non-zero, not 0x7f)
+        if ((status & 0x7f) != 0 and (status & 0x7f) != 0x7f) {
+            self.pid = null;
+            return .{ .status = .signaled, .signal = @intCast(status & 0x7f) };
+        }
+        // WIFSTOPPED: (status & 0xff) == 0x7f
+        if ((status & 0xff) == 0x7f) {
+            return .{ .status = .stopped, .signal = @intCast((status >> 8) & 0xff) };
+        }
+        return .{ .status = .unknown };
     }
 
     /// Read the tracee's general-purpose registers using the native Linux ABI.

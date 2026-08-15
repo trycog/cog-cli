@@ -11,7 +11,12 @@ pub const FloatRegisterState = process_types.FloatRegisterState;
 // ── macOS Mach-based Process Control ────────────────────────────────────
 
 const WUNTRACED: u32 = if (builtin.os.tag == .macos) 0x00000002 else 0x00000002;
+const WNOHANG: u32 = 0x00000001;
 const SIGKILL: u8 = 9;
+
+/// Poll cadence for bounded waits. Short enough that a pause feels immediate,
+/// long enough that waiting costs no measurable CPU.
+const wait_poll_interval_ns: u64 = 2 * std.time.ns_per_ms;
 
 // macOS Mach thread state definitions (not in Zig's std.c)
 const ARM_THREAD_STATE64: std.c.thread_flavor_t = 6;
@@ -281,9 +286,37 @@ pub const MachProcessControl = struct {
     pub fn waitForStop(self: *MachProcessControl) !WaitResult {
         if (self.pid) |pid| {
             const result = posix.waitpid(pid, WUNTRACED);
+            return self.reapStatus(pid, result.status);
+        }
+        return error.NoProcess;
+    }
+
+    /// Wait for a stop event, giving up after `timeout_ms` and returning null.
+    ///
+    /// Each stop is reported exactly once, so a wait for an event that is never
+    /// coming -- SIGSTOP against a process that is already stopped -- blocks
+    /// forever. Callers that cannot prove an event is pending must use this
+    /// instead of `waitForStop`, because a parked debugger thread stalls every
+    /// other tool sharing the server.
+    pub fn waitForStopTimeout(self: *MachProcessControl, timeout_ms: u64) !?WaitResult {
+        const pid = self.pid orelse return error.NoProcess;
+        const deadline_ms = std.time.milliTimestamp() +| @as(i64, @intCast(timeout_ms));
+        while (true) {
+            const result = posix.waitpid(pid, WUNTRACED | WNOHANG);
+            if (result.pid != 0) return self.reapStatus(pid, result.status);
+            if (std.time.milliTimestamp() >= deadline_ms) {
+                debug_log.log("dwarf.process: pid={d} wait timed out after {d}ms", .{ pid, timeout_ms });
+                return null;
+            }
+            std.Thread.sleep(wait_poll_interval_ns);
+        }
+    }
+
+    /// Interpret a raw wait status, releasing process state when the child is gone.
+    fn reapStatus(self: *MachProcessControl, pid: posix.pid_t, status: u32) WaitResult {
+        {
             self.is_running = false;
 
-            const status = result.status;
             // WIFEXITED: (status & 0x7f) == 0
             if ((status & 0x7f) == 0) {
                 debug_log.log("dwarf.process: pid={d} exited, exit_code={d}", .{ pid, (status >> 8) & 0xff });
@@ -337,7 +370,6 @@ pub const MachProcessControl = struct {
             }
             return .{ .status = .unknown };
         }
-        return error.NoProcess;
     }
 
     pub fn readRegisters(self: *MachProcessControl) !RegisterState {
@@ -948,4 +980,58 @@ test "MachProcessControl pipe fields default to null" {
     const pc = MachProcessControl{};
     try std.testing.expect(pc.stdout_pipe_read == null);
     try std.testing.expect(pc.stderr_pipe_read == null);
+}
+
+// These use std.process.Child rather than spawn(), so they avoid the fork() that
+// hangs the multi-threaded test runner and can run in the normal suite.
+
+test "waitForStopTimeout gives up when no stop event arrives" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var child = std.process.Child.init(&.{ "/bin/sleep", "30" }, std.testing.allocator);
+    try child.spawn();
+    defer _ = child.kill() catch {};
+
+    var pc = MachProcessControl{};
+    pc.pid = child.id;
+    pc.is_running = true;
+    defer pc.pid = null; // the Child owns reaping
+
+    // Nothing is going to stop this child. An unbounded waitpid() would park the
+    // calling thread forever, and every tool sharing the server behind it.
+    const started = std.time.milliTimestamp();
+    const result = try pc.waitForStopTimeout(50);
+    const elapsed = std.time.milliTimestamp() - started;
+
+    try std.testing.expect(result == null);
+    try std.testing.expect(elapsed < 5_000);
+    // A timed-out wait observed no state change, so the process is still running.
+    try std.testing.expect(pc.is_running);
+}
+
+test "waitForStopTimeout reports a stop that has already been delivered" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    var child = std.process.Child.init(&.{ "/bin/sleep", "30" }, std.testing.allocator);
+    try child.spawn();
+    defer _ = child.kill() catch {};
+
+    var pc = MachProcessControl{};
+    pc.pid = child.id;
+    pc.is_running = true;
+    defer pc.pid = null;
+
+    try posix.kill(child.id, posix.SIG.STOP);
+
+    const result = (try pc.waitForStopTimeout(5_000)) orelse return error.StopNotReported;
+    try std.testing.expectEqual(process_types.WaitResult.Status.stopped, result.status);
+    try std.testing.expect(!pc.is_running);
+
+    // Each stop is reported exactly once. A second SIGSTOP against a process that
+    // is already stopped produces nothing to reap -- this is the shape that hung
+    // the MCP server, so the bounded wait must return instead of blocking.
+    try posix.kill(child.id, posix.SIG.STOP);
+    try std.testing.expect((try pc.waitForStopTimeout(50)) == null);
+
+    try posix.kill(child.id, posix.SIG.CONT);
 }
