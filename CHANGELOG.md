@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `cog init` no longer prints a `memory address ... leaked` report after running a project scan: the scan agent's captured stderr is now released instead of being discarded, and the reader thread is always joined before the scan returns.
+- A project-scan agent that exits on a signal (for example when it is interrupted) is now reported as a scan that produced no results, instead of aborting `cog init` on an invalid exit-status read.
+
 ## [0.27.1] - 2026-08-14
 
 ### Added

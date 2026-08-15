@@ -1031,21 +1031,28 @@ fn runProjectScan(
     };
 
     // Read stderr on background thread to avoid deadlock
+    var stderr_data: ?[]const u8 = null;
     const StderrReader = struct {
-        fn run(stderr: std.fs.File, alloc: std.mem.Allocator) void {
-            _ = stderr.readToEndAlloc(alloc, 10 * 1024 * 1024) catch {};
+        fn run(stderr: std.fs.File, alloc: std.mem.Allocator, out: *?[]const u8) void {
+            out.* = stderr.readToEndAlloc(alloc, 10 * 1024 * 1024) catch null;
         }
     };
-    const stderr_thread = std.Thread.spawn(.{}, StderrReader.run, .{ child.stderr.?, allocator }) catch null;
+    const stderr_thread = std.Thread.spawn(.{}, StderrReader.run, .{ child.stderr.?, allocator, &stderr_data }) catch null;
 
     // Read stdout (JSON output)
-    const stdout_data = child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
+    const stdout_read = child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
+
+    // The reader borrows stderr_data, which lives on this frame, so it has to be
+    // joined before any return below.
+    if (stderr_thread) |t| t.join();
+    defer if (stderr_data) |d| allocator.free(d);
+    debug_log.log("runProjectScan: agent stderr bytes={d}", .{if (stderr_data) |d| d.len else 0});
+
+    const stdout_data = stdout_read orelse {
         debug_log.log("runProjectScan: failed to read stdout", .{});
         _ = child.wait() catch {};
         return null;
     };
-
-    if (stderr_thread) |t| t.join();
 
     const term = child.wait() catch {
         debug_log.log("runProjectScan: wait failed", .{});
@@ -1053,10 +1060,17 @@ fn runProjectScan(
         return null;
     };
 
-    if (term.Exited != 0) {
-        debug_log.log("runProjectScan: agent exited with code {d}", .{term.Exited});
-        allocator.free(stdout_data);
-        return null;
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            debug_log.log("runProjectScan: agent exited with code {d}", .{code});
+            allocator.free(stdout_data);
+            return null;
+        },
+        else => {
+            debug_log.log("runProjectScan: agent terminated abnormally ({s})", .{@tagName(term)});
+            allocator.free(stdout_data);
+            return null;
+        },
     }
 
     if (stdout_data.len == 0) {
@@ -3474,6 +3488,67 @@ test "approving an external root preserves unrelated settings" {
             try std.testing.expectEqualStrings("/srv/alpha", roots[0].string);
             try std.testing.expectEqualStrings("/srv/beta", roots[1].string);
             try std.testing.expect(parsed.value.object.get("memory") != null);
+        }
+    }.run);
+}
+
+fn writeScanScript(body: []const u8) !void {
+    try std.fs.cwd().writeFile(.{ .sub_path = "scan.sh", .data = body });
+}
+
+test "runProjectScan releases the agent stderr buffer" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeScanScript(
+                \\i=0
+                \\while [ $i -lt 400 ]; do
+                \\  echo "scan progress line $i" >&2
+                \\  i=$((i + 1))
+                \\done
+                \\printf '%s' '{"index_patterns":["src/**/*.zig"]}'
+                \\
+            );
+
+            const result = runProjectScan(allocator, null, "/bin/sh ./scan.sh") orelse
+                return error.ScanProducedNoResult;
+            defer allocator.free(result);
+
+            try std.testing.expectEqualStrings("{\"index_patterns\":[\"src/**/*.zig\"]}", result);
+        }
+    }.run);
+}
+
+test "runProjectScan releases the agent stderr buffer when the scan fails" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeScanScript(
+                \\i=0
+                \\while [ $i -lt 400 ]; do
+                \\  echo "scan progress line $i" >&2
+                \\  i=$((i + 1))
+                \\done
+                \\exit 3
+                \\
+            );
+
+            try std.testing.expect(runProjectScan(allocator, null, "/bin/sh ./scan.sh") == null);
+        }
+    }.run);
+}
+
+test "runProjectScan reports no result when the agent dies from a signal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try withTempCwd(struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            try writeScanScript(
+                \\echo "partial scan output" >&2
+                \\kill -TERM $$
+                \\
+            );
+
+            try std.testing.expect(runProjectScan(allocator, null, "/bin/sh ./scan.sh") == null);
         }
     }.run);
 }
