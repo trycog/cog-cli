@@ -131,6 +131,13 @@ pub fn enabled() bool {
     return log_file != null;
 }
 
+/// Darwin reports `ru_maxrss` in bytes where Linux reports kilobytes, so the
+/// raw value is normalized here rather than leaving a `rss_kb` field that means
+/// something different depending on the host reading the log.
+fn maxRssKilobytes(raw: i64) i64 {
+    return if (builtin.os.tag.isDarwin()) @divTrunc(raw, 1024) else raw;
+}
+
 pub fn resourceUsage() ?ResourceUsage {
     if (@TypeOf(std.c.rusage) == void) return null;
 
@@ -140,7 +147,7 @@ pub fn resourceUsage() ?ResourceUsage {
     return .{
         .user_ms = @as(i64, @intCast(usage.utime.sec)) * 1000 + @divTrunc(@as(i64, @intCast(usage.utime.usec)), 1000),
         .system_ms = @as(i64, @intCast(usage.stime.sec)) * 1000 + @divTrunc(@as(i64, @intCast(usage.stime.usec)), 1000),
-        .max_rss_kb = @as(i64, @intCast(usage.maxrss)),
+        .max_rss_kb = maxRssKilobytes(@as(i64, @intCast(usage.maxrss))),
         .minor_faults = @as(i64, @intCast(usage.minflt)),
         .major_faults = @as(i64, @intCast(usage.majflt)),
         .vol_cs = @as(i64, @intCast(usage.nvcsw)),
@@ -203,6 +210,13 @@ fn signalHandler(sig: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.
     }
 
     f.writeAll("=== end crash ===\n") catch {};
+}
+
+test "max rss is normalized to the kilobytes the field name promises" {
+    const half_gib: i64 = 591 * 1024 * 1024;
+    const expected: i64 = if (builtin.os.tag.isDarwin()) half_gib / 1024 else half_gib;
+    try std.testing.expectEqual(expected, maxRssKilobytes(half_gib));
+    try std.testing.expectEqual(@as(i64, 0), maxRssKilobytes(0));
 }
 
 test "debug_log disabled by default" {
