@@ -1976,46 +1976,53 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             .scip_binary => |sc| sc,
             .tree_sitter => continue,
         };
-        const batch_files = ext_files[ext_idx].items;
-        if (batch_files.len == 0) continue;
-        const progress_path = batch_files[batch_files.len - 1];
-        if (show_progress) {
-            tui.progressUpdate(indexed_count, total_files, total_symbols, progress_path);
-        }
+        const all_files = ext_files[ext_idx].items;
+        if (all_files.len == 0) continue;
 
-        debug_log.log("codeIndex: invoking bulk external indexer {s} for {d} files", .{ scip_config.command, batch_files.len });
-        debug_log.logResourceUsage("codeIndex:external:start");
-        const batch_start_count = indexed_count;
-        var progress_ctx = ExternalIndexerProgress{
-            .indexed_count = &indexed_count,
-            .total_files = total_files,
-            .total_symbols = &total_symbols,
-            .show_progress = show_progress,
-        };
-        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, &progress_ctx) catch |err| {
-            debug_log.log("codeIndex: external_failed command={s} files={d} err={s}", .{ scip_config.command, batch_files.len, @errorName(err) });
-            return err;
-        };
+        var batch_start: usize = 0;
+        while (batch_start < all_files.len) {
+            const batch_files = externalBatchSlice(all_files, batch_start);
+            batch_start += batch_files.len;
 
-        backing_buffers.append(allocator, result.backing_data.?) catch {};
-        for (result.index.documents) |doc| {
-            mergeDocumentList(allocator, &doc_list, doc);
-            total_symbols += doc.symbols.len;
-        }
-        allocator.free(result.index.documents);
-        for (result.index.external_symbols) |sym| {
-            mergeExternalSymbolList(allocator, &external_symbol_list, sym);
-        }
-        allocator.free(result.index.external_symbols);
-        if (indexed_count == batch_start_count) indexed_count += batch_files.len;
-        debug_log.log(
-            "codeIndex: external_done command={s} files={d} docs={d} external_symbols={d}",
-            .{ scip_config.command, batch_files.len, result.index.documents.len, result.index.external_symbols.len },
-        );
-        debug_log.logResourceUsage("codeIndex:external:done");
+            const progress_path = batch_files[batch_files.len - 1];
+            if (show_progress) {
+                tui.progressUpdate(indexed_count, total_files, total_symbols, progress_path);
+            }
 
-        if (show_progress) {
-            tui.progressUpdate(indexed_count, total_files, total_symbols, progress_path);
+            debug_log.log("codeIndex: invoking bulk external indexer {s} for {d} files ({d}/{d} queued)", .{ scip_config.command, batch_files.len, batch_start, all_files.len });
+            debug_log.logResourceUsage("codeIndex:external:start");
+            const batch_start_count = indexed_count;
+            var progress_ctx = ExternalIndexerProgress{
+                .indexed_count = &indexed_count,
+                .total_files = total_files,
+                .total_symbols = &total_symbols,
+                .show_progress = show_progress,
+            };
+            const result = invokeIndexerForFileList(allocator, batch_files, scip_config, &progress_ctx) catch |err| {
+                debug_log.log("codeIndex: external_failed command={s} files={d} err={s}", .{ scip_config.command, batch_files.len, @errorName(err) });
+                return err;
+            };
+
+            backing_buffers.append(allocator, result.backing_data.?) catch {};
+            for (result.index.documents) |doc| {
+                mergeDocumentList(allocator, &doc_list, doc);
+                total_symbols += doc.symbols.len;
+            }
+            allocator.free(result.index.documents);
+            for (result.index.external_symbols) |sym| {
+                mergeExternalSymbolList(allocator, &external_symbol_list, sym);
+            }
+            allocator.free(result.index.external_symbols);
+            if (indexed_count == batch_start_count) indexed_count += batch_files.len;
+            debug_log.log(
+                "codeIndex: external_done command={s} files={d} docs={d} external_symbols={d}",
+                .{ scip_config.command, batch_files.len, result.index.documents.len, result.index.external_symbols.len },
+            );
+            debug_log.logResourceUsage("codeIndex:external:done");
+
+            if (show_progress) {
+                tui.progressUpdate(indexed_count, total_files, total_symbols, progress_path);
+            }
         }
     }
 
@@ -2649,6 +2656,19 @@ fn invokeIndexerForFile(allocator: std.mem.Allocator, file_path: []const u8, con
         },
         .backing_data = tmp_data,
     };
+}
+
+/// Files handed to an external indexer per invocation. One invocation's SCIP
+/// payload is read whole, so an unbounded file list eventually exceeds the read
+/// cap: a 6,325-file Zig tree of generated bindings produced over 256 MiB and
+/// failed with FileTooBig. Chunking bounds both that payload and peak RSS.
+/// Cross-document references still resolve, because `CodeIndex.build` matches
+/// SCIP symbol strings over the merged index rather than within one invocation.
+pub const EXTERNAL_INDEXER_BATCH_LIMIT: usize = 1000;
+
+/// The batch starting at `start`, capped at `EXTERNAL_INDEXER_BATCH_LIMIT`.
+fn externalBatchSlice(files: []const []const u8, start: usize) []const []const u8 {
+    return files[start..@min(start + EXTERNAL_INDEXER_BATCH_LIMIT, files.len)];
 }
 
 fn invokeIndexerForFileList(
@@ -5500,48 +5520,57 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
             .scip_binary => |sc| sc,
             .tree_sitter => continue,
         };
-        const batch_files = ext_files[ext_idx].items;
-        if (batch_files.len == 0) continue;
-        debug_log.log("codeIndexInner: invoking bulk external indexer {s} for {d} files", .{ scip_config.command, batch_files.len });
-        debug_log.logResourceUsage("codeIndexInner:external:start");
-        const result = invokeIndexerForFileList(allocator, batch_files, scip_config, null) catch |err| {
-            debug_log.log("codeIndexInner: external batch failed command={s} files={d} error={s}", .{
-                scip_config.command,
-                batch_files.len,
-                @errorName(err),
-            });
-            continue;
-        };
-        backing_buffers.append(allocator, result.backing_data.?) catch {};
+        const all_files = ext_files[ext_idx].items;
+        if (all_files.len == 0) continue;
 
-        // Documents come back keyed by the physical paths the indexer was
-        // given; the index is keyed by logical path, exactly as the
-        // tree-sitter branch above already stores it.
-        var remapped: std.ArrayListUnmanaged(scip.Document) = .empty;
-        defer remapped.deinit(allocator);
-        remapExternalDocuments(allocator, ext_mappings[ext_idx].items, result.index.documents, &remapped) catch {
-            debug_log.log("codeIndexInner: alias remap failed command={s} docs={d}", .{
-                scip_config.command,
-                result.index.documents.len,
-            });
-            for (result.index.documents) |*doc| scip.freeDocument(allocator, doc);
+        var batch_start: usize = 0;
+        while (batch_start < all_files.len) {
+            const batch_files = externalBatchSlice(all_files, batch_start);
+            const mapping_slice = ext_mappings[ext_idx].items;
+            batch_start += batch_files.len;
+
+            debug_log.log("codeIndexInner: invoking bulk external indexer {s} for {d} files ({d}/{d} queued)", .{ scip_config.command, batch_files.len, batch_start, all_files.len });
+            debug_log.logResourceUsage("codeIndexInner:external:start");
+            const result = invokeIndexerForFileList(allocator, batch_files, scip_config, null) catch |err| {
+                debug_log.log("codeIndexInner: external batch failed command={s} files={d} error={s}", .{
+                    scip_config.command,
+                    batch_files.len,
+                    @errorName(err),
+                });
+                continue;
+            };
+            backing_buffers.append(allocator, result.backing_data.?) catch {};
+
+            // Documents come back keyed by the physical paths the indexer was
+            // given; the index is keyed by logical path, exactly as the
+            // tree-sitter branch above already stores it. The full mapping is
+            // passed even for a partial batch, since it is only a lookup table.
+            var remapped: std.ArrayListUnmanaged(scip.Document) = .empty;
+            defer remapped.deinit(allocator);
+            remapExternalDocuments(allocator, mapping_slice, result.index.documents, &remapped) catch {
+                debug_log.log("codeIndexInner: alias remap failed command={s} docs={d}", .{
+                    scip_config.command,
+                    result.index.documents.len,
+                });
+                for (result.index.documents) |*doc| scip.freeDocument(allocator, doc);
+                allocator.free(result.index.documents);
+                for (result.index.external_symbols) |*sym| freeSymbolInformation(allocator, sym);
+                allocator.free(result.index.external_symbols);
+                continue;
+            };
+            for (remapped.items) |doc| {
+                mergeDocumentList(allocator, &doc_list, doc);
+                total_symbols += doc.symbols.len;
+            }
             allocator.free(result.index.documents);
-            for (result.index.external_symbols) |*sym| freeSymbolInformation(allocator, sym);
+            for (result.index.external_symbols) |sym| {
+                mergeExternalSymbolList(allocator, &external_symbol_list, sym);
+            }
             allocator.free(result.index.external_symbols);
-            continue;
-        };
-        for (remapped.items) |doc| {
-            mergeDocumentList(allocator, &doc_list, doc);
-            total_symbols += doc.symbols.len;
+            indexed_count += batch_files.len;
+            debug_log.log("codeIndexInner: external_done command={s} files={d} docs={d} external_symbols={d}", .{ scip_config.command, batch_files.len, result.index.documents.len, result.index.external_symbols.len });
+            debug_log.logResourceUsage("codeIndexInner:external:done");
         }
-        allocator.free(result.index.documents);
-        for (result.index.external_symbols) |sym| {
-            mergeExternalSymbolList(allocator, &external_symbol_list, sym);
-        }
-        allocator.free(result.index.external_symbols);
-        indexed_count += batch_files.len;
-        debug_log.log("codeIndexInner: external_done command={s} files={d} docs={d} external_symbols={d}", .{ scip_config.command, batch_files.len, result.index.documents.len, result.index.external_symbols.len });
-        debug_log.logResourceUsage("codeIndexInner:external:done");
     }
 
     for (0..num_unique) |ext_idx| {
@@ -5580,6 +5609,28 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
+
+test "external indexer batches cover every file within the payload limit" {
+    var file_list: [2500][]const u8 = undefined;
+    for (&file_list) |*p| p.* = "a.zig";
+
+    var covered: usize = 0;
+    var chunks: usize = 0;
+    var start: usize = 0;
+    while (start < file_list.len) {
+        const chunk = externalBatchSlice(&file_list, start);
+        try std.testing.expect(chunk.len > 0);
+        try std.testing.expect(chunk.len <= EXTERNAL_INDEXER_BATCH_LIMIT);
+        covered += chunk.len;
+        chunks += 1;
+        start += chunk.len;
+    }
+    try std.testing.expectEqual(file_list.len, covered);
+    try std.testing.expectEqual(@as(usize, 3), chunks);
+
+    // Anything at or below the limit stays a single invocation.
+    try std.testing.expectEqual(@as(usize, 5), externalBatchSlice(file_list[0..5], 0).len);
+}
 
 test "CodeIndex.build and findSymbol" {
     const allocator = std.testing.allocator;
