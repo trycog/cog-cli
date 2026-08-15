@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.2] - 2026-08-15
+
 ### Fixed
 
 - `cog init` no longer prints a `memory address ... leaked` report after running a project scan: the scan agent's captured stderr is now released instead of being discarded, and the reader thread is always joined before the scan returns.
@@ -800,6 +802,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
 [0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
+[0.27.2]: https://github.com/trycog/cog-cli/releases/tag/v0.27.2
 [0.27.1]: https://github.com/trycog/cog-cli/releases/tag/v0.27.1
 [0.26.0]: https://github.com/trycog/cog-cli/releases/tag/v0.26.0
 [0.25.0]: https://github.com/trycog/cog-cli/releases/tag/v0.25.0
