@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.4] - 2026-08-16
+
 ### Fixed
 
 - `cog code:index` now shows progress during the phases that run before and after file indexing. Loading the previous index, walking the project for source files, and encoding and writing the result can each take minutes on a large repository, and all of them ran outside the progress block — so the terminal stayed blank for most of the run even though the per-file bar itself worked. The block is now printed before the first of those phases and updated in place throughout: the detail line names the current phase, the file total fills in once the walk determines it, and the bar then fills as before.
@@ -813,6 +815,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
 [0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
+[0.27.4]: https://github.com/trycog/cog-cli/releases/tag/v0.27.4
 [0.27.3]: https://github.com/trycog/cog-cli/releases/tag/v0.27.3
 [0.27.2]: https://github.com/trycog/cog-cli/releases/tag/v0.27.2
 [0.27.1]: https://github.com/trycog/cog-cli/releases/tag/v0.27.1
