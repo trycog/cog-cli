@@ -16,11 +16,25 @@ const excluded_directories = [_][]const u8{
     "__pycache__",
 };
 
+/// Called once per directory entry `collect` visits.
+///
+/// A walk over a large repository spends minutes inside a syscall loop with
+/// nothing to say, and a caller with no view into that loop can only present it
+/// as a hang. `scanned` counts every entry considered — matched, pruned, or
+/// skipped — and `matched` is how many have been collected so far, which is
+/// enough for a caller to show motion without the matcher knowing anything
+/// about terminals.
+pub const ScanObserver = struct {
+    context: *anyopaque,
+    onEntry: *const fn (context: *anyopaque, scanned: usize, matched: usize) void,
+};
+
 pub const Options = struct {
     project_root: []const u8,
     patterns: []const []const u8,
     external_roots: []const []const u8 = &.{},
     max_depth: usize = DEFAULT_MAX_DEPTH,
+    scan_observer: ?ScanObserver = null,
 };
 
 pub const MatchedPath = struct {
@@ -64,6 +78,11 @@ pub const PathMatcher = struct {
     aliases: std.ArrayListUnmanaged(Alias),
     aliases_discovered: bool,
     max_depth: usize,
+    scan_observer: ?ScanObserver,
+    /// Entries visited across every walk this matcher has performed. Cumulative
+    /// rather than per-walk because alias discovery walks the same tree before
+    /// collection does, and both passes are work the caller is waiting on.
+    scanned: usize,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !PathMatcher {
         const project_root = try std.fs.realpathAlloc(allocator, options.project_root);
@@ -145,6 +164,8 @@ pub const PathMatcher = struct {
             .aliases = .empty,
             .aliases_discovered = false,
             .max_depth = options.max_depth,
+            .scan_observer = options.scan_observer,
+            .scanned = 0,
         };
     }
 
@@ -205,6 +226,7 @@ pub const PathMatcher = struct {
             defer active.deinit();
             try self.walkDirectory(root.canonical_path, root.logical_prefix, 0, &active, out, false, null);
         }
+        debug_log.log("PathMatcher.collect: scanned={d} matched={d}", .{ self.scanned, out.items.len });
         std.mem.sort(MatchedPath, out.items, {}, struct {
             fn lessThan(_: void, a: MatchedPath, b: MatchedPath) bool {
                 const a_external = std.mem.startsWith(u8, a.logical_path, "@external/");
@@ -282,6 +304,11 @@ pub const PathMatcher = struct {
         return self.max_depth;
     }
 
+    fn reportScanned(self: *PathMatcher, matched: usize) void {
+        const observer = self.scan_observer orelse return;
+        observer.onEntry(observer.context, self.scanned, matched);
+    }
+
     pub fn freeMatchedPaths(self: *const PathMatcher, paths: []const MatchedPath) void {
         for (paths) |path| {
             self.allocator.free(path.logical_path);
@@ -341,6 +368,13 @@ pub const PathMatcher = struct {
         var iter = dir.iterate();
         while (try iter.next()) |entry| {
             if (!isTraversableEntryName(entry.name)) continue;
+
+            // Deferred so it reports on every path out of the loop body,
+            // pruning included. On a tree whose matching files are a rounding
+            // error on its total size, an observer that only fired for matches
+            // would sit still for the entire walk.
+            self.scanned += 1;
+            defer self.reportScanned(out.items.len);
 
             const logical_child = try joinLogical(self.allocator, logical_dir, entry.name);
             defer self.allocator.free(logical_child);
@@ -1337,4 +1371,55 @@ test "PathMatcher terminates symlink cycles and enforces depth cap" {
     }
     try matcher.collect(&paths);
     try expectLogicalPaths(&.{"a/shallow.zig"}, paths.items);
+}
+
+test "collect reports every entry it walks, including pruned ones" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "src/main.zig", "pub fn main() void {}\n");
+    try writeTestFile(tmp.dir, "src/util.zig", "pub const util = 1;\n");
+    try writeTestFile(tmp.dir, "assets/big/one.bin", "unreachable by any pattern\n");
+
+    const project_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(project_root);
+
+    const Recorder = struct {
+        calls: usize = 0,
+        scanned: usize = 0,
+        matched: usize = 0,
+
+        fn onEntry(context: *anyopaque, scanned: usize, matched: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            self.scanned = scanned;
+            self.matched = matched;
+        }
+    };
+    var recorder: Recorder = .{};
+
+    var matcher = try PathMatcher.init(allocator, .{
+        .project_root = project_root,
+        .patterns = &.{"src/**/*.zig"},
+        .scan_observer = .{ .context = &recorder, .onEntry = Recorder.onEntry },
+    });
+    defer matcher.deinit();
+
+    var paths: std.ArrayListUnmanaged(MatchedPath) = .empty;
+    defer {
+        matcher.freeMatchedPaths(paths.items);
+        paths.deinit(allocator);
+    }
+    try matcher.collect(&paths);
+
+    try expectLogicalPaths(&.{ "src/main.zig", "src/util.zig" }, paths.items);
+    // `assets` is pruned before it is descended into, but the entry itself is
+    // still visited — reporting it is what keeps the status line moving through
+    // a tree whose matching files are a rounding error on its total size.
+    try std.testing.expect(recorder.calls > paths.items.len);
+    try std.testing.expectEqual(recorder.calls, recorder.scanned);
+    // The final report carries the finished match count, so a caller that only
+    // renders the last tick still shows the number collection returned.
+    try std.testing.expectEqual(@as(usize, 2), recorder.matched);
 }

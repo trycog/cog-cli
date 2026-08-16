@@ -260,6 +260,18 @@ test "truncatePath sanitizes non-printable bytes" {
     try std.testing.expectEqualStrings("src/?debug/?file.zig", rendered);
 }
 
+test "renderScanStatus advances the spinner and groups the count" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "    " ++ dim ++ scan_spinner_frames[0] ++ " scanning files  0" ++ reset ++ "\n",
+        renderScanStatus(&buf, 0, "scanning files", 0),
+    );
+    try std.testing.expectEqualStrings(
+        "    " ++ dim ++ scan_spinner_frames[1] ++ " scanning files  258,110" ++ reset ++ "\n",
+        renderScanStatus(&buf, scan_spinner_frames.len + 1, "scanning files", 258110),
+    );
+}
+
 // Box-drawing characters for progress bar
 const bar_filled = "\xE2\x94\x81"; // ━ (heavy horizontal)
 const bar_empty = "\xE2\x94\x80"; // ─ (light horizontal)
@@ -303,6 +315,51 @@ fn renderBar(buf: []u8, current: usize, total: usize) []const u8 {
     pos += pct_str.len;
 
     return buf[0..pos];
+}
+
+// ── Scan Status ─────────────────────────────────────────────────────────
+
+// Braille spinner. A phase with no countable total has no bar to fill, so
+// rotation is the only thing distinguishing "working" from "hung".
+const scan_spinner_frames = [_][]const u8{
+    "\xE2\xA0\x8B", "\xE2\xA0\x99", "\xE2\xA0\xB9", "\xE2\xA0\xB8", "\xE2\xA0\xBC",
+    "\xE2\xA0\xB4", "\xE2\xA0\xA6", "\xE2\xA0\xA7", "\xE2\xA0\x87", "\xE2\xA0\x8F",
+};
+
+/// Render the scan status line into a buffer. Returns the written slice.
+/// Format: "    ⠙ scanning files  258,110"
+fn renderScanStatus(buf: []u8, frame: usize, label: []const u8, count: usize) []const u8 {
+    var num_buf: [32]u8 = undefined;
+    return std.fmt.bufPrint(buf, "    " ++ dim ++ "{s} {s}  {s}" ++ reset ++ "\n", .{
+        scan_spinner_frames[frame % scan_spinner_frames.len],
+        label,
+        formatNumber(&num_buf, count),
+    }) catch buf[0..0];
+}
+
+/// Print the pre-index status block (3 lines): heading, blank, status line.
+///
+/// Indexing opens with work whose size is not yet known — decoding the previous
+/// index and walking the tree for sources — and on a large repository that runs
+/// for minutes. The block claims its lines up front so `scanStatusUpdate` has
+/// somewhere to draw, and `scanStatusFinish` hands them to the counted progress
+/// block once the file total exists.
+pub fn scanStatusStart() void {
+    stderrWrite("  " ++ cyan ++ bold ++ "Indexing" ++ reset ++ "\n");
+    stderrWrite("\n");
+    stderrWrite("\n");
+}
+
+/// Redraw the status line (1 line) with the current phase and count.
+pub fn scanStatusUpdate(frame: usize, label: []const u8, count: usize) void {
+    clearLines(1);
+    var buf: [256]u8 = undefined;
+    stderrWrite(renderScanStatus(&buf, frame, label, count));
+}
+
+/// Erase all 3 status lines so `progressStart` can draw over them.
+pub fn scanStatusFinish() void {
+    clearLines(3);
 }
 
 /// Print the initial progress block (6 lines):

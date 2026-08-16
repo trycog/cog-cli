@@ -66,6 +66,63 @@ const bold = "\x1B[1m";
 const dim = "\x1B[2m";
 const reset = "\x1B[0m";
 
+/// Rate limiter for the pre-index status line.
+///
+/// The file scan reports once per directory entry — hundreds of thousands of
+/// times on a large repository — so deciding whether to redraw has to cost less
+/// than the syscalls being reported on. A counter stride absorbs the common
+/// case without consulting the clock at all, and a minimum interval keeps the
+/// terminal from being flooded when that stride is crossed many times a second.
+const ScanTicker = struct {
+    /// Entries between clock checks.
+    const entry_stride: usize = 512;
+    /// Milliseconds between redraws once the stride is crossed.
+    const min_interval_ms: i64 = 80;
+
+    started: bool = false,
+    last_ms: i64 = 0,
+
+    fn shouldTick(self: *ScanTicker, scanned: usize, now_ms: i64) bool {
+        // The first entry always draws. A phase that finishes before the first
+        // stride is crossed would otherwise never appear on screen at all.
+        if (!self.started) {
+            self.started = true;
+            self.last_ms = now_ms;
+            return true;
+        }
+        if (scanned % entry_stride != 0) return false;
+        if (now_ms - self.last_ms < min_interval_ms) return false;
+        self.last_ms = now_ms;
+        return true;
+    }
+};
+
+/// Bridges `PathMatcher`'s scan callback to the status line.
+///
+/// Kept separate from the matcher so the traversal policy stays free of any
+/// notion of a terminal, and separate from `tui` so the rate limiting is
+/// testable without one.
+const ScanStatus = struct {
+    show_progress: bool,
+    ticker: ScanTicker = .{},
+    frame: usize = 0,
+    scanned: usize = 0,
+
+    fn observer(self: *ScanStatus) path_matcher.ScanObserver {
+        return .{ .context = self, .onEntry = onEntry };
+    }
+
+    fn onEntry(context: *anyopaque, scanned: usize, matched: usize) void {
+        const self: *ScanStatus = @ptrCast(@alignCast(context));
+        self.scanned = scanned;
+        _ = matched;
+        if (!self.show_progress) return;
+        if (!self.ticker.shouldTick(scanned, std.time.milliTimestamp())) return;
+        self.frame += 1;
+        tui.scanStatusUpdate(self.frame, "scanning files", scanned);
+    }
+};
+
 const ExternalIndexerProgress = struct {
     indexed_count: *usize,
     total_files: usize,
@@ -1783,12 +1840,24 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         backing_buffers.deinit(allocator);
     }
 
+    // Claimed before the first slow step rather than after it. Decoding the
+    // previous index and walking the tree for sources both run for minutes on a
+    // large repository, and until this block exists there is nothing on screen
+    // to distinguish that work from a hang.
+    const show_progress = tui.isStderrTty();
+    if (show_progress) {
+        tui.header();
+        tui.scanStatusStart();
+        tui.scanStatusUpdate(0, "loading index", 0);
+    }
+
     const loaded = loadExistingIndex(allocator, index_path);
     var master_index = loaded.index;
     defer scip.freeIndex(allocator, &master_index);
     if (loaded.backing_data) |data| {
         backing_buffers.append(allocator, data) catch {};
     }
+    debug_log.log("codeIndex: loaded existing documents={d}", .{master_index.documents.len});
 
     const project_root = std.fs.path.dirname(cog_dir) orelse {
         printErr("error: failed to resolve project root\n");
@@ -1808,20 +1877,33 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         files.deinit(allocator);
     }
-    try collectMatchedFiles(allocator, project_root, patterns.items, external_roots, &files);
+    var scan_status: ScanStatus = .{ .show_progress = show_progress };
+    try collectMatchedFiles(
+        allocator,
+        project_root,
+        patterns.items,
+        external_roots,
+        &files,
+        scan_status.observer(),
+    );
 
     if (files.items.len == 0) {
+        if (show_progress) tui.scanStatusFinish();
         printErr("error: no files matched\n");
         return error.Explained;
     }
-    debug_log.log("codeIndex: start patterns={d} matched_files={d}", .{ patterns.items.len, files.items.len });
+    debug_log.log("codeIndex: start patterns={d} scanned_entries={d} matched_files={d}", .{
+        patterns.items.len,
+        scan_status.scanned,
+        files.items.len,
+    });
     debug_log.logResourceUsage("codeIndex:start");
 
-    // TTY progress display — show header immediately so the user sees output
-    const show_progress = tui.isStderrTty();
     const total_files = files.items.len;
     if (show_progress) {
-        tui.header();
+        // Hand the status block's lines to the counted progress block; the file
+        // total only exists now that the walk has finished.
+        tui.scanStatusFinish();
         tui.progressStart(total_files);
     }
 
@@ -2031,13 +2113,17 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     master_index.external_symbols = try external_symbol_list.toOwnedSlice(allocator);
     // doc_list is now empty; its defer is a no-op
 
-    // Encode and write the master index
+    // Encode and write the master index. Serializing and rewriting hundreds of
+    // megabytes takes long enough to look like a stall, so the last file's name
+    // is replaced with what is actually happening.
+    if (show_progress) tui.progressUpdate(indexed_count, total_files, total_symbols, "encoding index");
     const encoded = scip_encode.encodeIndex(allocator, master_index) catch {
         printErr("error: failed to encode index\n");
         return error.Explained;
     };
     defer allocator.free(encoded);
 
+    if (show_progress) tui.progressUpdate(indexed_count, total_files, total_symbols, "writing index");
     const lock_fd = acquireIndexLock(allocator, cog_dir) orelse {
         printErr("error: failed to lock index file\n");
         return error.Explained;
@@ -2327,11 +2413,13 @@ fn collectMatchedFiles(
     patterns: []const []const u8,
     external_roots: []const []const u8,
     out: *std.ArrayListUnmanaged(path_matcher.MatchedPath),
+    scan_observer: ?path_matcher.ScanObserver,
 ) !void {
     var matcher = try path_matcher.PathMatcher.init(allocator, .{
         .project_root = project_root,
         .patterns = patterns,
         .external_roots = external_roots,
+        .scan_observer = scan_observer,
     });
     defer matcher.deinit();
     try matcher.collect(out);
@@ -2348,7 +2436,7 @@ fn collectConfiguredFiles(
         "collectConfiguredFiles: project={s} patterns={d} external_roots={d}",
         .{ project_root, patterns.len, external_roots.len },
     );
-    try collectMatchedFiles(allocator, project_root, patterns, external_roots, out);
+    try collectMatchedFiles(allocator, project_root, patterns, external_roots, out, null);
     debug_log.log("collectConfiguredFiles: matched={d}", .{out.items.len});
 }
 
@@ -5388,7 +5476,7 @@ pub fn codeIndexInner(allocator: std.mem.Allocator, pattern_list: ?[]const []con
         }
         files.deinit(allocator);
     }
-    try collectMatchedFiles(allocator, project_root, patterns_buf.items, external_roots, &files);
+    try collectMatchedFiles(allocator, project_root, patterns_buf.items, external_roots, &files, null);
 
     if (files.items.len == 0) return error.NoFilesMatched;
     debug_log.log("codeIndexInner: start patterns={d} matched_files={d}", .{ patterns_buf.items.len, files.items.len });
@@ -5855,7 +5943,7 @@ test "collectMatchedFiles applies shared excludes and preserves symlink aliases"
 
     const project_root = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(project_root);
-    try collectMatchedFiles(allocator, project_root, &.{ "**/*.js", "!apps/**/priv/static/**" }, &.{}, &files);
+    try collectMatchedFiles(allocator, project_root, &.{ "**/*.js", "!apps/**/priv/static/**" }, &.{}, &files, null);
     try std.testing.expectEqual(@as(usize, 2), files.items.len);
     try std.testing.expectEqualStrings("apps/foo/assets/js/app.js", files.items[0].logical_path);
     try std.testing.expectEqualStrings("workspace-assets/js/app.js", files.items[1].logical_path);
@@ -7623,6 +7711,19 @@ test "queryIndexStatusForRuntime returns unavailable for invalid index" {
             try std.testing.expect(queryIndexStatusForRuntime(allocator) == .unavailable);
         }
     }.run);
+}
+
+test "ScanTicker draws immediately then rate limits redraws" {
+    var ticker: ScanTicker = .{};
+
+    // The first entry must draw, or a phase that finishes quickly never appears.
+    try std.testing.expect(ticker.shouldTick(1, 1_000));
+    // Cheap counter gate: entries between strides never consult the clock.
+    try std.testing.expect(!ticker.shouldTick(2, 5_000));
+    // On a stride boundary but inside the redraw interval.
+    try std.testing.expect(!ticker.shouldTick(ScanTicker.entry_stride, 1_010));
+    try std.testing.expect(ticker.shouldTick(ScanTicker.entry_stride * 2, 1_500));
+    try std.testing.expect(!ticker.shouldTick(ScanTicker.entry_stride * 3, 1_510));
 }
 
 test "parseIndexerProgressEvent parses file_done event" {
