@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.3] - 2026-08-16
+
 ### Fixed
 
 - `cog code:index` no longer appears to hang on large projects. Three separate defects stacked into one silent 80-second failure: file collection walked the entire project twice — once to discover symlink aliases, once to match — ignoring the configured `code.index` patterns, so a project indexing `src/**/*.zig` beside a large scratch directory spent all of its time in directories that could never produce a match; the whole file list was then handed to an external indexer in a single invocation whose SCIP output exceeded the 256 MiB read limit; and the resulting error was discarded by the top-level handler, which exited 1 without printing anything. Traversal now skips entries no include pattern can reach, external indexers are invoked in bounded batches, and any unhandled error is reported with a pointer to `--debug`.
@@ -807,6 +809,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/trycog/cog-cli/releases/tag/v0.9.0
 [0.23.0]: https://github.com/trycog/cog-cli/releases/tag/v0.23.0
 [0.23.1]: https://github.com/trycog/cog-cli/releases/tag/v0.23.1
+[0.27.3]: https://github.com/trycog/cog-cli/releases/tag/v0.27.3
 [0.27.2]: https://github.com/trycog/cog-cli/releases/tag/v0.27.2
 [0.27.1]: https://github.com/trycog/cog-cli/releases/tag/v0.27.1
 [0.26.0]: https://github.com/trycog/cog-cli/releases/tag/v0.26.0

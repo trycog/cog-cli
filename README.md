@@ -477,6 +477,18 @@ cog doctor
 
 Validates your Cog installation: config resolution, memory backend connectivity, code index health, installed extensions, and agent integration files. Reports pass/warn/fail per check with a summary line. Exits 1 on any failure — useful in CI or after setup changes.
 
+### Debug logging
+
+```sh
+cog code:index --debug
+```
+
+`--debug` is accepted by every command and writes a detailed log of configuration
+resolution, file operations, subprocess invocations, and network calls. When a
+command fails with an unexpected error, Cog prints the error name and points you
+here. Persist it with `{"debug": true}` in `.cog/settings.json` instead of passing
+the flag each time.
+
 ---
 
 ## Development
