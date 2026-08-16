@@ -97,7 +97,7 @@ const ScanTicker = struct {
     }
 };
 
-/// Bridges `PathMatcher`'s scan callback to the status line.
+/// Bridges `PathMatcher`'s scan callback to the progress block's detail line.
 ///
 /// Kept separate from the matcher so the traversal policy stays free of any
 /// notion of a terminal, and separate from `tui` so the rate limiting is
@@ -105,7 +105,6 @@ const ScanTicker = struct {
 const ScanStatus = struct {
     show_progress: bool,
     ticker: ScanTicker = .{},
-    frame: usize = 0,
     scanned: usize = 0,
 
     fn observer(self: *ScanStatus) path_matcher.ScanObserver {
@@ -118,8 +117,10 @@ const ScanStatus = struct {
         _ = matched;
         if (!self.show_progress) return;
         if (!self.ticker.shouldTick(scanned, std.time.milliTimestamp())) return;
-        self.frame += 1;
-        tui.scanStatusUpdate(self.frame, "scanning files", scanned);
+        // Totals are still zero: no file has been indexed yet, and the number
+        // of files to index is exactly what this walk is determining.
+        var detail_buf: [96]u8 = undefined;
+        tui.progressUpdate(0, 0, 0, tui.formatPhaseDetail(&detail_buf, "scanning files", scanned));
     }
 };
 
@@ -1844,11 +1845,16 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // previous index and walking the tree for sources both run for minutes on a
     // large repository, and until this block exists there is nothing on screen
     // to distinguish that work from a hang.
+    //
+    // The file total is not known until the walk finishes, so the block opens
+    // at zero and the detail line carries the phase. Every later redraw is a
+    // `progressUpdate` into these same six lines — the totals fill in once the
+    // walk supplies them, and the block is never torn down and reprinted.
     const show_progress = tui.isStderrTty();
     if (show_progress) {
         tui.header();
-        tui.scanStatusStart();
-        tui.scanStatusUpdate(0, "loading index", 0);
+        tui.progressStart(0);
+        tui.progressUpdate(0, 0, 0, "loading index");
     }
 
     const loaded = loadExistingIndex(allocator, index_path);
@@ -1888,7 +1894,8 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     );
 
     if (files.items.len == 0) {
-        if (show_progress) tui.scanStatusFinish();
+        // Erase the block rather than leaving a half-drawn one above the error.
+        if (show_progress) tui.clearLines(6);
         printErr("error: no files matched\n");
         return error.Explained;
     }
@@ -1900,12 +1907,9 @@ fn codeIndex(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     debug_log.logResourceUsage("codeIndex:start");
 
     const total_files = files.items.len;
-    if (show_progress) {
-        // Hand the status block's lines to the counted progress block; the file
-        // total only exists now that the walk has finished.
-        tui.scanStatusFinish();
-        tui.progressStart(total_files);
-    }
+    // The block is already on screen; the walk has just supplied the total that
+    // lets the bar start filling.
+    if (show_progress) tui.progressUpdate(0, total_files, 0, "indexing files");
 
     var indexed_count: usize = 0;
     var total_symbols: usize = 0;

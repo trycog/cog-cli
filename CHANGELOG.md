@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `cog code:index` now shows progress during the phases that run before file indexing starts. Loading the previous index and walking the project for source files can each take minutes on a large repository, and both ran before anything was drawn — so the terminal stayed blank for most of the run even though the per-file progress bar itself worked. The header now appears immediately, followed by a status line that names the current phase and counts directory entries as they are scanned. Encoding and writing the index are labelled the same way, closing the silent window between the last indexed file and the summary.
+- `cog code:index` now shows progress during the phases that run before and after file indexing. Loading the previous index, walking the project for source files, and encoding and writing the result can each take minutes on a large repository, and all of them ran outside the progress block — so the terminal stayed blank for most of the run even though the per-file bar itself worked. The block is now printed before the first of those phases and updated in place throughout: the detail line names the current phase, the file total fills in once the walk determines it, and the bar then fills as before.
 
 ## [0.27.3] - 2026-08-16
 
